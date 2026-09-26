@@ -120,6 +120,12 @@ const requestLog = [];
 let requestLogSeq = 0;
 let logSeq = 0;
 const serverStartedAt = Date.now();
+const rewriteFailures = [];
+function recordRewriteFailure(url, mode, err) {
+  rewriteFailures.push({ time: new Date().toISOString(), url, mode, message: err?.message || String(err) });
+  if (rewriteFailures.length > 100) rewriteFailures.splice(0, rewriteFailures.length - 100);
+  serverLog("error", "PROXY", `HTML/CSS/JS rewrite failed for ${url} (${mode}): ${err?.message || err} — served the page unrewritten instead of failing the request.`);
+}
 const ROOT = path.join("/tmp", "veyra-browse-jobs");
 fs.mkdirSync(ROOT, { recursive: true });
 
@@ -765,10 +771,15 @@ function rewriteHtml(html, base) {
   }
   $("video[poster]").each((_, el) => { const u = resolveResource($(el).attr("poster"), base); if (u) $(el).attr("poster", makeResourceUrl(u, base)); });
   $("track[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), base); if (u) $(el).attr("src", makeResourceUrl(u, base)); });
-  $("use[href],use[xlink\:href],image[href],image[xlink\:href]").each((_, el) => {
-    const attr = $(el).attr("href") != null ? "href" : "xlink:href";
-    const raw = $(el).attr(attr) || "";
-    const u = resolveResource(raw, base);
+  // Do not use CSS selectors containing xlink:href here: css-select/Cheerio can
+  // throw on the escaped namespace syntax for otherwise valid SVG documents.
+  // Walk the SVG elements directly and inspect both href forms.
+  $("use, image").each((_, el) => {
+    const rawHref = $(el).attr("href");
+    const rawXlink = $(el).attr("xlink:href");
+    const attr = rawHref != null ? "href" : (rawXlink != null ? "xlink:href" : null);
+    if (!attr) return;
+    const u = resolveResource($(el).attr(attr) || "", base);
     if (u) $(el).attr(attr, makeResourceUrl(u, base));
   });
   $("[imagesrcset]").each((_, el) => $(el).attr("imagesrcset", rewriteSrcset($(el).attr("imagesrcset"), base)));
@@ -777,11 +788,6 @@ function rewriteHtml(html, base) {
   }
   $(`[data-srcset]`).each((_, el) => $(el).attr("data-srcset", rewriteSrcset($(el).attr("data-srcset"), base)));
   $("track[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), base); if (u) $(el).attr("src", makeResourceUrl(u, base)); });
-  $("use[href],use[xlink\:href],image[href],image[xlink\:href]").each((_, el) => {
-    const attr = $(el).attr("href") != null ? "href" : "xlink:href"; const raw = $(el).attr(attr) || "";
-    const u = resolveResource(raw, base); if (u) $(el).attr(attr, makeResourceUrl(u, base));
-  });
-  $("[imagesrcset]").each((_, el) => $(el).attr("imagesrcset", rewriteSrcset($(el).attr("imagesrcset"), base)));
   $("[srcset]").each((_, el) => $(el).attr("srcset", rewriteSrcset($(el).attr("srcset"), base)));
   $("meta[http-equiv='refresh'],meta[http-equiv='Refresh']").each((_, el) => {
     const raw = $(el).attr("content") || ""; const m = raw.match(/^(\s*\d+\s*;\s*url\s*=\s*)(.+)$/i); if (!m) return;
@@ -1347,9 +1353,18 @@ async function proxyRequest(req, res, mode) {
     return res.status(200).type("html").send(challengeFallbackHtml(canonical, challenge));
   }
   let payload = result.body;
-  if (mode === "view" && (/html|xhtml|^$/.test(result.contentType.toLowerCase()))) payload = Buffer.from(rewriteHtml(payload.toString("utf8"), result.finalUrl || canonical), "utf8");
-  else if (mode === "resource" && result.contentType.toLowerCase().includes("text/css")) payload = Buffer.from(rewriteCssText(payload.toString("utf8"), result.finalUrl || canonical), "utf8");
-  else if (mode === "resource" && /javascript|ecmascript/.test(result.contentType.toLowerCase())) payload = Buffer.from(rewriteJsText(payload.toString("utf8"), result.finalUrl || canonical), "utf8");
+  try {
+    if (mode === "view" && (/html|xhtml|^$/.test(result.contentType.toLowerCase()))) payload = Buffer.from(rewriteHtml(payload.toString("utf8"), result.finalUrl || canonical), "utf8");
+    else if (mode === "resource" && result.contentType.toLowerCase().includes("text/css")) payload = Buffer.from(rewriteCssText(payload.toString("utf8"), result.finalUrl || canonical), "utf8");
+    else if (mode === "resource" && /javascript|ecmascript/.test(result.contentType.toLowerCase())) payload = Buffer.from(rewriteJsText(payload.toString("utf8"), result.finalUrl || canonical), "utf8");
+  } catch (rewriteErr) {
+    // A parser edge case in the HTML/CSS/JS rewriter should degrade the page,
+    // not fail the whole request. Serve the untouched upstream body instead —
+    // in-page links/resources may point at the original site rather than
+    // through Veyra, but the page still loads instead of hard-502ing.
+    recordRewriteFailure(result.finalUrl || canonical, mode, rewriteErr);
+    payload = result.body;
+  }
   for (const [k,v] of Object.entries(upstreamHeaders)) if (v) res.setHeader(k, v);
   res.setHeader("X-Veyra-Canonical-URL", result.finalUrl || canonical);
   res.setHeader("X-Veyra-Content-Type", result.contentType || "application/octet-stream");
@@ -1564,6 +1579,9 @@ function buildStatusReport() {
   for (const name of setUnused) addIssue("warn", `${name} is set but this server build never reads it — it has no effect. Remove it or check you're deploying the version of the code that's supposed to use it.`);
   for (const u of unrecognized) addIssue("warn", `${u.name} looks like a Veyra config variable but isn't recognized by this server build (raw value: ${u.raw}). Check for a typo, e.g. did you mean one of: ${STATUS_VAR_DEFS.flatMap(d => d.names).filter(n => n.slice(0, 4) === u.name.slice(0, 4)).join(", ") || "(no close match found)"}.`);
 
+  if (rewriteFailures.length) addIssue("warn", `${rewriteFailures.length} page(s) failed HTML/CSS/JS rewriting since boot and were served unrewritten as a fallback (links on those pages may point outside Veyra). Most recent: ${rewriteFailures[rewriteFailures.length - 1].url} — ${rewriteFailures[rewriteFailures.length - 1].message}`);
+
+
   const severityRankNum = { error: 0, warn: 1, info: 2 };
   issues.sort((a, b) => severityRankNum[a.severity] - severityRankNum[b.severity]);
 
@@ -1582,7 +1600,8 @@ function buildStatusReport() {
     issues,
     groups: STATUS_VAR_DEFS.reduce((acc, def) => { (acc[def.group] ||= []).push(byKey[def.key]); return acc; }, {}),
     unrecognizedVars: unrecognized,
-    unusedButSetVars: setUnused
+    unusedButSetVars: setUnused,
+    recentRewriteFailures: rewriteFailures.slice(-20)
   };
 }
 
