@@ -385,7 +385,13 @@ async function fetchBuffer(url, opts = {}) {
           body: opts.body && method !== "GET" && method !== "HEAD" ? opts.body : undefined
         });
         clearTimeout(timer);
-        if (response.status >= 300 && response.status < 400) {
+        if (response.status === 304) {
+          if (cached) return { ...cached.response, status: cached.response.status || 200, revalidated: true, redirectChain };
+          // No local cached copy to revalidate against (e.g. cache evicted between the
+          // conditional request being formed and this response arriving). Treat as a
+          // normal empty-body 200 rather than throwing, so a benign 304 never surfaces
+          // as a crawl/proxy failure.
+        } else if (response.status >= 300 && response.status < 400) {
           const loc = response.headers.get("location");
           if (!loc) throw new Error(`HTTP ${response.status} redirect without Location`);
           const next = resolveNavigation(loc, current);
@@ -394,9 +400,6 @@ async function fetchBuffer(url, opts = {}) {
           current = next;
           cached = null;
           break;
-        }
-        if (response.status === 304 && cached) {
-          return { ...cached.response, status: cached.response.status || 200, revalidated: true, redirectChain };
         }
         if (retryableStatus(response.status) && attempt < (opts.retries ?? CFG.maxRetries)) {
           lastError = new Error(`HTTP ${response.status}`);
