@@ -11,6 +11,24 @@ const path = require("path");
 const app = express();
 app.use(cors({ origin: "*", methods: ["GET","POST","OPTIONS"], allowedHeaders: ["Content-Type"] }));
 app.use(express.json({ limit: "32kb" }));
+app.use((req, res, next) => {
+  const start = process.hrtime.bigint();
+  res.on("finish", () => {
+    const ms = Number(process.hrtime.bigint() - start) / 1e6;
+    requestLog.push({
+      id: ++requestLogSeq,
+      time: now(),
+      method: req.method,
+      path: req.path,
+      query: req.originalUrl.includes("?") ? req.originalUrl.slice(req.originalUrl.indexOf("?") + 1).slice(0, 300) : "",
+      status: res.statusCode,
+      ms: Math.round(ms * 10) / 10,
+      ip: req.ip
+    });
+    if (requestLog.length > MAX_REQUEST_LOG) requestLog.splice(0, requestLog.length - MAX_REQUEST_LOG);
+  });
+  next();
+});
 
 const PORT = Number(process.env.PORT || 10000);
 
@@ -50,6 +68,14 @@ const activeByRoot = new Map();
 const proxyCache = new Map();
 const ROOT = path.join("/tmp", "veyra-browse-jobs");
 fs.mkdirSync(ROOT, { recursive: true });
+
+// --- Dev/debug request log -------------------------------------------------
+// Ring buffer of recent HTTP requests handled by this server, so the frontend
+// /dev panel can show a live view of backend traffic without extra infra.
+const MAX_REQUEST_LOG = 500;
+const requestLog = [];
+let requestLogSeq = 0;
+const serverStartedAt = Date.now();
 
 function now() { return new Date().toISOString(); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -384,7 +410,11 @@ async function worker(job,type){
       await sleep(8);continue;
     }
     job.activeWorkers++;
-    try{await processItem(job,item)}finally{job.activeWorkers--}
+    if(type==="html")job.activeHtmlWorkers++;else job.activeAssetWorkers++;
+    try{await processItem(job,item)}finally{
+      job.activeWorkers--;
+      if(type==="html")job.activeHtmlWorkers--;else job.activeAssetWorkers--;
+    }
   }
 }
 
@@ -423,16 +453,25 @@ function createJob(root){
     id,url:root,root,createdAt:now(),finishedAt:null,done:false,stop:false,status:"running",
     statusText:"Crawling in background…",pageQueue:[],assetQueue:[],visited:new Set(),
     discovered:new Set(),resources:[],resourceByUrl:new Map(),links:[],robots:null,sitemaps:[],
-    logs:[],logSeq:0,activeWorkers:0,processed:0,sourceFiles:0,textBytesStored:0,limitReason:null,
+    logs:[],logSeq:0,activeWorkers:0,activeHtmlWorkers:0,activeAssetWorkers:0,processed:0,sourceFiles:0,textBytesStored:0,limitReason:null,
     sourceDir:path.join(ROOT,id),counts:{htmlPages:0,css:0,js:0,links:0,bytesScanned:0}
   };
 }
 function publicJob(job){
   return {
-    id:job.id,url:job.url,createdAt:job.createdAt,finishedAt:job.finishedAt,done:job.done,
+    id:job.id,url:job.url,createdAt:job.createdAt,finishedAt:job.finishedAt,done:job.done,stop:job.stop,
     status:job.status,statusText:job.statusText,
     maxUrls:CFG.maxResources,maxScanBytes:CFG.maxScanBytes,
+    elapsedMs:Date.now()-new Date(job.createdAt).getTime(),
     counts:{...job.counts,processed:job.processed,queued:job.pageQueue.length+job.assetQueue.length,active:job.activeWorkers},
+    workers:{
+      html:{active:job.activeHtmlWorkers,max:CFG.htmlWorkers,queued:job.pageQueue.length},
+      asset:{active:job.activeAssetWorkers,max:CFG.assetWorkers,queued:job.assetQueue.length}
+    },
+    limits:{maxPages:CFG.maxPages,maxResources:CFG.maxResources,maxLinks:CFG.maxLinks,maxScanBytes:CFG.maxScanBytes,maxSourceFiles:CFG.maxSourceFiles},
+    robotsLoaded:!!job.robots,sitemapsFound:job.sitemaps.length,
+    sourceFiles:job.sourceFiles,textBytesStored:job.textBytesStored,
+    resourceCount:job.resources.length,linkCount:job.links.length,
     logs:job.logs.slice(-120)
   };
 }
@@ -441,6 +480,38 @@ function cleanupJob(job){
 }
 
 app.get("/health",(req,res)=>res.json({ok:true,service:"veyra-browse-crawler-v6",time:now()}));
+
+// --- Dev/debug endpoints ---------------------------------------------------
+// Read-only introspection used by the frontend's /dev panel: no config is
+// exposed that isn't already effectively public via observed crawl behavior.
+app.get("/api/debug/system",(req,res)=>{
+  const mem=process.memoryUsage();
+  res.json({
+    time:now(),
+    uptimeSec:Math.round(process.uptime()),
+    startedAt:new Date(serverStartedAt).toISOString(),
+    nodeVersion:process.version,
+    platform:process.platform,
+    pid:process.pid,
+    memory:{rss:mem.rss,heapUsed:mem.heapUsed,heapTotal:mem.heapTotal,external:mem.external},
+    jobs:{
+      total:jobs.size,
+      active:[...jobs.values()].filter(j=>!j.done).length,
+      done:[...jobs.values()].filter(j=>j.done).length
+    },
+    proxyCacheEntries:proxyCache.size,
+    requestsLogged:requestLog.length
+  });
+});
+app.get("/api/debug/config",(req,res)=>res.json({...CFG}));
+app.get("/api/debug/jobs",(req,res)=>{
+  const list=[...jobs.values()].sort((a,b)=>new Date(b.createdAt)-new Date(a.createdAt)).map(publicJob);
+  res.json({jobs:list});
+});
+app.get("/api/debug/requests",(req,res)=>{
+  const limit=Math.min(MAX_REQUEST_LOG,Math.max(1,Number(req.query.limit||200)));
+  res.json({requests:requestLog.slice(-limit).slice().reverse()});
+});
 
 app.post("/api/open",async(req,res)=>{
   try{
