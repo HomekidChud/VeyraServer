@@ -1,6 +1,6 @@
 const assert = require("assert/strict");
 const {
-  normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl,
+  CFG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, crawlLimitForContentType,
   rewriteHtml, rewriteCssText, rewriteJsText, injectRuntime, detectChallenge, PriorityFrontier, crawlPriority,
   tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument
 } = require("./server");
@@ -15,10 +15,23 @@ const {
   assert.match(makeViewUrl("https://example.com/a?x=1&y=2"), /^\/api\/view\?url=/);
   assert.match(makeResourceUrl("https://example.com/app.js"), /^\/api\/resource\?url=/);
   assert.match(makeResourceUrl("https://example.com/app.js", "https://example.com/path/page"), /from=/);
+  assert.match(makeViewUrl("https://example.com/a", "abcdef0123456789"), /sid=abcdef0123456789/);
+  assert.match(makeResourceUrl("https://example.com/app.js", "https://example.com/path/page", "abcdef0123456789"), /sid=abcdef0123456789/);
+  assert.equal(crawlLimitForContentType("image/png"), CFG.maxProxyImageBytes);
+  assert.equal(crawlLimitForContentType("video/mp4"), CFG.maxProxyMediaBytes);
+  assert.equal(crawlLimitForContentType("application/json"), CFG.maxTextBytesPerResource);
 
   const c = detectChallenge("<title>Just a moment...</title><p>Performing security verification</p>", "text/html", 403, {});
   assert.equal(c.type, "security-verification");
   assert.equal(detectChallenge("<title>Example</title><p>Hello world</p>", "text/html", 200, {}), null);
+
+  const sem = new Semaphore(1);
+  const release1 = await sem.acquire();
+  const waiting = sem.acquire();
+  assert.equal(sem.active, 1);
+  release1();
+  const release2 = await waiting;
+  release2();
 
   const q = new PriorityFrontier(10);
   q.add({url:"https://a.example/low",type:"html"}, 1, "a");

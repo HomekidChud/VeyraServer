@@ -1,4 +1,4 @@
-# Veyra Browse — Render backend v8
+# Veyra Browse — Render backend v8.3
 
 This repository preserves the existing Express architecture and expands it into a bounded browser/proxy/crawler/search service.
 
@@ -38,68 +38,103 @@ Start command: `npm start`
 
 ## Render environment variables
 
-Core crawler limits:
+Recommended high-throughput configuration for a constrained single Render Web Service:
 
 ```text
+PORT=10000
 PROCESS_ROLE=web
-MAX_GLOBAL_CONCURRENCY=12
-MAX_PER_HOST_CONCURRENCY=3
+
+FRONTEND_ORIGIN=https://homekidchud.github.io
+PUBLIC_API_ORIGIN=https://veyraserver-xscy.onrender.com
+VEYRA_USER_AGENT=VeyraBrowseCrawler/8.3 (+https://github.com/HomekidChud/VeyraServer)
+
+# 1,000 lightweight logical robot lanes. These do not mean 1,000 simultaneous sockets.
+CRAWLER_ROBOTS=1000
+
+# Actual concurrent upstream network requests. Keep this bounded on Render.
+MAX_ACTIVE_FETCHES=128
+CRAWLER_PER_HOST_CONCURRENCY=8
+
 MAX_PENDING_QUEUE=1500
+MAX_ACTIVE_JOBS=3
 MAX_PAGES=10000
 MAX_RESOURCES=20000
 MAX_LINKS=100000
 MAX_SCAN_BYTES=536870912
 MAX_TEXT_BYTES_PER_RESOURCE=2097152
+MAX_SOURCE_FILES=20000
+MAX_JOB_AGE_MS=3600000
+
+REQUEST_TIMEOUT_MS=15000
+BODY_TIMEOUT_MS=15000
+DNS_TIMEOUT_MS=4000
+MAX_REDIRECTS=6
+MAX_RETRIES=2
+RETRY_BASE_MS=400
+HOST_BACKOFF_MS=1200
+MAX_HOST_BACKOFF_MS=30000
+ROBOTS_TIMEOUT_MS=8000
+SITEMAP_TIMEOUT_MS=12000
+MAX_SITEMAP_FILES=50
+MAX_SITEMAP_URLS=50000
+
+CACHE_TTL_MS=10000
+MAX_CACHE_ENTRIES=200
+MAX_CACHE_BODY_BYTES=4194304
+SEARCH_CACHE_TTL_MS=30000
+MAX_SEARCH_CACHE_ENTRIES=100
+MAX_REQUEST_LOG=500
+MAX_SERVER_LOG=800
+MAX_CLIENT_LOG=500
+
+PROXY_SESSION_TTL_MS=1800000
+MAX_PROXY_SESSIONS=500
+MAX_SESSION_COOKIES=50
+
+PROXY_WARM_ROBOTS=64
+PROXY_WARM_CONCURRENCY=12
+PROXY_WARM_LIMIT=64
+PROXY_WARM_PER_HOST=3
+
+MAX_PROXY_BODY_BYTES=4194304
 MAX_PROXY_TEXT_BYTES=8388608
 MAX_PROXY_IMAGE_BYTES=16777216
 MAX_PROXY_MEDIA_BYTES=33554432
 MAX_PROXY_OTHER_BYTES=16777216
-REQUEST_TIMEOUT_MS=15000
-BODY_TIMEOUT_MS=15000
-DNS_TIMEOUT_MS=4000
-MAX_RETRIES=2
-CACHE_TTL_MS=10000
-MAX_JOB_AGE_MS=3600000
-```
+MAX_FORM_BODY_BYTES=1048576
 
-Search / Veyra Index:
-
-```text
 SEARCH_PROVIDER=local
-MAX_INDEX_DOCS=20000
-MAX_INDEX_TEXT_CHARS=8000
-MAX_SEARCH_QUERY_TERMS=20
-INDEX_SEEDS=https://example.com,https://developer.mozilla.org
-INDEX_SEED_CRAWL=true
-INDEX_REFRESH_MS=21600000
-
 SEARCH_API_KEY=
 SEARCH_ENDPOINT=
+SEARCH_AUTH_HEADER=
+MAX_SEARCH_QUERY_CHARS=256
+MAX_SEARCH_RESULTS=20
+MAX_SEARCH_QUERY_TERMS=20
+
+MAX_INDEX_DOCS=20000
+MAX_INDEX_TEXT_CHARS=8000
+INDEX_SEEDS=
+INDEX_SEED_CRAWL=true
+INDEX_REFRESH_MS=21600000
+INDEX_SNAPSHOT_ENABLED=false
+INDEX_SNAPSHOT_PATH=/tmp/veyra-search-index.json
+
+BROWSER_RENDER_FALLBACK=false
+SERVER_LOG_LEVEL=info
+NORMALIZE_SORT_QUERY_PARAMS=false
+
+SEARCH_API_KEY=
 BRAVE_SEARCH_API_KEY=
 BING_SEARCH_API_KEY=
 ```
 
-`local` is the default first-party search mode. Each crawled HTML page contributes title, description, headings, URL, body text and metadata to the inverted index. Search uses relevance scoring instead of hard-coded results. `INDEX_SEEDS` is optional; when populated, Veyra starts background seed crawls and refreshes them after the configured interval.
+`CRAWLER_ROBOTS=1000` creates a large logical fleet while `MAX_ACTIVE_FETCHES` limits actual upstream concurrency. This prevents 1,000 asynchronous workers from becoming 1,000 simultaneous outbound requests. Per-host scheduling and robots.txt Crawl-delay still apply.
 
-Supported local query operators:
+The crawler captures HTML, CSS, JavaScript, JSON/XML/text data, images, fonts and other discovered assets with content-type-aware limits. API/resource proxying also keeps a bounded per-tab cookie jar, preserves useful public-site request metadata, and preserves upstream 2xx status codes such as 201/204 where applicable.
 
-```text
-site:example.com cats
-intitle:browser security
-inurl:docs crawler
-"exact phrase"
-space -tracking
-```
+Search / Veyra Index:
 
-External providers remain optional adapters. `auto` prefers the local Veyra index once it contains content, otherwise it falls back to a configured external provider.
-
-CORS:
-
-```text
-FRONTEND_ORIGIN=https://YOUR-FRONTEND-HOST
-```
-
-For local development, use a comma-separated list when needed.
+`local` is the first-party mode and requires no paid API key. Crawled HTML pages contribute metadata and body text to the inverted index. Optional `INDEX_SEEDS` can continuously grow the corpus.
 
 ## Public API
 
@@ -130,4 +165,4 @@ Security verification/challenge pages are detected conservatively and shown thro
 Sources default to `/tmp/veyra-browse-jobs` and are deleted with expired jobs. This is compatible with ephemeral Render storage. The `sourceStore` abstraction is intentionally isolated so an object-storage implementation can be added later without changing crawler/proxy APIs.
 
 
-Veyra 8.1.1 patch notes: CRAWLER_ROBOTS and CRAWLER_PER_HOST_CONCURRENCY now control actual crawler worker counts; proxy referrer handling is fixed; proxy history uses canonical unwrapping and absolute Veyra proxy URLs.
+Veyra 8.3 notes: `CRAWLER_ROBOTS` supports a 1,000-robot logical fleet while `MAX_ACTIVE_FETCHES` bounds real upstream concurrency; the proxy keeps per-tab cookie sessions, preserves useful public-site request metadata, captures JSON/XML/text data, uses content-type-aware crawler limits, and preserves upstream 2xx status codes such as 201/204. SVG namespace rewriting is handled without fragile `xlink:href` CSS selectors.
