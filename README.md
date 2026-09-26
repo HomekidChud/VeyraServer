@@ -9,13 +9,14 @@ This repository preserves the existing Express architecture and expands it into 
 - Central URL resolution for navigation and resources, including query/fragment/protocol-relative/relative URL handling.
 - HTML, CSS, JavaScript, `srcset`, `imagesrcset`, lazy-load attributes, SVG references, media tracks, forms, iframe and module-resource rewriting.
 - Runtime handling for anchor navigation, `history.pushState`/`replaceState`, `fetch`, XHR, EventSource, `window.open`, simple POST forms, and service-worker isolation.
-- Bounded priority frontier with configurable crawler robots (parallel workers), per-host concurrency limits, deduplication, backpressure, timeouts, retries with jitter, and temporary host backoff.
-- Non-blocking page-resource warming: several warm robots can fetch likely-needed images, CSS, JS, fonts and media into the short-lived proxy cache while the first document is already rendering.
+- Bounded priority frontier with global and per-host concurrency limits, deduplication, backpressure, timeouts, retries with jitter, and temporary host backoff.
 - HTTP caching with ETag/Last-Modified revalidation and a small in-memory hot cache.
 - Streaming response-size protection and content-type-aware proxy limits for documents, images, media, fonts and other binary resources; HTTP Range forwarding for media.
 - Robots parsing with user-agent matching, allow/disallow precedence, Crawl-delay, sitemap indexes, and concurrent sitemap processing.
 - Conservative security-challenge detection with a Veyra fallback; no challenge/CAPTCHA bypassing.
-- Veyra Search provider abstraction for local index, Brave, Bing, custom API, or no provider.
+- Veyra Search is now a first-party local search engine with an inverted index, BM25-style relevance scoring, title/heading/URL boosts, phrase matching, negative terms, `site:`, `intitle:` and `inurl:` operators, snippets, pagination, suggestions, and index statistics.
+- External search providers (Brave/Bing/custom) remain optional adapters; no provider is required for the core Veyra Index.
+- Optional `INDEX_SEEDS` let the server continuously grow and refresh the Veyra index from responsible public crawl roots while respecting robots.txt.
 - Bounded source storage through a filesystem abstraction designed to be replaced by object storage later.
 - Structured server logs, bounded request logs, client log ingestion, safe debug endpoints, and a backend-only `/console` dashboard.
 - `PROCESS_ROLE=web|worker|all` architecture switch. Without external queue infrastructure, the default single-process mode remains supported.
@@ -41,9 +42,8 @@ Core crawler limits:
 
 ```text
 PROCESS_ROLE=web
-CRAWLER_ROBOTS=12
-CRAWLER_PER_HOST_CONCURRENCY=3
-# MAX_GLOBAL_CONCURRENCY / MAX_PER_HOST_CONCURRENCY remain accepted as backwards-compatible fallbacks.
+MAX_GLOBAL_CONCURRENCY=12
+MAX_PER_HOST_CONCURRENCY=3
 MAX_PENDING_QUEUE=1500
 MAX_PAGES=10000
 MAX_RESOURCES=20000
@@ -60,22 +60,38 @@ DNS_TIMEOUT_MS=4000
 MAX_RETRIES=2
 CACHE_TTL_MS=10000
 MAX_JOB_AGE_MS=3600000
-PROXY_WARM_ROBOTS=8
-PROXY_WARM_LIMIT=64
-PROXY_WARM_PER_HOST=3
 ```
 
-Search:
+Search / Veyra Index:
 
 ```text
-SEARCH_PROVIDER=auto
+SEARCH_PROVIDER=local
+MAX_INDEX_DOCS=20000
+MAX_INDEX_TEXT_CHARS=8000
+MAX_SEARCH_QUERY_TERMS=20
+INDEX_SEEDS=https://example.com,https://developer.mozilla.org
+INDEX_SEED_CRAWL=true
+INDEX_REFRESH_MS=21600000
+
 SEARCH_API_KEY=
 SEARCH_ENDPOINT=
 BRAVE_SEARCH_API_KEY=
 BING_SEARCH_API_KEY=
 ```
 
-`auto` uses a configured Brave/Bing provider when credentials exist, otherwise it uses the in-memory Veyra index if one has content, otherwise it returns an explicit unconfigured state.
+`local` is the default first-party search mode. Each crawled HTML page contributes title, description, headings, URL, body text and metadata to the inverted index. Search uses relevance scoring instead of hard-coded results. `INDEX_SEEDS` is optional; when populated, Veyra starts background seed crawls and refreshes them after the configured interval.
+
+Supported local query operators:
+
+```text
+site:example.com cats
+intitle:browser security
+inurl:docs crawler
+"exact phrase"
+space -tracking
+```
+
+External providers remain optional adapters. `auto` prefers the local Veyra index once it contains content, otherwise it falls back to a configured external provider.
 
 CORS:
 
@@ -90,7 +106,9 @@ For local development, use a comma-separated list when needed.
 - `POST /api/open` — validate a public URL and create/reuse a background crawl job.
 - `GET /api/view?url=...` — fast page proxy. Supports HTML navigation and simple form POSTs.
 - `GET|POST /api/resource?url=...` — resource/API proxy with CSS/JS rewriting where applicable.
-- `GET /api/search?q=...&offset=0&limit=10` — normalized search results.
+- `GET /api/search?q=...&offset=0&limit=10` — first-party Veyra Search results or an optional external provider.
+- `GET /api/search/stats` — index size, domain count, vocabulary size, newest indexed page, and seed activity.
+- `GET /api/search/suggest?q=...` — lightweight local query suggestions.
 - `GET /api/crawl/:id` — crawl status.
 - `POST /api/crawl/:id/stop` — request stop.
 - `GET /api/crawl/:id/resources` — captured text resources.
@@ -110,3 +128,6 @@ Security verification/challenge pages are detected conservatively and shown thro
 ## Storage
 
 Sources default to `/tmp/veyra-browse-jobs` and are deleted with expired jobs. This is compatible with ephemeral Render storage. The `sourceStore` abstraction is intentionally isolated so an object-storage implementation can be added later without changing crawler/proxy APIs.
+
+
+Veyra 8.1.1 patch notes: CRAWLER_ROBOTS and CRAWLER_PER_HOST_CONCURRENCY now control actual crawler worker counts; proxy referrer handling is fixed; proxy history uses canonical unwrapping and absolute Veyra proxy URLs.

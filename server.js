@@ -39,10 +39,10 @@ function enumEnv(name, fallback, allowed) {
 
 const CFG = Object.freeze({
   processRole: enumEnv("PROCESS_ROLE", "web", ["web", "worker", "all"]),
-  // CRAWLER_ROBOTS is the public tuning knob for parallel crawler robots.
-  // MAX_GLOBAL_CONCURRENCY remains a backwards-compatible fallback.
-  crawlerRobots: numberEnv("CRAWLER_ROBOTS", numberEnv("MAX_GLOBAL_CONCURRENCY", 12, 1, 96), 1, 96),
-  perHostConcurrency: numberEnv("CRAWLER_PER_HOST_CONCURRENCY", numberEnv("MAX_PER_HOST_CONCURRENCY", 3, 1, 32), 1, 32),
+  // CRAWLER_ROBOTS/CRAWLER_PER_HOST_CONCURRENCY are the preferred names.
+  // Legacy MAX_GLOBAL_CONCURRENCY/MAX_PER_HOST_CONCURRENCY remain fallbacks.
+  globalConcurrency: numberEnv("CRAWLER_ROBOTS", numberEnv("MAX_GLOBAL_CONCURRENCY", 12, 1, 64), 1, 64),
+  perHostConcurrency: numberEnv("CRAWLER_PER_HOST_CONCURRENCY", numberEnv("MAX_PER_HOST_CONCURRENCY", 3, 1, 16), 1, 16),
   maxPendingQueue: numberEnv("MAX_PENDING_QUEUE", 1500, 50, 20000),
   maxPages: numberEnv("MAX_PAGES", 10000, 1, 100000),
   maxResources: numberEnv("MAX_RESOURCES", 20000, 1, 250000),
@@ -77,16 +77,21 @@ const CFG = Object.freeze({
   maxProxyImageBytes: numberEnv("MAX_PROXY_IMAGE_BYTES", 16 * 1024 * 1024, 256 * 1024, 64 * 1024 * 1024),
   maxProxyMediaBytes: numberEnv("MAX_PROXY_MEDIA_BYTES", 32 * 1024 * 1024, 512 * 1024, 128 * 1024 * 1024),
   maxProxyOtherBytes: numberEnv("MAX_PROXY_OTHER_BYTES", 16 * 1024 * 1024, 256 * 1024, 64 * 1024 * 1024),
-  proxyWarmRobots: numberEnv("PROXY_WARM_ROBOTS", 8, 1, 32),
-  proxyWarmLimit: numberEnv("PROXY_WARM_LIMIT", 64, 0, 250),
-  proxyWarmPerHost: numberEnv("PROXY_WARM_PER_HOST", 3, 1, 12),
   maxFormBodyBytes: numberEnv("MAX_FORM_BODY_BYTES", 1 * 1024 * 1024, 16 * 1024, 8 * 1024 * 1024),
   userAgent: process.env.VEYRA_USER_AGENT || "VeyraBrowseCrawler/8.0 (+https://github.com/)",
   frontendOrigins: csvEnv("FRONTEND_ORIGIN", ["*"]),
-  searchProvider: enumEnv("SEARCH_PROVIDER", "auto", ["auto", "local", "brave", "bing", "custom", "none"]),
+  searchProvider: enumEnv("SEARCH_PROVIDER", "local", ["auto", "local", "brave", "bing", "custom", "none"]),
   searchEndpoint: process.env.SEARCH_ENDPOINT || "",
   searchApiKey: process.env.SEARCH_API_KEY || "",
   customSearchAuth: process.env.SEARCH_AUTH_HEADER || "",
+  maxIndexDocs: numberEnv("MAX_INDEX_DOCS", 20000, 100, 100000),
+  maxIndexTextChars: numberEnv("MAX_INDEX_TEXT_CHARS", 8000, 1000, 50000),
+  maxSearchQueryTerms: numberEnv("MAX_SEARCH_QUERY_TERMS", 20, 1, 64),
+  indexSeeds: csvEnv("INDEX_SEEDS", []),
+  indexSeedCrawl: boolEnv("INDEX_SEED_CRAWL", true),
+  indexRefreshMs: numberEnv("INDEX_REFRESH_MS", 6 * 60 * 60 * 1000, 0, 30 * 24 * 60 * 60 * 1000),
+  indexSnapshotEnabled: boolEnv("INDEX_SNAPSHOT_ENABLED", false),
+  indexSnapshotPath: process.env.INDEX_SNAPSHOT_PATH || "/tmp/veyra-search-index.json",
   processBrowserFallback: boolEnv("BROWSER_RENDER_FALLBACK", false),
   logLevel: enumEnv("SERVER_LOG_LEVEL", "info", ["error", "warn", "info", "debug"]),
   sortQueryParams: boolEnv("NORMALIZE_SORT_QUERY_PARAMS", false)
@@ -107,6 +112,8 @@ const activeByRoot = new Map();
 const proxyCache = new Map();
 const searchCache = new Map();
 const searchIndex = new Map();
+const invertedIndex = new Map();
+const termCounts = new Map();
 const serverLogs = [];
 const clientLogs = [];
 const requestLog = [];
@@ -689,12 +696,12 @@ function injectRuntime(html, original) {
   function unwrap(v){try{const raw=String(v||'');if(raw==='/api/view'||raw==='/api/resource')return virtualUrl;const u=new URL(raw,location.origin);if((u.pathname==='/api/view'||u.pathname==='/api/resource')&&u.searchParams.get('url'))return u.searchParams.get('url');return raw}catch{return String(v||'')}}
   function resolve(v){try{return new URL(unwrap(typeof v==='string'?v:v&&v.url||''),virtualUrl).href}catch{return String(v||'')}}
   function shouldProxy(v){try{const u=new URL(unwrap(v));return /^https?:$/.test(u.protocol)}catch{return false}}
-  function proxy(kind,u){const base=(kind==='view'?'/api/view?url=':'/api/resource?url=')+encodeURIComponent(u);return kind==='view'?base:base+'&from='+encodeURIComponent(new URL(virtualUrl).origin+new URL(virtualUrl).pathname)}
+  function proxy(kind,u){const prefix=API_ORIGIN || location.origin;const base=prefix+(kind==='view'?'/api/view?url=':'/api/resource?url=')+encodeURIComponent(u);return kind==='view'?base:base+'&from='+encodeURIComponent(new URL(virtualUrl).origin+new URL(virtualUrl).pathname)}
   function topPost(msg){try{window.top.postMessage(msg,'*')}catch{}}
   function emit(source,url,extra){if(!url)return;topPost({type:'veyra:navigate',url,source,...extra})}
   function canonicalizeMaybeProxy(href){try{const u=new URL(unwrap(href),virtualUrl);if(!/^https?:$/.test(u.protocol))return null;return u.href}catch{return null}}
   function proxyHistory(method){const native=history[method].bind(history);return function(state,title,url){
-    let next=virtualUrl;try{if(url!=null)next=new URL(String(url),virtualUrl).href}catch{}
+    let next=virtualUrl;try{if(url!=null)next=new URL(unwrap(String(url)),virtualUrl).href}catch{}
     virtualUrl=next;window.__VEYRA_PAGE_URL__=next;
     try{native(state,title,proxy('view',next))}catch{}
     emit('history.'+method,next);return undefined;
@@ -736,37 +743,6 @@ function injectRuntime(html, original) {
   const withoutMetaCsp = String(html).replace(/<meta[^>]+http-equiv=["']?content-security-policy["']?[^>]*>/gi, "");
   return withoutMetaCsp.replace(/<head([^>]*)>/i, (m, attrs) => `<head${attrs}>${code}`);
 }
-function parseSrcsetCandidates(value) {
-  return String(value || "").split(",").map(x => x.trim().split(/\s+/)[0]).filter(Boolean);
-}
-function collectPageWarmUrls(html, base, max = CFG.proxyWarmLimit) {
-  if (!CFG.proxyWarmLimit || max <= 0) return [];
-  try {
-    const $ = cheerio.load(String(html || ""), { decodeEntities: false });
-    const out = [];
-    const add = (raw) => {
-      const u = resolveResource(raw, base);
-      if (u) out.push(u);
-    };
-    $("img[src],source[src],audio[src],video[src],input[src],embed[src],object[data],track[src],iframe[src]").each((_, el) => {
-      const attr = el.name === "object" ? "data" : "src";
-      add($(el).attr(attr));
-    });
-    $("script[src],link[href]").each((_, el) => add($(el).attr(el.name === "script" ? "src" : "href")));
-    $("video[poster]").each((_, el) => add($(el).attr("poster")));
-    $("use[href],use[xlink\\:href],image[href],image[xlink\\:href]").each((_, el) => add($(el).attr($(el).attr("href") != null ? "href" : "xlink:href")));
-    $("[srcset],[imagesrcset],[data-srcset]").each((_, el) => parseSrcsetCandidates($(el).attr("srcset") || $(el).attr("imagesrcset") || $(el).attr("data-srcset")).forEach(add));
-    $("[data-src],[data-original],[data-lazy-src]").each((_, el) => {
-      add($(el).attr("data-src") || $(el).attr("data-original") || $(el).attr("data-lazy-src"));
-    });
-    $("style,[style]").each((_, el) => {
-      const css = el.name === "style" ? $(el).text() : $(el).attr("style") || "";
-      const re = /url\(\s*(["']?)([^"')]+)\1\s*\)/gi;
-      let m; while ((m = re.exec(css))) add(m[2]);
-    });
-    return [...new Set(out)].slice(0, max);
-  } catch { return []; }
-}
 function rewriteHtml(html, base) {
   const $ = cheerio.load(String(html || ""), { decodeEntities: false });
   $("base").remove();
@@ -778,28 +754,32 @@ function rewriteHtml(html, base) {
   $("link[href]").each((_, el) => {
     const rel = String($(el).attr("rel") || "").toLowerCase();
     if (rel.includes("canonical")) return;
-    const raw = $(el).attr("href"); const u = resolveResource(raw, base);
-    if (u) { $(el).attr("href", makeResourceUrl(u, base)); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); }
+    const raw = $(el).attr("href"); const u = resolveResource(raw, base); if (u) { $(el).attr("href", makeResourceUrl(u, base)); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); }
   });
-  $("script[src]").each((_, el) => {
-    const u = resolveResource($(el).attr("src"), base);
-    if (u) { $(el).attr("src", makeResourceUrl(u, base)); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); }
-  });
-  for (const tag of ["img", "source", "audio", "video", "input", "embed"]) {
+  $("script[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), base); if (u) { $(el).attr("src", makeResourceUrl(u, base)); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); } });
+  for (const tag of ["img", "source", "audio", "input", "embed"]) {
     $(`${tag}[src]`).each((_, el) => { const u = resolveResource($(el).attr("src"), base); if (u) $(el).attr("src", makeResourceUrl(u, base)); });
   }
   $("video[poster]").each((_, el) => { const u = resolveResource($(el).attr("poster"), base); if (u) $(el).attr("poster", makeResourceUrl(u, base)); });
   $("track[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), base); if (u) $(el).attr("src", makeResourceUrl(u, base)); });
-  $("use[href],use[xlink\\:href],image[href],image[xlink\\:href]").each((_, el) => {
+  $("use[href],use[xlink\:href],image[href],image[xlink\:href]").each((_, el) => {
     const attr = $(el).attr("href") != null ? "href" : "xlink:href";
-    const u = resolveResource($(el).attr(attr), base); if (u) $(el).attr(attr, makeResourceUrl(u, base));
+    const raw = $(el).attr(attr) || "";
+    const u = resolveResource(raw, base);
+    if (u) $(el).attr(attr, makeResourceUrl(u, base));
   });
   $("[imagesrcset]").each((_, el) => $(el).attr("imagesrcset", rewriteSrcset($(el).attr("imagesrcset"), base)));
-  $("[srcset]").each((_, el) => $(el).attr("srcset", rewriteSrcset($(el).attr("srcset"), base)));
   for (const attr of ["data-src", "data-original", "data-lazy-src"]) {
     $(`[${attr}]`).each((_, el) => { const u = resolveResource($(el).attr(attr), base); if (u) $(el).attr(attr, makeResourceUrl(u, base)); });
   }
-  $("[data-srcset]").each((_, el) => $(el).attr("data-srcset", rewriteSrcset($(el).attr("data-srcset"), base)));
+  $(`[data-srcset]`).each((_, el) => $(el).attr("data-srcset", rewriteSrcset($(el).attr("data-srcset"), base)));
+  $("track[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), base); if (u) $(el).attr("src", makeResourceUrl(u, base)); });
+  $("use[href],use[xlink\:href],image[href],image[xlink\:href]").each((_, el) => {
+    const attr = $(el).attr("href") != null ? "href" : "xlink:href"; const raw = $(el).attr(attr) || "";
+    const u = resolveResource(raw, base); if (u) $(el).attr(attr, makeResourceUrl(u, base));
+  });
+  $("[imagesrcset]").each((_, el) => $(el).attr("imagesrcset", rewriteSrcset($(el).attr("imagesrcset"), base)));
+  $("[srcset]").each((_, el) => $(el).attr("srcset", rewriteSrcset($(el).attr("srcset"), base)));
   $("meta[http-equiv='refresh'],meta[http-equiv='Refresh']").each((_, el) => {
     const raw = $(el).attr("content") || ""; const m = raw.match(/^(\s*\d+\s*;\s*url\s*=\s*)(.+)$/i); if (!m) return;
     const u = resolveNavigation(m[2].trim().replace(/^['"]|['"]$/g, ""), base); if (u) $(el).attr("content", `${m[1]}${makeViewUrl(u)}`);
@@ -809,33 +789,194 @@ function rewriteHtml(html, base) {
   return injectRuntime($.html(), base);
 }
 
+const SEARCH_STOP_WORDS = new Set([
+  "a","an","and","are","as","at","be","by","for","from","has","have","how","in","is","it","of","on","or","that","the","this","to","was","what","when","where","which","who","why","with","you","your"
+]);
+function tokenizeSearch(value) {
+  const raw = String(value || "").toLocaleLowerCase();
+  const tokens = raw.normalize("NFKC").match(/[\p{L}\p{N}][\p{L}\p{N}'_-]{1,63}/gu) || [];
+  return tokens.map(x => x.replace(/^['_-]+|['_-]+$/g, "")).filter(x => x && (x.length > 1 || /\d/.test(x)) && !SEARCH_STOP_WORDS.has(x));
+}
+function parseSearchQuery(query) {
+  const source = String(query || "").trim().slice(0, CFG.maxSearchQueryChars);
+  const phrases = [];
+  const stripped = source.replace(/"([^\"]{1,160})"/g, (_, phrase) => { phrases.push(phrase.trim().toLocaleLowerCase()); return " "; });
+  const filters = { site: "", intitle: "", inurl: "" };
+  const negative = [];
+  const positiveRaw = [];
+  for (const part of stripped.split(/\s+/).filter(Boolean)) {
+    if (/^site:[^\s]+$/i.test(part)) filters.site = part.slice(5).toLocaleLowerCase();
+    else if (/^intitle:[^\s]+$/i.test(part)) filters.intitle = part.slice(8).toLocaleLowerCase();
+    else if (/^inurl:[^\s]+$/i.test(part)) filters.inurl = part.slice(6).toLocaleLowerCase();
+    else if (/^-[^\s-]+$/.test(part)) negative.push(...tokenizeSearch(part.slice(1)));
+    else positiveRaw.push(part);
+  }
+  let terms = tokenizeSearch(positiveRaw.join(" "));
+  for (const phrase of phrases) terms.push(...tokenizeSearch(phrase));
+  terms = [...new Set(terms)].slice(0, CFG.maxSearchQueryTerms);
+  const negativeTerms = [...new Set(negative)].slice(0, CFG.maxSearchQueryTerms);
+  const normalizedPhrases = [...new Set(phrases)].filter(Boolean).slice(0, 8);
+  return { raw: source, terms, negativeTerms, phrases: normalizedPhrases, filters };
+}
+function searchFieldHas(doc, field, term) { return String(doc[field] || "").toLocaleLowerCase().includes(term); }
+function removeIndexedDocument(doc) {
+  if (!doc?.termFreq) return;
+  for (const term of doc.termFreq.keys()) {
+    const postings = invertedIndex.get(term);
+    if (postings) {
+      postings.delete(doc.url);
+      if (!postings.size) invertedIndex.delete(term);
+    }
+    const count = (termCounts.get(term) || 0) - 1;
+    if (count > 0) termCounts.set(term, count); else termCounts.delete(term);
+  }
+}
 function extractPageMeta(text, url) {
   const $ = cheerio.load(String(text || ""), { decodeEntities: false });
-  const title = String($("title").first().text() || "").trim().slice(0, 300) || hostOf(url);
-  const description = String($("meta[name='description']").attr("content") || "").trim().slice(0, 500);
-  const bodyText = String($("body").text() || "").replace(/\s+/g, " ").trim().slice(0, 1000);
-  const snippet = description || bodyText || title;
+  $("script,style,noscript,template").remove();
+  const title = String($("title").first().text() || $("h1").first().text() || "").replace(/\s+/g, " ").trim().slice(0, 300) || hostOf(url);
+  const description = String($("meta[name='description'],meta[property='og:description']").first().attr("content") || "").replace(/\s+/g, " ").trim().slice(0, 600);
+  const headings = String($("h1,h2,h3").map((_, el) => $(el).text()).get().join(" | ") || "").replace(/\s+/g, " ").trim().slice(0, 1200);
+  const bodyText = String($("main,article").first().text() || $("body").text() || "").replace(/\s+/g, " ").trim();
+  const textContent = (description ? `${description} ` : "") + bodyText;
+  const snippet = description || bodyText.slice(0, 600) || title;
   let favicon = "";
   const rawIcon = $("link[rel~='icon'],link[rel='shortcut icon']").first().attr("href");
   if (rawIcon) favicon = resolveResource(rawIcon, url) || "";
   const canonical = resolveNavigation($("link[rel='canonical']").attr("href"), url);
-  return { title, description, snippet, favicon, canonical };
+  const lang = String($("html").attr("lang") || "").slice(0, 32);
+  const allText = `${title} ${headings} ${textContent} ${url}`;
+  const termFreq = new Map();
+  for (const term of tokenizeSearch(allText)) termFreq.set(term, (termFreq.get(term) || 0) + 1);
+  return {
+    title, description, headings, snippet, text: bodyText.slice(0, CFG.maxIndexTextChars), favicon, canonical, lang,
+    host: hostOf(canonical || url), path: pathOf(canonical || url), wordCount: Math.max(1, tokenizeSearch(bodyText).length), termFreq
+  };
+}
+function addIndexedDocument(doc) {
+  const key = doc.url;
+  searchIndex.set(key, doc);
+  for (const [term, tf] of doc.termFreq.entries()) {
+    let postings = invertedIndex.get(term);
+    if (!postings) { postings = new Map(); invertedIndex.set(term, postings); }
+    postings.set(key, tf);
+    termCounts.set(term, (termCounts.get(term) || 0) + 1);
+  }
+  while (searchIndex.size > CFG.maxIndexDocs) {
+    const oldest = [...searchIndex.values()].sort((a,b) => Date.parse(a.indexedAt || 0) - Date.parse(b.indexedAt || 0))[0];
+    if (!oldest) break;
+    removeIndexedDocument(oldest); searchIndex.delete(oldest.url);
+  }
 }
 function indexDocument(url, text) {
   try {
     const meta = extractPageMeta(text, url);
-    const canonical = meta.canonical || url;
-    searchIndex.set(canonical, {
-      title: meta.title,
+    const candidateCanonical = normalizeUrl(meta.canonical || url) || url;
+    const canonical = sameOrigin(candidateCanonical, url) ? candidateCanonical : url;
+    const existing = searchIndex.get(canonical);
+    if (existing) removeIndexedDocument(existing);
+    const doc = {
       url: canonical,
+      title: meta.title,
+      description: meta.description,
+      headings: meta.headings,
       snippet: meta.snippet,
-      displayUrl: canonical,
+      text: meta.text,
       favicon: meta.favicon,
+      displayUrl: canonical,
       source: "veyra-index",
-      score: 0
-    });
-    while (searchIndex.size > CFG.maxPages) searchIndex.delete(searchIndex.keys().next().value);
-  } catch {}
+      lang: meta.lang,
+      host: meta.host,
+      path: meta.path,
+      wordCount: meta.wordCount,
+      indexedAt: now(),
+      termFreq: meta.termFreq
+    };
+    addIndexedDocument(doc);
+    invalidateSearchCaches();
+    return doc;
+  } catch (e) {
+    serverLog("warn", "SEARCH", `Indexing failed for ${url}: ${e.message}`);
+    return null;
+  }
+}
+function invalidateSearchCaches() { searchCache.clear(); }
+function makeSearchSnippet(doc, parsed) {
+  const source = String(doc.snippet || doc.text || doc.description || doc.title || "").replace(/\s+/g, " ").trim();
+  if (!source) return "No description available.";
+  const hay = source.toLocaleLowerCase();
+  const hit = parsed.terms.map(t => hay.indexOf(t)).filter(x => x >= 0).sort((a,b) => a-b)[0];
+  if (hit == null || hit < 80) return source.slice(0, 260) + (source.length > 260 ? "…" : "");
+  const start = Math.max(0, hit - 90), end = Math.min(source.length, start + 300);
+  return `${start > 0 ? "…" : ""}${source.slice(start, end)}${end < source.length ? "…" : ""}`;
+}
+function localSearch(query, offset, limit) {
+  const parsed = parseSearchQuery(query);
+  const N = searchIndex.size;
+  if (!N) return { total: 0, results: [], indexSize: 0, terms: parsed.terms, filters: parsed.filters };
+  const candidateScores = new Map();
+  const k1 = 1.35, b = 0.75;
+  let avgLen = 0;
+  for (const doc of searchIndex.values()) avgLen += doc.wordCount || 1;
+  avgLen = Math.max(1, avgLen / N);
+  const candidateUrls = new Set();
+  if (parsed.terms.length) {
+    for (const term of parsed.terms) {
+      for (const url of (invertedIndex.get(term)?.keys() || [])) candidateUrls.add(url);
+    }
+  } else {
+    for (const doc of [...searchIndex.values()].sort((a,b) => Date.parse(b.indexedAt || 0) - Date.parse(a.indexedAt || 0)).slice(0, 5000)) candidateUrls.add(doc.url);
+  }
+  for (const url of candidateUrls) {
+    const doc = searchIndex.get(url); if (!doc) continue;
+    const host = doc.host.toLocaleLowerCase();
+    if (parsed.filters.site && !(host === parsed.filters.site || host.endsWith(`.${parsed.filters.site}`))) continue;
+    if (parsed.filters.intitle && !searchFieldHas(doc, "title", parsed.filters.intitle)) continue;
+    if (parsed.filters.inurl && !String(doc.url).toLocaleLowerCase().includes(parsed.filters.inurl)) continue;
+    if (parsed.negativeTerms.some(term => doc.termFreq.has(term) || searchFieldHas(doc, "url", term))) continue;
+    let score = 0;
+    for (const term of parsed.terms) {
+      const postings = invertedIndex.get(term); const tf = postings?.get(doc.url) || 0; const df = postings?.size || 0;
+      if (!tf || !df) continue;
+      const idf = Math.log(1 + (N - df + 0.5) / (df + 0.5));
+      const dl = doc.wordCount || 1;
+      const denom = tf + k1 * (1 - b + b * dl / avgLen);
+      score += idf * ((tf * (k1 + 1)) / denom);
+      if (searchFieldHas(doc, "title", term)) score += 3.5 * idf;
+      if (searchFieldHas(doc, "headings", term)) score += 1.8 * idf;
+      if (searchFieldHas(doc, "url", term)) score += 1.2 * idf;
+      if (searchFieldHas(doc, "description", term)) score += 0.9 * idf;
+    }
+    for (const phrase of parsed.phrases) {
+      const phraseText = `${doc.title} ${doc.headings} ${doc.text} ${doc.description}`.toLocaleLowerCase();
+      if (phraseText.includes(phrase)) score += 7;
+    }
+    if (!parsed.terms.length && (doc.title || doc.description)) score += 0.05;
+    const ageDays = Math.max(0, (Date.now() - Date.parse(doc.indexedAt || now())) / 86400000);
+    score += 0.25 / (1 + ageDays);
+    if (score > 0) candidateScores.set(doc.url, score);
+  }
+  const ranked = [...candidateScores.entries()].sort((a,b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  const total = ranked.length;
+  const results = ranked.slice(offset, offset + limit).map(([url, score]) => {
+    const doc = searchIndex.get(url);
+    return {
+      title: doc.title, url: doc.url, snippet: makeSearchSnippet(doc, parsed), displayUrl: doc.displayUrl,
+      favicon: doc.favicon || searchFavicon(doc.url), source: "veyra-index", score: Number(score.toFixed(4)),
+      indexedAt: doc.indexedAt, lang: doc.lang, domain: doc.host
+    };
+  });
+  return { total, results, indexSize: N, terms: parsed.terms, filters: parsed.filters };
+}
+function localSearchSuggestions(query, limit = 8) {
+  const prefix = String(query || "").trim().toLocaleLowerCase().split(/\s+/).pop() || "";
+  const source = prefix ? [...termCounts.keys()].filter(t => t.startsWith(prefix)) : [...termCounts.keys()];
+  return source.sort((a,b) => (termCounts.get(b) || 0) - (termCounts.get(a) || 0) || a.localeCompare(b)).slice(0, limit);
+}
+function searchIndexStats() {
+  const domains = new Set([...searchIndex.values()].map(d => d.host).filter(Boolean));
+  const latest = [...searchIndex.values()].sort((a,b) => Date.parse(b.indexedAt || 0) - Date.parse(a.indexedAt || 0))[0];
+  return { documents: searchIndex.size, terms: invertedIndex.size, domains: domains.size, latestIndexedAt: latest?.indexedAt || null, seeds: CFG.indexSeeds.length, provider: "veyra-index" };
 }
 
 function addLink(job, rawUrl, hint, source, reason = "discovered") {
@@ -881,26 +1022,17 @@ function discoverHtml(job, text, base) {
   $("a[href],area[href]").each((_, el) => addLink(job, $(el).attr("href"), "html", base, "navigation"));
   $("link[href]").each((_, el) => {
     const rel = String($(el).attr("rel") || "").toLowerCase();
-    const resourceRel = /(?:stylesheet|icon|shortcut icon|mask-icon|apple-touch-icon|manifest|preload|modulepreload|prefetch|prerender)/i.test(rel);
-    const hint = resourceRel ? "asset" : "html";
+    const hint = rel.includes("stylesheet") ? "css" : rel.includes("icon") || rel.includes("preload") || rel.includes("modulepreload") ? "asset" : "html";
     addLink(job, $(el).attr("href"), hint, base, rel.includes("canonical") ? "canonical" : "discovered");
   });
   $("script[src]").each((_, el) => addLink(job, $(el).attr("src"), "js", base));
   $("iframe[src]").each((_, el) => addLink(job, $(el).attr("src"), "html", base));
-  $("img[src],source[src],audio[src],video[src],input[src],embed[src],object[data],track[src]").each((_, el) => {
+  $("img[src],source[src],audio[src],video[src],input[src],embed[src],object[data]").each((_, el) => {
     const attr = el.name === "object" ? "data" : "src"; addLink(job, $(el).attr(attr), "asset", base);
   });
-  $("video[poster]").each((_, el) => addLink(job, $(el).attr("poster"), "asset", base));
-  $("use[href],use[xlink\\:href],image[href],image[xlink\\:href]").each((_, el) => {
-    const attr = $(el).attr("href") != null ? "href" : "xlink:href"; addLink(job, $(el).attr(attr), "asset", base);
-  });
   $("form[action]").each((_, el) => addLink(job, $(el).attr("action"), "html", base, "navigation"));
-  for (const attr of ["srcset", "imagesrcset", "data-srcset"]) {
-    $(`[${attr}]`).each((_, el) => parseSrcsetCandidates($(el).attr(attr)).forEach(src => addLink(job, src, "asset", base)));
-  }
-  for (const attr of ["data-src", "data-original", "data-lazy-src"]) {
-    $(`[${attr}]`).each((_, el) => addLink(job, $(el).attr(attr), "asset", base));
-  }
+  $("link[rel='canonical']").each((_, el) => addLink(job, $(el).attr("href"), "html", base, "canonical"));
+  $("[srcset]").each((_, el) => String($(el).attr("srcset") || "").split(",").forEach(x => addLink(job, x.trim().split(/\s+/)[0], "asset", base)));
   $("style").each((_, el) => discoverCss(job, $(el).text(), base));
   $("[style]").each((_, el) => discoverCss(job, $(el).attr("style") || "", base));
   discoverJs(job, String(text || ""), base);
@@ -912,7 +1044,6 @@ function createJob(root) {
     id, root, url: root, createdAt: now(), finishedAt: null, done: false, stopRequested: false, status: "queued", statusText: "Queued",
     pageFrontier: new PriorityFrontier(CFG.maxPendingQueue), resourceFrontier: new PriorityFrontier(CFG.maxPendingQueue), visited: new Set(), discovered: new Set(),
     resources: [], links: [], logs: [], logSeq: 0, sourceDir: path.join(ROOT, id), sourceFiles: 0, textBytesStored: 0,
-    robotCount: CFG.crawlerRobots, perHostConcurrency: CFG.perHostConcurrency,
     activeWorkers: 0, activeHtmlWorkers: 0, activeAssetWorkers: 0, processed: 0, pagesDiscovered: 0, resourcesScheduled: 0,
     robots: null, robotsReady: false, sitemaps: new Set(), challengeHosts: new Set(), hostActive: new Map(), hostCooldowns: new Map(), hostLastRequested: new Map(), hostFailures: new Map(), hostDelayMs: 0, stopReason: null,
     counts: { htmlPages: 0, css: 0, js: 0, links: 0, bytesScanned: 0, bytesStored: 0, bytesDiscarded: 0, requestCount: 0, retries: 0, challenges: 0, errors: 0 },
@@ -926,8 +1057,9 @@ function publicJob(job) {
     status: job.status, statusText: job.statusText, stopRequested: job.stopRequested,
     maxUrls: CFG.maxResources, maxScanBytes: CFG.maxScanBytes, elapsedMs: Date.now() - Date.parse(job.createdAt),
     counts: { ...job.counts, processed: job.processed, queued, active: job.activeWorkers },
-    workers: { robots: { active: job.activeWorkers, max: job.robotCount, queued: job.pageFrontier.size + job.resourceFrontier.size }, html: { active: job.activeHtmlWorkers, max: job.robotCount, queued: job.pageFrontier.size }, asset: { active: job.activeAssetWorkers, max: job.robotCount, queued: job.resourceFrontier.size } },
-    limits: { robots: job.robotCount, crawlerRobotsMax: CFG.crawlerRobots, globalConcurrency: job.robotCount, perHostConcurrency: job.perHostConcurrency, maxPages: CFG.maxPages, maxResources: CFG.maxResources, maxLinks: CFG.maxLinks, maxScanBytes: CFG.maxScanBytes, proxyWarmRobots: CFG.proxyWarmRobots, proxyWarmLimit: CFG.proxyWarmLimit },
+    workers: { html: { active: job.activeHtmlWorkers, max: CFG.globalConcurrency, queued: job.pageFrontier.size }, asset: { active: job.activeAssetWorkers, max: CFG.globalConcurrency, queued: job.resourceFrontier.size } },
+    limits: { globalConcurrency: CFG.globalConcurrency, crawlerRobots: CFG.globalConcurrency, perHostConcurrency: CFG.perHostConcurrency, maxPages: CFG.maxPages, maxResources: CFG.maxResources, maxLinks: CFG.maxLinks, maxScanBytes: CFG.maxScanBytes },
+    searchIndex: searchIndexStats(),
     robotsLoaded: job.robotsReady, sitemapsFound: job.sitemaps.size, sourceFiles: job.sourceFiles, textBytesStored: job.textBytesStored,
     resourceCount: job.resources.length, linkCount: job.links.length, logs: job.logs.slice(-120), queue: { pages: job.pageFrontier.snapshot().slice(0, 50), resources: job.resourceFrontier.snapshot().slice(0, 50) }
   };
@@ -1009,10 +1141,10 @@ async function frontierWorker(job) {
     if (!job.robotsReady) { await sleep(15); continue; }
     if (job.counts.bytesScanned >= CFG.maxScanBytes) { job.stopRequested = true; job.stopReason = "scan-byte-limit"; break; }
     let type = job.pageFrontier.size ? "html" : "asset";
-    let item = type === "html" ? job.pageFrontier.takeNext(job.hostActive, job.perHostConcurrency, job.hostCooldowns) : job.resourceFrontier.takeNext(job.hostActive, job.perHostConcurrency, job.hostCooldowns);
+    let item = type === "html" ? job.pageFrontier.takeNext(job.hostActive, CFG.perHostConcurrency, job.hostCooldowns) : job.resourceFrontier.takeNext(job.hostActive, CFG.perHostConcurrency, job.hostCooldowns);
     if (!item) {
       if (job.pageFrontier.size || job.resourceFrontier.size) {
-        item = job.resourceFrontier.takeNext(job.hostActive, job.perHostConcurrency, job.hostCooldowns);
+        item = job.resourceFrontier.takeNext(job.hostActive, CFG.perHostConcurrency, job.hostCooldowns);
         type = item ? "asset" : "html";
       }
     }
@@ -1034,7 +1166,7 @@ async function runCrawl(job) {
   job.status = "starting"; job.statusText = "Preparing crawl…";
   await fsp.mkdir(job.sourceDir, { recursive: true });
   addLink(job, job.root, "html", null, "root");
-  const workers = Array.from({ length: job.robotCount }, () => frontierWorker(job));
+  const workers = Array.from({ length: CFG.globalConcurrency }, () => frontierWorker(job));
   try {
     await loadRobots(job);
     if (!job.stopRequested) await loadSitemaps(job);
@@ -1052,18 +1184,17 @@ async function runCrawl(job) {
   }
 }
 
-// Search abstraction.
+// Search abstraction. Local Veyra indexing is first-class; external providers are optional.
 function selectedSearchProvider() {
   if (CFG.searchProvider === "auto") {
+    if (searchIndex.size) return "local";
     if (process.env.BRAVE_SEARCH_API_KEY || (CFG.searchApiKey && /brave/i.test(CFG.searchEndpoint))) return "brave";
     if (process.env.BING_SEARCH_API_KEY || (CFG.searchApiKey && /bing/i.test(CFG.searchEndpoint))) return "bing";
-    return searchIndex.size ? "local" : "none";
+    return "local";
   }
   return CFG.searchProvider;
 }
-function searchFavicon(url) {
-  try { return `https://www.google.com/s2/favicons?domain=${encodeURIComponent(new URL(url).hostname)}&sz=64`; } catch { return ""; }
-}
+function searchFavicon(url) { return ""; }
 async function externalSearch(provider, query, offset, limit) {
   let endpoint; const headers = { accept: "application/json" };
   const key = provider === "brave" ? (process.env.BRAVE_SEARCH_API_KEY || CFG.searchApiKey) : provider === "bing" ? (process.env.BING_SEARCH_API_KEY || CFG.searchApiKey) : CFG.searchApiKey;
@@ -1083,54 +1214,58 @@ async function externalSearch(provider, query, offset, limit) {
   const r = await fetchBuffer(u.href, { headers, limit: 2 * 1024 * 1024, timeout: 12000, retries: 1, accept: "application/json" });
   if (!r.ok) throw new Error(`Search provider HTTP ${r.status}.`);
   const data = JSON.parse(r.body.toString("utf8"));
-  let items = [];
-  let total = null;
+  let items = [], total = null;
   if (provider === "brave") { items = data.web?.results || []; total = data.web?.total ?? null; }
   else if (provider === "bing") { items = data.webPages?.value || []; total = data.webPages?.totalEstimatedMatches ?? null; }
   else { items = Array.isArray(data) ? data : data.results || []; total = data.total ?? null; }
-  return { total, results: items.map((item, i) => ({
-    title: String(item.title || item.name || item.heading || "Untitled").slice(0, 300),
-    url: normalizeUrl(item.url || item.link || ""),
-    snippet: String(item.description || item.snippet || item.summary || "").slice(0, 700),
-    displayUrl: String(item.displayUrl || item.url || item.link || "").slice(0, 500),
-    favicon: item.favicon || item.profile?.img || searchFavicon(item.url || item.link || ""),
-    source: provider, score: Number(item.score ?? (limit - i))
-  })).filter(x => x.url) };
-}
-async function localSearch(query, offset, limit) {
-  const terms = query.toLowerCase().split(/\s+/).filter(Boolean).slice(0, 12);
-  const scored = [];
-  for (const doc of searchIndex.values()) {
-    const hay = `${doc.title} ${doc.url} ${doc.snippet}`.toLowerCase();
-    let score = 0;
-    for (const term of terms) { if (doc.title.toLowerCase().includes(term)) score += 6; if (doc.url.toLowerCase().includes(term)) score += 3; if (doc.snippet.toLowerCase().includes(term)) score += 2; }
-    if (score) scored.push({ ...doc, score });
-  }
-  scored.sort((a,b) => b.score - a.score || a.title.localeCompare(b.title));
-  return { total: scored.length, results: scored.slice(offset, offset + limit).map(x => ({ ...x, source: "veyra-index" })) };
+  return { total, results: items.map((item, i) => ({ title: String(item.title || item.name || item.heading || "Untitled").slice(0, 300), url: normalizeUrl(item.url || item.link || ""), snippet: String(item.description || item.snippet || item.summary || "").slice(0, 700), displayUrl: String(item.displayUrl || item.url || item.link || "").slice(0, 500), favicon: item.favicon || item.profile?.img || searchFavicon(item.url || item.link || ""), source: provider, score: Number(item.score ?? (limit - i)) })).filter(x => x.url) };
 }
 async function searchService(query, offset, limit) {
   const provider = selectedSearchProvider();
   const key = `${provider}|${offset}|${limit}|${query.toLowerCase()}`;
-  const hit = cacheGet(searchCache, key, CFG.searchCacheMs); if (hit) return { ...hit.value, cached: true };
+  const hit = cacheGet(searchCache, key, CFG.searchCacheMs);
+  if (hit) return { ...hit.value, cached: true };
   let result;
-  if (provider === "local") result = await localSearch(query, offset, limit);
-  else if (provider === "none") throw Object.assign(new Error("No search provider is configured yet. Set SEARCH_PROVIDER to local or configure Brave/Bing/custom search."), { code: "SEARCH_NOT_CONFIGURED" });
+  if (provider === "local") result = localSearch(query, offset, limit);
+  else if (provider === "none") result = { total: 0, results: [], indexSize: searchIndex.size, terms: [], filters: {}, disabled: true };
   else result = await externalSearch(provider, query, offset, limit);
-  const value = { provider, ...result };
+  const value = { provider, ...result, indexStats: searchIndexStats() };
   cacheSet(searchCache, key, { value }, CFG.maxSearchCacheEntries);
   return value;
+}
+const indexSeedState = new Map();
+async function pumpIndexSeeds() {
+  if (!CFG.indexSeedCrawl || !CFG.indexSeeds.length) return;
+  const maxActive = numberEnv("MAX_ACTIVE_JOBS", 3, 1, 20);
+  const activeCount = [...jobs.values()].filter(j => !j.done && !j.stopRequested).length;
+  if (activeCount >= maxActive) return;
+  for (const raw of CFG.indexSeeds.slice(0, 50)) {
+    if ([...jobs.values()].some(j => !j.done && j.root === normalizeUrl(raw))) continue;
+    const lastRun = indexSeedState.get(raw) || 0;
+    if (lastRun && CFG.indexRefreshMs > 0 && Date.now() - lastRun < CFG.indexRefreshMs) continue;
+    if ([...jobs.values()].filter(j => !j.done && !j.stopRequested).length >= maxActive) break;
+    try {
+      const root = normalizeUrl(raw); if (!root) continue;
+      await assertPublicUrl(root);
+      const job = createJob(root); jobs.set(job.id, job); activeByRoot.set(root, job.id); indexSeedState.set(raw, Date.now());
+      jobLog(job, "info", "Index seed crawl queued.", { source: "INDEX", seed: raw });
+      runCrawl(job).catch(e => { job.done = true; job.finishedAt = now(); job.status = "error"; job.statusText = e.message; jobLog(job, "error", e.stack || e.message); });
+    } catch (e) { indexSeedState.set(raw, Date.now()); serverLog("warn", "SEARCH", `Index seed rejected: ${raw} — ${e.message}`); }
+  }
 }
 
 // Health and debug.
 app.get("/health", (req, res) => res.json({ ok: true, service: "veyra", uptimeSec: Math.round(process.uptime()), activeJobs: [...jobs.values()].filter(j => !j.done).length, processRole: CFG.processRole }));
 app.get("/api/debug/system", (req, res) => {
   const mem = process.memoryUsage();
-  res.json({ time: now(), uptimeSec: Math.round(process.uptime()), startedAt: new Date(serverStartedAt).toISOString(), nodeVersion: process.version, platform: process.platform, processRole: CFG.processRole, memory: { rss: mem.rss, heapUsed: mem.heapUsed, heapTotal: mem.heapTotal, external: mem.external }, jobs: { total: jobs.size, active: [...jobs.values()].filter(j => !j.done).length, done: [...jobs.values()].filter(j => j.done).length }, proxyCacheEntries: proxyCache.size, searchCacheEntries: searchCache.size, searchIndexEntries: searchIndex.size, requestsLogged: requestLog.length, logs: serverLogs.length });
+  const idx = searchIndexStats();
+  res.json({ time: now(), uptimeSec: Math.round(process.uptime()), startedAt: new Date(serverStartedAt).toISOString(), nodeVersion: process.version, platform: process.platform, processRole: CFG.processRole, memory: { rss: mem.rss, heapUsed: mem.heapUsed, heapTotal: mem.heapTotal, external: mem.external }, jobs: { total: jobs.size, active: [...jobs.values()].filter(j => !j.done).length, done: [...jobs.values()].filter(j => j.done).length }, proxyCacheEntries: proxyCache.size, searchCacheEntries: searchCache.size, searchIndexEntries: idx.documents, searchIndexTerms: idx.terms, searchIndexDomains: idx.domains, requestsLogged: requestLog.length, logs: serverLogs.length });
 });
 app.get("/api/debug/config", (req, res) => res.json({ ...CFG, searchApiKey: undefined }));
 app.get("/api/debug/jobs", (req, res) => res.json({ jobs: [...jobs.values()].sort((a,b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)).map(publicJob) }));
 app.get("/api/debug/requests", (req, res) => { const limit = Math.min(CFG.maxRequestLog, Math.max(1, Number(req.query.limit || 200))); res.json({ requests: requestLog.slice(-limit).reverse() }); });
+app.get("/api/search/stats", (req, res) => { res.json({ ok: true, ...searchIndexStats(), crawlJobs: [...jobs.values()].filter(j => !j.done).length, activeIndexSeeds: [...jobs.values()].filter(j => !j.done && CFG.indexSeeds.includes(j.root)).length }); });
+app.get("/api/search/suggest", (req, res) => { const q = String(req.query.q || "").slice(0, 80); const limit = Math.min(12, Math.max(1, Number(req.query.limit || 8) || 8)); res.json({ ok: true, query: q, suggestions: localSearchSuggestions(q, limit) }); });
 app.get("/api/debug/logs", (req, res) => {
   const limit = Math.min(CFG.maxServerLog, Math.max(1, Number(req.query.limit || 200)));
   const source = String(req.query.source || "all");
@@ -1161,10 +1296,10 @@ app.get("/api/search", async (req, res) => {
   if (query.length > CFG.maxSearchQueryChars) return respondError(res, 400, "Search query is too long.", "SEARCH_QUERY_TOO_LONG");
   try {
     const result = await searchService(query, offset, limit);
-    res.json({ ok: true, query, provider: result.provider, total: result.total, offset, limit, responseTimeMs: Math.round((performance.now() - started) * 10) / 10, cached: !!result.cached, results: result.results });
+    res.json({ ok: true, query, provider: result.provider, total: result.total, offset, limit, responseTimeMs: Math.round((performance.now() - started) * 10) / 10, cached: !!result.cached, indexSize: result.indexSize ?? result.indexStats?.documents ?? searchIndex.size, indexStats: result.indexStats || searchIndexStats(), terms: result.terms || [], filters: result.filters || {}, results: result.results, disabled: !!result.disabled });
   } catch (e) {
     const status = e.code === "SEARCH_NOT_CONFIGURED" ? 503 : 502;
-    respondError(res, status, e.message, e.code || "SEARCH_PROVIDER_ERROR");
+    respondError(res, status, e.message, e.code || "SEARCH_PROVIDER_ERROR", { indexStats: searchIndexStats() });
   }
 });
 
@@ -1183,8 +1318,8 @@ async function proxyRequest(req, res, mode) {
   })();
   if (body && Buffer.byteLength(body) > CFG.maxProxyBodyBytes) return respondError(res, 413, "Proxy request body is too large.", "PROXY_BODY_TOO_LARGE");
   const sourceUrl = (() => { try { const u = new URL(String(req.query.from || "")); return /^https?:$/.test(u.protocol) ? `${u.origin}${u.pathname}` : ""; } catch { return ""; } })();
-  const referer = sourceUrl ? new URL(sourceUrl).origin : "";
-  const headers = { accept, "content-type": req.get("Content-Type") || undefined, ...(req.get("Range") ? { range: String(req.get("Range")).slice(0, 200) } : {}), ...(referer ? { referer } : {}) };
+  const referrer = sourceUrl ? new URL(sourceUrl).origin : "";
+  const headers = { accept, "content-type": req.get("Content-Type") || undefined, ...(req.get("Range") ? { range: String(req.get("Range")).slice(0, 200) } : {}), ...(referrer ? { referer: referrer } : {}) };
   const limitForContentType = (ct) => {
     const type = String(ct || "").toLowerCase();
     if (type.includes("text/html") || type.includes("application/xhtml") || type.includes("text/css") || /javascript|ecmascript|json|xml/.test(type)) return CFG.maxProxyTextBytes;
@@ -1196,7 +1331,7 @@ async function proxyRequest(req, res, mode) {
   if (result.tooLarge) return respondError(res, 413, "The upstream response exceeds Veyra's safety limit.", "RESPONSE_TOO_LARGE");
   const upstreamHeaders = {
     "content-type": result.contentType || (mode === "view" ? "text/html; charset=utf-8" : "application/octet-stream"),
-    "cache-control": mode === "view" ? "no-store" : "public, max-age=30",
+    "cache-control": mode === "view" ? "no-store" : "public, max-age=15",
     "x-content-type-options": "nosniff",
     "referrer-policy": "no-referrer",
     ...(result.contentRange ? { "content-range": result.contentRange } : {}),
@@ -1209,13 +1344,8 @@ async function proxyRequest(req, res, mode) {
     return res.status(200).type("html").send(challengeFallbackHtml(canonical, challenge));
   }
   let payload = result.body;
-  if (mode === "view" && (/html|xhtml|^$/.test(result.contentType.toLowerCase()))) {
-    const originalHtml = payload.toString("utf8");
-    const pageBase = result.finalUrl || canonical;
-    payload = Buffer.from(rewriteHtml(originalHtml, pageBase), "utf8");
-    // Start resource warming before returning the page; the browser remains free to render immediately.
-    void warmProxyResources(originalHtml, pageBase).catch(() => {});
-  } else if (mode === "resource" && result.contentType.toLowerCase().includes("text/css")) payload = Buffer.from(rewriteCssText(payload.toString("utf8"), result.finalUrl || canonical), "utf8");
+  if (mode === "view" && (/html|xhtml|^$/.test(result.contentType.toLowerCase()))) payload = Buffer.from(rewriteHtml(payload.toString("utf8"), result.finalUrl || canonical), "utf8");
+  else if (mode === "resource" && result.contentType.toLowerCase().includes("text/css")) payload = Buffer.from(rewriteCssText(payload.toString("utf8"), result.finalUrl || canonical), "utf8");
   else if (mode === "resource" && /javascript|ecmascript/.test(result.contentType.toLowerCase())) payload = Buffer.from(rewriteJsText(payload.toString("utf8"), result.finalUrl || canonical), "utf8");
   for (const [k,v] of Object.entries(upstreamHeaders)) if (v) res.setHeader(k, v);
   res.setHeader("X-Veyra-Canonical-URL", result.finalUrl || canonical);
@@ -1241,13 +1371,8 @@ app.post("/api/open", async (req, res) => {
     if (old && !old.done && !old.stopRequested) return res.status(202).json({ jobId: old.id, url: root, viewUrl: makeViewUrl(root) });
     const activeCount = [...jobs.values()].filter(j => !j.done && !j.stopRequested).length;
     if (activeCount >= numberEnv("MAX_ACTIVE_JOBS", 3, 1, 20)) return respondError(res, 503, "Crawler capacity is busy; try again shortly.", "CRAWLER_CAPACITY_BUSY");
-    const job = createJob(root);
-    const requestedRobots = Number(req.body?.robots);
-    const requestedPerHost = Number(req.body?.perHostConcurrency);
-    if (Number.isFinite(requestedRobots)) job.robotCount = Math.min(CFG.crawlerRobots, Math.max(1, Math.floor(requestedRobots)));
-    if (Number.isFinite(requestedPerHost)) job.perHostConcurrency = Math.min(CFG.perHostConcurrency, Math.max(1, Math.floor(requestedPerHost)));
-    jobs.set(job.id, job); activeByRoot.set(root, job.id);
-    jobLog(job, "info", `Background crawl queued with ${job.robotCount} crawler robots (per-host ${job.perHostConcurrency}).`);
+    const job = createJob(root); jobs.set(job.id, job); activeByRoot.set(root, job.id);
+    jobLog(job, "info", "Background crawl queued.");
     runCrawl(job).catch(e => { job.done = true; job.finishedAt = now(); job.status = "error"; job.statusText = e.message; jobLog(job, "error", e.stack || e.message); });
     res.status(202).json({ jobId: job.id, url: root, viewUrl: makeViewUrl(root), state: "queued" });
   } catch (e) { respondError(res, 400, e.message, "OPEN_FAILED"); }
@@ -1288,9 +1413,15 @@ setInterval(async () => {
 }, 60000).unref();
 
 if (require.main === module && CFG.processRole !== "worker") {
-  app.listen(PORT, "0.0.0.0", () => serverLog("info", "SYSTEM", `Veyra server listening on ${PORT}`));
+  app.listen(PORT, "0.0.0.0", () => {
+    serverLog("info", "SYSTEM", `Veyra server listening on ${PORT}`);
+    pumpIndexSeeds().catch(e => serverLog("warn", "SEARCH", `Seed startup failed: ${e.message}`));
+    if (CFG.indexRefreshMs > 0) setInterval(() => pumpIndexSeeds().catch(e => serverLog("warn", "SEARCH", `Seed scheduler failed: ${e.message}`)), 30000).unref();
+  });
 } else if (require.main === module) {
+  pumpIndexSeeds().catch(e => serverLog("warn", "SEARCH", `Seed startup failed: ${e.message}`));
+  if (CFG.indexRefreshMs > 0) setInterval(() => pumpIndexSeeds().catch(e => serverLog("warn", "SEARCH", `Seed scheduler failed: ${e.message}`)), 30000).unref();
   serverLog("info", "SYSTEM", "PROCESS_ROLE=worker selected; no HTTP listener started.");
 }
 
-module.exports = { app, CFG, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, detectChallenge, PriorityFrontier, robotsAllowed, crawlPriority, collectPageWarmUrls };
+module.exports = { app, CFG, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, injectRuntime, detectChallenge, PriorityFrontier, robotsAllowed, crawlPriority, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions };

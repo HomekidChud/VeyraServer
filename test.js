@@ -1,7 +1,8 @@
 const assert = require("assert/strict");
 const {
   normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl,
-  rewriteHtml, rewriteCssText, rewriteJsText, detectChallenge, PriorityFrontier, crawlPriority, collectPageWarmUrls
+  rewriteHtml, rewriteCssText, rewriteJsText, injectRuntime, detectChallenge, PriorityFrontier, crawlPriority,
+  tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument
 } = require("./server");
 
 (async () => {
@@ -36,14 +37,31 @@ const {
   assert(sample.includes('icons.svg'));
   assert(sample.includes('data-src="/api/resource?url=https%3A%2F%2Fexample.com%2Flazy.png'));
 
-  const warm = collectPageWarmUrls('<img src="/img/a.png"><script src="/js/app.js"></script><link rel="stylesheet" href="/css/app.css"><img srcset="/img/a.png 1x, /img/b.png 2x">', 'https://example.com/page');
-  assert.deepEqual(warm.sort(), ['https://example.com/css/app.css', 'https://example.com/img/a.png', 'https://example.com/img/b.png', 'https://example.com/js/app.js'].sort());
+  const runtime = injectRuntime('<!doctype html><html><head><title>T</title></head><body></body></html>', 'https://example.com/path/page');
+  assert(runtime.includes('new URL(unwrap(String(url)),virtualUrl).href'));
+  assert(runtime.includes('const prefix=API_ORIGIN || location.origin'));
 
   const css = rewriteCssText('@font-face{src:url(../fonts/a.woff2)}', 'https://example.com/css/app.css');
   assert(css.includes('/api/resource?url=https%3A%2F%2Fexample.com%2Ffonts%2Fa.woff2'));
   const js = rewriteJsText('import("./chunk.js")', 'https://example.com/assets/app.js');
   assert(js.includes('/api/resource?url=https%3A%2F%2Fexample.com%2Fassets%2Fchunk.js'));
 
+
+  assert.deepEqual(tokenizeSearch("The quick brown fox 123"), ["quick", "brown", "fox", "123"]);
+  const parsed = parseSearchQuery('site:example.com "cats dogs" -spam intitle:cats');
+  assert.equal(parsed.filters.site, "example.com");
+  assert.equal(parsed.filters.intitle, "cats");
+  assert.ok(parsed.phrases.includes("cats dogs"));
+  assert.ok(parsed.negativeTerms.includes("spam"));
+  indexDocument("https://example.com/cats", '<!doctype html><html><head><title>Cats Guide</title><meta name="description" content="A guide to cats and kittens"></head><body><main><h1>Cats guide</h1><p>Cats are curious companion animals.</p></main></body></html>');
+  indexDocument("https://example.org/dogs", '<!doctype html><html><head><title>Dogs Guide</title><meta name="description" content="A guide to dogs"></head><body><main><h1>Dogs guide</h1><p>Dogs are loyal companion animals.</p></main></body></html>');
+  const sr = localSearch("cats", 0, 10);
+  assert.equal(sr.total >= 1, true);
+  assert.equal(sr.results[0].url, "https://example.com/cats");
+  assert.equal(localSearch("site:example.com cats -kittens", 0, 10).total, 0);
+  assert.equal(localSearch('"cats guide"', 0, 10).results[0].url, "https://example.com/cats");
+  assert.equal(searchIndexStats().documents >= 2, true);
   console.log("Veyra server tests passed");
-  console.log("rewrite/resource tests passed");
+  assert.equal(typeof CFG.globalConcurrency, "number");
+  console.log("rewrite/resource/navigation tests passed");
 })().catch(err => { console.error(err); process.exit(1); });
