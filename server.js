@@ -71,6 +71,10 @@ const CFG = Object.freeze({
   maxSearchQueryChars: numberEnv("MAX_SEARCH_QUERY_CHARS", 256, 32, 1000),
   maxSearchResults: numberEnv("MAX_SEARCH_RESULTS", 20, 1, 50),
   maxProxyBodyBytes: numberEnv("MAX_PROXY_BODY_BYTES", 4 * 1024 * 1024, 64 * 1024, 32 * 1024 * 1024),
+  maxProxyTextBytes: numberEnv("MAX_PROXY_TEXT_BYTES", 8 * 1024 * 1024, 256 * 1024, 32 * 1024 * 1024),
+  maxProxyImageBytes: numberEnv("MAX_PROXY_IMAGE_BYTES", 16 * 1024 * 1024, 256 * 1024, 64 * 1024 * 1024),
+  maxProxyMediaBytes: numberEnv("MAX_PROXY_MEDIA_BYTES", 32 * 1024 * 1024, 512 * 1024, 128 * 1024 * 1024),
+  maxProxyOtherBytes: numberEnv("MAX_PROXY_OTHER_BYTES", 16 * 1024 * 1024, 256 * 1024, 64 * 1024 * 1024),
   maxFormBodyBytes: numberEnv("MAX_FORM_BODY_BYTES", 1 * 1024 * 1024, 16 * 1024, 8 * 1024 * 1024),
   userAgent: process.env.VEYRA_USER_AGENT || "VeyraBrowseCrawler/8.0 (+https://github.com/)",
   frontendOrigins: csvEnv("FRONTEND_ORIGIN", ["*"]),
@@ -232,9 +236,19 @@ function resolveNavigation(value, documentUrl) {
     return u.href;
   } catch { return null; }
 }
-function resolveResource(value, documentUrl) { return resolveNavigation(value, documentUrl); }
+function resolveResource(value, documentUrl) {
+  const raw = String(value ?? "").trim();
+  if (!raw || raw.startsWith("#") || /^(?:data|blob|mailto|javascript|tel|about):/i.test(raw)) return null;
+  return resolveNavigation(raw, documentUrl);
+}
 function makeViewUrl(url) { return `/api/view?url=${encodeURIComponent(url)}`; }
-function makeResourceUrl(url) { return `/api/resource?url=${encodeURIComponent(url)}`; }
+function makeResourceUrl(url, referrer = "") {
+  const q = `/api/resource?url=${encodeURIComponent(url)}`;
+  try {
+    const r = new URL(referrer);
+    return `${q}&from=${encodeURIComponent(`${r.origin}${r.pathname}`)}`;
+  } catch { return q; }
+}
 function typeFor(url, hint = "") {
   const p = String(url).toLowerCase().split("?")[0];
   if (hint === "css" || /\.css$/i.test(p)) return "css";
@@ -337,6 +351,7 @@ async function fetchBuffer(url, opts = {}) {
   const headers = new Headers(opts.headers || {});
   headers.set("user-agent", opts.userAgent || CFG.userAgent);
   if (!headers.has("accept")) headers.set("accept", opts.accept || "text/html,application/xhtml+xml,application/xml,text/css,application/javascript,text/javascript,*/*;q=0.05");
+  if (opts.range && !headers.has("range")) headers.set("range", String(opts.range).slice(0, 200));
   const redirectChain = [];
   let cached = opts.cached || null;
   for (let redirect = 0; redirect <= maxRedirects; redirect++) {
@@ -378,7 +393,8 @@ async function fetchBuffer(url, opts = {}) {
           continue;
         }
         const contentType = response.headers.get("content-type") || "";
-        const body = await readBodyLimited(response, limit);
+        const bodyLimit = typeof opts.limitForContentType === "function" ? opts.limitForContentType(contentType, response.headers) : limit;
+        const body = await readBodyLimited(response, bodyLimit);
         return {
           ok: response.ok,
           status: response.status,
@@ -389,6 +405,9 @@ async function fetchBuffer(url, opts = {}) {
           etag: response.headers.get("etag") || "",
           lastModified: response.headers.get("last-modified") || "",
           expires: response.headers.get("expires") || "",
+          contentRange: response.headers.get("content-range") || "",
+          acceptRanges: response.headers.get("accept-ranges") || "",
+          contentLength: response.headers.get("content-length") || "",
           serverHeader: response.headers.get("server") || "",
           cfMitigated: response.headers.get("cf-mitigated") || "",
           xFrameOptions: response.headers.get("x-frame-options") || "",
@@ -426,7 +445,8 @@ function cacheSet(map, key, value, maxEntries) {
 }
 async function fetchCached(url, opts = {}) {
   const method = String(opts.method || "GET").toUpperCase();
-  const key = `${method} ${normalizeUrl(url)}`;
+  const referrerKey = String(opts.referrer || "");
+  const key = `${method} ${normalizeUrl(url)} | ref=${referrerKey}`;
   const cachedEntry = opts.noCache || method !== "GET" ? null : proxyCache.get(key) || null;
   if (cachedEntry && Date.now() - cachedEntry.time <= CFG.proxyCacheMs && !opts.revalidate) {
     return { ...cachedEntry.response, cacheHit: true };
@@ -625,11 +645,11 @@ function rewriteCssText(text, base) {
   const src = String(text || "");
   const withUrls = src.replace(/url\(\s*(["']?)([^"')]+)\1\s*\)/gi, (m, quote, value) => {
     const u = resolveResource(value.trim(), base);
-    return u ? `url("${makeResourceUrl(u)}")` : m;
+    return u ? `url("${makeResourceUrl(u, base)}")` : m;
   });
   return withUrls.replace(/@import\s+(?:url\(\s*)?(["'])([^"']+)\1\s*\)?/gi, (m, quote, value) => {
     const u = resolveResource(value.trim(), base);
-    return u ? `@import "${makeResourceUrl(u)}"` : m;
+    return u ? `@import "${makeResourceUrl(u, base)}"` : m;
   });
 }
 function rewriteJsText(text, base) {
@@ -640,7 +660,7 @@ function rewriteJsText(text, base) {
   for (const re of patterns) {
     out = out.replace(re, (m, prefix, quote, spec) => {
       const u = resolveResource(spec, base);
-      return u ? `${prefix}${quote}${makeResourceUrl(u)}${quote}` : m;
+      return u ? `${prefix}${quote}${makeResourceUrl(u, base)}${quote}` : m;
     });
   }
   return out;
@@ -650,7 +670,7 @@ function rewriteSrcset(raw, base) {
     const parts = candidate.trim().split(/\s+/);
     if (!parts[0]) return candidate;
     const u = resolveResource(parts[0], base);
-    if (u) parts[0] = makeResourceUrl(u);
+    if (u) parts[0] = makeResourceUrl(u, base);
     return parts.join(" ");
   }).join(", ");
 }
@@ -661,10 +681,10 @@ function injectRuntime(html, original) {
   let virtualUrl=CANONICAL;
   window.__VEYRA_PAGE_URL__=CANONICAL;
   window.__VEYRA_PROXY__=true;
-  function unwrap(v){try{const u=new URL(String(v||''),location.origin);if(u.origin===location.origin&&(u.pathname==='/api/view'||u.pathname==='/api/resource'))return u.searchParams.get('url')||String(v);return String(v)}catch{return String(v||'')}}
+  function unwrap(v){try{const raw=String(v||'');if(raw==='/api/view'||raw==='/api/resource')return virtualUrl;const u=new URL(raw,location.origin);if((u.pathname==='/api/view'||u.pathname==='/api/resource')&&u.searchParams.get('url'))return u.searchParams.get('url');return raw}catch{return String(v||'')}}
   function resolve(v){try{return new URL(unwrap(typeof v==='string'?v:v&&v.url||''),virtualUrl).href}catch{return String(v||'')}}
   function shouldProxy(v){try{const u=new URL(unwrap(v));return /^https?:$/.test(u.protocol)}catch{return false}}
-  function proxy(kind,u){return (kind==='view'?'/api/view?url=':'/api/resource?url=')+encodeURIComponent(u)}
+  function proxy(kind,u){const base=(kind==='view'?'/api/view?url=':'/api/resource?url=')+encodeURIComponent(u);return kind==='view'?base:base+'&from='+encodeURIComponent(new URL(virtualUrl).origin+new URL(virtualUrl).pathname)}
   function topPost(msg){try{window.top.postMessage(msg,'*')}catch{}}
   function emit(source,url,extra){if(!url)return;topPost({type:'veyra:navigate',url,source,...extra})}
   function canonicalizeMaybeProxy(href){try{const u=new URL(unwrap(href),virtualUrl);if(!/^https?:$/.test(u.protocol))return null;return u.href}catch{return null}}
@@ -718,17 +738,35 @@ function rewriteHtml(html, base) {
   $("a[href],area[href]").each((_, el) => { const u = resolveNavigation($(el).attr("href"), base); if (u) $(el).attr("href", makeViewUrl(u)); });
   $("form[action]").each((_, el) => { const u = resolveNavigation($(el).attr("action"), base); if (u) $(el).attr("action", makeViewUrl(u)); });
   $("iframe[src]").each((_, el) => { const u = resolveNavigation($(el).attr("src"), base); if (u) $(el).attr("src", makeViewUrl(u)); });
-  $("object[data]").each((_, el) => { const u = resolveResource($(el).attr("data"), base); if (u) $(el).attr("data", makeResourceUrl(u)); });
+  $("object[data]").each((_, el) => { const u = resolveResource($(el).attr("data"), base); if (u) $(el).attr("data", makeResourceUrl(u, base)); });
   $("link[href]").each((_, el) => {
     const rel = String($(el).attr("rel") || "").toLowerCase();
     if (rel.includes("canonical")) return;
-    const raw = $(el).attr("href"); const u = resolveResource(raw, base); if (u) $(el).attr("href", makeResourceUrl(u));
+    const raw = $(el).attr("href"); const u = resolveResource(raw, base); if (u) { $(el).attr("href", makeResourceUrl(u, base)); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); }
   });
-  $("script[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), base); if (u) $(el).attr("src", makeResourceUrl(u)); });
+  $("script[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), base); if (u) { $(el).attr("src", makeResourceUrl(u, base)); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); } });
   for (const tag of ["img", "source", "audio", "input", "embed"]) {
-    $(`${tag}[src]`).each((_, el) => { const u = resolveResource($(el).attr("src"), base); if (u) $(el).attr("src", makeResourceUrl(u)); });
+    $(`${tag}[src]`).each((_, el) => { const u = resolveResource($(el).attr("src"), base); if (u) $(el).attr("src", makeResourceUrl(u, base)); });
   }
-  $("video[poster]").each((_, el) => { const u = resolveResource($(el).attr("poster"), base); if (u) $(el).attr("poster", makeResourceUrl(u)); });
+  $("video[poster]").each((_, el) => { const u = resolveResource($(el).attr("poster"), base); if (u) $(el).attr("poster", makeResourceUrl(u, base)); });
+  $("track[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), base); if (u) $(el).attr("src", makeResourceUrl(u, base)); });
+  $("use[href],use[xlink\:href],image[href],image[xlink\:href]").each((_, el) => {
+    const attr = $(el).attr("href") != null ? "href" : "xlink:href";
+    const raw = $(el).attr(attr) || "";
+    const u = resolveResource(raw, base);
+    if (u) $(el).attr(attr, makeResourceUrl(u, base));
+  });
+  $("[imagesrcset]").each((_, el) => $(el).attr("imagesrcset", rewriteSrcset($(el).attr("imagesrcset"), base)));
+  for (const attr of ["data-src", "data-original", "data-lazy-src"]) {
+    $(`[${attr}]`).each((_, el) => { const u = resolveResource($(el).attr(attr), base); if (u) $(el).attr(attr, makeResourceUrl(u, base)); });
+  }
+  $(`[data-srcset]`).each((_, el) => $(el).attr("data-srcset", rewriteSrcset($(el).attr("data-srcset"), base)));
+  $("track[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), base); if (u) $(el).attr("src", makeResourceUrl(u, base)); });
+  $("use[href],use[xlink\:href],image[href],image[xlink\:href]").each((_, el) => {
+    const attr = $(el).attr("href") != null ? "href" : "xlink:href"; const raw = $(el).attr(attr) || "";
+    const u = resolveResource(raw, base); if (u) $(el).attr(attr, makeResourceUrl(u, base));
+  });
+  $("[imagesrcset]").each((_, el) => $(el).attr("imagesrcset", rewriteSrcset($(el).attr("imagesrcset"), base)));
   $("[srcset]").each((_, el) => $(el).attr("srcset", rewriteSrcset($(el).attr("srcset"), base)));
   $("meta[http-equiv='refresh'],meta[http-equiv='Refresh']").each((_, el) => {
     const raw = $(el).attr("content") || ""; const m = raw.match(/^(\s*\d+\s*;\s*url\s*=\s*)(.+)$/i); if (!m) return;
@@ -1102,14 +1140,25 @@ async function proxyRequest(req, res, mode) {
     return typeof req.body === "string" ? req.body : undefined;
   })();
   if (body && Buffer.byteLength(body) > CFG.maxProxyBodyBytes) return respondError(res, 413, "Proxy request body is too large.", "PROXY_BODY_TOO_LARGE");
-  const headers = { accept, "content-type": req.get("Content-Type") || undefined };
-  const result = await fetchCached(canonical, { method, headers, body, limit: CFG.maxTextBytesPerResource, noCache: method !== "GET" });
+  const sourceUrl = (() => { try { const u = new URL(String(req.query.from || "")); return /^https?:$/.test(u.protocol) ? `${u.origin}${u.pathname}` : ""; } catch { return ""; } })();
+  const referer = sourceUrl ? new URL(sourceUrl).origin : "";
+  const headers = { accept, "content-type": req.get("Content-Type") || undefined, ...(req.get("Range") ? { range: String(req.get("Range")).slice(0, 200) } : {}), ...(referer ? { referer } : {}) };
+  const limitForContentType = (ct) => {
+    const type = String(ct || "").toLowerCase();
+    if (type.includes("text/html") || type.includes("application/xhtml") || type.includes("text/css") || /javascript|ecmascript|json|xml/.test(type)) return CFG.maxProxyTextBytes;
+    if (type.startsWith("image/") || type.includes("svg")) return CFG.maxProxyImageBytes;
+    if (type.startsWith("video/") || type.startsWith("audio/") || type.includes("application/pdf")) return CFG.maxProxyMediaBytes;
+    return CFG.maxProxyOtherBytes;
+  };
+  const result = await fetchCached(canonical, { method, headers, body, referrer, limit: CFG.maxTextBytesPerResource, limitForContentType, noCache: method !== "GET" });
   if (result.tooLarge) return respondError(res, 413, "The upstream response exceeds Veyra's safety limit.", "RESPONSE_TOO_LARGE");
   const upstreamHeaders = {
     "content-type": result.contentType || (mode === "view" ? "text/html; charset=utf-8" : "application/octet-stream"),
     "cache-control": mode === "view" ? "no-store" : "public, max-age=15",
     "x-content-type-options": "nosniff",
-    "referrer-policy": "no-referrer"
+    "referrer-policy": "no-referrer",
+    ...(result.contentRange ? { "content-range": result.contentRange } : {}),
+    ...(result.acceptRanges ? { "accept-ranges": result.acceptRanges } : {})
   };
   const challenge = mode === "view" ? detectChallenge(result.body.toString("utf8"), result.contentType, result.status, { server: result.serverHeader, "cf-mitigated": result.cfMitigated }) : null;
   if (challenge) {
@@ -1126,7 +1175,10 @@ async function proxyRequest(req, res, mode) {
   res.setHeader("X-Veyra-Content-Type", result.contentType || "application/octet-stream");
   if (result.etag) res.setHeader("ETag", result.etag);
   if (result.lastModified) res.setHeader("Last-Modified", result.lastModified);
-  res.status(result.status >= 400 ? result.status : 200).send(payload);
+  const outputStatus = result.status >= 400 ? result.status : (result.status === 206 ? 206 : 200);
+  const transformedText = (mode === "view" && /html|xhtml|^$/i.test(result.contentType || "")) || (mode === "resource" && /(?:text\/css|javascript|ecmascript)/i.test(result.contentType || ""));
+  if (result.contentLength && !transformedText && !result.truncated && outputStatus !== 200) res.setHeader("content-length", result.contentLength);
+  res.status(outputStatus).send(payload);
 }
 
 app.get("/api/view", async (req, res) => { try { await proxyRequest(req, res, "view"); } catch (e) { respondError(res, 502, `Veyra could not load this page: ${e.message}`, "PROXY_VIEW_ERROR", { requestId: req.veyraRequestId }); } });
@@ -1189,4 +1241,4 @@ if (require.main === module && CFG.processRole !== "worker") {
   serverLog("info", "SYSTEM", "PROCESS_ROLE=worker selected; no HTTP listener started.");
 }
 
-module.exports = { app, CFG, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, detectChallenge, PriorityFrontier, robotsAllowed, crawlPriority };
+module.exports = { app, CFG, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, detectChallenge, PriorityFrontier, robotsAllowed, crawlPriority };

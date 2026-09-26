@@ -7,11 +7,11 @@ This repository preserves the existing Express architecture and expands it into 
 - Fast `/api/view` initial page proxy independent of crawl completion.
 - Explicit canonical/original URL signalling from proxied documents; proxy URLs never become Veyra's visible browsing state.
 - Central URL resolution for navigation and resources, including query/fragment/protocol-relative/relative URL handling.
-- HTML, CSS, JavaScript, `srcset`, forms, iframe and module-resource rewriting.
+- HTML, CSS, JavaScript, `srcset`, `imagesrcset`, lazy-load attributes, SVG references, media tracks, forms, iframe and module-resource rewriting.
 - Runtime handling for anchor navigation, `history.pushState`/`replaceState`, `fetch`, XHR, EventSource, `window.open`, simple POST forms, and service-worker isolation.
 - Bounded priority frontier with global and per-host concurrency limits, deduplication, backpressure, timeouts, retries with jitter, and temporary host backoff.
 - HTTP caching with ETag/Last-Modified revalidation and a small in-memory hot cache.
-- Streaming response-size protection and content-type filtering.
+- Streaming response-size protection and content-type-aware proxy limits for documents, images, media, fonts and other binary resources; HTTP Range forwarding for media.
 - Robots parsing with user-agent matching, allow/disallow precedence, Crawl-delay, sitemap indexes, and concurrent sitemap processing.
 - Conservative security-challenge detection with a Veyra fallback; no challenge/CAPTCHA bypassing.
 - Veyra Search provider abstraction for local index, Brave, Bing, custom API, or no provider.
@@ -48,6 +48,10 @@ MAX_RESOURCES=20000
 MAX_LINKS=100000
 MAX_SCAN_BYTES=536870912
 MAX_TEXT_BYTES_PER_RESOURCE=2097152
+MAX_PROXY_TEXT_BYTES=8388608
+MAX_PROXY_IMAGE_BYTES=16777216
+MAX_PROXY_MEDIA_BYTES=33554432
+MAX_PROXY_OTHER_BYTES=16777216
 REQUEST_TIMEOUT_MS=15000
 BODY_TIMEOUT_MS=15000
 DNS_TIMEOUT_MS=4000
