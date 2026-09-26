@@ -1,8 +1,8 @@
 {
   "name": "veyra-browse-crawler",
-  "version": "5.0.0",
+  "version": "6.0.0",
   "private": true,
-  "description": "Fast server-side crawler and browser proxy API for Veyra Browse.",
+  "description": "High-throughput server-side crawler and browser proxy for Veyra Browse.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
