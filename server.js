@@ -45,6 +45,15 @@ const CFG = Object.freeze({
   maxActiveFetches: numberEnv("MAX_ACTIVE_FETCHES", numberEnv("MAX_GLOBAL_CONCURRENCY", 128, 1, 256), 1, 256),
   globalConcurrency: numberEnv("MAX_ACTIVE_FETCHES", numberEnv("MAX_GLOBAL_CONCURRENCY", 128, 1, 256), 1, 256),
   perHostConcurrency: numberEnv("CRAWLER_PER_HOST_CONCURRENCY", numberEnv("MAX_PER_HOST_CONCURRENCY", 8, 1, 32), 1, 32),
+  robotTaskCapacity: numberEnv("ROBOT_TASK_CAPACITY", 4, 1, 16),
+  robotActiveTasks: numberEnv("ROBOT_ACTIVE_TASKS", 2, 1, 8),
+  robotHelpEnabled: boolEnv("ROBOT_HELP_ENABLED", true),
+  robotHelpThreshold: numberEnv("ROBOT_HELP_THRESHOLD", 2, 1, 16),
+  robotHelpCooldownMs: numberEnv("ROBOT_HELP_COOLDOWN_MS", 250, 0, 10000),
+  robotHelpScanLimit: numberEnv("ROBOT_HELP_SCAN_LIMIT", 24, 1, 128),
+  browserMaxActiveFetches: numberEnv("BROWSER_MAX_ACTIVE_FETCHES", 24, 1, 64),
+  browserPerHostConcurrency: numberEnv("BROWSER_PER_HOST_CONCURRENCY", 8, 1, 32),
+  dnsCacheTtlMs: numberEnv("DNS_CACHE_TTL_MS", 5000, 0, 60000),
   maxPendingQueue: numberEnv("MAX_PENDING_QUEUE", 1500, 50, 20000),
   maxPages: numberEnv("MAX_PAGES", 10000, 1, 100000),
   maxResources: numberEnv("MAX_RESOURCES", 20000, 1, 250000),
@@ -88,7 +97,7 @@ const CFG = Object.freeze({
   proxyWarmConcurrency: numberEnv("PROXY_WARM_CONCURRENCY", 12, 1, 64),
   proxyWarmLimit: numberEnv("PROXY_WARM_LIMIT", 64, 1, 256),
   proxyWarmPerHost: numberEnv("PROXY_WARM_PER_HOST", 3, 1, 16),
-  userAgent: process.env.VEYRA_USER_AGENT || "VeyraBrowseCrawler/8.3 (+https://github.com/HomekidChud/VeyraServer)",
+  userAgent: process.env.VEYRA_USER_AGENT || "VeyraBrowseCrawler/8.4 (+https://github.com/HomekidChud/VeyraServer)",
   frontendOrigins: csvEnv("FRONTEND_ORIGIN", ["*"]),
   searchProvider: enumEnv("SEARCH_PROVIDER", "local", ["auto", "local", "brave", "bing", "custom", "none"]),
   searchEndpoint: process.env.SEARCH_ENDPOINT || "",
@@ -157,6 +166,7 @@ class Semaphore {
 }
 const fetchSemaphore = new Semaphore(CFG.maxActiveFetches);
 const proxyWarmSemaphore = new Semaphore(CFG.proxyWarmConcurrency);
+const dnsPublicCache = new Map();
 const searchIndex = new Map();
 const invertedIndex = new Map();
 const termCounts = new Map();
@@ -357,7 +367,7 @@ async function withTimeout(promise, ms, message) {
     ]);
   } finally { clearTimeout(timer); }
 }
-async function assertPublicUrl(url) {
+async function assertPublicUrl(url, cache = dnsPublicCache) {
   const u = new URL(url);
   if (!['http:', 'https:'].includes(u.protocol)) throw new Error("Only HTTP(S) URLs are allowed.");
   const host = u.hostname.toLowerCase();
@@ -365,9 +375,17 @@ async function assertPublicUrl(url) {
     throw new Error("Private/local destinations are blocked.");
   }
   if (net.isIP(host) && !assertIpPublic(host)) throw new Error("Private/local destinations are blocked.");
+  const cached = cache?.get(host);
+  if (cached && Date.now() - cached.time <= CFG.dnsCacheTtlMs) {
+    if (cached.records.some(x => !assertIpPublic(x.address))) throw new Error("Private/local destinations are blocked.");
+    return cached.records;
+  }
   const records = await withTimeout(dns.lookup(host, { all: true, verbatim: true }), CFG.dnsTimeoutMs, "DNS lookup timed out.");
   if (!records.length) throw new Error("Destination could not be resolved.");
   if (records.some(x => !assertIpPublic(x.address))) throw new Error("Private/local destinations are blocked.");
+  cache?.set(host, { time: Date.now(), records: records.map(x => ({ address: x.address, family: x.family })) });
+  while (cache && cache.size > 5000) cache.delete(cache.keys().next().value);
+  return records;
 }
 
 function normalizeSessionId(value) {
@@ -497,7 +515,7 @@ async function fetchBuffer(url, opts = {}) {
   const redirectChain = [];
   let cached = opts.cached || null;
   for (let redirect = 0; redirect <= maxRedirects; redirect++) {
-    await assertPublicUrl(current);
+    await assertPublicUrl(current, opts.dnsCache || dnsPublicCache);
     let lastError = null;
     let retriesUsed = 0;
     for (let attempt = 0; attempt <= (opts.retries ?? CFG.maxRetries); attempt++) {
@@ -667,6 +685,104 @@ class PriorityFrontier {
   #down(i) { for (;;) { const l = i * 2 + 1, r = l + 1; let best = i; if (l < this.heap.length && this.#greater(this.heap[l], this.heap[best])) best = l; if (r < this.heap.length && this.#greater(this.heap[r], this.heap[best])) best = r; if (best === i) break; [this.heap[i], this.heap[best]] = [this.heap[best], this.heap[i]]; i = best; } }
   #pop() { const top = this.heap[0], last = this.heap.pop(); if (this.heap.length) { this.heap[0] = last; this.#down(0); } return top; }
 }
+class BrowserTaskScheduler {
+  constructor(limit, perHost, maxQueue = 2000) {
+    this.limit = Math.max(1, limit);
+    this.perHost = Math.max(1, perHost);
+    this.maxQueue = Math.max(32, maxQueue);
+    this.queue = [];
+    this.queuedKeys = new Set();
+    this.inflight = new Map();
+    this.hostActive = new Map();
+    this.active = 0;
+    this.seq = 0;
+    this.scheduled = false;
+    this.stats = { enqueued: 0, completed: 0, failed: 0, deduped: 0, dropped: 0 };
+  }
+  score(item) { return Number(item.priority) || 0; }
+  greater(a, b) { return this.score(a) > this.score(b) || (this.score(a) === this.score(b) && a.seq < b.seq); }
+  up(i) {
+    while (i > 0) {
+      const p = (i - 1) >> 1;
+      if (!this.greater(this.queue[i], this.queue[p])) break;
+      [this.queue[i], this.queue[p]] = [this.queue[p], this.queue[i]]; i = p;
+    }
+  }
+  down(i) {
+    for (;;) {
+      const l = i * 2 + 1, r = l + 1; let best = i;
+      if (l < this.queue.length && this.greater(this.queue[l], this.queue[best])) best = l;
+      if (r < this.queue.length && this.greater(this.queue[r], this.queue[best])) best = r;
+      if (best === i) break;
+      [this.queue[i], this.queue[best]] = [this.queue[best], this.queue[i]]; i = best;
+    }
+  }
+  popReady() {
+    if (!this.queue.length) return null;
+    const blocked = [];
+    let picked = null;
+    while (this.queue.length) {
+      const top = this.queue[0];
+      const active = this.hostActive.get(top.host) || 0;
+      this.queue[0] = this.queue[this.queue.length - 1]; this.queue.pop(); if (this.queue.length) this.down(0);
+      this.queuedKeys.delete(top.key);
+      if (active < this.perHost) { picked = top; break; }
+      blocked.push(top);
+    }
+    for (const item of blocked) {
+      this.queue.push(item); this.queuedKeys.add(item.key); this.up(this.queue.length - 1);
+    }
+    return picked;
+  }
+  pumpSoon() {
+    if (this.scheduled) return;
+    this.scheduled = true;
+    queueMicrotask(() => { this.scheduled = false; this.pump(); });
+  }
+  pump() {
+    while (this.active < this.limit) {
+      const item = this.popReady();
+      if (!item) break;
+      this.active += 1;
+      this.hostActive.set(item.host, (this.hostActive.get(item.host) || 0) + 1);
+      Promise.resolve().then(item.run).then(value => {
+        this.stats.completed += 1; item.resolve(value);
+      }, error => {
+        this.stats.failed += 1; item.reject(error);
+      }).finally(() => {
+        this.active = Math.max(0, this.active - 1);
+        this.hostActive.set(item.host, Math.max(0, (this.hostActive.get(item.host) || 1) - 1));
+        this.inflight.delete(item.key);
+        this.pump();
+      });
+    }
+  }
+  request(key, run, options = {}) {
+    const k = String(key);
+    const existing = this.inflight.get(k);
+    if (existing) { this.stats.deduped += 1; return existing; }
+    if (this.queue.length >= this.maxQueue && (Number(options.priority) || 0) < 1000) {
+      this.stats.dropped += 1;
+      return Promise.reject(new Error("Browser request queue is busy; retry shortly."));
+    }
+    const host = String(options.host || hostOf(options.url || k));
+    const promise = new Promise((resolve, reject) => {
+      const item = { key: k, host, priority: Number(options.priority) || 0, seq: ++this.seq, run, resolve, reject };
+      this.queue.push(item); this.queuedKeys.add(k); this.stats.enqueued += 1; this.up(this.queue.length - 1);
+    });
+    this.inflight.set(k, promise);
+    this.pumpSoon();
+    return promise;
+  }
+  status() {
+    return {
+      active: this.active, queued: this.queue.length, limit: this.limit, perHost: this.perHost,
+      inFlight: this.inflight.size, ...this.stats
+    };
+  }
+}
+const browserScheduler = new BrowserTaskScheduler(CFG.browserMaxActiveFetches, CFG.browserPerHostConcurrency, 2000);
+
 function pathDepth(url) { try { return new URL(url).pathname.split("/").filter(Boolean).length; } catch { return 0; } }
 function crawlPriority(url, kind, reason = "discovered") {
   let score = kind === "html" ? 70 : 35;
@@ -780,7 +896,7 @@ async function loadSitemaps(job) {
       }
     } catch (e) { jobLog(job, "debug", `Sitemap failed: ${sm} — ${e.message}`); }
   }
-  while (pending.length && files < CFG.maxSitemapFiles && urls < CFG.maxSitemapUrls && !job.stop) {
+  while (pending.length && files < CFG.maxSitemapFiles && urls < CFG.maxSitemapUrls && !job.stopRequested) {
     const batch = pending.splice(0, 4);
     await Promise.allSettled(batch.map(processSitemap));
   }
@@ -855,6 +971,9 @@ function injectRuntime(html, original, sid = "") {
   };
   try{const nativeOpen=XMLHttpRequest.prototype.open;XMLHttpRequest.prototype.open=function(method,url,...rest){const target=resolve(url);return nativeOpen.call(this,method,shouldProxy(target)?proxy('resource',target):url,...rest)}}catch{}
   try{const NativeEventSource=window.EventSource;if(NativeEventSource)window.EventSource=function(url,options){const target=resolve(url);return new NativeEventSource(shouldProxy(target)?proxy('resource',target):url,options)}}catch{}
+  try{const nativeBeacon=navigator.sendBeacon&&navigator.sendBeacon.bind(navigator);if(nativeBeacon)navigator.sendBeacon=function(url,data){try{const target=resolve(url);if(shouldProxy(target)){let body=data;let type='text/plain;charset=UTF-8';if(typeof Blob!=='undefined'&&data instanceof Blob)type=data.type||type;void fetch(proxy('resource',target),{method:'POST',body,keepalive:true,headers:{'content-type':type}});return true}}catch{}return nativeBeacon(url,data)}}catch{}
+  try{const nativeFormSubmit=HTMLFormElement.prototype.submit;HTMLFormElement.prototype.submit=function(){try{const method=String(this.method||'get').toUpperCase();const target=canonicalizeMaybeProxy(this.getAttribute('action')||virtualUrl);if(target&&method==='GET'){const fd=new FormData(this);const u=new URL(target);for(const [k,v] of fd.entries())if(typeof v==='string')u.searchParams.append(k,v);emit('form.submit',u.href);return;}if(target&&method==='POST'){const fd=new FormData(this);const entries=[];for(const [k,v] of fd.entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});return;}}catch{}return nativeFormSubmit.call(this)}}catch{}
+  try{const nativeRequestSubmit=HTMLFormElement.prototype.requestSubmit;if(nativeRequestSubmit)HTMLFormElement.prototype.requestSubmit=function(submitter){try{const target=canonicalizeMaybeProxy(this.getAttribute('action')||virtualUrl);if(target){const method=String(this.method||'get').toUpperCase();const fd=new FormData(this,submitter);if(method==='GET'){const u=new URL(target);for(const [k,v] of fd.entries())if(typeof v==='string')u.searchParams.append(k,v);emit('form.requestSubmit',u.href);return;}if(method==='POST'){const entries=[];for(const [k,v] of fd.entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});return;}}catch{}return nativeRequestSubmit.call(this,submitter)}}catch{}
   try{const nativeOpen=window.open;window.open=function(url,target,features){const u=canonicalizeMaybeProxy(url);if(u){topPost({type:'veyra:open',url:u,sessionId:SESSION_ID});return null}return nativeOpen.call(window,url,target,features)}}catch{}
   try{['log','info','debug','warn','error'].forEach(level=>{const native=console[level].bind(console);console[level]=(...args)=>{native(...args);topPost({type:'veyra:page-console',level,sessionId:SESSION_ID,message:args.map(x=>typeof x==='string'?x:(()=>{try{return JSON.stringify(x)}catch{return String(x)}})()).join(' '),pageUrl:virtualUrl})}})}catch{}
   window.addEventListener('error',e=>topPost({type:'veyra:page-error',level:'error',sessionId:SESSION_ID,message:e.message||'Resource error',url:e.filename||'',line:e.lineno||null,column:e.colno||null,stack:e.error&&e.error.stack||'',pageUrl:virtualUrl}),true);
@@ -1197,7 +1316,10 @@ function createJob(root) {
     activeWorkers: 0, activeHtmlWorkers: 0, activeAssetWorkers: 0, processed: 0, pagesDiscovered: 0, resourcesScheduled: 0,
     robots: null, robotsReady: false, sitemaps: new Set(), challengeHosts: new Set(), hostActive: new Map(), hostCooldowns: new Map(), hostLastRequested: new Map(), hostFailures: new Map(), hostDelayMs: 0, stopReason: null,
     counts: { htmlPages: 0, css: 0, js: 0, data: 0, assets: 0, links: 0, bytesScanned: 0, bytesStored: 0, bytesDiscarded: 0, requestCount: 0, retries: 0, challenges: 0, errors: 0 },
-    controller: new AbortController()
+    controller: new AbortController(),
+    dnsCache: new Map(),
+    robotPool: null,
+    robotEvents: []
   };
 }
 function publicJob(job) {
@@ -1211,7 +1333,9 @@ function publicJob(job) {
     limits: { globalConcurrency: CFG.maxActiveFetches, crawlerRobots: CFG.logicalRobots, logicalRobots: CFG.logicalRobots, maxActiveFetches: CFG.maxActiveFetches, perHostConcurrency: CFG.perHostConcurrency, maxPages: CFG.maxPages, maxResources: CFG.maxResources, maxLinks: CFG.maxLinks, maxScanBytes: CFG.maxScanBytes },
     searchIndex: searchIndexStats(),
     robotsLoaded: job.robotsReady, sitemapsFound: job.sitemaps.size, sourceFiles: job.sourceFiles, textBytesStored: job.textBytesStored,
-    resourceCount: job.resources.length, linkCount: job.links.length, logs: job.logs.slice(-120), queue: { pages: job.pageFrontier.snapshot().slice(0, 50), resources: job.resourceFrontier.snapshot().slice(0, 50) }
+    resourceCount: job.resources.length, linkCount: job.links.length, logs: job.logs.slice(-120),
+    robotMesh: job.robotPool ? { summary: job.robotPool.report(1).summary } : null,
+    queue: { pages: job.pageFrontier.snapshot().slice(0, 50), resources: job.resourceFrontier.snapshot().slice(0, 50) }
   };
 }
 function crawlLimitForContentType(contentType) {
@@ -1238,7 +1362,7 @@ async function processItem(job, item) {
   const accept = item.type === "html" ? "text/html,application/xhtml+xml,application/xml,text/plain;q=0.4,*/*;q=0.05" : "text/css,application/javascript,text/javascript,application/json,image/avif,image/webp,image/apng,image/svg+xml,image/*,font/*,video/*,audio/*,*/*;q=0.05";
   try {
     job.counts.requestCount += 1;
-    const r = await fetchCached(item.url, { accept, limit: CFG.maxTextBytesPerResource, limitForContentType: crawlLimitForContentType, timeout: CFG.requestTimeoutMs, retries: CFG.maxRetries, referrer: item.source || "" });
+    const r = await fetchCached(item.url, { accept, limit: CFG.maxTextBytesPerResource, limitForContentType: crawlLimitForContentType, timeout: CFG.requestTimeoutMs, retries: CFG.maxRetries, referrer: item.source || "", dnsCache: job.dnsCache });
     job.counts.bytesScanned += r.bytes;
     if (r.retries) job.counts.retries += r.retries;
     if (r.truncated || r.tooLarge) { job.counts.bytesDiscarded += r.bytes; jobLog(job, "warn", `Response skipped after size limit: ${item.url}`); return; }
@@ -1306,58 +1430,360 @@ async function processItem(job, item) {
     jobLog(job, "error", `Fetch failed ${item.url} — ${e.name || "Error"}: ${e.message}`, { retryClass: statusRetryClass(Number(String(e.message).match(/HTTP (\d+)/)?.[1] || 0)) });
   } finally { job.processed += 1; }
 }
-async function frontierWorker(job) {
-  while (!job.stopRequested) {
-    if (!job.robotsReady) { await sleep(15); continue; }
-    if (job.counts.bytesScanned >= CFG.maxScanBytes) { job.stopRequested = true; job.stopReason = "scan-byte-limit"; break; }
-    let type = job.pageFrontier.size ? "html" : "asset";
-    let item = type === "html" ? job.pageFrontier.takeNext(job.hostActive, CFG.perHostConcurrency, job.hostCooldowns) : job.resourceFrontier.takeNext(job.hostActive, CFG.perHostConcurrency, job.hostCooldowns);
-    if (!item) {
-      if (job.pageFrontier.size || job.resourceFrontier.size) {
-        item = job.resourceFrontier.takeNext(job.hostActive, CFG.perHostConcurrency, job.hostCooldowns);
-        type = item ? "asset" : "html";
+class CooperativeRobotPool {
+  constructor(job) {
+    this.job = job;
+    this.count = Math.max(1, job.robotFleet || CFG.logicalRobots);
+    this.taskCapacity = CFG.robotTaskCapacity;
+    this.activeCapacity = Math.min(CFG.robotActiveTasks, this.taskCapacity);
+    this.robots = Array.from({ length: this.count }, (_, index) => ({
+      id: `robot-${String(index + 1).padStart(4, "0")}`,
+      status: "idle",
+      queue: [],
+      activeTasks: 0,
+      completed: 0,
+      errors: 0,
+      helpRequests: 0,
+      helpAccepted: 0,
+      helpDeclined: 0,
+      helpGiven: 0,
+      tasksTakenByHelp: 0,
+      lastTask: null,
+      lastActionAt: now(),
+      lastHelpAt: 0,
+      lastHelpDecision: null,
+      currentHosts: new Set(),
+      activeHelpTasks: 0,
+      loadBucket: 0,
+      countActive: false,
+      countMulti: false,
+      countIdle: true
+    }));
+    this.loadBuckets = Array.from({ length: this.taskCapacity + this.activeCapacity + 1 }, () => new Set());
+    this.helpCandidates = new Set();
+    for (const robot of this.robots) { robot.loadBucket = 0; this.loadBuckets[0].add(robot); }
+    this.totalQueued = 0;
+    this.activeRobotCount = 0;
+    this.multitaskingRobotCount = 0;
+    this.idleRobotCount = this.count;
+    this.activePromises = new Set();
+    this.running = false;
+    this.eventSeq = 0;
+    this.events = [];
+  }
+  event(type, data = {}) {
+    const e = { id: ++this.eventSeq, time: now(), type, ...data };
+    this.events.push(e);
+    if (this.events.length > 250) this.events.splice(0, this.events.length - 250);
+    return e;
+  }
+  load(robot) { return robot.activeTasks + robot.queue.length; }
+  loadLimit() { return this.taskCapacity + this.activeCapacity; }
+  updateLoadBucket(robot) {
+    const old = robot.loadBucket ?? this.load(robot);
+    const next = this.load(robot);
+    if (old === next) return;
+    this.loadBuckets[old]?.delete(robot);
+    if (!this.loadBuckets[next]) this.loadBuckets[next] = new Set();
+    this.loadBuckets[next].add(robot);
+    robot.loadBucket = next;
+  }
+  markShareable(robot) {
+    const should = robot.queue.length >= CFG.robotHelpThreshold;
+    if (should) this.helpCandidates.add(robot);
+    else this.helpCandidates.delete(robot);
+  }
+  idleRobots(limit = Infinity) {
+    const out = [];
+    const bucket = this.loadBuckets[0] || new Set();
+    for (const r of bucket) { out.push(r); if (out.length >= limit) break; }
+    return out;
+  }
+  availableHelpers(limit = Infinity) {
+    const out = [];
+    for (let load = 0; load < this.activeCapacity && out.length < limit; load++) {
+      for (const robot of this.loadBuckets[load] || []) {
+        if (robot.queue.length === 0 && robot.activeTasks < this.activeCapacity) out.push(robot);
+        if (out.length >= limit) break;
       }
     }
-    if (!item) {
-      if (job.activeWorkers === 0 && !job.pageFrontier.size && !job.resourceFrontier.size) break;
-      await sleep(20); continue;
+    return out;
+  }
+  availableRobots() {
+    const out = [];
+    for (let load = 0; load < this.loadBuckets.length; load++) {
+      for (const r of this.loadBuckets[load] || []) out.push(r);
+      if (out.length >= this.count) break;
     }
+    return out;
+  }
+  busyRobots() { return this.robots.filter(r => r.activeTasks > 0 || r.queue.length > 0); }
+  pendingLocal() { return this.totalQueued; }
+  totalPending() { return this.pendingLocal() + this.job.pageFrontier.size + this.job.resourceFrontier.size; }
+  active() { return this.activePromises.size; }
+  chooseFrontierTask() {
+    if (!this.job.pageFrontier.size && !this.job.resourceFrontier.size) return null;
+    // Keep document navigation ahead of secondary assets while still serving assets
+    // aggressively once the page frontier is short.
+    let type = "html";
+    if (!this.job.pageFrontier.size) type = "asset";
+    else if (this.job.resourceFrontier.size > this.job.pageFrontier.size * 2) type = "asset";
+    let item = type === "html"
+      ? this.job.pageFrontier.takeNext(this.job.hostActive, CFG.perHostConcurrency, this.job.hostCooldowns)
+      : this.job.resourceFrontier.takeNext(this.job.hostActive, CFG.perHostConcurrency, this.job.hostCooldowns);
+    if (!item) {
+      const other = type === "html" ? "asset" : "html";
+      item = other === "html"
+        ? this.job.pageFrontier.takeNext(this.job.hostActive, CFG.perHostConcurrency, this.job.hostCooldowns)
+        : this.job.resourceFrontier.takeNext(this.job.hostActive, CFG.perHostConcurrency, this.job.hostCooldowns);
+    }
+    return item || null;
+  }
+  chooseReceiver() {
+    // Load buckets make 1,000 logical robots cheap: selecting a receiver is O(1-ish)
+    // instead of scanning the entire fleet for every assignment.
+    const maxLoad = this.loadLimit();
+    for (let load = 0; load <= maxLoad && load < this.taskCapacity; load++) {
+      const bucket = this.loadBuckets[load];
+      if (!bucket?.size) continue;
+      // Set insertion order naturally rotates robots as their load changes; no
+      // 1,000-element array copy is needed for every assignment.
+      return bucket.values().next().value || null;
+    }
+    return null;
+  }
+  assignGlobalTasks() {
+    let assignments = 0;
+    const budget = Math.max(CFG.maxActiveFetches * 2, this.count);
+    while (assignments < budget) {
+      const robot = this.chooseReceiver();
+      if (!robot) break;
+      const item = this.chooseFrontierTask();
+      if (!item) break;
+      robot.queue.push(item);
+      this.totalQueued += 1;
+      if (item._helped) delete item._helped;
+      this.updateLoadBucket(robot);
+      this.markShareable(robot);
+      robot.lastActionAt = now();
+      assignments += 1;
+      this.updateStatus(robot);
+    }
+    return assignments;
+  }
+  decideHelp(target, requester) {
+    const backlog = target.queue.length;
+    const healthy = target.errors < Math.max(3, target.completed / 25 + 1);
+    const cooldownOk = Date.now() - target.lastHelpAt >= CFG.robotHelpCooldownMs;
+    const hasShareableWork = backlog >= CFG.robotHelpThreshold;
+    const minimumKeep = 1;
+    const spareAfterTransfer = backlog - 1 >= minimumKeep;
+    const accept = CFG.robotHelpEnabled && healthy && cooldownOk && hasShareableWork && spareAfterTransfer;
+    target.lastHelpDecision = { from: requester.id, accepted: accept, backlog, at: now(), keep: minimumKeep };
+    return accept;
+  }
+  async requestHelp(requester) {
+    if (!CFG.robotHelpEnabled || requester.helpRequests >= 1000 || requester.activeTasks >= this.activeCapacity || requester.queue.length > 0) return false;
+    const candidates = [...this.helpCandidates]
+      .filter(r => r.id !== requester.id && r.queue.length >= CFG.robotHelpThreshold)
+      .sort((a, b) => b.queue.length - a.queue.length || b.activeTasks - a.activeTasks || a.errors - b.errors)
+      .slice(0, CFG.robotHelpScanLimit);
+    if (!candidates.length) return false;
+    requester.helpRequests += 1;
+    this.event("help-requested", { requester: requester.id, candidates: candidates.map(r => ({ id: r.id, queuedTasks: r.queue.length })) });
+    for (const target of candidates) {
+      const accepted = this.decideHelp(target, requester);
+      if (accepted) {
+        const item = target.queue.shift();
+        if (!item) continue;
+        this.totalQueued = Math.max(0, this.totalQueued - 1);
+        item._helped = true;
+        item._helpFrom = target.id;
+        requester.queue.push(item);
+        this.totalQueued += 1;
+        this.updateLoadBucket(target);
+        this.updateLoadBucket(requester);
+        this.markShareable(target);
+        this.markShareable(requester);
+        requester.helpAccepted += 1;
+        requester.tasksTakenByHelp += 1;
+        target.helpGiven += 1;
+        target.lastHelpAt = Date.now();
+        this.event("help-accepted", { requester: requester.id, target: target.id, task: { url: item.url, type: item.type, reason: item.reason || "discovered" } });
+        this.updateStatus(target); this.updateStatus(requester);
+        return true;
+      }
+      requester.helpDeclined += 1;
+      this.event("help-declined", { requester: requester.id, target: target.id, backlog: target.queue.length, reason: target.lastHelpDecision });
+    }
+    return false;
+  }
+  sweepHelpRequests() {
+    if (!CFG.robotHelpEnabled || Date.now() - this.lastHelpSweep < CFG.robotHelpCooldownMs) return 0;
+    this.lastHelpSweep = Date.now();
+    const requests = this.availableHelpers(CFG.robotHelpScanLimit);
+    let accepted = 0;
+    if (!requests.length || !this.helpCandidates.size) return 0;
+    for (const robot of requests) {
+      if (!this.helpCandidates.size) break;
+      if (this.requestHelp(robot)) accepted += 1;
+    }
+    return accepted;
+  }
+  updateStatus(robot) {
+    if (robot.activeTasks > 1) robot.status = robot.activeHelpTasks > 0 ? "multitasking-help" : "multitasking";
+    else if (robot.activeTasks === 1) robot.status = robot.activeHelpTasks > 0 ? "helping" : "working";
+    else if (robot.queue.length) robot.status = "queued";
+    else robot.status = "idle";
+    const isActive = robot.activeTasks > 0;
+    const isMulti = robot.activeTasks > 1;
+    const isIdle = robot.activeTasks === 0 && robot.queue.length === 0;
+    this.activeRobotCount += Number(isActive) - Number(robot.countActive);
+    this.multitaskingRobotCount += Number(isMulti) - Number(robot.countMulti);
+    this.idleRobotCount += Number(isIdle) - Number(robot.countIdle);
+    robot.countActive = isActive;
+    robot.countMulti = isMulti;
+    robot.countIdle = isIdle;
+  }
+  startTask(robot, item) {
+    if (!item || robot.activeTasks >= this.activeCapacity) return false;
+    const helped = !!item._helped;
+    robot.activeTasks += 1;
+    if (helped) robot.activeHelpTasks += 1;
+    robot.lastTask = { url: item.url, type: item.type, reason: item.reason || "discovered", startedAt: now(), helped, helpedBy: item._helpFrom || null };
+    delete item._helped; delete item._helpFrom;
+    robot.lastActionAt = now();
     const host = hostOf(item.url);
-    job.activeWorkers += 1; job.hostActive.set(host, (job.hostActive.get(host) || 0) + 1);
-    if (type === "html") job.activeHtmlWorkers += 1; else job.activeAssetWorkers += 1;
-    let release = null;
-    try {
-      release = await fetchSemaphore.acquire(job.controller.signal);
-      await processItem(job, item);
-    } catch (e) {
-      if (!job.stopRequested && e?.message !== "Operation cancelled.") jobLog(job, "warn", `Worker could not acquire network slot for ${item.url}: ${e.message}`);
-    } finally {
-      if (release) release();
-      job.activeWorkers -= 1; job.hostActive.set(host, Math.max(0, (job.hostActive.get(host) || 1) - 1));
-      if (type === "html") job.activeHtmlWorkers -= 1; else job.activeAssetWorkers -= 1;
+    robot.currentHosts.add(host);
+    this.updateLoadBucket(robot);
+    this.markShareable(robot);
+    this.updateStatus(robot);
+    const run = (async () => {
+      this.job.activeWorkers += 1;
+      this.job.hostActive.set(host, (this.job.hostActive.get(host) || 0) + 1);
+      if (item.type === "html") this.job.activeHtmlWorkers += 1; else this.job.activeAssetWorkers += 1;
+      let release = null;
+      try {
+        release = await fetchSemaphore.acquire(this.job.controller.signal);
+        await processItem(this.job, item);
+        robot.completed += 1;
+      } catch (e) {
+        robot.errors += 1;
+        if (!this.job.stopRequested && e?.message !== "Operation cancelled.") {
+          jobLog(this.job, "debug", `${robot.id} could not process ${item.url}: ${e.message}`);
+        }
+      } finally {
+        if (release) release();
+        this.job.activeWorkers = Math.max(0, this.job.activeWorkers - 1);
+        this.job.hostActive.set(host, Math.max(0, (this.job.hostActive.get(host) || 1) - 1));
+        if (item.type === "html") this.job.activeHtmlWorkers = Math.max(0, this.job.activeHtmlWorkers - 1);
+        else this.job.activeAssetWorkers = Math.max(0, this.job.activeAssetWorkers - 1);
+        robot.activeTasks = Math.max(0, robot.activeTasks - 1);
+        if (helped && robot.activeHelpTasks > 0) robot.activeHelpTasks -= 1;
+        robot.currentHosts.delete(host);
+        robot.lastActionAt = now();
+        robot.lastTask = { ...(robot.lastTask || {}), finishedAt: now() };
+        this.updateLoadBucket(robot);
+        this.markShareable(robot);
+        this.updateStatus(robot);
+        // Every time a robot becomes fully free, it immediately inspects the mesh
+        // and asks another robot for work. The target explicitly accepts or declines.
+        if (robot.queue.length === 0 && robot.activeTasks < this.activeCapacity && !this.job.stopRequested) void this.requestHelp(robot);
+      }
+    })();
+    this.activePromises.add(run);
+    run.finally(() => this.activePromises.delete(run)).catch(() => {});
+    return true;
+  }
+  startAvailable() {
+    let started = 0;
+    // Starting work from lowest-load buckets keeps work spread across the fleet.
+    for (let load = 0; load < this.loadBuckets.length && this.activePromises.size < CFG.maxActiveFetches; load++) {
+      const robots = [...(this.loadBuckets[load] || [])];
+      for (const robot of robots) {
+        while (robot.activeTasks < this.activeCapacity && robot.queue.length && this.activePromises.size < CFG.maxActiveFetches) {
+          const item = robot.queue.shift();
+          this.totalQueued = Math.max(0, this.totalQueued - 1);
+          this.updateLoadBucket(robot); this.markShareable(robot);
+          if (this.startTask(robot, item)) started += 1;
+          else { robot.queue.unshift(item); this.totalQueued += 1; this.updateLoadBucket(robot); this.markShareable(robot); break; }
+        }
+        this.updateStatus(robot);
+        if (this.activePromises.size >= CFG.maxActiveFetches) break;
+      }
+    }
+    return started;
+  }
+  rebalanceLocals() {
+    if (!CFG.robotHelpEnabled) return;
+    this.sweepHelpRequests();
+    if (this.helpCandidates.size) {
+      for (const robot of this.availableHelpers(CFG.robotHelpScanLimit)) void this.requestHelp(robot);
     }
   }
+  report(limit = 48) {
+    const rows = this.robots
+      .filter(r => r.activeTasks || r.queue.length || r.completed || r.helpRequests)
+      .sort((a,b) => this.load(b) - this.load(a) || b.completed - a.completed)
+      .slice(0, Math.max(1, Math.min(limit, this.count)))
+      .map(r => ({
+        id: r.id, status: r.status, activeTasks: r.activeTasks, queuedTasks: r.queue.length,
+        completed: r.completed, errors: r.errors, helpRequests: r.helpRequests,
+        helpAccepted: r.helpAccepted, helpDeclined: r.helpDeclined, helpGiven: r.helpGiven,
+        tasksTakenByHelp: r.tasksTakenByHelp, lastTask: r.lastTask, lastHelpDecision: r.lastHelpDecision,
+        hosts: [...r.currentHosts]
+      }));
+    const summary = {
+      logicalRobots: this.count, taskCapacity: this.taskCapacity, activeTaskCapacityPerRobot: this.activeCapacity,
+      activeRobots: this.activeRobotCount,
+      multitaskingRobots: this.multitaskingRobotCount,
+      idleRobots: this.idleRobotCount,
+      queuedRobotTasks: this.pendingLocal(), globalPageQueue: this.job.pageFrontier.size, globalResourceQueue: this.job.resourceFrontier.size,
+      networkActive: this.active(), networkLimit: CFG.maxActiveFetches,
+      helpRequests: this.robots.reduce((n,r) => n + r.helpRequests, 0), helpAccepted: this.robots.reduce((n,r) => n + r.helpAccepted, 0),
+      helpDeclined: this.robots.reduce((n,r) => n + r.helpDeclined, 0), helpGiven: this.robots.reduce((n,r) => n + r.helpGiven, 0)
+    };
+    return { summary, robots: rows, events: this.events.slice(-80) };
+  }
+  async run() {
+    this.running = true;
+    while (!this.job.stopRequested) {
+      if (!this.job.robotsReady) { await sleep(5); continue; }
+      if (this.job.counts.bytesScanned >= CFG.maxScanBytes) { this.job.stopRequested = true; this.job.stopReason = "scan-byte-limit"; break; }
+      this.assignGlobalTasks();
+      this.rebalanceLocals();
+      this.startAvailable();
+      if (!this.activePromises.size) {
+        if (!this.totalPending()) break;
+        await sleep(8);
+        continue;
+      }
+      await Promise.race(this.activePromises);
+    }
+    await Promise.allSettled([...this.activePromises]);
+    this.running = false;
+  }
 }
+
 async function runCrawl(job) {
-  job.status = "starting"; job.statusText = "Preparing crawl…";
+  job.status = "starting"; job.statusText = "Preparing cooperative robot mesh…";
   await fsp.mkdir(job.sourceDir, { recursive: true });
   addLink(job, job.root, "html", null, "root");
-  const workerCount = Math.min(CFG.maxActiveFetches, CFG.logicalRobots);
   job.robotFleet = CFG.logicalRobots;
   job.networkSlots = CFG.maxActiveFetches;
-  const workers = Array.from({ length: workerCount }, () => frontierWorker(job));
+  job.robotPool = new CooperativeRobotPool(job);
   try {
     await loadRobots(job);
     if (!job.stopRequested) await loadSitemaps(job);
-    job.status = "crawling"; job.statusText = "Crawling in background…";
-    await Promise.allSettled(workers);
+    job.status = "crawling"; job.statusText = `Crawling with ${CFG.logicalRobots.toLocaleString()} cooperative robots…`;
+    await job.robotPool.run();
     job.done = true; job.finishedAt = now();
     if (job.status === "challenge") job.statusText = "Security verification required; crawl stopped.";
     else if (job.stopRequested && job.stopReason === "scan-byte-limit") { job.status = "done"; job.statusText = `Scan budget reached (${bytesLabel(CFG.maxScanBytes)}).`; }
     else if (job.stopRequested && job.stopReason === "resource-limit") { job.status = "done"; job.statusText = `Resource safety limit reached (${CFG.maxResources.toLocaleString()}).`; }
     else if (job.stopRequested) { job.status = "stopped"; job.statusText = "Stopped by user."; }
-    else { job.status = "done"; job.statusText = `Complete — ${job.processed.toLocaleString()} resources processed; frontier exhausted.`; }
-    jobLog(job, job.status === "done" || job.status === "crawling" ? "info" : "warn", job.statusText);
+    else { job.status = "done"; job.statusText = `Complete — ${job.processed.toLocaleString()} resources processed; cooperative robot mesh exhausted.`; }
+    jobLog(job, job.status === "done" ? "info" : "warn", job.statusText, { robots: job.robotPool.report(12).summary });
   } catch (e) {
     job.done = true; job.finishedAt = now(); job.status = "error"; job.statusText = e.message || "Crawler error"; jobLog(job, "error", e.stack || e.message);
   }
@@ -1438,7 +1864,7 @@ app.get("/health", (req, res) => res.json({ ok: true, service: "veyra", uptimeSe
 app.get("/api/debug/system", (req, res) => {
   const mem = process.memoryUsage();
   const idx = searchIndexStats();
-  res.json({ time: now(), uptimeSec: Math.round(process.uptime()), startedAt: new Date(serverStartedAt).toISOString(), nodeVersion: process.version, platform: process.platform, processRole: CFG.processRole, memory: { rss: mem.rss, heapUsed: mem.heapUsed, heapTotal: mem.heapTotal, external: mem.external }, jobs: { total: jobs.size, active: [...jobs.values()].filter(j => !j.done).length, done: [...jobs.values()].filter(j => j.done).length }, proxyCacheEntries: proxyCache.size, searchCacheEntries: searchCache.size, network: { crawlerActive: fetchSemaphore.active, crawlerQueued: fetchSemaphore.queued, crawlerLimit: CFG.maxActiveFetches, logicalRobots: CFG.logicalRobots, warmActive: proxyWarmSemaphore.active, warmQueued: proxyWarmSemaphore.queued, warmLimit: CFG.proxyWarmConcurrency, warmLogicalRobots: CFG.proxyWarmRobots }, searchIndexEntries: idx.documents, searchIndexTerms: idx.terms, searchIndexDomains: idx.domains, requestsLogged: requestLog.length, logs: serverLogs.length });
+  res.json({ time: now(), uptimeSec: Math.round(process.uptime()), startedAt: new Date(serverStartedAt).toISOString(), nodeVersion: process.version, platform: process.platform, processRole: CFG.processRole, memory: { rss: mem.rss, heapUsed: mem.heapUsed, heapTotal: mem.heapTotal, external: mem.external }, jobs: { total: jobs.size, active: [...jobs.values()].filter(j => !j.done).length, done: [...jobs.values()].filter(j => j.done).length }, proxyCacheEntries: proxyCache.size, searchCacheEntries: searchCache.size, network: { crawlerActive: fetchSemaphore.active, crawlerQueued: fetchSemaphore.queued, crawlerLimit: CFG.maxActiveFetches, logicalRobots: CFG.logicalRobots, warmActive: proxyWarmSemaphore.active, warmQueued: proxyWarmSemaphore.queued, warmLimit: CFG.proxyWarmConcurrency, warmLogicalRobots: CFG.proxyWarmRobots, browserActive: browserScheduler.active, browserQueued: browserScheduler.queue.length, browserLimit: CFG.browserMaxActiveFetches, browserPerHost: CFG.browserPerHostConcurrency }, browser: { ...browserScheduler.status(), sessions: proxySessions.size, cacheEntries: proxyCache.size }, searchIndexEntries: idx.documents, searchIndexTerms: idx.terms, searchIndexDomains: idx.domains, requestsLogged: requestLog.length, logs: serverLogs.length });
 });
 app.get("/api/debug/config", (req, res) => res.json({ ...CFG, searchApiKey: undefined }));
 app.get("/api/debug/jobs", (req, res) => res.json({ jobs: [...jobs.values()].sort((a,b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)).map(publicJob) }));
@@ -1556,7 +1982,10 @@ async function proxyRequest(req, res, mode) {
     if (type.startsWith("video/") || type.startsWith("audio/") || type.includes("application/pdf")) return CFG.maxProxyMediaBytes;
     return CFG.maxProxyOtherBytes;
   };
-  const result = await fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, limit: CFG.maxTextBytesPerResource, limitForContentType, noCache: method !== "GET" });
+  try {
+    const browserKey = `${method} ${canonical}|ref=${referrer}|sid=${sid}|range=${headers.range || ""}|body=${body || ""}`;
+    const browserPriority = mode === "view" ? 1000 : (/css|javascript|font|svg/i.test(accept) ? 900 : /image/i.test(accept) ? 800 : 700);
+    const result = await browserScheduler.request(browserKey, () => fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, limit: CFG.maxTextBytesPerResource, limitForContentType, noCache: method !== "GET" }), { priority: browserPriority, host: hostOf(canonical), url: canonical });
   if (result.tooLarge) return respondError(res, 413, "The upstream response exceeds Veyra's safety limit.", "RESPONSE_TOO_LARGE");
   const upstreamHeaders = {
     "content-type": result.contentType || (mode === "view" ? "text/html; charset=utf-8" : "application/octet-stream"),
@@ -1598,6 +2027,9 @@ async function proxyRequest(req, res, mode) {
   if (mode === "view" && !result.truncated && !result.tooLarge && /html|xhtml|^$/i.test(result.contentType || "")) {
     void warmPageResources(result.body.toString("utf8"), result.finalUrl || canonical, sid);
   }
+  } finally {
+    // BrowserTaskScheduler owns browser request slots/host limits.
+  }
 }
 
 app.get("/api/view", async (req, res) => { try { await proxyRequest(req, res, "view"); } catch (e) { respondError(res, 502, `Veyra could not load this page: ${e.message}`, "PROXY_VIEW_ERROR", { requestId: req.veyraRequestId }); } });
@@ -1622,6 +2054,7 @@ app.post("/api/open", async (req, res) => {
 
 app.get("/api/crawl/:id", (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); res.json(publicJob(j)); });
 app.post("/api/crawl/:id/stop", (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); j.stopRequested = true; j.stopReason = "user"; j.status = "stopping"; j.statusText = "Stopping…"; j.controller.abort(); jobLog(j, "warn", "Stop requested."); res.json({ ok: true }); });
+app.get("/api/crawl/:id/robots", (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); if (!j.robotPool) return res.json({ summary: { logicalRobots: j.robotFleet || CFG.logicalRobots, activeRobots: 0, multitaskingRobots: 0, idleRobots: j.robotFleet || CFG.logicalRobots, queuedRobotTasks: 0, globalPageQueue: j.pageFrontier.size, globalResourceQueue: j.resourceFrontier.size, networkActive: fetchSemaphore.active, networkLimit: CFG.maxActiveFetches, helpRequests: 0, helpAccepted: 0, helpDeclined: 0, helpGiven: 0 }, robots: [], events: [] }); const limit = Math.min(100, Math.max(1, Number(req.query.limit || 48) || 48)); res.json(j.robotPool.report(limit)); });
 app.get("/api/crawl/:id/resources", (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); res.json({ resources: j.resources.map(r => ({ id: r.id, url: r.url, requestedUrl: r.requestedUrl, type: r.type, status: r.status, contentType: r.contentType, bytes: r.bytes, bytesLabel: r.bytesLabel, truncated: r.truncated, sourceId: r.sourceId })) }); });
 app.get("/api/crawl/:id/source/:resourceId", async (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); const id = Number(req.params.resourceId); const r = j.resources[id]; if (!r) return respondError(res, 404, "Resource not found.", "RESOURCE_NOT_FOUND"); res.json({ id: r.id, url: r.url, type: r.type, source: await sourceStore.read(j, r) }); });
 app.get("/api/crawl/:id/links", (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); const offset = Math.max(0, Number(req.query.offset || 0) || 0); const limit = Math.min(10000, Math.max(1, Number(req.query.limit || 1000) || 1000)); res.json({ total: j.links.length, offset, limit, links: j.links.slice(offset, offset + limit) }); });
@@ -1700,6 +2133,15 @@ const STATUS_VAR_DEFS = [
   { group: "Crawler concurrency", key: "logicalRobots", label: "Logical crawler robots", kind: "number", names: ["CRAWLER_ROBOTS"], fallback: 1000, min: 1, max: 1000 },
   { group: "Crawler concurrency", key: "maxActiveFetches", label: "Active network fetch slots", kind: "number", names: ["MAX_ACTIVE_FETCHES", "MAX_GLOBAL_CONCURRENCY"], fallback: 128, min: 1, max: 256, note: "This is the real simultaneous upstream-request ceiling; CRAWLER_ROBOTS is a larger logical fleet." },
   { group: "Crawler concurrency", key: "perHostConcurrency", label: "Per-host concurrency", kind: "number", names: ["CRAWLER_PER_HOST_CONCURRENCY", "MAX_PER_HOST_CONCURRENCY"], fallback: 8, min: 1, max: 32, note: "Per-origin safety cap; robots.txt Crawl-delay still applies." },
+  { group: "Crawler cooperation", key: "robotTaskCapacity", label: "Tasks queued/robot", kind: "number", names: ["ROBOT_TASK_CAPACITY"], fallback: 4, min: 1, max: 16 },
+  { group: "Crawler cooperation", key: "robotActiveTasks", label: "Active tasks/robot", kind: "number", names: ["ROBOT_ACTIVE_TASKS"], fallback: 2, min: 1, max: 8 },
+  { group: "Crawler cooperation", key: "robotHelpEnabled", label: "Robot help enabled", kind: "bool", names: ["ROBOT_HELP_ENABLED"], fallback: true },
+  { group: "Crawler cooperation", key: "robotHelpThreshold", label: "Help backlog threshold", kind: "number", names: ["ROBOT_HELP_THRESHOLD"], fallback: 2, min: 1, max: 16 },
+  { group: "Crawler cooperation", key: "robotHelpCooldownMs", label: "Help cooldown (ms)", kind: "number", names: ["ROBOT_HELP_COOLDOWN_MS"], fallback: 250, min: 0, max: 10000 },
+  { group: "Crawler cooperation", key: "robotHelpScanLimit", label: "Robots inspected/request", kind: "number", names: ["ROBOT_HELP_SCAN_LIMIT"], fallback: 24, min: 1, max: 128 },
+  { group: "Browser engine", key: "browserMaxActiveFetches", label: "Browser fetch slots", kind: "number", names: ["BROWSER_MAX_ACTIVE_FETCHES"], fallback: 24, min: 1, max: 64 },
+  { group: "Browser engine", key: "browserPerHostConcurrency", label: "Browser per-host concurrency", kind: "number", names: ["BROWSER_PER_HOST_CONCURRENCY"], fallback: 8, min: 1, max: 32 },
+  { group: "Security / DNS", key: "dnsCacheTtlMs", label: "DNS public-result cache TTL (ms)", kind: "number", names: ["DNS_CACHE_TTL_MS"], fallback: 5000, min: 0, max: 60000 },
   { group: "Crawl limits", key: "maxActiveJobs", label: "Max active jobs", kind: "number", names: ["MAX_ACTIVE_JOBS"], fallback: 3, min: 1, max: 20 },
   { group: "Crawl limits", key: "maxPendingQueue", label: "Max pending queue", kind: "number", names: ["MAX_PENDING_QUEUE"], fallback: 1500, min: 50, max: 20000 },
   { group: "Crawl limits", key: "maxPages", label: "Max pages", kind: "number", names: ["MAX_PAGES"], fallback: 10000, min: 1, max: 100000 },
@@ -1766,7 +2208,7 @@ const STATUS_VAR_DEFS = [
 // not read anywhere. Setting these has no effect — flagged explicitly so they
 // don't get mistaken for working configuration.
 const STATUS_KNOWN_UNUSED = [];
-const STATUS_WATCHED_PREFIXES = ["CRAWLER_", "MAX_", "PROXY_", "SEARCH_", "INDEX_", "VEYRA_", "ROBOTS_", "SITEMAP_", "CACHE_", "BROWSER_", "NORMALIZE_", "FRONTEND_", "PUBLIC_", "PORT", "PROCESS_ROLE", "SERVER_LOG_LEVEL", "REQUEST_TIMEOUT_MS", "BODY_TIMEOUT_MS", "DNS_TIMEOUT_MS", "HOST_BACKOFF_MS", "RETRY_BASE_MS", "BING_", "BRAVE_"];
+const STATUS_WATCHED_PREFIXES = ["CRAWLER_", "ROBOT_", "MAX_", "PROXY_", "SEARCH_", "INDEX_", "VEYRA_", "ROBOTS_", "SITEMAP_", "CACHE_", "BROWSER_", "NORMALIZE_", "FRONTEND_", "PUBLIC_", "PORT", "PROCESS_ROLE", "SERVER_LOG_LEVEL", "REQUEST_TIMEOUT_MS", "BODY_TIMEOUT_MS", "DNS_TIMEOUT_MS", "HOST_BACKOFF_MS", "RETRY_BASE_MS", "BING_", "BRAVE_"];
 
 function buildStatusReport() {
   const vars = STATUS_VAR_DEFS.map(def => {
@@ -1802,6 +2244,8 @@ function buildStatusReport() {
 
   if (byKey.perHostConcurrency.effective > byKey.maxActiveFetches.effective) addIssue("info", `CRAWLER_PER_HOST_CONCURRENCY (${byKey.perHostConcurrency.effective}) is higher than MAX_ACTIVE_FETCHES (${byKey.maxActiveFetches.effective}) — the per-host cap can never actually be reached.`);
   if (byKey.logicalRobots.effective > byKey.maxActiveFetches.effective) addIssue("info", `CRAWLER_ROBOTS (${byKey.logicalRobots.effective}) is a logical fleet larger than MAX_ACTIVE_FETCHES (${byKey.maxActiveFetches.effective}) — extra robots wait for shared network slots instead of opening extra sockets.`);
+  if (byKey.robotActiveTasks.effective > byKey.robotTaskCapacity.effective) addIssue("warn", `ROBOT_ACTIVE_TASKS (${byKey.robotActiveTasks.effective}) exceeds ROBOT_TASK_CAPACITY (${byKey.robotTaskCapacity.effective}) — active task capacity will be capped to the task capacity.`);
+  if (byKey.browserMaxActiveFetches.effective > byKey.maxActiveFetches.effective) addIssue("info", `BROWSER_MAX_ACTIVE_FETCHES (${byKey.browserMaxActiveFetches.effective}) is larger than crawler MAX_ACTIVE_FETCHES (${byKey.maxActiveFetches.effective}); the browser lane is intentionally independent.`);
   if (process.env.CRAWLER_ROBOTS && process.env.MAX_GLOBAL_CONCURRENCY && process.env.CRAWLER_ROBOTS !== process.env.MAX_GLOBAL_CONCURRENCY) addIssue("info", `Both CRAWLER_ROBOTS (${process.env.CRAWLER_ROBOTS}) and legacy MAX_GLOBAL_CONCURRENCY (${process.env.MAX_GLOBAL_CONCURRENCY}) are set — the robot fleet and network fetch ceiling are intentionally separate in this build.`);
   if (process.env.CRAWLER_PER_HOST_CONCURRENCY && process.env.MAX_PER_HOST_CONCURRENCY && process.env.CRAWLER_PER_HOST_CONCURRENCY !== process.env.MAX_PER_HOST_CONCURRENCY) addIssue("info", `Both CRAWLER_PER_HOST_CONCURRENCY (${process.env.CRAWLER_PER_HOST_CONCURRENCY}) and legacy MAX_PER_HOST_CONCURRENCY (${process.env.MAX_PER_HOST_CONCURRENCY}) are set with different values — CRAWLER_PER_HOST_CONCURRENCY wins.`);
 
@@ -1939,4 +2383,4 @@ if (require.main === module && CFG.processRole !== "worker") {
   serverLog("info", "SYSTEM", "PROCESS_ROLE=worker selected; no HTTP listener started.");
 }
 
-module.exports = { app, CFG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, injectRuntime, detectChallenge, PriorityFrontier, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions };
+module.exports = { app, CFG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions };

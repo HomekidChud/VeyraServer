@@ -1,7 +1,7 @@
 const assert = require("assert/strict");
 const {
   CFG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, crawlLimitForContentType,
-  rewriteHtml, rewriteCssText, rewriteJsText, injectRuntime, detectChallenge, PriorityFrontier, crawlPriority,
+  rewriteHtml, rewriteCssText, rewriteJsText, injectRuntime, detectChallenge, PriorityFrontier, CooperativeRobotPool, crawlPriority,
   tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument
 } = require("./server");
 
@@ -25,6 +25,16 @@ const {
   assert.equal(c.type, "security-verification");
   assert.equal(detectChallenge("<title>Example</title><p>Hello world</p>", "text/html", 200, {}), null);
 
+  const browser = new BrowserTaskScheduler(2, 1, 10);
+  const browserResults = await Promise.all([
+    browser.request("a1", async () => { await new Promise(r => setTimeout(r, 10)); return "a1"; }, { host: "a.example", url: "https://a.example/1", priority: 100 }),
+    browser.request("a1", async () => "duplicate", { host: "a.example", url: "https://a.example/1", priority: 1 }),
+    browser.request("b1", async () => "b1", { host: "b.example", url: "https://b.example/1", priority: 50 })
+  ]);
+  assert.deepEqual(browserResults.slice(0,2), ["a1", "a1"]);
+  assert.equal(browser.stats.deduped, 1);
+  assert.equal(browser.active, 0);
+
   const sem = new Semaphore(1);
   const release1 = await sem.acquire();
   const waiting = sem.acquire();
@@ -38,6 +48,32 @@ const {
   q.add({url:"https://b.example/high",type:"html"}, 10, "b");
   assert.equal(q.takeNext(new Map(), 2, new Map()).url, "https://b.example/high");
   assert.ok(crawlPriority("https://example.com/", "html", "root") > crawlPriority("https://example.com/a/b", "html", "discovered"));
+
+  const fakeJob = {
+    robotFleet: 4, pageFrontier: new PriorityFrontier(20), resourceFrontier: new PriorityFrontier(20),
+    hostActive: new Map(), hostCooldowns: new Map()
+  };
+  const mesh = new CooperativeRobotPool(fakeJob);
+  mesh.robots[0].queue.push({ url: "https://example.com/a", type: "html" }, { url: "https://example.com/b", type: "html" });
+  const helper = mesh.robots[1];
+  assert.equal(await mesh.requestHelp(helper), true);
+  assert.equal(helper.helpAccepted, 1);
+  assert.equal(mesh.robots[0].helpGiven, 1);
+  assert.equal(helper.queue.length, 1);
+  assert.equal(mesh.robots[0].queue.length, 1);
+  assert.equal(mesh.events.at(-1)?.type, "help-accepted");
+  const multitaskRequester = mesh.robots[2];
+  multitaskRequester.activeTasks = 1;
+  multitaskRequester.countActive = true;
+  multitaskRequester.countIdle = false;
+  mesh.activeRobotCount += 1;
+  mesh.idleRobotCount = Math.max(0, mesh.idleRobotCount - 1);
+  mesh.updateLoadBucket(multitaskRequester);
+  assert.equal(await mesh.requestHelp(multitaskRequester), true);
+  assert.equal(multitaskRequester.activeTasks, 1);
+  assert.equal(multitaskRequester.queue.length, 1);
+  assert.equal(multitaskRequester.helpAccepted, 1);
+  console.log("cooperative robot multitask handoff passed");
 
   const sample = rewriteHtml(
     '<!doctype html><html><head><title>T</title><link rel="stylesheet" href="/assets/app.css"><script src="/assets/app.js" integrity="sha256-test"></script></head><body><img src="/images/logo.png"><picture><source srcset="/images/a.png 1x, /images/b.png 2x"></picture><video poster="/img/poster.jpg"><source src="/movie.mp4"></video><svg><use href="/icons.svg#logo"></use></svg><img data-src="/lazy.png"><img data-srcset="/a.png 1x, /b.png 2x"></body></html>',
