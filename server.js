@@ -1388,6 +1388,263 @@ app.get("/api/crawl/:id/source/:resourceId", async (req, res) => { const j = job
 app.get("/api/crawl/:id/links", (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); const offset = Math.max(0, Number(req.query.offset || 0) || 0); const limit = Math.min(10000, Math.max(1, Number(req.query.limit || 1000) || 1000)); res.json({ total: j.links.length, offset, limit, links: j.links.slice(offset, offset + limit) }); });
 app.get("/api/crawl/:id/export", (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); res.setHeader("content-type", "application/json; charset=utf-8"); res.setHeader("content-disposition", `attachment; filename="veyra-${j.id}.json"`); res.send(JSON.stringify({ id:j.id, root:j.root, createdAt:j.createdAt, finishedAt:j.finishedAt, status:j.status, counts:j.counts, links:j.links, resources:j.resources.map(r => ({ id:r.id,url:r.url,type:r.type,status:r.status,contentType:r.contentType,bytes:r.bytes,truncated:r.truncated,redirectChain:r.redirectChain })) }, null, 2)); });
 
+// ---------------------------------------------------------------------------
+// /status — configuration diagnostics.
+// Re-parses every environment variable the server actually reads (independent
+// of the already-frozen CFG object) so it can report, per variable: whether it
+// was set, whether the raw value was valid, whether it got clamped into range,
+// and what value is actually in effect. It also scans process.env for
+// look-alike keys (CRAWLER_/MAX_/PROXY_/SEARCH_/INDEX_/VEYRA_ prefixes) that
+// aren't read anywhere in this file, so a typo'd or leftover env var shows up
+// instead of silently doing nothing. Finally it runs a small set of
+// cross-field rules that call out combinations known to cause runtime errors.
+// ---------------------------------------------------------------------------
+function diagNumber(names, fallback, min, max) {
+  for (const name of names) {
+    const raw = process.env[name];
+    if (raw === undefined || String(raw).trim() === "") continue;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return { name, raw, present: true, effective: fallback, status: "invalid", detail: `"${raw}" is not a number — falling back to default ${fallback}.` };
+    const clamped = Math.min(max, Math.max(min, Math.floor(n)));
+    if (clamped !== Math.floor(n)) return { name, raw, present: true, effective: clamped, status: "clamped", detail: `${raw} is outside the allowed range ${min}–${max} — using ${clamped}.` };
+    return { name, raw, present: true, effective: clamped, status: "set", detail: `Using ${clamped}.` };
+  }
+  return { name: names[0], raw: undefined, present: false, effective: fallback, status: "default", detail: `Not set — using default ${fallback}.` };
+}
+function diagBool(names, fallback) {
+  for (const name of names) {
+    const raw = process.env[name];
+    if (raw === undefined || String(raw).trim() === "") continue;
+    const norm = String(raw).trim().toLowerCase();
+    const known = ["1", "true", "yes", "on", "0", "false", "no", "off"];
+    const effective = ["1", "true", "yes", "on"].includes(norm);
+    if (!known.includes(norm)) return { name, raw, present: true, effective: fallback, status: "invalid", detail: `"${raw}" isn't a recognized boolean — falling back to default ${fallback}.` };
+    return { name, raw, present: true, effective, status: "set", detail: `Using ${effective}.` };
+  }
+  return { name: names[0], raw: undefined, present: false, effective: fallback, status: "default", detail: `Not set — using default ${fallback}.` };
+}
+function diagEnum(names, fallback, allowed) {
+  for (const name of names) {
+    const raw = process.env[name];
+    if (raw === undefined || String(raw).trim() === "") continue;
+    const norm = String(raw).trim().toLowerCase();
+    if (!allowed.includes(norm)) return { name, raw, present: true, effective: fallback, status: "invalid", detail: `"${raw}" isn't one of ${allowed.join(", ")} — falling back to default "${fallback}".` };
+    return { name, raw, present: true, effective: norm, status: "set", detail: `Using "${norm}".` };
+  }
+  return { name: names[0], raw: undefined, present: false, effective: fallback, status: "default", detail: `Not set — using default "${fallback}".` };
+}
+function diagCsv(names, fallback) {
+  for (const name of names) {
+    const raw = process.env[name];
+    if (raw === undefined || String(raw).trim() === "") continue;
+    const list = raw.split(",").map(x => x.trim()).filter(Boolean);
+    return { name, raw, present: true, effective: list, status: "set", detail: `Using [${list.join(", ")}].` };
+  }
+  return { name: names[0], raw: undefined, present: false, effective: fallback, status: "default", detail: `Not set — using default [${fallback.join(", ")}].` };
+}
+function diagString(names, fallback, secret = false) {
+  for (const name of names) {
+    const raw = process.env[name];
+    if (raw === undefined || String(raw).trim() === "") continue;
+    return { name, raw: secret ? "(hidden)" : raw, present: true, effective: secret ? "(hidden)" : raw, status: "set", detail: secret ? "A value is set." : `Using "${raw}".` };
+  }
+  return { name: names[0], raw: undefined, present: false, effective: secret ? "" : fallback, status: fallback ? "default" : "unset", detail: fallback ? `Not set — using default "${fallback}".` : "Not set." };
+}
+
+const STATUS_VAR_DEFS = [
+  { group: "Core service", key: "port", label: "Port", kind: "number", names: ["PORT"], fallback: 10000, min: 1, max: 65535, note: "Render supplies this automatically; only set it manually for local runs." },
+  { group: "Core service", key: "processRole", label: "Process role", kind: "enum", names: ["PROCESS_ROLE"], fallback: "web", allowed: ["web", "worker", "all"] },
+  { group: "Core service", key: "logLevel", label: "Log level", kind: "enum", names: ["SERVER_LOG_LEVEL"], fallback: "info", allowed: ["error", "warn", "info", "debug"] },
+  { group: "Frontend / CORS", key: "frontendOrigin", label: "Allowed frontend origin(s)", kind: "csv", names: ["FRONTEND_ORIGIN"], fallback: ["*"] },
+  { group: "Frontend / CORS", key: "publicApiOrigin", label: "Public API origin (for rewritten pages)", kind: "string", names: ["PUBLIC_API_ORIGIN"], fallback: "" },
+  { group: "Frontend / CORS", key: "userAgent", label: "Crawler user agent", kind: "string", names: ["VEYRA_USER_AGENT"], fallback: "VeyraBrowseCrawler/8.0 (+https://github.com/)" },
+  { group: "Crawler concurrency", key: "globalConcurrency", label: "Crawler robots (global concurrency)", kind: "number", names: ["CRAWLER_ROBOTS", "MAX_GLOBAL_CONCURRENCY"], fallback: 12, min: 1, max: 64 },
+  { group: "Crawler concurrency", key: "perHostConcurrency", label: "Per-host concurrency", kind: "number", names: ["CRAWLER_PER_HOST_CONCURRENCY", "MAX_PER_HOST_CONCURRENCY"], fallback: 3, min: 1, max: 16 },
+  { group: "Crawl limits", key: "maxActiveJobs", label: "Max active jobs", kind: "number", names: ["MAX_ACTIVE_JOBS"], fallback: 3, min: 1, max: 20 },
+  { group: "Crawl limits", key: "maxPendingQueue", label: "Max pending queue", kind: "number", names: ["MAX_PENDING_QUEUE"], fallback: 1500, min: 50, max: 20000 },
+  { group: "Crawl limits", key: "maxPages", label: "Max pages", kind: "number", names: ["MAX_PAGES"], fallback: 10000, min: 1, max: 100000 },
+  { group: "Crawl limits", key: "maxResources", label: "Max resources", kind: "number", names: ["MAX_RESOURCES"], fallback: 20000, min: 1, max: 250000 },
+  { group: "Crawl limits", key: "maxLinks", label: "Max links", kind: "number", names: ["MAX_LINKS"], fallback: 100000, min: 100, max: 1000000 },
+  { group: "Crawl limits", key: "maxScanBytes", label: "Max scan bytes", kind: "number", names: ["MAX_SCAN_BYTES"], fallback: 512 * 1024 * 1024, min: 1024 * 1024, max: 8 * 1024 * 1024 * 1024 },
+  { group: "Crawl limits", key: "maxTextBytesPerResource", label: "Max text bytes/resource", kind: "number", names: ["MAX_TEXT_BYTES_PER_RESOURCE"], fallback: 2 * 1024 * 1024, min: 64 * 1024, max: 16 * 1024 * 1024 },
+  { group: "Crawl limits", key: "maxSourceFiles", label: "Max stored source files", kind: "number", names: ["MAX_SOURCE_FILES"], fallback: 20000, min: 100, max: 250000 },
+  { group: "Crawl limits", key: "maxJobAgeMs", label: "Max job age (ms)", kind: "number", names: ["MAX_JOB_AGE_MS"], fallback: 60 * 60 * 1000, min: 60 * 1000, max: 24 * 60 * 60 * 1000 },
+  { group: "Network / retries", key: "requestTimeoutMs", label: "Request timeout (ms)", kind: "number", names: ["REQUEST_TIMEOUT_MS"], fallback: 15000, min: 1000, max: 120000 },
+  { group: "Network / retries", key: "bodyTimeoutMs", label: "Body timeout (ms)", kind: "number", names: ["BODY_TIMEOUT_MS"], fallback: 15000, min: 1000, max: 120000 },
+  { group: "Network / retries", key: "dnsTimeoutMs", label: "DNS timeout (ms)", kind: "number", names: ["DNS_TIMEOUT_MS"], fallback: 4000, min: 500, max: 30000 },
+  { group: "Network / retries", key: "maxRedirects", label: "Max redirects", kind: "number", names: ["MAX_REDIRECTS"], fallback: 6, min: 0, max: 15 },
+  { group: "Network / retries", key: "maxRetries", label: "Max retries", kind: "number", names: ["MAX_RETRIES"], fallback: 2, min: 0, max: 5 },
+  { group: "Network / retries", key: "retryBaseMs", label: "Retry base (ms)", kind: "number", names: ["RETRY_BASE_MS"], fallback: 400, min: 50, max: 10000 },
+  { group: "Network / retries", key: "hostBackoffMs", label: "Host backoff (ms)", kind: "number", names: ["HOST_BACKOFF_MS"], fallback: 1200, min: 100, max: 60000 },
+  { group: "Network / retries", key: "maxHostBackoffMs", label: "Max host backoff (ms)", kind: "number", names: ["MAX_HOST_BACKOFF_MS"], fallback: 30000, min: 1000, max: 300000 },
+  { group: "Network / retries", key: "robotsTimeoutMs", label: "robots.txt timeout (ms)", kind: "number", names: ["ROBOTS_TIMEOUT_MS"], fallback: 8000, min: 1000, max: 60000 },
+  { group: "Network / retries", key: "sitemapTimeoutMs", label: "Sitemap timeout (ms)", kind: "number", names: ["SITEMAP_TIMEOUT_MS"], fallback: 12000, min: 1000, max: 60000 },
+  { group: "Network / retries", key: "maxSitemapFiles", label: "Max sitemap files", kind: "number", names: ["MAX_SITEMAP_FILES"], fallback: 50, min: 1, max: 1000 },
+  { group: "Network / retries", key: "maxSitemapUrls", label: "Max sitemap URLs", kind: "number", names: ["MAX_SITEMAP_URLS"], fallback: 50000, min: 100, max: 500000 },
+  { group: "Cache & logs", key: "proxyCacheMs", label: "Proxy cache TTL (ms)", kind: "number", names: ["CACHE_TTL_MS"], fallback: 10000, min: 0, max: 300000 },
+  { group: "Cache & logs", key: "maxProxyCacheEntries", label: "Max proxy cache entries", kind: "number", names: ["MAX_CACHE_ENTRIES"], fallback: 200, min: 10, max: 5000 },
+  { group: "Cache & logs", key: "searchCacheMs", label: "Search cache TTL (ms)", kind: "number", names: ["SEARCH_CACHE_TTL_MS"], fallback: 30000, min: 0, max: 600000 },
+  { group: "Cache & logs", key: "maxSearchCacheEntries", label: "Max search cache entries", kind: "number", names: ["MAX_SEARCH_CACHE_ENTRIES"], fallback: 100, min: 10, max: 5000 },
+  { group: "Cache & logs", key: "maxRequestLog", label: "Max request log entries", kind: "number", names: ["MAX_REQUEST_LOG"], fallback: 500, min: 50, max: 5000 },
+  { group: "Cache & logs", key: "maxServerLog", label: "Max server log entries", kind: "number", names: ["MAX_SERVER_LOG"], fallback: 800, min: 100, max: 10000 },
+  { group: "Cache & logs", key: "maxClientLog", label: "Max client log entries", kind: "number", names: ["MAX_CLIENT_LOG"], fallback: 500, min: 50, max: 5000 },
+  { group: "Proxy safety limits", key: "maxProxyBodyBytes", label: "Max proxy request body bytes", kind: "number", names: ["MAX_PROXY_BODY_BYTES"], fallback: 4 * 1024 * 1024, min: 64 * 1024, max: 32 * 1024 * 1024 },
+  { group: "Proxy safety limits", key: "maxProxyTextBytes", label: "Max proxy text bytes", kind: "number", names: ["MAX_PROXY_TEXT_BYTES"], fallback: 8 * 1024 * 1024, min: 256 * 1024, max: 32 * 1024 * 1024 },
+  { group: "Proxy safety limits", key: "maxProxyImageBytes", label: "Max proxy image bytes", kind: "number", names: ["MAX_PROXY_IMAGE_BYTES"], fallback: 16 * 1024 * 1024, min: 256 * 1024, max: 64 * 1024 * 1024 },
+  { group: "Proxy safety limits", key: "maxProxyMediaBytes", label: "Max proxy media bytes", kind: "number", names: ["MAX_PROXY_MEDIA_BYTES"], fallback: 32 * 1024 * 1024, min: 512 * 1024, max: 128 * 1024 * 1024 },
+  { group: "Proxy safety limits", key: "maxProxyOtherBytes", label: "Max proxy other bytes", kind: "number", names: ["MAX_PROXY_OTHER_BYTES"], fallback: 16 * 1024 * 1024, min: 256 * 1024, max: 64 * 1024 * 1024 },
+  { group: "Proxy safety limits", key: "maxFormBodyBytes", label: "Max form body bytes", kind: "number", names: ["MAX_FORM_BODY_BYTES"], fallback: 1 * 1024 * 1024, min: 16 * 1024, max: 8 * 1024 * 1024 },
+  { group: "Search", key: "searchProvider", label: "Search provider", kind: "enum", names: ["SEARCH_PROVIDER"], fallback: "local", allowed: ["auto", "local", "brave", "bing", "custom", "none"] },
+  { group: "Search", key: "searchEndpoint", label: "Custom search endpoint", kind: "string", names: ["SEARCH_ENDPOINT"], fallback: "" },
+  { group: "Search", key: "searchApiKey", label: "Search API key", kind: "string", names: ["SEARCH_API_KEY"], fallback: "", secret: true },
+  { group: "Search", key: "customSearchAuth", label: "Custom search auth header", kind: "string", names: ["SEARCH_AUTH_HEADER"], fallback: "", secret: true },
+  { group: "Search", key: "braveKey", label: "Brave Search API key", kind: "string", names: ["BRAVE_SEARCH_API_KEY"], fallback: "", secret: true },
+  { group: "Search", key: "bingKey", label: "Bing Search API key", kind: "string", names: ["BING_SEARCH_API_KEY"], fallback: "", secret: true },
+  { group: "Search", key: "maxSearchQueryChars", label: "Max search query chars", kind: "number", names: ["MAX_SEARCH_QUERY_CHARS"], fallback: 256, min: 32, max: 1000 },
+  { group: "Search", key: "maxSearchResults", label: "Max search results", kind: "number", names: ["MAX_SEARCH_RESULTS"], fallback: 20, min: 1, max: 50 },
+  { group: "Search index", key: "maxIndexDocs", label: "Max indexed docs", kind: "number", names: ["MAX_INDEX_DOCS"], fallback: 20000, min: 100, max: 100000 },
+  { group: "Search index", key: "maxIndexTextChars", label: "Max index text chars/doc", kind: "number", names: ["MAX_INDEX_TEXT_CHARS"], fallback: 8000, min: 1000, max: 50000 },
+  { group: "Search index", key: "maxSearchQueryTerms", label: "Max search query terms", kind: "number", names: ["MAX_SEARCH_QUERY_TERMS"], fallback: 20, min: 1, max: 64 },
+  { group: "Search index", key: "indexSeeds", label: "Index seed URLs", kind: "csv", names: ["INDEX_SEEDS"], fallback: [] },
+  { group: "Search index", key: "indexSeedCrawl", label: "Auto-crawl index seeds", kind: "bool", names: ["INDEX_SEED_CRAWL"], fallback: true },
+  { group: "Search index", key: "indexRefreshMs", label: "Index refresh interval (ms)", kind: "number", names: ["INDEX_REFRESH_MS"], fallback: 6 * 60 * 60 * 1000, min: 0, max: 30 * 24 * 60 * 60 * 1000 },
+  { group: "Search index", key: "indexSnapshotEnabled", label: "Index snapshot enabled", kind: "bool", names: ["INDEX_SNAPSHOT_ENABLED"], fallback: false },
+  { group: "Search index", key: "indexSnapshotPath", label: "Index snapshot path", kind: "string", names: ["INDEX_SNAPSHOT_PATH"], fallback: "/tmp/veyra-search-index.json" },
+  { group: "Misc", key: "browserRenderFallback", label: "Browser render fallback", kind: "bool", names: ["BROWSER_RENDER_FALLBACK"], fallback: false },
+  { group: "Misc", key: "sortQueryParams", label: "Normalize/sort query params", kind: "bool", names: ["NORMALIZE_SORT_QUERY_PARAMS"], fallback: false }
+];
+
+// Env vars seen in the wild for this project that this build of server.js does
+// not read anywhere. Setting these has no effect — flagged explicitly so they
+// don't get mistaken for working configuration.
+const STATUS_KNOWN_UNUSED = ["PROXY_WARM_LIMIT", "PROXY_WARM_PER_HOST", "PROXY_WARM_ROBOTS"];
+const STATUS_WATCHED_PREFIXES = ["CRAWLER_", "MAX_", "PROXY_", "SEARCH_", "INDEX_", "VEYRA_", "ROBOTS_", "SITEMAP_", "CACHE_", "BROWSER_", "NORMALIZE_", "FRONTEND_", "PUBLIC_", "PORT", "PROCESS_ROLE", "SERVER_LOG_LEVEL", "REQUEST_TIMEOUT_MS", "BODY_TIMEOUT_MS", "DNS_TIMEOUT_MS", "HOST_BACKOFF_MS", "RETRY_BASE_MS", "BING_", "BRAVE_"];
+
+function buildStatusReport() {
+  const vars = STATUS_VAR_DEFS.map(def => {
+    let d;
+    if (def.kind === "number") d = diagNumber(def.names, def.fallback, def.min, def.max);
+    else if (def.kind === "bool") d = diagBool(def.names, def.fallback);
+    else if (def.kind === "enum") d = diagEnum(def.names, def.fallback, def.allowed);
+    else if (def.kind === "csv") d = diagCsv(def.names, def.fallback);
+    else d = diagString(def.names, def.fallback, !!def.secret);
+    return { group: def.group, key: def.key, label: def.label, note: def.note || "", secret: !!def.secret, ...d };
+  });
+
+  const knownNames = new Set(STATUS_VAR_DEFS.flatMap(d => d.names).concat(STATUS_KNOWN_UNUSED));
+  const unrecognized = Object.keys(process.env)
+    .filter(name => STATUS_WATCHED_PREFIXES.some(p => name.startsWith(p)) && !knownNames.has(name))
+    .sort()
+    .map(name => ({ name, raw: name.includes("KEY") || name.includes("SECRET") || name.includes("AUTH") ? "(hidden)" : process.env[name] }));
+
+  const setUnused = STATUS_KNOWN_UNUSED.filter(name => process.env[name] !== undefined && String(process.env[name]).trim() !== "");
+
+  const byKey = Object.fromEntries(vars.map(v => [v.key, v]));
+  const issues = [];
+  const addIssue = (severity, message) => issues.push({ severity, message });
+
+  const provider = byKey.searchProvider.effective;
+  if (provider === "brave" && !byKey.braveKey.present) addIssue("error", "SEARCH_PROVIDER is \"brave\" but BRAVE_SEARCH_API_KEY is not set — search requests will fail at query time.");
+  if (provider === "bing" && !byKey.bingKey.present) addIssue("error", "SEARCH_PROVIDER is \"bing\" but BING_SEARCH_API_KEY is not set — search requests will fail at query time.");
+  if (provider === "custom" && !byKey.searchEndpoint.present) addIssue("error", "SEARCH_PROVIDER is \"custom\" but SEARCH_ENDPOINT is not set — search requests will fail at query time.");
+  if (provider === "auto" && !byKey.braveKey.present && !byKey.bingKey.present) addIssue("info", "SEARCH_PROVIDER is \"auto\" with no external provider keys set — Veyra will rely entirely on the local index until BRAVE_SEARCH_API_KEY or BING_SEARCH_API_KEY is added.");
+
+  if (!byKey.publicApiOrigin.present) addIssue("warn", "PUBLIC_API_ORIGIN is not set — proxied pages won't reliably know this backend's public URL for their own resource/API calls. Set it to this Render service's URL.");
+  if (Array.isArray(byKey.frontendOrigin.effective) && byKey.frontendOrigin.effective.includes("*")) addIssue("warn", "FRONTEND_ORIGIN is not set (defaulting to \"*\") — CORS currently allows any origin. Fine for testing, but set it to your actual frontend URL before relying on this in production.");
+
+  if (byKey.perHostConcurrency.effective > byKey.globalConcurrency.effective) addIssue("info", `CRAWLER_PER_HOST_CONCURRENCY (${byKey.perHostConcurrency.effective}) is higher than CRAWLER_ROBOTS (${byKey.globalConcurrency.effective}) — the per-host cap can never actually be reached.`);
+  if (process.env.CRAWLER_ROBOTS && process.env.MAX_GLOBAL_CONCURRENCY && process.env.CRAWLER_ROBOTS !== process.env.MAX_GLOBAL_CONCURRENCY) addIssue("info", `Both CRAWLER_ROBOTS (${process.env.CRAWLER_ROBOTS}) and legacy MAX_GLOBAL_CONCURRENCY (${process.env.MAX_GLOBAL_CONCURRENCY}) are set with different values — CRAWLER_ROBOTS wins.`);
+  if (process.env.CRAWLER_PER_HOST_CONCURRENCY && process.env.MAX_PER_HOST_CONCURRENCY && process.env.CRAWLER_PER_HOST_CONCURRENCY !== process.env.MAX_PER_HOST_CONCURRENCY) addIssue("info", `Both CRAWLER_PER_HOST_CONCURRENCY (${process.env.CRAWLER_PER_HOST_CONCURRENCY}) and legacy MAX_PER_HOST_CONCURRENCY (${process.env.MAX_PER_HOST_CONCURRENCY}) are set with different values — CRAWLER_PER_HOST_CONCURRENCY wins.`);
+
+  if (byKey.indexSeedCrawl.effective && (!Array.isArray(byKey.indexSeeds.effective) || byKey.indexSeeds.effective.length === 0)) addIssue("info", "INDEX_SEED_CRAWL is on but INDEX_SEEDS is empty — there's nothing to auto-seed yet; the index will only grow as people browse pages through Veyra.");
+
+  for (const v of vars) if (v.status === "invalid") addIssue("error", `${v.name}="${v.raw}" is invalid for ${v.label} — the server silently fell back to the default (${JSON.stringify(v.effective)}). Fix or remove this variable.`);
+  for (const v of vars) if (v.status === "clamped") addIssue("warn", `${v.name}="${v.raw}" for ${v.label} is outside the allowed range — clamped to ${v.effective}.`);
+
+  for (const name of setUnused) addIssue("warn", `${name} is set but this server build never reads it — it has no effect. Remove it or check you're deploying the version of the code that's supposed to use it.`);
+  for (const u of unrecognized) addIssue("warn", `${u.name} looks like a Veyra config variable but isn't recognized by this server build (raw value: ${u.raw}). Check for a typo, e.g. did you mean one of: ${STATUS_VAR_DEFS.flatMap(d => d.names).filter(n => n.slice(0, 4) === u.name.slice(0, 4)).join(", ") || "(no close match found)"}.`);
+
+  const severityRankNum = { error: 0, warn: 1, info: 2 };
+  issues.sort((a, b) => severityRankNum[a.severity] - severityRankNum[b.severity]);
+
+  return {
+    generatedAt: new Date().toISOString(),
+    uptimeSec: Math.round(process.uptime()),
+    processRole: byKey.processRole.effective,
+    port: byKey.port.effective,
+    crawlerRobotsInEffect: byKey.globalConcurrency.effective,
+    perHostConcurrencyInEffect: byKey.perHostConcurrency.effective,
+    counts: {
+      error: issues.filter(i => i.severity === "error").length,
+      warn: issues.filter(i => i.severity === "warn").length,
+      info: issues.filter(i => i.severity === "info").length
+    },
+    issues,
+    groups: STATUS_VAR_DEFS.reduce((acc, def) => { (acc[def.group] ||= []).push(byKey[def.key]); return acc; }, {}),
+    unrecognizedVars: unrecognized,
+    unusedButSetVars: setUnused
+  };
+}
+
+function statusPage() {
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Veyra Status</title><style>
+body{margin:0;background:#0e1116;color:#e7edf5;font:13px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace}
+header{padding:16px 20px;border-bottom:1px solid #2a313b;position:sticky;top:0;background:#11151b;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px}
+h1{font:700 18px system-ui;margin:0}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;font:600 12px system-ui;margin-left:8px}
+.pill.err{background:#3a1a1a;color:#ff9f9f}.pill.warn{background:#3a2f14;color:#e9c36f}.pill.info{background:#122a3a;color:#8fc3ea}.pill.ok{background:#123a1e;color:#8fea9f}
+main{padding:16px 20px;max-width:1100px;margin:0 auto}
+section{margin-bottom:22px}
+h2{font:700 14px system-ui;margin:0 0 10px;color:#c7d3e0}
+.issue{display:flex;gap:10px;padding:9px 10px;border-radius:8px;margin-bottom:6px;align-items:flex-start}
+.issue.error{background:#1c1010;border:1px solid #4a2020}
+.issue.warn{background:#1c1710;border:1px solid #4a3a18}
+.issue.info{background:#0f1a22;border:1px solid #204058}
+.badge{font:700 10px system-ui;text-transform:uppercase;padding:2px 7px;border-radius:5px;white-space:nowrap}
+.badge.error{background:#ff9f9f;color:#2a0d0d}.badge.warn{background:#e9c36f;color:#2a2005}.badge.info{background:#8fc3ea;color:#08202f}
+table{width:100%;border-collapse:collapse;margin-bottom:14px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #1c2229;vertical-align:top}
+th{color:#8b97a7;font-weight:600;font-size:11px;text-transform:uppercase}
+.status-set{color:#8fea9f}.status-default{color:#8b97a7}.status-clamped{color:#e9c36f}.status-invalid{color:#ff9f9f}
+.mono{font-family:inherit}
+.empty{color:#5b6675;font-style:italic}
+button{background:#1a2029;color:#dce5ef;border:1px solid #343d49;border-radius:7px;padding:7px 11px;cursor:pointer;font:600 12px system-ui}
+</style></head><body>
+<header><h1>Veyra — /status</h1><div id="pills"></div><button id="refresh">Refresh</button></header>
+<main id="app">Loading…</main>
+<script>
+function esc(s){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
+function fmtVal(v){ if (Array.isArray(v)) return v.length ? esc(v.join(', ')) : '<span class="empty">(none)</span>'; if (v === '' || v === undefined || v === null) return '<span class="empty">(empty)</span>'; return esc(String(v)) }
+async function load(){
+  const r = await fetch('/api/debug/status');
+  const d = await r.json();
+  document.getElementById('pills').innerHTML =
+    '<span class="pill err">'+d.counts.error+' error'+(d.counts.error===1?'':'s')+'</span>'+
+    '<span class="pill warn">'+d.counts.warn+' warn'+(d.counts.warn===1?'':'s')+'</span>'+
+    '<span class="pill info">'+d.counts.info+' info</span>'+
+    '<span class="pill ok">'+d.crawlerRobotsInEffect+' robots × '+d.perHostConcurrencyInEffect+'/host</span>';
+  let html = '';
+  html += '<section><h2>Issues</h2>';
+  if (!d.issues.length) html += '<p class="empty">No configuration issues detected.</p>';
+  else html += d.issues.map(i => '<div class="issue '+i.severity+'"><span class="badge '+i.severity+'">'+i.severity+'</span><div>'+esc(i.message)+'</div></div>').join('');
+  html += '</section>';
+  for (const [group, items] of Object.entries(d.groups)) {
+    html += '<section><h2>'+esc(group)+'</h2><table><thead><tr><th>Variable</th><th>Raw value</th><th>Effective value</th><th>Status</th><th>Detail</th></tr></thead><tbody>';
+    for (const v of items) {
+      html += '<tr><td class="mono">'+esc(v.name)+(v.note?'<br><span class="empty">'+esc(v.note)+'</span>':'')+'</td><td class="mono">'+(v.present ? (v.secret ? '(hidden)' : fmtVal(v.raw)) : '<span class="empty">(not set)</span>')+'</td><td class="mono">'+fmtVal(v.secret ? (v.present ? '(hidden)' : '') : v.effective)+'</td><td class="status-'+v.status+'">'+esc(v.status)+'</td><td>'+esc(v.detail)+'</td></tr>';
+    }
+    html += '</tbody></table></section>';
+  }
+  document.getElementById('app').innerHTML = html;
+}
+document.getElementById('refresh').onclick = load;
+load();
+</script>
+</body></html>`;
+}
+app.get("/api/debug/status", (req, res) => res.json(buildStatusReport()));
+app.get("/status", (req, res) => res.type("html").send(statusPage()));
+
 function consolePage() {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Veyra Console</title><style>body{margin:0;background:#0e1116;color:#e7edf5;font:13px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace}header{padding:16px 20px;border-bottom:1px solid #2a313b;position:sticky;top:0;background:#11151b}h1{font:700 18px system-ui;margin:0 0 8px}.bar{display:flex;gap:8px;flex-wrap:wrap}select,button{background:#1a2029;color:#dce5ef;border:1px solid #343d49;border-radius:7px;padding:7px 9px}main{padding:16px 20px}.log{display:grid;grid-template-columns:155px 72px 72px 1fr;gap:10px;padding:7px 8px;border-bottom:1px solid #181e26;white-space:pre-wrap;word-break:break-word}.SERVER{background:#121821}.BROWSER{background:#11171b}.err{color:#ff9f9f}.warn{color:#e9c36f}.info{color:#a9c8f0}.debug{color:#8f9aaa}@media(max-width:800px){.log{grid-template-columns:1fr}.log span{display:block}}</style></head><body><header><h1>Veyra — /console</h1><div class="bar"><select id="source"><option>all</option><option>browser</option><option>server</option></select><select id="level"><option>all</option><option>error</option><option>warn</option><option>info</option><option>debug</option></select><button id="refresh">Refresh</button><button id="auto">Auto: on</button></div></header><main id="log">Loading…</main><script>let on=true;async function load(){try{const s=document.getElementById('source').value,l=document.getElementById('level').value;const r=await fetch('/api/debug/logs?source='+encodeURIComponent(s)+'&level='+encodeURIComponent(l)+'&limit=500');const b=await r.json();document.getElementById('log').innerHTML=(b.logs||[]).map(x=>'<div class="log '+(x.source||'')+'"><span>'+esc(x.time||'')+'</span><span>'+esc(x.source||'')+'</span><span class="'+esc(x.level||'')+'">'+esc(x.level||'')+'</span><span>'+esc(x.message||'')+' '+esc(x.requestId||'')+'</span></div>').join('')||'<p>No logs.</p>'}catch(e){document.getElementById('log').textContent=e.message}}function esc(s){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]) )}document.getElementById('refresh').onclick=load;document.getElementById('source').onchange=load;document.getElementById('level').onchange=load;document.getElementById('auto').onclick=()=>{on=!on;document.getElementById('auto').textContent='Auto: '+(on?'on':'off')};load();setInterval(()=>on&&load(),2000);</script></body></html>`;
 }
