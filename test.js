@@ -62,6 +62,10 @@ const {
   assert.equal(helper.queue.length, 1);
   assert.equal(mesh.robots[0].queue.length, 1);
   assert.equal(mesh.events.at(-1)?.type, "help-accepted");
+  mesh.robots[0].queue.push({ url: "https://example.com/c", type: "html" });
+  mesh.robots[0].queue.push({ url: "https://example.com/d", type: "html" });
+  mesh.updateLoadBucket(mesh.robots[0]);
+  mesh.markShareable(mesh.robots[0]);
   const multitaskRequester = mesh.robots[2];
   multitaskRequester.activeTasks = 1;
   multitaskRequester.countActive = true;
@@ -89,6 +93,8 @@ const {
   const runtime = injectRuntime('<!doctype html><html><head><title>T</title></head><body></body></html>', 'https://example.com/path/page');
   assert(runtime.includes('new URL(unwrap(String(url)),virtualUrl).href'));
   assert(runtime.includes('const prefix=API_ORIGIN || location.origin'));
+  assert(runtime.includes("d.type==='veyra:find'"));
+  assert(runtime.includes("d.type==='veyra:print'"));
 
   const css = rewriteCssText('@font-face{src:url(../fonts/a.woff2)}', 'https://example.com/css/app.css');
   assert(css.includes('/api/resource?url=https%3A%2F%2Fexample.com%2Ffonts%2Fa.woff2'));

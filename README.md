@@ -61,3 +61,14 @@ npm install
 npm test
 npm start
 ```
+
+
+## v8.5 cooperative mesh
+`CRAWLER_ROBOTS` is the logical fleet size. `ROBOT_WORKSET_SIZE` limits the active scheduling workset so a 1,000-robot fleet remains cheap to manage. Idle robots may request spare queued work; target robots explicitly accept or decline before task transfer. Actual upstream concurrency remains controlled by `MAX_ACTIVE_FETCHES` and the per-host limit.
+
+The proxy/browser lane is separate from background crawl work. Foreground document/resource requests are prioritized so browser interaction does not wait behind indexing.
+
+## v8.5 browser subsystem and robot mesh refinement
+The 1,000-robot logical fleet can run up to four active tasks per robot (bounded by shared network slots), and idle or lightly-loaded robots can request spare work from another robot. A target robot evaluates backlog/health/cooldown and explicitly accepts or declines the request before queued tasks are transferred. The frontier is host-aware so a large blocked queue on one origin does not force repeated scans of every queued item.
+
+The proxy endpoint `/api/download` now marks the response as an attachment and enforces `MAX_DOWNLOAD_BYTES`. The browser UI includes custom downloads (Ctrl+J), local history (Ctrl+H), inspect mode (Ctrl+Shift+I), find-in-page (Ctrl+F), print (Ctrl+P), a tools dropdown, an extension store/developer mode and a loading Stop button.
