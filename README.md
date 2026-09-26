@@ -1,19 +1,18 @@
-# Veyra Browse — Render Crawler API
+# Veyra Browse — Render backend
 
-This repository contains only the Node.js crawler API for Veyra Browse.
+This repository contains ONLY the Node server.
 
-Runtime files:
-- `server.js`
-- `package.json`
+Files:
+- server.js
+- package.json
 
-There is no HTML/CSS/frontend here.
+Render runs this as a public Web Service. GitHub Pages hosts the Veyra Browse UI.
 
-Deploy this repository as a Render Web Service.
+The backend provides:
+- `/api/open` to start/reuse a server-side crawl and return a page-view URL
+- `/api/view` to proxy/rewrite HTML for the browser view
+- `/api/resource` to proxy page assets
+- `/api/crawl/...` for crawl status, sources, links, logs, and export
+- `/health` for health checks
 
-Render runs the crawler/API only. GitHub Pages hosts the Veyra Browse website.
-
-Current frontend API endpoint:
-`https://minibrowse-crawler.onrender.com`
-
-The internal Render service name may remain `minibrowse-crawler` so an existing
-deployment does not break. The product branding shown to users is Veyra Browse.
+No frontend HTML/CSS/JS belongs in this repository.
