@@ -39,8 +39,10 @@ function enumEnv(name, fallback, allowed) {
 
 const CFG = Object.freeze({
   processRole: enumEnv("PROCESS_ROLE", "web", ["web", "worker", "all"]),
-  globalConcurrency: numberEnv("MAX_GLOBAL_CONCURRENCY", 12, 1, 64),
-  perHostConcurrency: numberEnv("MAX_PER_HOST_CONCURRENCY", 3, 1, 16),
+  // CRAWLER_ROBOTS is the public tuning knob for parallel crawler robots.
+  // MAX_GLOBAL_CONCURRENCY remains a backwards-compatible fallback.
+  crawlerRobots: numberEnv("CRAWLER_ROBOTS", numberEnv("MAX_GLOBAL_CONCURRENCY", 12, 1, 96), 1, 96),
+  perHostConcurrency: numberEnv("CRAWLER_PER_HOST_CONCURRENCY", numberEnv("MAX_PER_HOST_CONCURRENCY", 3, 1, 32), 1, 32),
   maxPendingQueue: numberEnv("MAX_PENDING_QUEUE", 1500, 50, 20000),
   maxPages: numberEnv("MAX_PAGES", 10000, 1, 100000),
   maxResources: numberEnv("MAX_RESOURCES", 20000, 1, 250000),
@@ -75,6 +77,9 @@ const CFG = Object.freeze({
   maxProxyImageBytes: numberEnv("MAX_PROXY_IMAGE_BYTES", 16 * 1024 * 1024, 256 * 1024, 64 * 1024 * 1024),
   maxProxyMediaBytes: numberEnv("MAX_PROXY_MEDIA_BYTES", 32 * 1024 * 1024, 512 * 1024, 128 * 1024 * 1024),
   maxProxyOtherBytes: numberEnv("MAX_PROXY_OTHER_BYTES", 16 * 1024 * 1024, 256 * 1024, 64 * 1024 * 1024),
+  proxyWarmRobots: numberEnv("PROXY_WARM_ROBOTS", 8, 1, 32),
+  proxyWarmLimit: numberEnv("PROXY_WARM_LIMIT", 64, 0, 250),
+  proxyWarmPerHost: numberEnv("PROXY_WARM_PER_HOST", 3, 1, 12),
   maxFormBodyBytes: numberEnv("MAX_FORM_BODY_BYTES", 1 * 1024 * 1024, 16 * 1024, 8 * 1024 * 1024),
   userAgent: process.env.VEYRA_USER_AGENT || "VeyraBrowseCrawler/8.0 (+https://github.com/)",
   frontendOrigins: csvEnv("FRONTEND_ORIGIN", ["*"]),
@@ -731,6 +736,37 @@ function injectRuntime(html, original) {
   const withoutMetaCsp = String(html).replace(/<meta[^>]+http-equiv=["']?content-security-policy["']?[^>]*>/gi, "");
   return withoutMetaCsp.replace(/<head([^>]*)>/i, (m, attrs) => `<head${attrs}>${code}`);
 }
+function parseSrcsetCandidates(value) {
+  return String(value || "").split(",").map(x => x.trim().split(/\s+/)[0]).filter(Boolean);
+}
+function collectPageWarmUrls(html, base, max = CFG.proxyWarmLimit) {
+  if (!CFG.proxyWarmLimit || max <= 0) return [];
+  try {
+    const $ = cheerio.load(String(html || ""), { decodeEntities: false });
+    const out = [];
+    const add = (raw) => {
+      const u = resolveResource(raw, base);
+      if (u) out.push(u);
+    };
+    $("img[src],source[src],audio[src],video[src],input[src],embed[src],object[data],track[src],iframe[src]").each((_, el) => {
+      const attr = el.name === "object" ? "data" : "src";
+      add($(el).attr(attr));
+    });
+    $("script[src],link[href]").each((_, el) => add($(el).attr(el.name === "script" ? "src" : "href")));
+    $("video[poster]").each((_, el) => add($(el).attr("poster")));
+    $("use[href],use[xlink\\:href],image[href],image[xlink\\:href]").each((_, el) => add($(el).attr($(el).attr("href") != null ? "href" : "xlink:href")));
+    $("[srcset],[imagesrcset],[data-srcset]").each((_, el) => parseSrcsetCandidates($(el).attr("srcset") || $(el).attr("imagesrcset") || $(el).attr("data-srcset")).forEach(add));
+    $("[data-src],[data-original],[data-lazy-src]").each((_, el) => {
+      add($(el).attr("data-src") || $(el).attr("data-original") || $(el).attr("data-lazy-src"));
+    });
+    $("style,[style]").each((_, el) => {
+      const css = el.name === "style" ? $(el).text() : $(el).attr("style") || "";
+      const re = /url\(\s*(["']?)([^"')]+)\1\s*\)/gi;
+      let m; while ((m = re.exec(css))) add(m[2]);
+    });
+    return [...new Set(out)].slice(0, max);
+  } catch { return []; }
+}
 function rewriteHtml(html, base) {
   const $ = cheerio.load(String(html || ""), { decodeEntities: false });
   $("base").remove();
@@ -742,32 +778,28 @@ function rewriteHtml(html, base) {
   $("link[href]").each((_, el) => {
     const rel = String($(el).attr("rel") || "").toLowerCase();
     if (rel.includes("canonical")) return;
-    const raw = $(el).attr("href"); const u = resolveResource(raw, base); if (u) { $(el).attr("href", makeResourceUrl(u, base)); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); }
+    const raw = $(el).attr("href"); const u = resolveResource(raw, base);
+    if (u) { $(el).attr("href", makeResourceUrl(u, base)); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); }
   });
-  $("script[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), base); if (u) { $(el).attr("src", makeResourceUrl(u, base)); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); } });
-  for (const tag of ["img", "source", "audio", "input", "embed"]) {
+  $("script[src]").each((_, el) => {
+    const u = resolveResource($(el).attr("src"), base);
+    if (u) { $(el).attr("src", makeResourceUrl(u, base)); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); }
+  });
+  for (const tag of ["img", "source", "audio", "video", "input", "embed"]) {
     $(`${tag}[src]`).each((_, el) => { const u = resolveResource($(el).attr("src"), base); if (u) $(el).attr("src", makeResourceUrl(u, base)); });
   }
   $("video[poster]").each((_, el) => { const u = resolveResource($(el).attr("poster"), base); if (u) $(el).attr("poster", makeResourceUrl(u, base)); });
   $("track[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), base); if (u) $(el).attr("src", makeResourceUrl(u, base)); });
-  $("use[href],use[xlink\:href],image[href],image[xlink\:href]").each((_, el) => {
+  $("use[href],use[xlink\\:href],image[href],image[xlink\\:href]").each((_, el) => {
     const attr = $(el).attr("href") != null ? "href" : "xlink:href";
-    const raw = $(el).attr(attr) || "";
-    const u = resolveResource(raw, base);
-    if (u) $(el).attr(attr, makeResourceUrl(u, base));
-  });
-  $("[imagesrcset]").each((_, el) => $(el).attr("imagesrcset", rewriteSrcset($(el).attr("imagesrcset"), base)));
-  for (const attr of ["data-src", "data-original", "data-lazy-src"]) {
-    $(`[${attr}]`).each((_, el) => { const u = resolveResource($(el).attr(attr), base); if (u) $(el).attr(attr, makeResourceUrl(u, base)); });
-  }
-  $(`[data-srcset]`).each((_, el) => $(el).attr("data-srcset", rewriteSrcset($(el).attr("data-srcset"), base)));
-  $("track[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), base); if (u) $(el).attr("src", makeResourceUrl(u, base)); });
-  $("use[href],use[xlink\:href],image[href],image[xlink\:href]").each((_, el) => {
-    const attr = $(el).attr("href") != null ? "href" : "xlink:href"; const raw = $(el).attr(attr) || "";
-    const u = resolveResource(raw, base); if (u) $(el).attr(attr, makeResourceUrl(u, base));
+    const u = resolveResource($(el).attr(attr), base); if (u) $(el).attr(attr, makeResourceUrl(u, base));
   });
   $("[imagesrcset]").each((_, el) => $(el).attr("imagesrcset", rewriteSrcset($(el).attr("imagesrcset"), base)));
   $("[srcset]").each((_, el) => $(el).attr("srcset", rewriteSrcset($(el).attr("srcset"), base)));
+  for (const attr of ["data-src", "data-original", "data-lazy-src"]) {
+    $(`[${attr}]`).each((_, el) => { const u = resolveResource($(el).attr(attr), base); if (u) $(el).attr(attr, makeResourceUrl(u, base)); });
+  }
+  $("[data-srcset]").each((_, el) => $(el).attr("data-srcset", rewriteSrcset($(el).attr("data-srcset"), base)));
   $("meta[http-equiv='refresh'],meta[http-equiv='Refresh']").each((_, el) => {
     const raw = $(el).attr("content") || ""; const m = raw.match(/^(\s*\d+\s*;\s*url\s*=\s*)(.+)$/i); if (!m) return;
     const u = resolveNavigation(m[2].trim().replace(/^['"]|['"]$/g, ""), base); if (u) $(el).attr("content", `${m[1]}${makeViewUrl(u)}`);
@@ -849,17 +881,26 @@ function discoverHtml(job, text, base) {
   $("a[href],area[href]").each((_, el) => addLink(job, $(el).attr("href"), "html", base, "navigation"));
   $("link[href]").each((_, el) => {
     const rel = String($(el).attr("rel") || "").toLowerCase();
-    const hint = rel.includes("stylesheet") ? "css" : rel.includes("icon") || rel.includes("preload") || rel.includes("modulepreload") ? "asset" : "html";
+    const resourceRel = /(?:stylesheet|icon|shortcut icon|mask-icon|apple-touch-icon|manifest|preload|modulepreload|prefetch|prerender)/i.test(rel);
+    const hint = resourceRel ? "asset" : "html";
     addLink(job, $(el).attr("href"), hint, base, rel.includes("canonical") ? "canonical" : "discovered");
   });
   $("script[src]").each((_, el) => addLink(job, $(el).attr("src"), "js", base));
   $("iframe[src]").each((_, el) => addLink(job, $(el).attr("src"), "html", base));
-  $("img[src],source[src],audio[src],video[src],input[src],embed[src],object[data]").each((_, el) => {
+  $("img[src],source[src],audio[src],video[src],input[src],embed[src],object[data],track[src]").each((_, el) => {
     const attr = el.name === "object" ? "data" : "src"; addLink(job, $(el).attr(attr), "asset", base);
   });
+  $("video[poster]").each((_, el) => addLink(job, $(el).attr("poster"), "asset", base));
+  $("use[href],use[xlink\\:href],image[href],image[xlink\\:href]").each((_, el) => {
+    const attr = $(el).attr("href") != null ? "href" : "xlink:href"; addLink(job, $(el).attr(attr), "asset", base);
+  });
   $("form[action]").each((_, el) => addLink(job, $(el).attr("action"), "html", base, "navigation"));
-  $("link[rel='canonical']").each((_, el) => addLink(job, $(el).attr("href"), "html", base, "canonical"));
-  $("[srcset]").each((_, el) => String($(el).attr("srcset") || "").split(",").forEach(x => addLink(job, x.trim().split(/\s+/)[0], "asset", base)));
+  for (const attr of ["srcset", "imagesrcset", "data-srcset"]) {
+    $(`[${attr}]`).each((_, el) => parseSrcsetCandidates($(el).attr(attr)).forEach(src => addLink(job, src, "asset", base)));
+  }
+  for (const attr of ["data-src", "data-original", "data-lazy-src"]) {
+    $(`[${attr}]`).each((_, el) => addLink(job, $(el).attr(attr), "asset", base));
+  }
   $("style").each((_, el) => discoverCss(job, $(el).text(), base));
   $("[style]").each((_, el) => discoverCss(job, $(el).attr("style") || "", base));
   discoverJs(job, String(text || ""), base);
@@ -871,6 +912,7 @@ function createJob(root) {
     id, root, url: root, createdAt: now(), finishedAt: null, done: false, stopRequested: false, status: "queued", statusText: "Queued",
     pageFrontier: new PriorityFrontier(CFG.maxPendingQueue), resourceFrontier: new PriorityFrontier(CFG.maxPendingQueue), visited: new Set(), discovered: new Set(),
     resources: [], links: [], logs: [], logSeq: 0, sourceDir: path.join(ROOT, id), sourceFiles: 0, textBytesStored: 0,
+    robotCount: CFG.crawlerRobots, perHostConcurrency: CFG.perHostConcurrency,
     activeWorkers: 0, activeHtmlWorkers: 0, activeAssetWorkers: 0, processed: 0, pagesDiscovered: 0, resourcesScheduled: 0,
     robots: null, robotsReady: false, sitemaps: new Set(), challengeHosts: new Set(), hostActive: new Map(), hostCooldowns: new Map(), hostLastRequested: new Map(), hostFailures: new Map(), hostDelayMs: 0, stopReason: null,
     counts: { htmlPages: 0, css: 0, js: 0, links: 0, bytesScanned: 0, bytesStored: 0, bytesDiscarded: 0, requestCount: 0, retries: 0, challenges: 0, errors: 0 },
@@ -884,8 +926,8 @@ function publicJob(job) {
     status: job.status, statusText: job.statusText, stopRequested: job.stopRequested,
     maxUrls: CFG.maxResources, maxScanBytes: CFG.maxScanBytes, elapsedMs: Date.now() - Date.parse(job.createdAt),
     counts: { ...job.counts, processed: job.processed, queued, active: job.activeWorkers },
-    workers: { html: { active: job.activeHtmlWorkers, max: CFG.globalConcurrency, queued: job.pageFrontier.size }, asset: { active: job.activeAssetWorkers, max: CFG.globalConcurrency, queued: job.resourceFrontier.size } },
-    limits: { globalConcurrency: CFG.globalConcurrency, perHostConcurrency: CFG.perHostConcurrency, maxPages: CFG.maxPages, maxResources: CFG.maxResources, maxLinks: CFG.maxLinks, maxScanBytes: CFG.maxScanBytes },
+    workers: { robots: { active: job.activeWorkers, max: job.robotCount, queued: job.pageFrontier.size + job.resourceFrontier.size }, html: { active: job.activeHtmlWorkers, max: job.robotCount, queued: job.pageFrontier.size }, asset: { active: job.activeAssetWorkers, max: job.robotCount, queued: job.resourceFrontier.size } },
+    limits: { robots: job.robotCount, crawlerRobotsMax: CFG.crawlerRobots, globalConcurrency: job.robotCount, perHostConcurrency: job.perHostConcurrency, maxPages: CFG.maxPages, maxResources: CFG.maxResources, maxLinks: CFG.maxLinks, maxScanBytes: CFG.maxScanBytes, proxyWarmRobots: CFG.proxyWarmRobots, proxyWarmLimit: CFG.proxyWarmLimit },
     robotsLoaded: job.robotsReady, sitemapsFound: job.sitemaps.size, sourceFiles: job.sourceFiles, textBytesStored: job.textBytesStored,
     resourceCount: job.resources.length, linkCount: job.links.length, logs: job.logs.slice(-120), queue: { pages: job.pageFrontier.snapshot().slice(0, 50), resources: job.resourceFrontier.snapshot().slice(0, 50) }
   };
@@ -967,10 +1009,10 @@ async function frontierWorker(job) {
     if (!job.robotsReady) { await sleep(15); continue; }
     if (job.counts.bytesScanned >= CFG.maxScanBytes) { job.stopRequested = true; job.stopReason = "scan-byte-limit"; break; }
     let type = job.pageFrontier.size ? "html" : "asset";
-    let item = type === "html" ? job.pageFrontier.takeNext(job.hostActive, CFG.perHostConcurrency, job.hostCooldowns) : job.resourceFrontier.takeNext(job.hostActive, CFG.perHostConcurrency, job.hostCooldowns);
+    let item = type === "html" ? job.pageFrontier.takeNext(job.hostActive, job.perHostConcurrency, job.hostCooldowns) : job.resourceFrontier.takeNext(job.hostActive, job.perHostConcurrency, job.hostCooldowns);
     if (!item) {
       if (job.pageFrontier.size || job.resourceFrontier.size) {
-        item = job.resourceFrontier.takeNext(job.hostActive, CFG.perHostConcurrency, job.hostCooldowns);
+        item = job.resourceFrontier.takeNext(job.hostActive, job.perHostConcurrency, job.hostCooldowns);
         type = item ? "asset" : "html";
       }
     }
@@ -992,7 +1034,7 @@ async function runCrawl(job) {
   job.status = "starting"; job.statusText = "Preparing crawl…";
   await fsp.mkdir(job.sourceDir, { recursive: true });
   addLink(job, job.root, "html", null, "root");
-  const workers = Array.from({ length: CFG.globalConcurrency }, () => frontierWorker(job));
+  const workers = Array.from({ length: job.robotCount }, () => frontierWorker(job));
   try {
     await loadRobots(job);
     if (!job.stopRequested) await loadSitemaps(job);
@@ -1154,7 +1196,7 @@ async function proxyRequest(req, res, mode) {
   if (result.tooLarge) return respondError(res, 413, "The upstream response exceeds Veyra's safety limit.", "RESPONSE_TOO_LARGE");
   const upstreamHeaders = {
     "content-type": result.contentType || (mode === "view" ? "text/html; charset=utf-8" : "application/octet-stream"),
-    "cache-control": mode === "view" ? "no-store" : "public, max-age=15",
+    "cache-control": mode === "view" ? "no-store" : "public, max-age=30",
     "x-content-type-options": "nosniff",
     "referrer-policy": "no-referrer",
     ...(result.contentRange ? { "content-range": result.contentRange } : {}),
@@ -1167,8 +1209,13 @@ async function proxyRequest(req, res, mode) {
     return res.status(200).type("html").send(challengeFallbackHtml(canonical, challenge));
   }
   let payload = result.body;
-  if (mode === "view" && (/html|xhtml|^$/.test(result.contentType.toLowerCase()))) payload = Buffer.from(rewriteHtml(payload.toString("utf8"), result.finalUrl || canonical), "utf8");
-  else if (mode === "resource" && result.contentType.toLowerCase().includes("text/css")) payload = Buffer.from(rewriteCssText(payload.toString("utf8"), result.finalUrl || canonical), "utf8");
+  if (mode === "view" && (/html|xhtml|^$/.test(result.contentType.toLowerCase()))) {
+    const originalHtml = payload.toString("utf8");
+    const pageBase = result.finalUrl || canonical;
+    payload = Buffer.from(rewriteHtml(originalHtml, pageBase), "utf8");
+    // Start resource warming before returning the page; the browser remains free to render immediately.
+    void warmProxyResources(originalHtml, pageBase).catch(() => {});
+  } else if (mode === "resource" && result.contentType.toLowerCase().includes("text/css")) payload = Buffer.from(rewriteCssText(payload.toString("utf8"), result.finalUrl || canonical), "utf8");
   else if (mode === "resource" && /javascript|ecmascript/.test(result.contentType.toLowerCase())) payload = Buffer.from(rewriteJsText(payload.toString("utf8"), result.finalUrl || canonical), "utf8");
   for (const [k,v] of Object.entries(upstreamHeaders)) if (v) res.setHeader(k, v);
   res.setHeader("X-Veyra-Canonical-URL", result.finalUrl || canonical);
@@ -1194,8 +1241,13 @@ app.post("/api/open", async (req, res) => {
     if (old && !old.done && !old.stopRequested) return res.status(202).json({ jobId: old.id, url: root, viewUrl: makeViewUrl(root) });
     const activeCount = [...jobs.values()].filter(j => !j.done && !j.stopRequested).length;
     if (activeCount >= numberEnv("MAX_ACTIVE_JOBS", 3, 1, 20)) return respondError(res, 503, "Crawler capacity is busy; try again shortly.", "CRAWLER_CAPACITY_BUSY");
-    const job = createJob(root); jobs.set(job.id, job); activeByRoot.set(root, job.id);
-    jobLog(job, "info", "Background crawl queued.");
+    const job = createJob(root);
+    const requestedRobots = Number(req.body?.robots);
+    const requestedPerHost = Number(req.body?.perHostConcurrency);
+    if (Number.isFinite(requestedRobots)) job.robotCount = Math.min(CFG.crawlerRobots, Math.max(1, Math.floor(requestedRobots)));
+    if (Number.isFinite(requestedPerHost)) job.perHostConcurrency = Math.min(CFG.perHostConcurrency, Math.max(1, Math.floor(requestedPerHost)));
+    jobs.set(job.id, job); activeByRoot.set(root, job.id);
+    jobLog(job, "info", `Background crawl queued with ${job.robotCount} crawler robots (per-host ${job.perHostConcurrency}).`);
     runCrawl(job).catch(e => { job.done = true; job.finishedAt = now(); job.status = "error"; job.statusText = e.message; jobLog(job, "error", e.stack || e.message); });
     res.status(202).json({ jobId: job.id, url: root, viewUrl: makeViewUrl(root), state: "queued" });
   } catch (e) { respondError(res, 400, e.message, "OPEN_FAILED"); }
@@ -1241,4 +1293,4 @@ if (require.main === module && CFG.processRole !== "worker") {
   serverLog("info", "SYSTEM", "PROCESS_ROLE=worker selected; no HTTP listener started.");
 }
 
-module.exports = { app, CFG, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, detectChallenge, PriorityFrontier, robotsAllowed, crawlPriority };
+module.exports = { app, CFG, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, detectChallenge, PriorityFrontier, robotsAllowed, crawlPriority, collectPageWarmUrls };

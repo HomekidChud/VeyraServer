@@ -1,7 +1,7 @@
 const assert = require("assert/strict");
 const {
   normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl,
-  rewriteHtml, rewriteCssText, rewriteJsText, detectChallenge, PriorityFrontier, crawlPriority
+  rewriteHtml, rewriteCssText, rewriteJsText, detectChallenge, PriorityFrontier, crawlPriority, collectPageWarmUrls
 } = require("./server");
 
 (async () => {
@@ -35,6 +35,9 @@ const {
   assert(sample.includes('b.png'));
   assert(sample.includes('icons.svg'));
   assert(sample.includes('data-src="/api/resource?url=https%3A%2F%2Fexample.com%2Flazy.png'));
+
+  const warm = collectPageWarmUrls('<img src="/img/a.png"><script src="/js/app.js"></script><link rel="stylesheet" href="/css/app.css"><img srcset="/img/a.png 1x, /img/b.png 2x">', 'https://example.com/page');
+  assert.deepEqual(warm.sort(), ['https://example.com/css/app.css', 'https://example.com/img/a.png', 'https://example.com/img/b.png', 'https://example.com/js/app.js'].sort());
 
   const css = rewriteCssText('@font-face{src:url(../fonts/a.woff2)}', 'https://example.com/css/app.css');
   assert(css.includes('/api/resource?url=https%3A%2F%2Fexample.com%2Ffonts%2Fa.woff2'));

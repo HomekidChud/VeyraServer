@@ -9,7 +9,8 @@ This repository preserves the existing Express architecture and expands it into 
 - Central URL resolution for navigation and resources, including query/fragment/protocol-relative/relative URL handling.
 - HTML, CSS, JavaScript, `srcset`, `imagesrcset`, lazy-load attributes, SVG references, media tracks, forms, iframe and module-resource rewriting.
 - Runtime handling for anchor navigation, `history.pushState`/`replaceState`, `fetch`, XHR, EventSource, `window.open`, simple POST forms, and service-worker isolation.
-- Bounded priority frontier with global and per-host concurrency limits, deduplication, backpressure, timeouts, retries with jitter, and temporary host backoff.
+- Bounded priority frontier with configurable crawler robots (parallel workers), per-host concurrency limits, deduplication, backpressure, timeouts, retries with jitter, and temporary host backoff.
+- Non-blocking page-resource warming: several warm robots can fetch likely-needed images, CSS, JS, fonts and media into the short-lived proxy cache while the first document is already rendering.
 - HTTP caching with ETag/Last-Modified revalidation and a small in-memory hot cache.
 - Streaming response-size protection and content-type-aware proxy limits for documents, images, media, fonts and other binary resources; HTTP Range forwarding for media.
 - Robots parsing with user-agent matching, allow/disallow precedence, Crawl-delay, sitemap indexes, and concurrent sitemap processing.
@@ -40,8 +41,9 @@ Core crawler limits:
 
 ```text
 PROCESS_ROLE=web
-MAX_GLOBAL_CONCURRENCY=12
-MAX_PER_HOST_CONCURRENCY=3
+CRAWLER_ROBOTS=12
+CRAWLER_PER_HOST_CONCURRENCY=3
+# MAX_GLOBAL_CONCURRENCY / MAX_PER_HOST_CONCURRENCY remain accepted as backwards-compatible fallbacks.
 MAX_PENDING_QUEUE=1500
 MAX_PAGES=10000
 MAX_RESOURCES=20000
@@ -58,6 +60,9 @@ DNS_TIMEOUT_MS=4000
 MAX_RETRIES=2
 CACHE_TTL_MS=10000
 MAX_JOB_AGE_MS=3600000
+PROXY_WARM_ROBOTS=8
+PROXY_WARM_LIMIT=64
+PROXY_WARM_PER_HOST=3
 ```
 
 Search:
