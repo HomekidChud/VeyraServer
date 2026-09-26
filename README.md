@@ -1,39 +1,103 @@
-# Veyra Browse — Render crawler v6
+# Veyra Browse — Render backend v8
 
-This repository contains ONLY the Node.js server. GitHub Pages hosts the Veyra
-Browse frontend.
+This repository preserves the existing Express architecture and expands it into a bounded browser/proxy/crawler/search service.
 
-### What v6 does
+## What v8 adds
 
-- Displays pages through `/api/view` while the crawl runs independently.
-- 24 parallel HTML workers + 36 CSS/JS workers.
-- Recursive same-origin crawl until the frontier is exhausted.
-- Reads robots.txt and recursively discovers sitemap files.
-- De-duplicates URLs and removes common tracking query parameters.
-- Scans up to **2 GiB per crawl job** by default.
-- Supports up to **100,000 HTML pages** and **125,000 crawled text resources** per job.
-- Indexes up to **750,000 discovered links** per job.
-- Stores HTML/CSS/JS source on disk instead of keeping all source bodies in RAM.
-- Binary assets are indexed but fetched on-demand by the browser proxy, which saves
-  crawler bandwidth and memory.
-- `/api/crawl/:id/links` supports offset/limit pagination.
-- `/api/crawl/:id/source/:resourceId` loads source from disk.
-- Includes SSRF protection against private/local network destinations.
-- Keeps the frontend configuration-free.
+- Fast `/api/view` initial page proxy independent of crawl completion.
+- Explicit canonical/original URL signalling from proxied documents; proxy URLs never become Veyra's visible browsing state.
+- Central URL resolution for navigation and resources, including query/fragment/protocol-relative/relative URL handling.
+- HTML, CSS, JavaScript, `srcset`, forms, iframe and module-resource rewriting.
+- Runtime handling for anchor navigation, `history.pushState`/`replaceState`, `fetch`, XHR, EventSource, `window.open`, simple POST forms, and service-worker isolation.
+- Bounded priority frontier with global and per-host concurrency limits, deduplication, backpressure, timeouts, retries with jitter, and temporary host backoff.
+- HTTP caching with ETag/Last-Modified revalidation and a small in-memory hot cache.
+- Streaming response-size protection and content-type filtering.
+- Robots parsing with user-agent matching, allow/disallow precedence, Crawl-delay, sitemap indexes, and concurrent sitemap processing.
+- Conservative security-challenge detection with a Veyra fallback; no challenge/CAPTCHA bypassing.
+- Veyra Search provider abstraction for local index, Brave, Bing, custom API, or no provider.
+- Bounded source storage through a filesystem abstraction designed to be replaced by object storage later.
+- Structured server logs, bounded request logs, client log ingestion, safe debug endpoints, and a backend-only `/console` dashboard.
+- `PROCESS_ROLE=web|worker|all` architecture switch. Without external queue infrastructure, the default single-process mode remains supported.
+- Safer SSRF checks with DNS validation and redirect re-validation.
 
-### Render
+## Run
 
-Use a **Web Service**.
+```text
+npm install
+npm test
+npm start
+```
 
-Build command:
-`npm install`
+The default Render service type remains **Web Service**.
 
-Start command:
-`npm start`
+Build command: `npm install`
 
-The current free Render service has 512 MB RAM and 0.1 CPU and uses an ephemeral
-filesystem; local files disappear when the service restarts or spins down.
-For truly large/long-running crawls and persistent multi-GB source storage, use a
-paid compute plan and persistent disk or an external object store. Render documents
-that persistent disks are available to paid services and that free services cannot
-attach them. See the Render docs.
+Start command: `npm start`
+
+## Render environment variables
+
+Core crawler limits:
+
+```text
+PROCESS_ROLE=web
+MAX_GLOBAL_CONCURRENCY=12
+MAX_PER_HOST_CONCURRENCY=3
+MAX_PENDING_QUEUE=1500
+MAX_PAGES=10000
+MAX_RESOURCES=20000
+MAX_LINKS=100000
+MAX_SCAN_BYTES=536870912
+MAX_TEXT_BYTES_PER_RESOURCE=2097152
+REQUEST_TIMEOUT_MS=15000
+BODY_TIMEOUT_MS=15000
+DNS_TIMEOUT_MS=4000
+MAX_RETRIES=2
+CACHE_TTL_MS=10000
+MAX_JOB_AGE_MS=3600000
+```
+
+Search:
+
+```text
+SEARCH_PROVIDER=auto
+SEARCH_API_KEY=
+SEARCH_ENDPOINT=
+BRAVE_SEARCH_API_KEY=
+BING_SEARCH_API_KEY=
+```
+
+`auto` uses a configured Brave/Bing provider when credentials exist, otherwise it uses the in-memory Veyra index if one has content, otherwise it returns an explicit unconfigured state.
+
+CORS:
+
+```text
+FRONTEND_ORIGIN=https://YOUR-FRONTEND-HOST
+```
+
+For local development, use a comma-separated list when needed.
+
+## Public API
+
+- `POST /api/open` — validate a public URL and create/reuse a background crawl job.
+- `GET /api/view?url=...` — fast page proxy. Supports HTML navigation and simple form POSTs.
+- `GET|POST /api/resource?url=...` — resource/API proxy with CSS/JS rewriting where applicable.
+- `GET /api/search?q=...&offset=0&limit=10` — normalized search results.
+- `GET /api/crawl/:id` — crawl status.
+- `POST /api/crawl/:id/stop` — request stop.
+- `GET /api/crawl/:id/resources` — captured text resources.
+- `GET /api/crawl/:id/source/:resourceId` — source text.
+- `GET /api/crawl/:id/links` — paginated discovered links.
+- `GET /api/crawl/:id/export` — crawl JSON export.
+- `GET /health` — safe health response.
+- `GET /console` — backend-only diagnostics dashboard.
+- `/api/debug/system`, `/api/debug/config`, `/api/debug/jobs`, `/api/debug/requests`, `/api/debug/logs`, `POST /api/debug/client-log` — safe diagnostics.
+
+## Security boundary
+
+The proxy and crawler intentionally do not forward Veyra browser cookies, Authorization headers, server credentials, or arbitrary client headers. Anonymous public browsing is the supported path. SSRF validation is performed before every upstream request and after redirects. DNS validation reduces rebinding risk, but a generic HTTP proxy cannot make arbitrary third-party websites fully equivalent to a native browser.
+
+Security verification/challenge pages are detected conservatively and shown through a dedicated fallback instead of being indexed as site content. Veyra does not implement challenge solving, CAPTCHA solving, stealth fingerprints, or security-provider circumvention.
+
+## Storage
+
+Sources default to `/tmp/veyra-browse-jobs` and are deleted with expired jobs. This is compatible with ephemeral Render storage. The `sourceStore` abstraction is intentionally isolated so an object-storage implementation can be added later without changing crawler/proxy APIs.
