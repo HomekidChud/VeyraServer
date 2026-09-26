@@ -102,7 +102,7 @@ const CFG = Object.freeze({
   proxyWarmConcurrency: numberEnv("PROXY_WARM_CONCURRENCY", 12, 1, 64),
   proxyWarmLimit: numberEnv("PROXY_WARM_LIMIT", 64, 1, 256),
   proxyWarmPerHost: numberEnv("PROXY_WARM_PER_HOST", 3, 1, 16),
-  userAgent: process.env.VEYRA_USER_AGENT || "VeyraBrowseCrawler/8.5 (+https://github.com/HomekidChud/VeyraServer)",
+  userAgent: process.env.VEYRA_USER_AGENT || "VeyraBrowseCrawler/8.6 (+https://github.com/HomekidChud/VeyraServer)",
   frontendOrigins: csvEnv("FRONTEND_ORIGIN", ["*"]),
   searchProvider: enumEnv("SEARCH_PROVIDER", "local", ["auto", "local", "brave", "bing", "custom", "none"]),
   searchEndpoint: process.env.SEARCH_ENDPOINT || "",
@@ -118,7 +118,12 @@ const CFG = Object.freeze({
   indexSnapshotPath: process.env.INDEX_SNAPSHOT_PATH || "/tmp/veyra-search-index.json",
   processBrowserFallback: boolEnv("BROWSER_RENDER_FALLBACK", false),
   logLevel: enumEnv("SERVER_LOG_LEVEL", "info", ["error", "warn", "info", "debug"]),
-  sortQueryParams: boolEnv("NORMALIZE_SORT_QUERY_PARAMS", false)
+  sortQueryParams: boolEnv("NORMALIZE_SORT_QUERY_PARAMS", false),
+  proxyForwardCompatHeaders: boolEnv("PROXY_FORWARD_COMPAT_HEADERS", true),
+  proxyForwardClientHints: boolEnv("PROXY_FORWARD_CLIENT_HINTS", true),
+  proxyApiBodyBytes: numberEnv("PROXY_API_BODY_BYTES", 4 * 1024 * 1024, 64 * 1024, 32 * 1024 * 1024),
+  proxyJsHeavyThreshold: numberEnv("PROXY_JS_HEAVY_THRESHOLD", 3, 1, 20),
+  proxyApiRetries: numberEnv("PROXY_API_RETRIES", 1, 0, 3)
 });
 
 const allowedOrigins = CFG.frontendOrigins.includes("*") ? true : CFG.frontendOrigins;
@@ -2020,13 +2025,80 @@ function safeDownloadFilename(url, contentType = "") {
   return base;
 }
 
+
+function sameSiteFetchMetadata(targetUrl, sourceUrl, mode) {
+  try {
+    const target = new URL(targetUrl);
+    const source = sourceUrl ? new URL(sourceUrl) : null;
+    const sameOriginRequest = !!source && source.origin === target.origin;
+    return {
+      "sec-fetch-site": source ? (sameOriginRequest ? "same-origin" : "cross-site") : "none",
+      "sec-fetch-mode": mode === "view" ? "navigate" : "cors",
+      "sec-fetch-dest": mode === "view" ? "document" : "empty"
+    };
+  } catch {
+    return {};
+  }
+}
+
+function forwardProxyBrowserHeaders(req, targetUrl, sourceUrl, mode, baseHeaders = {}) {
+  const out = { ...baseHeaders };
+  if (CFG.proxyForwardCompatHeaders) {
+    // These headers are commonly used by real web applications and public web APIs
+    // (including modern YouTube/Google client APIs). We intentionally exclude
+    // Cookie/Authorization and all server-only credentials; the Veyra session jar
+    // handles cookies separately.
+    const allow = [
+      "accept-language", "dnt", "cache-control", "pragma", "priority",
+      "x-requested-with", "x-csrf-token", "x-xsrf-token",
+      "x-goog-visitor-id", "x-goog-api-format-version", "x-goog-pageid",
+      "x-youtube-client-name", "x-youtube-client-version", "x-youtube-bootstrap-logged-in",
+      "x-origin", "x-yt-ajax-command", "x-youtube-page-cl", "x-youtube-identity-token"
+    ];
+    // x-youtube-identity-token is relayed but never stored or logged; deployments
+    // handling authenticated traffic should keep explicit session controls enabled.
+    for (const name of allow) {
+      const value = req.get(name);
+      if (value) out[name] = String(value).slice(0, 20000);
+    }
+  }
+  if (CFG.proxyForwardClientHints) {
+    for (const name of [
+      "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "sec-ch-ua-arch",
+      "sec-ch-ua-bitness", "sec-ch-ua-full-version", "sec-ch-ua-full-version-list",
+      "sec-ch-ua-model", "sec-ch-ua-platform-version"
+    ]) {
+      const value = req.get(name);
+      if (value) out[name] = String(value).slice(0, 2000);
+    }
+    Object.assign(out, sameSiteFetchMetadata(targetUrl, sourceUrl, mode));
+  }
+  return out;
+}
+
+function proxyAcceptForResource(req, mode) {
+  if (req.get("Accept")) return String(req.get("Accept")).slice(0, 1000);
+  return mode === "view"
+    ? "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+    : "*/*";
+}
+
+function looksLikeApiResource(url, accept = "", method = "GET") {
+  try {
+    const u = new URL(url);
+    return method !== "GET" || /json|graphql|youtubei|api\//i.test(`${u.pathname}${u.search}`) || /json|graphql/i.test(accept);
+  } catch {
+    return false;
+  }
+}
+
 async function proxyRequest(req, res, mode) {
   const raw = String(req.query.url || "");
   const canonical = normalizeUrl(raw);
   const download = String(req.query.download || "") === "1";
   if (!canonical) return respondError(res, 400, "Missing or invalid public HTTP(S) URL.", "INVALID_URL");
   await assertPublicUrl(canonical);
-  const accept = String(req.get("Accept") || (mode === "view" ? "text/html,application/xhtml+xml,*/*" : "*/*")).slice(0, 500);
+  const accept = proxyAcceptForResource(req, mode);
   const method = req.method.toUpperCase();
   if (!safeMethod(method)) return respondError(res, 405, "Unsupported proxy method.", "PROXY_METHOD_NOT_ALLOWED");
   const body = method === "GET" || method === "HEAD" ? undefined : (() => {
@@ -2039,11 +2111,13 @@ async function proxyRequest(req, res, mode) {
   const referrer = sourceUrl || "";
   const sourceOrigin = sourceUrl ? new URL(sourceUrl).origin : "";
   const sid = normalizeSessionId(req.query.sid);
-  const headers = { accept, "content-type": req.get("Content-Type") || undefined, ...(req.get("Range") ? { range: String(req.get("Range")).slice(0, 200) } : {}), ...(referrer ? { referer: referrer } : {}), ...(sourceOrigin ? { origin: sourceOrigin } : {}) };
-  for (const name of ["accept-language", "x-requested-with", "x-csrf-token", "x-xsrf-token", "dnt", "cache-control", "pragma"]) {
-    const value = req.get(name);
-    if (value) headers[name] = String(value).slice(0, 2000);
-  }
+  const headers = forwardProxyBrowserHeaders(req, canonical, sourceUrl, mode, {
+    accept,
+    "content-type": req.get("Content-Type") || undefined,
+    ...(req.get("Range") ? { range: String(req.get("Range")).slice(0, 200) } : {}),
+    ...(referrer ? { referer: referrer } : {}),
+    ...(sourceOrigin ? { origin: sourceOrigin } : {})
+  });
   const limitForContentType = (ct) => {
     const type = String(ct || "").toLowerCase();
     if (type.includes("text/html") || type.includes("application/xhtml") || type.includes("text/css") || /javascript|ecmascript|json|xml/.test(type)) return CFG.maxProxyTextBytes;
@@ -2053,8 +2127,10 @@ async function proxyRequest(req, res, mode) {
   };
   try {
     const browserKey = `${method} ${canonical}|ref=${referrer}|sid=${sid}|range=${headers.range || ""}|body=${body || ""}`;
-    const browserPriority = mode === "view" ? 1000 : (/css|javascript|font|svg/i.test(accept) ? 900 : /image/i.test(accept) ? 800 : 700);
-    const result = await browserScheduler.request(browserKey, () => fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, limit: CFG.maxTextBytesPerResource, limitForContentType, noCache: method !== "GET" }), { priority: browserPriority, host: hostOf(canonical), url: canonical });
+    const browserPriority = mode === "view" ? 1000 : (looksLikeApiResource(canonical, accept, method) ? 980 : (/css|javascript|font|svg/i.test(accept) ? 900 : /image/i.test(accept) ? 800 : 700));
+    const requestLimit = looksLikeApiResource(canonical, accept, method) ? CFG.proxyApiBodyBytes : CFG.maxProxyBodyBytes;
+    const retries = looksLikeApiResource(canonical, accept, method) ? CFG.proxyApiRetries : CFG.maxRetries;
+    const result = await browserScheduler.request(browserKey, () => fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, limit: requestLimit, retries, limitForContentType, noCache: method !== "GET" }), { priority: browserPriority, host: hostOf(canonical), url: canonical });
   if (result.tooLarge || (download && result.bytes > CFG.maxDownloadBytes)) return respondError(res, 413, "The upstream response exceeds Veyra's safety limit.", "RESPONSE_TOO_LARGE");
   const upstreamHeaders = {
     "content-type": result.contentType || (mode === "view" ? "text/html; charset=utf-8" : "application/octet-stream"),
@@ -2089,6 +2165,7 @@ async function proxyRequest(req, res, mode) {
   res.setHeader("X-Veyra-Canonical-URL", result.finalUrl || canonical);
   res.setHeader("X-Veyra-Session-ID", sid);
   res.setHeader("X-Veyra-Content-Type", result.contentType || "application/octet-stream");
+  res.setHeader("X-Veyra-Proxy-Mode", mode);
   if (result.etag) res.setHeader("ETag", result.etag);
   if (result.lastModified) res.setHeader("Last-Modified", result.lastModified);
   const outputStatus = (result.status >= 300 && result.status < 400) ? 200 : result.status;

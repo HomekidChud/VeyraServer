@@ -72,3 +72,7 @@ The proxy/browser lane is separate from background crawl work. Foreground docume
 The 1,000-robot logical fleet can run up to four active tasks per robot (bounded by shared network slots), and idle or lightly-loaded robots can request spare work from another robot. A target robot evaluates backlog/health/cooldown and explicitly accepts or declines the request before queued tasks are transferred. The frontier is host-aware so a large blocked queue on one origin does not force repeated scans of every queued item.
 
 The proxy endpoint `/api/download` now marks the response as an attachment and enforces `MAX_DOWNLOAD_BYTES`. The browser UI includes custom downloads (Ctrl+J), local history (Ctrl+H), inspect mode (Ctrl+Shift+I), find-in-page (Ctrl+F), print (Ctrl+P), a tools dropdown, an extension store/developer mode and a loading Stop button.
+
+### Browser/API compatibility (v8.6)
+
+The proxy forwards a bounded allow-list of public web-app compatibility headers used by modern JavaScript APIs (including YouTube/Google-style `x-youtube-*` / `x-goog-*` client headers and browser client hints). Cookies and Authorization headers remain separately controlled and are never blindly forwarded. API-like browser requests receive higher priority and a larger bounded request-body allowance.
