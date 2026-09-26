@@ -176,6 +176,146 @@ class Semaphore {
 }
 const fetchSemaphore = new Semaphore(CFG.maxActiveFetches);
 const proxyWarmSemaphore = new Semaphore(CFG.proxyWarmConcurrency);
+
+// Foreground browser scheduler. This is intentionally independent from the
+// crawler scheduler so page navigation cannot be starved by background work.
+// It provides request coalescing, priority ordering, and per-host concurrency.
+class BrowserTaskScheduler {
+  constructor(limit = 24, perHost = 8, maxQueue = 2000) {
+    this.limit = Math.max(1, Number(limit) || 1);
+    this.perHost = Math.max(1, Number(perHost) || 1);
+    this.maxQueue = Math.max(32, Number(maxQueue) || 2000);
+    this.active = 0;
+    this.queue = [];
+    this.inFlight = new Map();
+    this.hostActive = new Map();
+    this.seq = 0;
+    this.running = false;
+    this.stats = {
+      queued: 0,
+      started: 0,
+      completed: 0,
+      failed: 0,
+      deduped: 0,
+      rejected: 0
+    };
+  }
+
+  _hostCount(host) {
+    return this.hostActive.get(host) || 0;
+  }
+
+  _incHost(host) {
+    this.hostActive.set(host, this._hostCount(host) + 1);
+  }
+
+  _decHost(host) {
+    const next = Math.max(0, this._hostCount(host) - 1);
+    if (next) this.hostActive.set(host, next);
+    else this.hostActive.delete(host);
+  }
+
+  _pickNext() {
+    let bestIndex = -1;
+    let best = null;
+    for (let i = 0; i < this.queue.length; i++) {
+      const item = this.queue[i];
+      if (this._hostCount(item.host) >= this.perHost) continue;
+      if (!best || item.priority > best.priority || (item.priority === best.priority && item.seq < best.seq)) {
+        best = item;
+        bestIndex = i;
+      }
+    }
+    if (bestIndex < 0) return null;
+    this.queue.splice(bestIndex, 1);
+    return best;
+  }
+
+  _pump() {
+    if (this.running) return;
+    this.running = true;
+    try {
+      while (this.active < this.limit && this.queue.length) {
+        const item = this._pickNext();
+        if (!item) break;
+        this.active += 1;
+        this._incHost(item.host);
+        this.stats.started += 1;
+        Promise.resolve()
+          .then(() => item.task())
+          .then(result => {
+            this.stats.completed += 1;
+            item.resolve(result);
+          }, error => {
+            this.stats.failed += 1;
+            item.reject(error);
+          })
+          .finally(() => {
+            this.active = Math.max(0, this.active - 1);
+            this._decHost(item.host);
+            if (this.inFlight.get(item.key) === item.promise) this.inFlight.delete(item.key);
+            this._pump();
+          });
+      }
+    } finally {
+      this.running = false;
+    }
+  }
+
+  request(key, task, meta = {}) {
+    const k = String(key || `anon-${++this.seq}`);
+    const existing = this.inFlight.get(k);
+    if (existing) {
+      this.stats.deduped += 1;
+      return existing;
+    }
+
+    if (this.queue.length >= this.maxQueue) {
+      this.stats.rejected += 1;
+      return Promise.reject(new Error("Browser request queue is full."));
+    }
+
+    const host = String(meta.host || hostOf(meta.url || "") || "").toLowerCase() || "unknown";
+    const priority = Number.isFinite(Number(meta.priority)) ? Number(meta.priority) : 0;
+    let resolvePromise, rejectPromise;
+    const promise = new Promise((resolve, reject) => {
+      resolvePromise = resolve;
+      rejectPromise = reject;
+    });
+    const item = {
+      key: k,
+      host,
+      priority,
+      seq: ++this.seq,
+      task: typeof task === "function" ? task : async () => task,
+      resolve: resolvePromise,
+      reject: rejectPromise,
+      promise
+    };
+    this.inFlight.set(k, promise);
+    this.queue.push(item);
+    this.stats.queued = Math.max(this.stats.queued, this.queue.length);
+    this._pump();
+    return promise;
+  }
+
+  status() {
+    return {
+      active: this.active,
+      queued: this.queue.length,
+      inFlight: this.inFlight.size,
+      limit: this.limit,
+      perHost: this.perHost,
+      deduped: this.stats.deduped,
+      started: this.stats.started,
+      completed: this.stats.completed,
+      failed: this.stats.failed,
+      rejected: this.stats.rejected,
+      hostsActive: this.hostActive.size
+    };
+  }
+}
+const browserScheduler = new BrowserTaskScheduler(CFG.browserMaxActiveFetches, CFG.browserPerHostConcurrency, 2000);
 const dnsPublicCache = new Map();
 const searchIndex = new Map();
 const invertedIndex = new Map();

@@ -9,3 +9,6 @@ ok("client hints are forwarded", s.includes("sec-ch-ua") && s.includes("sec-ch-u
 ok("fetch metadata is translated", s.includes("sec-fetch-site") && s.includes("sec-fetch-mode") && s.includes("sec-fetch-dest"));
 ok("API requests receive higher priority", s.includes("looksLikeApiResource(canonical, accept, method)"));
 ok("duplicate activeWorkers increment removed", !s.includes("this.job.activeWorkers += 1;\n      this.job.activeWorkers += 1;"));
+ok("BrowserTaskScheduler class is defined", /class BrowserTaskScheduler\s*\{/.test(s));
+ok("browser scheduler instance is initialized", /const browserScheduler = new BrowserTaskScheduler\(/.test(s));
+

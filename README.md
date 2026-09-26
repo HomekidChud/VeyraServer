@@ -1,6 +1,26 @@
-# Veyra Browser backend v8.4.2
+# Veyra Browser backend v8.6.1
 
-This release keeps the existing Express + crawler/proxy architecture and splits work into three cooperating layers: the crawler robot mesh, the interactive browser request scheduler, and the proxy warm-resource pool.
+This patch release restores the foreground browser task scheduler required by `/api/view`. The v8.6.0 compatibility build referenced `BrowserTaskScheduler` without defining/instantiating it, which caused `browserScheduler is not defined` on proxied pages.
+
+## Browser request lane
+- Dedicated foreground scheduler independent from the crawler lane.
+- Priority ordering for documents/API/CSS/JS/images.
+- Identical in-flight requests are deduplicated.
+- Per-host concurrency is enforced.
+- Queue growth is bounded.
+- Scheduler failures reject only the affected request instead of crashing the Express process.
+- `/api/debug/system` exposes browser active/queued/in-flight/completion/failure metrics.
+
+The rest of the v8.6 browser/API compatibility, cooperative crawler mesh, proxy session handling, and Veyra Search architecture remain unchanged.
+
+Run:
+
+```text
+npm install
+npm test
+npm start
+```
+
 
 ## Cooperative crawler robot mesh
 - `CRAWLER_ROBOTS` is a logical fleet, up to 1,000 robots.
