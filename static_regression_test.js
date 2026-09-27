@@ -11,6 +11,10 @@ ok('browser discoveries return to crawler', s.includes('job.browserDiscoveredCou
 ok('broad page scan exists', s.includes('broad-scan') && s.includes('MAX_BROAD_SCAN_CHARS'));
 ok('GET form actions preserve target', s.includes('data-veyra-action') && s.includes('GET form submissions replace the URL query component'));
 ok('explicit engine modes exist', s.includes('OPEN_ENGINE_MODES') && s.includes('engineMode') && s.includes('crawlerEnabled'));
+ok('page accelerator is bounded and fast', s.includes('crawlerPageAccelerator') && s.includes('crawlerPageWarmMs') && s.includes('crawlerPageMaxResources'));
+ok('page accelerator skips navigation expansion', s.includes('job.pageAccelerator && u !== job.root'));
+ok('combined mode preserves crawler concurrency', s.includes('!job?.pageAccelerator && browserEngine'));
+ok('seed crawl cannot hijack page accelerator', s.includes('!CFG.crawlerPageAccelerator || old.pageAccelerator'));
 ok('proxy-only mode can skip crawler', s.includes('state: "disabled"') && s.includes('shouldStartCrawlerForEngineMode'));
 ok('proxy referrer recovery is validated', s.includes('function proxyRefererCanonical') && s.includes('proxyRefererCanonical(req)'));
 

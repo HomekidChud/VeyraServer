@@ -58,7 +58,8 @@ class SessionManager {
   touch(sid) {
     const t = this.now();
     let rec = this.sessions.get(sid);
-    if (rec && this.timeLimitMs && t - rec.createdAt >= this.timeLimitMs) {
+    const recordLimit = rec?.timeLimitMs ?? this.timeLimitMs;
+    if (rec && recordLimit && t - rec.createdAt >= recordLimit) {
       this.expire(sid, "limit");
       rec = null;
     }
@@ -87,14 +88,15 @@ class SessionManager {
   peek(sid) { return this.sessions.get(sid) || null; }
 
   // Create a brand-new session and report its deadline.
-  create(sid) {
+  create(sid, { timeLimitMs = null } = {}) {
     if (this.sessions.has(sid) || this.isTerminated(sid)) throw Object.assign(new Error("Session id already used."), { code: "SESSION_EXISTS", status: 409 });
     const rec = this.touch(sid);
+    rec.timeLimitMs = timeLimitMs == null ? this.timeLimitMs : Math.max(0, Number(timeLimitMs) || 0);
     rec.requests = 0;
     return rec;
   }
-  expiresAt(rec) { return this.timeLimitMs ? rec.createdAt + this.timeLimitMs : null; }
-  remainingMs(rec) { return this.timeLimitMs ? Math.max(0, rec.createdAt + this.timeLimitMs - this.now()) : null; }
+  expiresAt(rec) { const limit = rec?.timeLimitMs ?? this.timeLimitMs; return limit ? rec.createdAt + limit : null; }
+  remainingMs(rec) { const limit = rec?.timeLimitMs ?? this.timeLimitMs; return limit ? Math.max(0, rec.createdAt + limit - this.now()) : null; }
   isTerminated(sid) {
     const at = this.tombstones.get(sid);
     if (at == null) return false;
@@ -106,7 +108,8 @@ class SessionManager {
     if (!sid) return false;
     if (this.isTerminated(sid)) return true;
     const rec = this.sessions.get(sid);
-    if (rec && this.timeLimitMs && this.now() - rec.createdAt >= this.timeLimitMs) { this.expire(sid, "limit"); return true; }
+    const limit = rec?.timeLimitMs ?? this.timeLimitMs;
+    if (rec && limit && this.now() - rec.createdAt >= limit) { this.expire(sid, "limit"); return true; }
     return false;
   }
   tombstone(sid) {
@@ -161,8 +164,11 @@ class SessionManager {
   async sweep() {
     const t = this.now();
     let n = 0;
-    if (this.timeLimitMs) {
-      for (const [sid, rec] of [...this.sessions]) if (t - rec.createdAt >= this.timeLimitMs) { this.expire(sid, "limit"); n += 1; }
+    if (this.timeLimitMs || [...this.sessions.values()].some(rec => rec.timeLimitMs)) {
+      for (const [sid, rec] of [...this.sessions]) {
+        const limit = rec.timeLimitMs ?? this.timeLimitMs;
+        if (limit && t - rec.createdAt >= limit) { this.expire(sid, "limit"); n += 1; }
+      }
       for (const [sid, at] of this.tombstones) { if (t - at <= this.tombstoneTtlMs) break; this.tombstones.delete(sid); }
     }
     // Map is LRU-ordered, so stop at the first session that is still fresh.
@@ -198,7 +204,7 @@ class SessionManager {
       active: this.sessions.size, max: this.maxSessions, timeLimitMs: this.timeLimitMs, tombstones: this.tombstones.size, idleTtlMs: this.idleTtlMs, hardTtlMs: this.hardTtlMs,
       cookies, browserSessions: browsers, oldestSessionAgeMs: oldest,
       sleeping: this.sleeping, serverIdleMs: this.serverIdleMs, idleForMs: t - this.lastActivity, stats: { ...this.stats },
-      sessions: [...this.sessions.entries()].slice(-100).reverse().map(([id, rec]) => ({ id: id.slice(0, 8) + "…", ageMs: t - rec.createdAt, remainingMs: this.remainingMs(rec), requests: rec.requests || 0, cookies: rec.cookies.size, browserSessions: rec.browserSessions.size, userId: rec.userId ? String(rec.userId).slice(0, 8) : null }))
+      sessions: [...this.sessions.entries()].slice(-100).reverse().map(([id, rec]) => ({ id: id.slice(0, 8) + "…", ageMs: t - rec.createdAt, remainingMs: this.remainingMs(rec), timeLimitMs: rec.timeLimitMs ?? this.timeLimitMs, requests: rec.requests || 0, cookies: rec.cookies.size, browserSessions: rec.browserSessions.size, userId: rec.userId ? String(rec.userId).slice(0, 8) : null }))
     };
   }
 }

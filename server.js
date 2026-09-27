@@ -200,6 +200,12 @@ const CFG = Object.freeze({
   memoryLimitMb: MEMORY_LIMIT_MB,
   browserCrawlerConcurrency: P.browserCrawlerConcurrency,
   browserKeepWarm: boolEnv("BROWSER_KEEP_WARM", RESOURCE_PROFILE !== "free"),
+  // Page-acceleration crawler: intentionally bounded so a single page is warmed
+  // quickly instead of turning the user's short browsing session into a full-site crawl.
+  crawlerPageAccelerator: boolEnv("CRAWLER_PAGE_ACCELERATOR", true),
+  crawlerPageWarmMs: numberEnv("CRAWLER_PAGE_WARM_MS", 8000, 2000, 60000),
+  crawlerPageMaxResources: numberEnv("CRAWLER_PAGE_MAX_RESOURCES", 128, 16, 2000),
+  crawlerPageMinPerHostConcurrency: numberEnv("CRAWLER_PAGE_MIN_PER_HOST_CONCURRENCY", 4, 1, 32),
   vpnEnabled: boolEnv("VPN_ENABLED", false),
   vpnMode: enumEnv("VPN_MODE", "proxy", ["proxy", "auto", "wireguard"]),
   vpnKillSwitch: boolEnv("VPN_KILL_SWITCH", true),
@@ -222,6 +228,8 @@ const CFG = Object.freeze({
   // Debug / dev / status endpoints need an admin account or VEYRA_ADMIN_TOKEN.
   adminGate: boolEnv("VEYRA_ADMIN_GATE", true),
   sessionTimeLimitMs: numberEnv("SESSION_TIME_LIMIT_MS", 2 * 60 * 1000, 0, 7 * 24 * 60 * 60 * 1000),
+  // Administrators get a longer browsing window for diagnostics and maintenance.
+  adminSessionTimeLimitMs: 10 * 60 * 1000,
   authSecret: process.env.VEYRA_AUTH_SECRET || "",
   authDataDir: process.env.VEYRA_DATA_DIR || path.join(__dirname, "data"),
   authAllowSignup: boolEnv("VEYRA_ALLOW_SIGNUP", true),
@@ -322,7 +330,9 @@ function effectiveCrawlerConcurrency(job = null) {
   let limit = CFG.maxActiveFetches;
   // Several crawlers share the global fetch budget fairly.
   if (job) { const running = activeCrawlCount(); if (running > 1) limit = Math.max(2, Math.ceil(limit / running)); }
-  if (browserEngine && browserEngine.status().sessions > 0) limit = Math.min(limit, CFG.browserCrawlerConcurrency);
+  // Chromium has its own request scheduler; do not unnecessarily throttle the
+  // fast page-accelerator lane just because the combined mode has a browser tab.
+  if (!job?.pageAccelerator && browserEngine && browserEngine.status().sessions > 0) limit = Math.min(limit, CFG.browserCrawlerConcurrency);
   if (runtimeGuard.pressure) limit = Math.min(limit, Math.max(1, Math.floor(limit / 2)));
   if (runtimeGuard.critical) limit = 1;
   return Math.max(1, limit);
@@ -372,7 +382,7 @@ sessionManager.on("expire", (sid, rec, reason) => {
   try { vpnManager.disconnect?.(sid); } catch {}
   // Crawl jobs started by this session stop with it.
   try { for (const j of jobs.values()) if (j.sessionId === sid && !j.done && !j.stopRequested) { if (!j.started) dequeueCrawl(j); j.stopRequested = true; j.stopReason = `session-${reason}`; } } catch {}
-  if (reason === "limit") serverLog("info", "SESSION", `Session ${sid.slice(0, 8)}… reached its ${Math.round(CFG.sessionTimeLimitMs / 1000)}s time limit and was deleted.`);
+  if (reason === "limit") serverLog("info", "SESSION", `Session ${sid.slice(0, 8)}… reached its ${Math.round((rec.timeLimitMs ?? CFG.sessionTimeLimitMs) / 1000)}s time limit and was deleted.`);
   try { scriptDirsBySession.delete(sid); } catch {}
   return browserEngine.stopForProxySession?.(sid);
 });
@@ -1911,12 +1921,17 @@ function addLink(job, rawUrl, hint, source, reason = "discovered") {
   // HTML pages. Non-HTML resources can be fetched when discovered from the page.
   if (type === "html" && !internal) return true;
   if (type === "html") {
+    // Page-acceleration mode warms the current document and its assets only.
+    // Navigation links are recorded for inspection but are not expanded into
+    // a site crawl, so opening one page cannot consume the whole session window.
+    if (job.pageAccelerator && u !== job.root) return true;
     if (job.pagesDiscovered >= CFG.maxPages || !robotsAllowed(u, job.robots)) return true;
     job.pagesDiscovered += 1;
     job.pageFrontier.add({ url: u, type, source: source || null, reason, priority }, priority, key);
     return true;
   }
-  if (job.resourcesScheduled >= CFG.maxResources) return true;
+  const resourceCeiling = job.pageAccelerator ? Math.min(CFG.maxResources, CFG.crawlerPageMaxResources) : CFG.maxResources;
+  if (job.resourcesScheduled >= resourceCeiling) return true;
   job.resourcesScheduled += 1;
   const critical = ["preload", "modulepreload", "render-critical", "critical-image", "browser-network", "api"].includes(String(reason).toLowerCase()) ||
     (type === "css" && /(stylesheet)/i.test(String(reason))) ||
@@ -2172,10 +2187,11 @@ function rewriteMediaManifest(text, base, sid='') {
   return src;
 }
 
-function createJob(root) {
+function createJob(root, options = {}) {
   const id = crypto.randomUUID();
+  const pageAccelerator = !!options.pageAccelerator;
   return {
-    id, root, url: root, createdAt: now(), finishedAt: null, done: false, stopRequested: false, status: "queued", statusText: "Queued",
+    id, root, url: root, createdAt: now(), pageAccelerator, warmDeadlineAt: pageAccelerator ? Date.now() + CFG.crawlerPageWarmMs : 0, finishedAt: null, done: false, stopRequested: false, status: "queued", statusText: "Queued",
     pageFrontier: new PriorityFrontier(CFG.maxPendingQueue), resourceFrontier: new PriorityFrontier(CFG.maxPendingQueue), criticalResourceFrontier: new PriorityFrontier(Math.min(CFG.maxPendingQueue, CFG.criticalResourceBudget * 4)), visited: new Set(), discovered: new Set(), retryCounts: new Map(),
     resources: [], links: [], logs: [], logSeq: 0, sourceDir: path.join(ROOT, id), sourceFiles: 0, textBytesStored: 0,
     activeWorkers: 0, activeHtmlWorkers: 0, activeAssetWorkers: 0, processed: 0, pagesDiscovered: 0, resourcesScheduled: 0, crossOriginResources: 0, sitemapLoading: false, browserDiscoveredCount: 0, browserDiscoveredHosts: new Set(),
@@ -2192,7 +2208,7 @@ function createJob(root) {
 function publicJob(job) {
   const queued = job.criticalResourceFrontier.size + job.pageFrontier.size + job.resourceFrontier.size;
   return {
-    id: job.id, url: job.url, createdAt: job.createdAt, finishedAt: job.finishedAt, done: job.done,
+    id: job.id, url: job.url, createdAt: job.createdAt, finishedAt: job.finishedAt, done: job.done, pageAccelerator: !!job.pageAccelerator,
     status: job.status, statusText: job.statusText, stopRequested: job.stopRequested,
     scheduler: { started: !!job.started, queuePosition: job.queuePosition || 0, seed: !!job.seed, activeCrawlers: activeCrawlCount(), maxCrawlers: effectiveMaxActiveJobs(), queued: crawlQueue.length },
     maxUrls: CFG.maxResources, maxScanBytes: CFG.maxScanBytes, elapsedMs: Date.now() - Date.parse(job.createdAt),
@@ -2217,17 +2233,20 @@ function crawlLimitForContentType(contentType) {
 function hostConcurrencyLimit(job, host) {
   const ceiling = CFG.perHostConcurrency;
   if (!CFG.adaptiveHostConcurrency) return ceiling;
+  const floor = job?.pageAccelerator ? Math.min(ceiling, CFG.crawlerPageMinPerHostConcurrency) : CFG.minPerHostConcurrency;
   const state = job.hostPolicy.get(host) || { limit: ceiling, successes: 0, errors: 0 };
-  state.limit = Math.max(CFG.minPerHostConcurrency, Math.min(ceiling, Number(state.limit) || ceiling));
+  state.limit = Math.max(floor, Math.min(ceiling, Number(state.limit) || ceiling));
   job.hostPolicy.set(host, state);
   return state.limit;
 }
 function noteHostSuccess(job, host) {
   if (!CFG.adaptiveHostConcurrency) return;
+  const floor = job?.pageAccelerator ? Math.min(CFG.perHostConcurrency, CFG.crawlerPageMinPerHostConcurrency) : CFG.minPerHostConcurrency;
   const state = job.hostPolicy.get(host) || { limit: CFG.perHostConcurrency, successes: 0, errors: 0 };
   state.successes += 1;
   state.errors = Math.max(0, state.errors - 1);
   if (state.successes % CFG.hostSuccessRamp === 0) state.limit = Math.min(CFG.perHostConcurrency, state.limit + 1);
+  state.limit = Math.max(floor, state.limit);
   job.hostPolicy.set(host, state);
 }
 function noteHostError(job, host) {
@@ -2235,7 +2254,8 @@ function noteHostError(job, host) {
   const state = job.hostPolicy.get(host) || { limit: CFG.perHostConcurrency, successes: 0, errors: 0 };
   state.errors += 1;
   state.successes = 0;
-  if (state.errors % CFG.hostErrorPenalty === 0) state.limit = Math.max(CFG.minPerHostConcurrency, state.limit - 1);
+  const floor = job?.pageAccelerator ? Math.min(CFG.perHostConcurrency, CFG.crawlerPageMinPerHostConcurrency) : CFG.minPerHostConcurrency;
+  if (state.errors % CFG.hostErrorPenalty === 0) state.limit = Math.max(floor, state.limit - 1);
   job.hostPolicy.set(host, state);
 }
 
@@ -2733,6 +2753,12 @@ class CooperativeRobotPool {
   async run() {
     this.running = true;
     while (!this.job.stopRequested) {
+      if (this.job.pageAccelerator && this.job.warmDeadlineAt && Date.now() >= this.job.warmDeadlineAt) {
+        this.job.stopRequested = true;
+        this.job.stopReason = "page-warm-deadline";
+        this.event("page-warm-deadline", { warmMs: CFG.crawlerPageWarmMs });
+        break;
+      }
       if (!this.job.robotsReady) { await sleep(5); continue; }
       if (this.job.counts.bytesScanned >= CFG.maxScanBytes) { this.job.stopRequested = true; this.job.stopReason = "scan-byte-limit"; break; }
       this.assignGlobalTasks();
@@ -2764,16 +2790,20 @@ async function runCrawl(job) {
   job.robotPool = new CooperativeRobotPool(job);
   try {
     await loadRobots(job);
-    if (!job.stopRequested) {
+    if (!job.stopRequested && !job.pageAccelerator) {
       job.sitemapLoading = true;
       void loadSitemaps(job).catch(e => jobLog(job, "debug", `Sitemap pass failed: ${e.message}`)).finally(() => { job.sitemapLoading = false; });
     }
-    job.status = "crawling"; job.statusText = `Crawling with ${CFG.logicalRobots.toLocaleString()} cooperative robots…`;
+    job.status = "crawling";
+    job.statusText = job.pageAccelerator
+      ? `Fast page warm-up with ${effectiveCrawlerConcurrency(job)} network workers…`
+      : `Crawling with ${CFG.logicalRobots.toLocaleString()} cooperative robots…`;
     await job.robotPool.run();
     job.done = true; job.finishedAt = now();
     if (job.status === "challenge") job.statusText = "Security verification required; crawl stopped.";
     else if (job.stopRequested && job.stopReason === "scan-byte-limit") { job.status = "done"; job.statusText = `Scan budget reached (${bytesLabel(CFG.maxScanBytes)}).`; }
     else if (job.stopRequested && job.stopReason === "resource-limit") { job.status = "done"; job.statusText = `Resource safety limit reached (${CFG.maxResources.toLocaleString()}).`; }
+    else if (job.stopRequested && job.stopReason === "page-warm-deadline") { job.status = "done"; job.statusText = `Fast page warm-up finished after ${Math.round(CFG.crawlerPageWarmMs / 1000)}s.`; }
     else if (job.stopRequested && job.stopReason === "abandoned") { job.status = "stopped"; job.statusText = "Stopped automatically — nobody has checked this crawl for a while (CRAWL_ABANDON_MS)."; }
     else if (job.stopRequested && job.stopReason === "shutdown") { job.status = "stopped"; job.statusText = "Stopped — server is shutting down."; }
     else if (job.stopRequested) { job.status = "stopped"; job.statusText = "Stopped by user."; }
@@ -2902,7 +2932,7 @@ async function pumpIndexSeeds() {
     try {
       const root = normalizeUrl(raw); if (!root) continue;
       await assertPublicUrl(root);
-      const job = createJob(root); jobs.set(job.id, job); activeByRoot.set(root, job.id); indexSeedState.set(raw, Date.now());
+      const job = createJob(root, { pageAccelerator: CFG.crawlerPageAccelerator }); jobs.set(job.id, job); activeByRoot.set(root, job.id); indexSeedState.set(raw, Date.now());
       jobLog(job, "info", "Index seed crawl queued.", { source: "INDEX", seed: raw });
       scheduleCrawl(job, { seed: true });
     } catch (e) { indexSeedState.set(raw, Date.now()); serverLog("warn", "SEARCH", `Index seed rejected: ${raw} — ${e.message}`); }
@@ -2993,7 +3023,7 @@ app.get('/api/vpn/ip', async (req, res) => {
 function sessionInfo(sid, rec) {
   const expiresAt = sessionManager.expiresAt(rec);
   return { sessionId: sid, active: true, createdAt: new Date(rec.createdAt).toISOString(), lastUsed: new Date(rec.lastUsed).toISOString(),
-    timeLimitMs: sessionManager.timeLimitMs || null, expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null, remainingMs: sessionManager.remainingMs(rec),
+    timeLimitMs: (rec.timeLimitMs ?? sessionManager.timeLimitMs) || null, expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null, remainingMs: sessionManager.remainingMs(rec),
     idleExpiresInMs: Math.max(0, CFG.sessionIdleTtlMs - (Date.now() - rec.lastUsed)), cookies: rec.cookies.size, requests: rec.requests,
     serverTime: new Date().toISOString(), vpn: vpnManager.sessionInfo?.(sid) || null };
 }
@@ -3002,8 +3032,11 @@ app.get('/api/sessions', requireAdmin, (req, res) => res.json({ ok: true, ...ses
 app.post('/api/session', (req, res) => {
   const user = authStore.userFromRequest(req);
   const sid = crypto.randomUUID().replaceAll("-", "");
-  const rec = sessionManager.create(sid);
+  const isAdmin = !!(user && authStore.roleFor(user.email) === "admin");
+  const limit = isAdmin ? CFG.adminSessionTimeLimitMs : CFG.sessionTimeLimitMs;
+  const rec = sessionManager.create(sid, { timeLimitMs: limit });
   rec.userId = user?.id || null;
+  rec.role = isAdmin ? "admin" : "user";
   res.status(201).json({ ok: true, ...sessionInfo(sid, rec), user: user ? authStore.publicUser(user) : null });
 });
 app.get('/api/session/:sid', (req, res) => {
@@ -3064,13 +3097,21 @@ function requireAdmin(req, res, next) {
 }
 app.post('/api/auth/signup', (req, res) => { try { res.status(201).json({ ok: true, ...authStore.signup(req.body || {}, clientIp(req)) }); } catch (e) { authFail(res, e); } });
 app.post('/api/auth/login', (req, res) => { try { res.json({ ok: true, ...authStore.login(req.body || {}, clientIp(req)) }); } catch (e) { authFail(res, e); } });
-app.get('/api/auth/me', requireUser, (req, res) => res.json({ ok: true, user: authStore.publicUser(req.veyraUser), sessionTimeLimitMs: CFG.sessionTimeLimitMs }));
+app.get('/api/auth/me', requireUser, (req, res) => {
+  const user = req.veyraUser;
+  const admin = authStore.roleFor(user.email) === "admin";
+  res.json({ ok: true, user: authStore.publicUser(user), sessionTimeLimitMs: admin ? CFG.adminSessionTimeLimitMs : CFG.sessionTimeLimitMs });
+});
 app.patch('/api/auth/me', requireUser, (req, res) => { try { res.json({ ok: true, ...authStore.update(req.veyraUser, req.body || {}) }); } catch (e) { authFail(res, e); } });
 app.delete('/api/auth/me', requireUser, (req, res) => { try { authStore.remove(req.veyraUser, req.body?.password); res.json({ ok: true }); } catch (e) { authFail(res, e); } });
 app.post('/api/auth/logout', (req, res) => { const user = authStore.userFromRequest(req); if (user && req.body?.everywhere) authStore.logoutEverywhere(user); res.json({ ok: true }); });
 app.get('/api/auth/data', requireUser, (req, res) => res.json({ ok: true, data: authStore.getData(req.veyraUser), updatedAt: req.veyraUser.dataUpdatedAt || null }));
 app.put('/api/auth/data', requireUser, (req, res) => { try { res.json({ ok: true, ...authStore.setData(req.veyraUser, req.body?.data) }); } catch (e) { authFail(res, e); } });
-app.get('/api/auth/config', (req, res) => res.json({ ok: true, signupEnabled: CFG.authAllowSignup, sessionTimeLimitMs: CFG.sessionTimeLimitMs, admin: isAdminRequest(req) }));
+app.get('/api/auth/config', (req, res) => {
+  const user = authStore.userFromRequest(req);
+  const admin = !!(user && authStore.roleFor(user.email) === "admin");
+  res.json({ ok: true, signupEnabled: CFG.authAllowSignup, sessionTimeLimitMs: admin ? CFG.adminSessionTimeLimitMs : CFG.sessionTimeLimitMs, admin: admin || configEditAllowed(req) });
+});
 
 // ---------------------------------------------------------------------------
 // Config — read-only everywhere; editable in development (or with VEYRA_ADMIN_TOKEN).
@@ -3085,7 +3126,7 @@ function configEditAllowed(req) {
 function runtimeConfigSummary() {
   return {
     plan: CFG.plan, resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb,
-    crawlers: { maxActiveJobs: CFG.maxActiveJobs, effectiveMaxActiveJobs: effectiveMaxActiveJobs(), running: activeCrawlCount(), queued: crawlQueue.length, queueMax: CFG.crawlQueueMax, abandonMs: CFG.crawlAbandonMs, robotsPerCrawl: CFG.logicalRobots, maxActiveFetches: CFG.maxActiveFetches, perHostConcurrency: CFG.perHostConcurrency },
+    crawlers: { maxActiveJobs: CFG.maxActiveJobs, effectiveMaxActiveJobs: effectiveMaxActiveJobs(), running: activeCrawlCount(), queued: crawlQueue.length, queueMax: CFG.crawlQueueMax, abandonMs: CFG.crawlAbandonMs, robotsPerCrawl: CFG.logicalRobots, maxActiveFetches: CFG.maxActiveFetches, perHostConcurrency: CFG.perHostConcurrency, pageAccelerator: CFG.crawlerPageAccelerator, pageWarmMs: CFG.crawlerPageWarmMs, pageWarmMaxResources: CFG.crawlerPageMaxResources },
     workers: workerPool ? workerPool.report() : { size: 0, mode: 'inline', configured: CFG.parseWorkers },
     sessions: { maxSessions: CFG.maxProxySessions, idleTtlMs: CFG.sessionIdleTtlMs, maxAgeMs: CFG.sessionMaxAgeMs, maxCookieBytes: CFG.sessionMaxCookieBytes, serverIdleSleepMs: CFG.serverIdleSleepMs },
     browser: { maxSessions: CFG.maxBrowserSessions, maxPages: CFG.maxBrowserPages, keepWarm: CFG.browserKeepWarm, warmIdleMs: CFG.browserWarmIdleMs },
@@ -3167,7 +3208,9 @@ app.post('/api/browser/session/:id/devtools', async (req, res) => {
 app.get('/api/browser/session/:id/screenshot', async (req,res) => { try { const png=await browserEngine.screenshot(req.params.id); if(!png) return respondError(res,503,'Screenshot unavailable.','BROWSER_SCREENSHOT_ERROR'); res.setHeader('content-type','image/png'); res.setHeader('cache-control','no-store'); res.send(png); } catch(e) { respondError(res,404,e.message,e.code||'BROWSER_SCREENSHOT_ERROR'); } });
 
 // Health and debug.
-app.get("/health", (req, res) => res.json({ ok: true, service: "veyra", plan: CFG.plan, sleeping: sessionManager.sleeping, sessions: sessionManager.size, crawlers: { running: activeCrawlCount(), queued: crawlQueue.length, max: effectiveMaxActiveJobs() }, uptimeSec: Math.round(process.uptime()), activeJobs: [...jobs.values()].filter(j => !j.done).length, processRole: CFG.processRole, resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb, crawlerFetchLimit: effectiveCrawlerConcurrency(), logicalRobots: CFG.logicalRobots, vpn: vpnManager.status() }));
+const healthPayload = () => ({ ok: true, service: "veyra", plan: CFG.plan, sleeping: sessionManager.sleeping, sessions: sessionManager.size, crawlers: { running: activeCrawlCount(), queued: crawlQueue.length, max: effectiveMaxActiveJobs() }, uptimeSec: Math.round(process.uptime()), activeJobs: [...jobs.values()].filter(j => !j.done).length, processRole: CFG.processRole, resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb, crawlerFetchLimit: effectiveCrawlerConcurrency(), logicalRobots: CFG.logicalRobots, vpn: vpnManager.status() });
+app.get("/health", (req, res) => res.json(healthPayload()));
+app.get("/api/health", (req, res) => res.json(healthPayload()));
 // DevTools bridge script (loaded on demand by the injected page runtime).
 const DEVTOOLS_BRIDGE = (() => { const src = fs.readFileSync(path.join(__dirname, "devtools-bridge.js"), "utf8"); return src.slice(0, src.indexOf("if (typeof module")) + "\nwindow.installVeyraDevtools = installVeyraDevtools;\n"; })();
 const DEVTOOLS_BRIDGE_ETAG = `"${crypto.createHash("sha1").update(DEVTOOLS_BRIDGE).digest("hex").slice(0, 16)}"`;
@@ -3605,7 +3648,7 @@ app.post("/api/open", async (req, res) => {
     const engineMode = normalizeOpenEngineMode(req.body?.engineMode);
     const crawlerEnabled = shouldStartCrawlerForEngineMode(engineMode);
     const oldId = activeByRoot.get(root); const old = oldId && jobs.get(oldId);
-    if (crawlerEnabled && old && !old.done && !old.stopRequested) return res.status(202).json({ jobId: old.id, url: root, viewUrl: makeViewUrl(root), engineMode, crawlerEnabled: true });
+    if (crawlerEnabled && old && !old.done && !old.stopRequested && (!CFG.crawlerPageAccelerator || old.pageAccelerator)) return res.status(202).json({ jobId: old.id, url: root, viewUrl: makeViewUrl(root), engineMode, crawlerEnabled: true });
     const openSid = String(req.body?.sessionId || req.body?.sid || "");
     if (openSid && sessionManager.checkLimit(openSid)) return respondError(res, 410, "This Veyra session reached its time limit and was deleted.", "SESSION_EXPIRED");
     if (!crawlerEnabled) return res.status(200).json({ ok: true, jobId: null, url: root, viewUrl: makeViewUrl(root), state: "disabled", engineMode, crawlerEnabled: false });

@@ -1,5 +1,5 @@
 "use strict";
-// Accounts, 2-minute session limit, admin gating and the DevTools bridge.
+// Accounts, role-aware session limits, admin gating and the DevTools bridge.
 const assert = require("assert");
 const fs = require("fs");
 const os = require("os");
@@ -41,6 +41,24 @@ const check = async (name, fn) => { await fn(); passed += 1; console.log(`ok - $
     assert.strictEqual(other.userFromToken(token), null, "different secret");
     a.logoutEverywhere(a.userFromToken(token));
     assert.strictEqual(a.userFromToken(token), null, "sign out everywhere");
+  });
+
+  await check("session limit: admin sessions use a separate 10-minute lifetime", async () => {
+    const SessionManager = require("./session-manager").SessionManager;
+    let now = 0;
+    const m = new SessionManager({ timeLimitMs: 120000, now: () => now });
+    const admin = m.create("c".repeat(32), { timeLimitMs: 600000 });
+    assert.strictEqual(admin.timeLimitMs, 600000);
+    assert.strictEqual(m.remainingMs(admin), 600000);
+    now = 599999; assert.strictEqual(m.checkLimit(admin.id), false);
+    now = 600000; assert.strictEqual(m.checkLimit(admin.id), true);
+  });
+
+  await check("server source: admin session creation is assigned 10 minutes", async () => {
+    const src = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
+    assert.ok(src.includes("adminSessionTimeLimitMs: 10 * 60 * 1000"));
+    assert.ok(src.includes("const limit = isAdmin ? CFG.adminSessionTimeLimitMs : CFG.sessionTimeLimitMs;"));
+    assert.ok(src.includes("sessionManager.create(sid, { timeLimitMs: limit })"));
   });
 
   await check("session limit: hard 2-minute lifetime, tombstoned ids can't be reused", async () => {
