@@ -25,9 +25,6 @@ class BrowserEngine {
   }
 
   async ensureBrowser() {
-    if (this.cfg.browserBackend === 'remote') {
-      throw Object.assign(new Error('Remote browser backend is not configured for this deployment.'), { code: 'BROWSER_BACKEND_UNAVAILABLE' });
-    }
     if (this.browser) return this.browser;
     if (this.startPromise) return this.startPromise;
     this.startPromise = (async () => {
@@ -96,27 +93,17 @@ class BrowserEngine {
   }
 
   attachPage(session, page) {
-    page.on('framenavigated', frame => {
-      if (frame !== page.mainFrame()) return;
-      session.canonicalUrl = frame.url();
-      session.lastUsed = Date.now();
-      page.title().then(title => { session.title = title || session.title; }).catch(() => {});
-      this.detectVerification(page).then(challenge => {
-        session.status = challenge ? 'VERIFICATION_REQUIRED' : (session.status === 'ERROR' ? 'ERROR' : 'NORMAL');
-        session.verification = challenge;
-      }).catch(() => {});
-    });
     page.on('console', msg => this.pushConsole(session, msg.type(), msg.text()));
     page.on('pageerror', err => this.pushConsole(session, 'error', err?.message || String(err)));
     page.on('requestfailed', req => this.pushNetwork(session, {
-      type: 'requestfailed', method: req.method(), url: sanitizeUrl(req.url), error: req.failure()?.errorText || 'request failed', resourceType: req.resourceType()
+      type: 'requestfailed', method: req.method(), url: sanitizeUrl(req.url)(), error: req.failure()?.errorText || 'request failed', resourceType: req.resourceType()
     }));
     page.on('response', response => {
       const req = response.request();
       this.pushNetwork(session, { type: 'response', method: req.method(), url: sanitizeUrl(response.url()), status: response.status(), resourceType: req.resourceType(), headers: sanitizeHeaderMap(response.headers()) });
     });
     page.on('request', req => {
-      this.pushNetwork(session, { type: 'request', method: req.method(), url: sanitizeUrl(req.url), resourceType: req.resourceType() });
+      this.pushNetwork(session, { type: 'request', method: req.method(), url: sanitizeUrl(req.url)(), resourceType: req.resourceType() });
     });
     page.on('download', download => {
       const item = { id: id('dl'), filename: download.suggestedFilename(), url: sanitizeUrl(download.url()), state: 'started', startedAt: now(), path: null };
@@ -124,12 +111,6 @@ class BrowserEngine {
       download.path().then(p => { item.path = p; item.state = 'complete'; item.completedAt = now(); }).catch(e => { item.state = 'error'; item.error = e.message; });
     });
     page.on('popup', popup => {
-      const totalPages = [...this.sessions.values()].reduce((n, current) => n + current.pages.size, 0);
-      if (totalPages >= this.cfg.maxBrowserPages) {
-        popup.close().catch(() => {});
-        this.pushConsole(session, 'warn', 'Popup blocked: browser page capacity is full.');
-        return;
-      }
       session.pages.add(popup); this.attachPage(session, popup);
       this.pushConsole(session, 'info', `Popup opened: ${popup.url()}`);
     });
@@ -241,12 +222,8 @@ class BrowserEngine {
   async stopNavigation(sid) { const s=this.get(sid); await s.page.evaluate(() => window.stop()).catch(() => {}); return this.public(s); }
 
   async expireIdle() {
-    const nowMs = Date.now();
-    const idleCutoff = nowMs - this.cfg.browserIdleTimeoutMs;
-    const ttlCutoff = nowMs - this.cfg.browserSessionTtlMs;
-    for (const [sid,s] of this.sessions) {
-      if (s.lastUsed < idleCutoff || s.createdAt < ttlCutoff) await this.stop(sid).catch(() => {});
-    }
+    const cutoff = Date.now() - this.cfg.browserIdleTimeoutMs;
+    for (const [sid,s] of this.sessions) if (s.lastUsed < cutoff) await this.stop(sid).catch(() => {});
   }
 
   async screenshot(sid) { const s=this.get(sid); await this.capture(s,true); return s.screenshot; }

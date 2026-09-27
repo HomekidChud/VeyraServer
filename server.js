@@ -459,9 +459,46 @@ function normalizedSearch(url) {
   u.hash = "";
   return u.href;
 }
+function queryStringValue(value) {
+  if (Array.isArray(value)) return value.map(x => String(x || "").trim()).find(Boolean) || "";
+  return String(value || "").trim();
+}
+function firstValidUrl(values, base) {
+  const list = Array.isArray(values) ? values : [values];
+  for (const value of list) {
+    const candidate = queryStringValue(value);
+    if (!candidate) continue;
+    const normalized = normalizeUrl(candidate, base);
+    if (normalized) return normalized;
+  }
+  return null;
+}
+function unwrapProxyTarget(value, base) {
+  let raw = queryStringValue(value);
+  if (!raw) return "";
+  for (let i = 0; i < 3; i++) {
+    try {
+      const probe = new URL(raw, base || undefined);
+      const isProxy = probe.pathname === "/api/view" || probe.pathname === "/api/resource" || probe.pathname === "/api/download";
+      if (isProxy) {
+        const embedded = probe.searchParams.get("url") || probe.searchParams.get("target") || probe.searchParams.get("u");
+        if (embedded) { raw = embedded; continue; }
+        return "";
+      }
+    } catch {}
+    try {
+      const decoded = decodeURIComponent(raw);
+      if (decoded !== raw && /^https?:\/\//i.test(decoded)) { raw = decoded; continue; }
+    } catch {}
+    break;
+  }
+  return raw;
+}
 function normalizeUrl(value, base) {
   try {
-    const u = new URL(String(value || ""), base);
+    const raw = unwrapProxyTarget(value, base);
+    if (!raw) return null;
+    const u = new URL(raw, base);
     if (!['http:', 'https:'].includes(u.protocol)) return null;
     return normalizedSearch(u.href);
   } catch { return null; }
@@ -1051,14 +1088,29 @@ function injectRuntime(html, original, sid = "") {
   let virtualUrl=CANONICAL;
   window.__VEYRA_PAGE_URL__=CANONICAL;
   window.__VEYRA_PROXY__=true;
-  function unwrap(v){try{const raw=String(v||'');if(raw==='/api/view'||raw==='/api/resource')return virtualUrl;const u=new URL(raw,location.origin);if((u.pathname==='/api/view'||u.pathname==='/api/resource')&&u.searchParams.get('url'))return u.searchParams.get('url');return raw}catch{return String(v||'')}}
+  function unwrap(v){
+    let raw=String(v||'');
+    for(let i=0;i<3;i++){
+      try{
+        const u=new URL(raw,location.origin);
+        if((u.pathname==='/api/view'||u.pathname==='/api/resource'||u.pathname==='/api/download')){
+          const embedded=u.searchParams.get('url')||u.searchParams.get('target')||u.searchParams.get('u');
+          if(embedded){raw=embedded;continue;}
+          return '';
+        }
+      }catch{}
+      try{const decoded=decodeURIComponent(raw);if(decoded!==raw&&/^https?:\/\//i.test(decoded)){raw=decoded;continue;}}catch{}
+      break;
+    }
+    return raw;
+  }
   function resolve(v){try{return new URL(unwrap(typeof v==='string'?v:v&&v.url||''),virtualUrl).href}catch{return String(v||'')}}
   function shouldProxy(v){try{const u=new URL(unwrap(v));return /^https?:$/.test(u.protocol)}catch{return false}}
   function proxy(kind,u){const prefix=API_ORIGIN || location.origin;const base=prefix+(kind==='view'?'/api/view?url=':'/api/resource?url=')+encodeURIComponent(u);const from=encodeURIComponent(new URL(virtualUrl).href);return kind==='view'?base+'&sid='+encodeURIComponent(SESSION_ID):base+'&from='+from+'&sid='+encodeURIComponent(SESSION_ID)}
   function topPost(msg){try{window.top.postMessage(msg,'*')}catch{}}
   function emit(source,url,extra){if(!url)return;topPost({type:'veyra:navigate',url,source,sessionId:SESSION_ID,...extra})}
   function net(method,url,status,ms,ok){topPost({type:'veyra:browser-network',sessionId:SESSION_ID,pageUrl:virtualUrl,method:String(method||'GET').toUpperCase(),url:String(url||''),status:status||0,duration:Math.round(ms||0),ok:!!ok})}
-  function canonicalizeMaybeProxy(href){try{const u=new URL(unwrap(href),virtualUrl);if(!/^https?:$/.test(u.protocol))return null;return u.href}catch{return null}}
+  function canonicalizeMaybeProxy(href){try{const raw=unwrap(href);if(!raw)return null;const u=new URL(raw,virtualUrl);if(!/^https?:$/.test(u.protocol))return null;return u.href}catch{return null}}
   function proxyHistory(method){const native=history[method].bind(history);return function(state,title,url){
     let next=virtualUrl;try{if(url!=null)next=new URL(unwrap(String(url)),virtualUrl).href}catch{}
     virtualUrl=next;window.__VEYRA_PAGE_URL__=next;
@@ -1066,6 +1118,11 @@ function injectRuntime(html, original, sid = "") {
     emit('history.'+method,next);return undefined;
   }}
   try{history.pushState=proxyHistory('pushState');history.replaceState=proxyHistory('replaceState')}catch{}
+  try{
+    const LP=Location&&Location.prototype;
+    if(LP&&LP.assign){const nativeAssign=LP.assign;LP.assign=function(next){const u=canonicalizeMaybeProxy(next);if(u){emit('location.assign',u);return;}return nativeAssign.call(this,next)}}
+    if(LP&&LP.replace){const nativeReplace=LP.replace;LP.replace=function(next){const u=canonicalizeMaybeProxy(next);if(u){emit('location.replace',u);return;}return nativeReplace.call(this,next)}}
+  }catch{}
   try{navigator.serviceWorker&&navigator.serviceWorker.register&&(navigator.serviceWorker.register=()=>Promise.reject(new Error('Service workers are disabled inside the Veyra proxy.')))}catch{}
   const nativeFetch=window.fetch;if(nativeFetch)window.fetch=function(input,init){
     const started=performance.now(); const method=String(init&&init.method||input&&input.method||'GET').toUpperCase(); const original=String(input&&input.url||input||''); let target='';
@@ -1075,8 +1132,10 @@ function injectRuntime(html, original, sid = "") {
   try{const nativeXhrOpen=XMLHttpRequest.prototype.open,nativeXhrSend=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(method,url,...rest){this.__veyraMethod=method;this.__veyraTarget=resolve(url);this.__veyraStarted=0;return nativeXhrOpen.call(this,method,shouldProxy(this.__veyraTarget)?proxy('resource',this.__veyraTarget):url,...rest)};XMLHttpRequest.prototype.send=function(body){this.__veyraStarted=performance.now();this.addEventListener('loadend',()=>net(this.__veyraMethod||'GET',this.__veyraTarget||'',this.status,performance.now()-this.__veyraStarted,this.status>=200&&this.status<400),{once:true});return nativeXhrSend.call(this,body)}}catch{}
   try{const NativeEventSource=window.EventSource;if(NativeEventSource)window.EventSource=function(url,options){const target=resolve(url);return new NativeEventSource(shouldProxy(target)?proxy('resource',target):url,options)}}catch{}
   try{const nativeBeacon=navigator.sendBeacon&&navigator.sendBeacon.bind(navigator);if(nativeBeacon)navigator.sendBeacon=function(url,data){try{const target=resolve(url);if(shouldProxy(target)){let body=data;let type='text/plain;charset=UTF-8';if(typeof Blob!=='undefined'&&data instanceof Blob)type=data.type||type;void fetch(proxy('resource',target),{method:'POST',body,keepalive:true,headers:{'content-type':type}});return true}}catch{}return nativeBeacon(url,data)}}catch{}
-  try{const nativeFormSubmit=HTMLFormElement.prototype.submit;HTMLFormElement.prototype.submit=function(){try{const method=String(this.method||'get').toUpperCase();const target=canonicalizeMaybeProxy(this.getAttribute('action')||virtualUrl);if(target&&method==='GET'){const fd=new FormData(this);const u=new URL(target);for(const [k,v] of fd.entries())if(typeof v==='string')u.searchParams.append(k,v);emit('form.submit',u.href);return;}if(target&&method==='POST'){const fd=new FormData(this);const entries=[];for(const [k,v] of fd.entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});return;}}catch{}return nativeFormSubmit.call(this)}}catch{}
-  try{const nativeRequestSubmit=HTMLFormElement.prototype.requestSubmit;if(nativeRequestSubmit)HTMLFormElement.prototype.requestSubmit=function(submitter){try{const target=canonicalizeMaybeProxy(this.getAttribute('action')||virtualUrl);if(target){const method=String(this.method||'get').toUpperCase();const fd=new FormData(this,submitter);if(method==='GET'){const u=new URL(target);for(const [k,v] of fd.entries())if(typeof v==='string')u.searchParams.append(k,v);emit('form.requestSubmit',u.href);return;}if(method==='POST'){const entries=[];for(const [k,v] of fd.entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});return;}}catch{}return nativeRequestSubmit.call(this,submitter)}}catch{}
+  function submitTarget(form,submitter){try{return canonicalizeMaybeProxy((submitter&&submitter.getAttribute('formaction'))||form.getAttribute('action')||virtualUrl)}catch{return null}}
+  function emitGetForm(form,submitter,source){const target=submitTarget(form,submitter);if(!target)return false;const method=String(form.method||'get').toUpperCase();if(method!=='GET')return false;const fd=new FormData(form,submitter||undefined);const u=new URL(target);for(const [k,v] of fd.entries())if(typeof v==='string')u.searchParams.append(k,v);emit(source||'form.submit',u.href);return true}
+  try{const nativeFormSubmit=HTMLFormElement.prototype.submit;HTMLFormElement.prototype.submit=function(){try{if(emitGetForm(this,null,'form.submit'))return;const target=submitTarget(this,null);const method=String(this.method||'get').toUpperCase();if(target&&method==='POST'){const fd=new FormData(this);const entries=[];for(const [k,v] of fd.entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});return;}}catch{}return nativeFormSubmit.call(this)}}catch{}
+  try{const nativeRequestSubmit=HTMLFormElement.prototype.requestSubmit;if(nativeRequestSubmit)HTMLFormElement.prototype.requestSubmit=function(submitter){try{if(emitGetForm(this,submitter,'form.requestSubmit'))return;const target=submitTarget(this,submitter);const method=String(this.method||'get').toUpperCase();if(target&&method==='POST'){const entries=[];for(const [k,v] of new FormData(this,submitter).entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});return;}}catch{}return nativeRequestSubmit.call(this,submitter)}}catch{}
   try{const nativeOpen=window.open;window.open=function(url,target,features){const u=canonicalizeMaybeProxy(url);if(u){topPost({type:'veyra:open',url:u,sessionId:SESSION_ID});return null}return nativeOpen.call(window,url,target,features)}}catch{}
   try{['log','info','debug','warn','error'].forEach(level=>{const native=console[level].bind(console);console[level]=(...args)=>{native(...args);topPost({type:'veyra:page-console',level,sessionId:SESSION_ID,message:args.map(x=>typeof x==='string'?x:(()=>{try{return JSON.stringify(x)}catch{return String(x)}})()).join(' '),pageUrl:virtualUrl})}})}catch{}
   window.addEventListener('error',e=>topPost({type:'veyra:page-error',level:'error',sessionId:SESSION_ID,message:e.message||'Resource error',url:e.filename||'',line:e.lineno||null,column:e.colno||null,stack:e.error&&e.error.stack||'',pageUrl:virtualUrl}),true);
@@ -1095,16 +1154,17 @@ function injectRuntime(html, original, sid = "") {
     if(String(a.getAttribute('target')||'').toLowerCase()==='_blank')topPost({type:'veyra:open',url:u,sessionId:SESSION_ID});else emit('document-navigation',u);
   },true);
   document.addEventListener('submit',function(ev){
-    const form=ev.target;if(!form||!form.action)return;const method=String(form.method||'get').toUpperCase();
-    const target=canonicalizeMaybeProxy(form.getAttribute('action')||virtualUrl);if(!target)return;
+    const form=ev.target;if(!form)return;const method=String(form.method||'get').toUpperCase();
+    const target=submitTarget(form,ev.submitter);if(!target)return;
     if(method==='GET'){
-      ev.preventDefault();const fd=new FormData(form);const u=new URL(target);for(const [k,v] of fd.entries()){if(typeof v==='string')u.searchParams.append(k,v)}emit('document-navigation',u.href);return;
+      ev.preventDefault();const fd=new FormData(form,ev.submitter||undefined);const u=new URL(target);for(const [k,v] of fd.entries()){if(typeof v==='string')u.searchParams.append(k,v)}emit('document-navigation',u.href);return;
     }
     if(method==='POST'){
-      const fd=new FormData(form);const entries=[];for(const [k,v] of fd.entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}
+      const fd=new FormData(form,ev.submitter||undefined);const entries=[];for(const [k,v] of fd.entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}
       ev.preventDefault();topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});
     }
   },true);
+  document.addEventListener('click',function(ev){try{const el=ev.target&&ev.target.closest?ev.target.closest('button[type=submit],input[type=submit],button[formaction]'):null;if(!el||el.disabled)return;const form=el.form;if(!form)return;if(String(form.method||'get').toUpperCase()!=='GET')return;if(submitTarget(form,el)){ev.preventDefault();ev.stopPropagation();emitGetForm(form,el,'form.click')}}catch{}},true);
   window.addEventListener('load',function(){
     try{const icon=document.querySelector('link[rel~=' + JSON.stringify('icon') + '],link[rel~=' + JSON.stringify('shortcut icon') + ']');let favicon=icon&&icon.getAttribute('href')||'';try{if(favicon.startsWith('/api/resource?url='))favicon=new URLSearchParams(favicon.split('?')[1]).get('url')||favicon;else favicon=new URL(favicon,virtualUrl).href}catch{}const title=document.title||new URL(virtualUrl).hostname;emit('document-navigation',virtualUrl,{title,favicon})}catch{emit('document-navigation',virtualUrl)}
   });
@@ -2112,22 +2172,13 @@ app.post('/api/browser/session', async (req, res) => {
   } catch (e) { respondError(res, e.code === 'BROWSER_CAPACITY' ? 503 : 502, e.message, e.code || 'BROWSER_ENGINE_ERROR'); }
 });
 app.get('/api/browser/session/:id', (req, res) => { try { res.json({ ok:true, session: browserEngine.public(browserEngine.get(req.params.id)) }); } catch(e) { respondError(res,404,e.message,e.code||'BROWSER_SESSION_NOT_FOUND'); } });
-app.post('/api/browser/session/:id/navigate', async (req,res) => { try { const s=browserEngine.get(req.params.id); const session=await browserEngine.navigateSession(s, normalizeUrl(String(req.body?.url||''))); res.json({ok:true,session}); } catch(e) { respondError(res,502,e.message,e.code||'BROWSER_NAVIGATION_ERROR'); } });
+app.post('/api/browser/session/:id/navigate', async (req,res) => { try { const s=browserEngine.get(req.params.id); const target = firstValidUrl([req.body?.url, req.body?.target, req.body?.u], s?.page?.url?.() || undefined); if (!target) return respondError(res,400,'Missing or invalid public HTTP(S) URL.','INVALID_URL'); const session=await browserEngine.navigateSession(s, target); res.json({ok:true,session}); } catch(e) { respondError(res,e.code==='INVALID_URL'?400:502,e.message,e.code||'BROWSER_NAVIGATION_ERROR'); } });
 app.post('/api/browser/session/:id/input', async (req,res) => { try { const session=await browserEngine.input(req.params.id, req.body || {}); res.json({ok:true,session}); } catch(e) { respondError(res,400,e.message,'BROWSER_INPUT_ERROR'); } });
 app.post('/api/browser/session/:id/history', async (req,res) => { try { const session=await browserEngine.history(req.params.id, String(req.body?.direction||'reload')); res.json({ok:true,session}); } catch(e) { respondError(res,400,e.message,'BROWSER_HISTORY_ERROR'); } });
 app.post('/api/browser/session/:id/inspect', async (req,res) => { try { const data=await browserEngine.inspect(req.params.id, req.body?.x, req.body?.y); res.json({ok:true,data}); } catch(e) { respondError(res,400,e.message,'BROWSER_INSPECT_ERROR'); } });
 app.post('/api/browser/session/:id/stop', async (req,res) => { try { const session=await browserEngine.stopNavigation(req.params.id); res.json({ok:true,session}); } catch(e) { respondError(res,400,e.message,'BROWSER_STOP_ERROR'); } });
 app.delete('/api/browser/session/:id', async (req,res) => { try { await browserEngine.stop(req.params.id); res.json({ok:true}); } catch(e) { respondError(res,404,e.message,e.code||'BROWSER_SESSION_NOT_FOUND'); } });
 app.get('/api/browser/session/:id/screenshot', async (req,res) => { try { const png=await browserEngine.screenshot(req.params.id); if(!png) return respondError(res,503,'Screenshot unavailable.','BROWSER_SCREENSHOT_ERROR'); res.setHeader('content-type','image/png'); res.setHeader('cache-control','no-store'); res.send(png); } catch(e) { respondError(res,404,e.message,e.code||'BROWSER_SCREENSHOT_ERROR'); } });
-app.get('/api/browser/session/:id/download/:downloadId', (req,res) => {
-  try {
-    const session = browserEngine.get(req.params.id);
-    const item = session.downloads.find(x => x.id === req.params.downloadId);
-    if (!item || item.state !== 'complete' || !item.path) return respondError(res,404,'Browser download is not ready.','BROWSER_DOWNLOAD_NOT_READY');
-    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(item.filename || 'download')}`);
-    res.sendFile(item.path, err => { if (err && !res.headersSent) respondError(res,404,'Browser download file is unavailable.','BROWSER_DOWNLOAD_GONE'); });
-  } catch(e) { respondError(res,404,e.message,e.code||'BROWSER_DOWNLOAD_ERROR'); }
-});
 
 // Health and debug.
 app.get("/health", (req, res) => res.json({ ok: true, service: "veyra", uptimeSec: Math.round(process.uptime()), activeJobs: [...jobs.values()].filter(j => !j.done).length, processRole: CFG.processRole }));
@@ -2305,8 +2356,7 @@ function looksLikeApiResource(url, accept = "", method = "GET") {
 }
 
 async function proxyRequest(req, res, mode) {
-  const raw = String(req.query.url || "");
-  const canonical = normalizeUrl(raw);
+  const canonical = firstValidUrl([req.query.url, req.query.target, req.query.u], req.get('Origin') || undefined);
   const download = String(req.query.download || "") === "1";
   if (!canonical) return respondError(res, 400, "Missing or invalid public HTTP(S) URL.", "INVALID_URL");
   await assertPublicUrl(canonical);

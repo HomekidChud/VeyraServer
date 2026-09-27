@@ -97,7 +97,7 @@ The proxy endpoint `/api/download` now marks the response as an attachment and e
 
 The proxy forwards a bounded allow-list of public web-app compatibility headers used by modern JavaScript APIs (including YouTube/Google-style `x-youtube-*` / `x-goog-*` client headers and browser client hints). Cookies and Authorization headers remain separately controlled and are never blindly forwarded. API-like browser requests receive higher priority and a larger bounded request-body allowance.
 
-## v8.7.1 hybrid browser engine
+## v8.7 hybrid browser engine
 
 Veyra now has three separate foreground/background modes:
 
@@ -117,17 +117,10 @@ The current static frontend uses a bounded remote-browser viewport backed by Chr
 
 Security verification is user-assisted only. Veyra detects verification pages, keeps the same browser context alive, shows the actual rendered page, and lets the user interact. It does not solve, bypass, spoof, or automate anti-bot challenges.
 
-## v8.7.1 corrections
-- Fixed browser request/request-failure telemetry URL sanitization callbacks.
-- Enforced browser page capacity for popups.
-- Enforced browser session TTL as well as idle expiration.
-- Added main-frame navigation telemetry for SPA navigations.
-- Added a browser-download retrieval route.
-- Explicitly reports an unavailable remote browser backend instead of silently using the local implementation.
+## v8.7.2 Google/search navigation hardening
 
-## Render browser-engine build
-For a local Chromium backend, the Render build command must install the Playwright browser binary in addition to npm dependencies:
-
-`npm install && npx playwright install chromium`
-
-The start command remains `npm start`. If Chromium cannot launch, the API reports `BROWSER_ENGINE_UNAVAILABLE` and the frontend can fall back to `FAST_PROXY`.
+- `/api/view`, `/api/resource`, and browser navigation now unwrap nested/encoded Veyra proxy URLs before validation.
+- Duplicate query parameters are handled by selecting a non-empty target value.
+- Proxy runtime form submission honors `formaction`/submitter values and normalizes nested proxy targets.
+- Proxy runtime now captures `location.assign()` / `location.replace()` navigation where the browser permits patching those methods.
+- Google-style GET search forms are routed through the canonical navigation protocol instead of relying on the iframe's proxy URL.

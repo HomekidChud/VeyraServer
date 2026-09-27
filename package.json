@@ -1,12 +1,13 @@
 {
   "name": "veyra-browse-crawler",
-  "version": "8.7.1",
+  "version": "8.7.2",
   "private": true,
   "description": "Veyra Browser API, high-throughput crawler, page proxy, search service, and diagnostics.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node test.js"
+    "test": "node test.js",
+    "test:urls": "node url_regression_test.js"
   },
   "engines": {
     "node": ">=20"
