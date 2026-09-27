@@ -152,7 +152,13 @@ const CFG = Object.freeze({
   proxyForwardClientHints: boolEnv("PROXY_FORWARD_CLIENT_HINTS", true),
   proxyApiBodyBytes: numberEnv("PROXY_API_BODY_BYTES", 4 * 1024 * 1024, 64 * 1024, 32 * 1024 * 1024),
   proxyJsHeavyThreshold: numberEnv("PROXY_JS_HEAVY_THRESHOLD", 3, 1, 20),
-  proxyApiRetries: numberEnv("PROXY_API_RETRIES", 1, 0, 3)
+  proxyApiRetries: numberEnv("PROXY_API_RETRIES", 1, 0, 3),
+  filterTemplateUrls: boolEnv("FILTER_TEMPLATE_URLS", true),
+  maxDiscoveredUrlLength: numberEnv("MAX_DISCOVERED_URL_LENGTH", 4096, 256, 20000),
+  maxCrossOriginResources: numberEnv("MAX_CROSS_ORIGIN_RESOURCES", 750, 0, 10000),
+  skipLowValueThirdParty: boolEnv("SKIP_LOW_VALUE_THIRD_PARTY", true),
+  browserAutoInstall: boolEnv("BROWSER_AUTO_INSTALL", true),
+  playwrightBrowsersPath: process.env.PLAYWRIGHT_BROWSERS_PATH || "0"
 });
 
 const allowedOrigins = CFG.frontendOrigins.includes("*") ? true : CFG.frontendOrigins;
@@ -1513,10 +1519,64 @@ function searchIndexStats() {
   return { documents: searchIndex.size, terms: invertedIndex.size, domains: domains.size, latestIndexedAt: latest?.indexedAt || null, seeds: CFG.indexSeeds.length, provider: "veyra-index" };
 }
 
+
+function decodeUrlEntities(value) {
+  return String(value || "")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">");
+}
+function sanitizeDiscoveredUrl(rawUrl, base) {
+  let raw = decodeUrlEntities(String(rawUrl ?? "").trim());
+  if (!raw) return null;
+  raw = raw.replace(/^[\"'`([{]+/, "").replace(/[\"'`\])},;]+$/, "").trim();
+  if (!raw || raw.length > CFG.maxDiscoveredUrlLength) return null;
+  if (/\s/.test(raw)) return null;
+  if (CFG.filterTemplateUrls && /(?:\$\{|\{\{|\}\}|<%|%>|\{[^}]*\}|\bundefined\b|\bnull\b)/i.test(raw)) return null;
+  if (/^(?:javascript|data|blob|mailto|tel|about):/i.test(raw)) return null;
+  const u = normalizeUrl(raw, base);
+  if (!u) return null;
+  try {
+    const parsed = new URL(u);
+    const host = parsed.hostname.toLowerCase();
+    if (/\.(?:corp\.goog|corp\.google|internal|local)$/i.test(host)) return null;
+    if (host === "localhost" || host === "metadata.google.internal") return null;
+    if (/^(?:0|127\.)/.test(host)) return null;
+    if (parsed.username || parsed.password) return null;
+    // Drop obviously empty/template query values that are common in analytics snippets.
+    if (CFG.filterTemplateUrls) {
+      const href = parsed.href;
+      if (/[?&](?:id|q|url|query|callback|next|redirect)=(?:$|undefined|null)$/i.test(href)) return null;
+    }
+    return parsed.href;
+  } catch { return null; }
+}
+function lowValueThirdPartyHost(url) {
+  if (!CFG.skipLowValueThirdParty) return false;
+  const host = hostOf(url).replace(/^www\./, "");
+  return /^(?:googletagmanager\.com|google-analytics\.com|doubleclick\.net|connect\.facebook\.net|static\.hotjar\.com|segment\.io)$/.test(host);
+}
+
 function addLink(job, rawUrl, hint, source, reason = "discovered") {
-  const u = normalizeUrl(rawUrl, source || job.root); if (!u) return false;
+  const u = sanitizeDiscoveredUrl(rawUrl, source || job.root); if (!u) return false;
   const type = typeFor(u, hint);
   const internal = crawlOriginAllowed(job, u);
+  if (!internal && lowValueThirdPartyHost(u)) {
+    const existing = job.links.find(x => x.url === u);
+    if (existing) return true;
+    // Keep these links available to the Links inspector, but do not spend crawler
+    // slots downloading analytics/tracking infrastructure during indexing.
+    const record = { url: u, path: pathOf(u), type, source: source || job.root, internal: false, captured: false, requestedUrl: u, redirectChain: [], priority: -100, reason: "third-party-skipped" };
+    if (job.links.length < CFG.maxLinks) { job.links.push(record); job.counts.links += 1; }
+    return true;
+  }
+  if (!internal && type !== "html") {
+    job.crossOriginResources = job.crossOriginResources || 0;
+    if (job.crossOriginResources >= CFG.maxCrossOriginResources) return true;
+    job.crossOriginResources += 1;
+  }
   const key = linkKey(type, u);
   if (job.discovered.has(key) || job.links.length >= CFG.maxLinks) return false;
   job.discovered.add(key);
@@ -1795,7 +1855,7 @@ function createJob(root) {
     id, root, url: root, createdAt: now(), finishedAt: null, done: false, stopRequested: false, status: "queued", statusText: "Queued",
     pageFrontier: new PriorityFrontier(CFG.maxPendingQueue), resourceFrontier: new PriorityFrontier(CFG.maxPendingQueue), criticalResourceFrontier: new PriorityFrontier(Math.min(CFG.maxPendingQueue, CFG.criticalResourceBudget * 4)), visited: new Set(), discovered: new Set(), retryCounts: new Map(),
     resources: [], links: [], logs: [], logSeq: 0, sourceDir: path.join(ROOT, id), sourceFiles: 0, textBytesStored: 0,
-    activeWorkers: 0, activeHtmlWorkers: 0, activeAssetWorkers: 0, processed: 0, pagesDiscovered: 0, resourcesScheduled: 0, sitemapLoading: false, browserDiscoveredCount: 0, browserDiscoveredHosts: new Set(),
+    activeWorkers: 0, activeHtmlWorkers: 0, activeAssetWorkers: 0, processed: 0, pagesDiscovered: 0, resourcesScheduled: 0, crossOriginResources: 0, sitemapLoading: false, browserDiscoveredCount: 0, browserDiscoveredHosts: new Set(),
     crawlOrigins: new Set([new URL(root).origin]),
     hostPolicy: new Map(),
     robots: null, robotsReady: false, sitemaps: new Set(), challengeHosts: new Set(), hostActive: new Map(), hostCooldowns: new Map(), hostLastRequested: new Map(), hostFailures: new Map(), hostDelayMs: 0, stopReason: null,
@@ -1814,7 +1874,7 @@ function publicJob(job) {
     maxUrls: CFG.maxResources, maxScanBytes: CFG.maxScanBytes, elapsedMs: Date.now() - Date.parse(job.createdAt),
     counts: { ...job.counts, processed: job.processed, queued, active: job.activeWorkers },
     workers: { html: { active: job.activeHtmlWorkers, max: CFG.maxActiveFetches, queued: job.pageFrontier.size }, asset: { active: job.activeAssetWorkers, max: CFG.maxActiveFetches, queued: job.resourceFrontier.size }, logicalRobots: job.robotFleet || CFG.logicalRobots, networkSlots: CFG.maxActiveFetches, availableNetworkSlots: fetchSemaphore.available, queuedNetworkWaiters: fetchSemaphore.queued },
-    limits: { globalConcurrency: CFG.maxActiveFetches, crawlerRobots: CFG.logicalRobots, logicalRobots: CFG.logicalRobots, maxActiveFetches: CFG.maxActiveFetches, perHostConcurrency: CFG.perHostConcurrency, maxPages: CFG.maxPages, maxResources: CFG.maxResources, maxLinks: CFG.maxLinks, maxScanBytes: CFG.maxScanBytes },
+    limits: { globalConcurrency: CFG.maxActiveFetches, crawlerRobots: CFG.logicalRobots, logicalRobots: CFG.logicalRobots, maxActiveFetches: CFG.maxActiveFetches, perHostConcurrency: CFG.perHostConcurrency, maxPages: CFG.maxPages, maxResources: CFG.maxResources, maxLinks: CFG.maxLinks, maxScanBytes: CFG.maxScanBytes, maxCrossOriginResources: CFG.maxCrossOriginResources },
     searchIndex: searchIndexStats(),
     robotsLoaded: job.robotsReady, sitemapsFound: job.sitemaps.size, sourceFiles: job.sourceFiles, textBytesStored: job.textBytesStored,
     resourceCount: job.resources.length, linkCount: job.links.length, browserDiscovered: job.browserDiscoveredCount || 0, browserDiscoveredHosts: job.browserDiscoveredHosts?.size || 0, criticalQueue: job.criticalResourceFrontier.size, logs: job.logs.slice(-120),
@@ -1892,7 +1952,8 @@ async function processItem(job, item) {
     if (!r.ok) {
       job.counts.errors += 1;
       if ([400,401,403,404,405,410,422].includes(r.status)) {
-        jobLog(job, "warn", `HTTP ${r.status}; page not indexed: ${item.url}`);
+        const resourceLike = item.type !== "html";
+        jobLog(job, resourceLike ? "debug" : "warn", resourceLike ? `HTTP ${r.status}; resource unavailable: ${item.url}` : `HTTP ${r.status}; page not indexed: ${item.url}`, { type: item.type, source: item.source || null });
         return;
       }
       const httpError = new Error(`HTTP ${r.status}`); httpError.status = r.status; throw httpError;
@@ -1959,7 +2020,8 @@ async function processItem(job, item) {
         jobLog(job, "debug", `Transient failure; task requeued (${retryCount}/${CFG.maxRetries}): ${item.url}`, { status, retryAtMs: backoff });
       }
     }
-    jobLog(job, status === 429 ? "warn" : "error", `Fetch failed ${item.url} — ${e.name || "Error"}: ${e.message}`, { retryClass: statusRetryClass(status) });
+    const noisyError = item.type === "html" || status >= 500 || status === 429;
+    jobLog(job, status === 429 ? "warn" : (noisyError ? "error" : "debug"), `Fetch failed ${item.url} — ${e.name || "Error"}: ${e.message}`, { retryClass: statusRetryClass(status), type: item.type, source: item.source || null });
   } finally { job.processed += 1; }
 }
 class CooperativeRobotPool {
@@ -2146,10 +2208,10 @@ class CooperativeRobotPool {
         while (moved < accepted) {
           const item = target.queue.pop();
           if (!item) break;
+          this.totalQueued = Math.max(0, this.totalQueued - 1);
           item._helped = true;
           item._helpFrom = target.id;
           requester.queue.push(item);
-          this.totalQueued = Math.max(0, this.totalQueued);
           tasks.push({ url: item.url, type: item.type, reason: item.reason || "discovered" });
           moved += 1;
         }

@@ -1,4 +1,6 @@
 const crypto = require('crypto');
+const { execFileSync } = require('child_process');
+const fs = require('fs');
 
 function id(prefix='b') { return `${prefix}_${crypto.randomBytes(12).toString('base64url')}`; }
 function sanitizeUrl(value) {
@@ -30,7 +32,16 @@ class BrowserEngine {
     if (this.startPromise) return this.startPromise;
     this.startPromise = (async () => {
       try {
+        if (this.cfg.playwrightBrowsersPath != null) process.env.PLAYWRIGHT_BROWSERS_PATH = String(this.cfg.playwrightBrowsersPath);
         this.playwright = require('playwright');
+        let executable = '';
+        try { executable = this.playwright.chromium.executablePath(); } catch {}
+        if ((!executable || !fs.existsSync(executable)) && this.cfg.browserAutoInstall !== false) {
+          const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx';
+          this.log('info', 'BROWSER', 'Chromium executable missing; attempting one-time Playwright browser installation.');
+          try { execFileSync(npx, ['playwright', 'install', 'chromium'], { stdio: 'inherit', timeout: 180000 }); }
+          catch (installError) { this.log('warn', 'BROWSER', `Chromium auto-install failed: ${installError.message}`); }
+        }
         this.browser = await this.playwright.chromium.launch({
           headless: this.cfg.browserHeadless !== false,
           args: ['--disable-dev-shm-usage']
@@ -97,7 +108,7 @@ class BrowserEngine {
     page.on('console', msg => this.pushConsole(session, msg.type(), msg.text()));
     page.on('pageerror', err => this.pushConsole(session, 'error', err?.message || String(err)));
     page.on('requestfailed', req => this.pushNetwork(session, {
-      type: 'requestfailed', method: req.method(), url: sanitizeUrl(req.url), error: req.failure()?.errorText || 'request failed', resourceType: req.resourceType()
+      type: 'requestfailed', method: req.method(), url: sanitizeUrl(req.url()), error: req.failure()?.errorText || 'request failed', resourceType: req.resourceType()
     }));
     page.on('response', response => {
       const req = response.request();
@@ -108,7 +119,7 @@ class BrowserEngine {
       }
     });
     page.on('request', req => {
-      this.pushNetwork(session, { type: 'request', method: req.method(), url: sanitizeUrl(req.url), resourceType: req.resourceType() });
+      this.pushNetwork(session, { type: 'request', method: req.method(), url: sanitizeUrl(req.url()), resourceType: req.resourceType() });
     });
     page.on('download', download => {
       const item = { id: id('dl'), filename: download.suggestedFilename(), url: sanitizeUrl(download.url()), state: 'started', startedAt: now(), path: null };
