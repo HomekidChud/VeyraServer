@@ -1,6 +1,9 @@
 services:
   - type: web
-    name: veyraserver
+    name: VeyraServer
     runtime: node
-    buildCommand: npm install && npx playwright install chromium
+    buildCommand: npm install
     startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: "20"

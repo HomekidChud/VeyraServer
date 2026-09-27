@@ -14,10 +14,11 @@ function sanitizeHeaderMap(headers = {}) {
 }
 
 class BrowserEngine {
-  constructor(cfg, assertPublicUrl, logger = () => {}) {
+  constructor(cfg, assertPublicUrl, logger = () => {}, discover = () => {}) {
     this.cfg = cfg;
     this.assertPublicUrl = assertPublicUrl;
     this.log = logger;
+    this.discover = typeof discover === 'function' ? discover : () => {};
     this.browser = null;
     this.playwright = null;
     this.sessions = new Map();
@@ -49,7 +50,7 @@ class BrowserEngine {
     return { sessions: this.sessions.size, maxSessions: this.cfg.maxBrowserSessions, maxPages: this.cfg.maxBrowserPages, maxContexts: this.cfg.maxBrowserContexts };
   }
 
-  async create(tabId, target) {
+  async create(tabId, target, jobId = '') {
     const url = safeUrl(target);
     if (!url) throw Object.assign(new Error('Invalid HTTP(S) browser URL.'), { code: 'INVALID_URL' });
     await this.assertPublicUrl(url);
@@ -76,7 +77,7 @@ class BrowserEngine {
     const page = await context.newPage();
     const sid = id('bs');
     const session = {
-      id: sid, tabId: String(tabId || ''), context, page, createdAt: Date.now(), lastUsed: Date.now(),
+      id: sid, tabId: String(tabId || ''), jobId: String(jobId || ''), context, page, createdAt: Date.now(), lastUsed: Date.now(),
       canonicalUrl: url, title: '', status: 'LOADING', error: '', verification: null,
       console: [], network: [], downloads: [], pages: new Set([page]), requestSeq: 0,
       screenshot: null, screenshotAt: 0
@@ -96,14 +97,18 @@ class BrowserEngine {
     page.on('console', msg => this.pushConsole(session, msg.type(), msg.text()));
     page.on('pageerror', err => this.pushConsole(session, 'error', err?.message || String(err)));
     page.on('requestfailed', req => this.pushNetwork(session, {
-      type: 'requestfailed', method: req.method(), url: sanitizeUrl(req.url)(), error: req.failure()?.errorText || 'request failed', resourceType: req.resourceType()
+      type: 'requestfailed', method: req.method(), url: sanitizeUrl(req.url), error: req.failure()?.errorText || 'request failed', resourceType: req.resourceType()
     }));
     page.on('response', response => {
       const req = response.request();
-      this.pushNetwork(session, { type: 'response', method: req.method(), url: sanitizeUrl(response.url()), status: response.status(), resourceType: req.resourceType(), headers: sanitizeHeaderMap(response.headers()) });
+      const safe = sanitizeUrl(response.url());
+      this.pushNetwork(session, { type: 'response', method: req.method(), url: safe, status: response.status(), resourceType: req.resourceType(), headers: sanitizeHeaderMap(response.headers()) });
+      if (req.method() === 'GET' && response.status() < 400 && safe) {
+        try { this.discover(session, { url: new URL(response.url()).href, type: req.resourceType(), status: response.status(), method: req.method() }); } catch {}
+      }
     });
     page.on('request', req => {
-      this.pushNetwork(session, { type: 'request', method: req.method(), url: sanitizeUrl(req.url)(), resourceType: req.resourceType() });
+      this.pushNetwork(session, { type: 'request', method: req.method(), url: sanitizeUrl(req.url), resourceType: req.resourceType() });
     });
     page.on('download', download => {
       const item = { id: id('dl'), filename: download.suggestedFilename(), url: sanitizeUrl(download.url()), state: 'started', startedAt: now(), path: null };
@@ -111,9 +116,12 @@ class BrowserEngine {
       download.path().then(p => { item.path = p; item.state = 'complete'; item.completedAt = now(); }).catch(e => { item.state = 'error'; item.error = e.message; });
     });
     page.on('popup', popup => {
+      if (session.pages.size >= this.cfg.maxBrowserPages) { popup.close().catch(() => {}); this.pushConsole(session, 'warn', 'Popup blocked: browser page capacity reached.'); return; }
       session.pages.add(popup); this.attachPage(session, popup);
+      popup.on('close', () => session.pages.delete(popup));
       this.pushConsole(session, 'info', `Popup opened: ${popup.url()}`);
     });
+    page.on('close', () => session.pages.delete(page));
   }
 
   pushConsole(session, level, message) {
@@ -222,14 +230,18 @@ class BrowserEngine {
   async stopNavigation(sid) { const s=this.get(sid); await s.page.evaluate(() => window.stop()).catch(() => {}); return this.public(s); }
 
   async expireIdle() {
-    const cutoff = Date.now() - this.cfg.browserIdleTimeoutMs;
-    for (const [sid,s] of this.sessions) if (s.lastUsed < cutoff) await this.stop(sid).catch(() => {});
+    const nowMs = Date.now();
+    const idleCutoff = nowMs - this.cfg.browserIdleTimeoutMs;
+    const ttlCutoff = nowMs - this.cfg.browserSessionTtlMs;
+    for (const [sid,s] of this.sessions) {
+      if (s.lastUsed < idleCutoff || s.createdAt < ttlCutoff) await this.stop(sid).catch(() => {});
+    }
   }
 
   async screenshot(sid) { const s=this.get(sid); await this.capture(s,true); return s.screenshot; }
 
   public(s) {
-    return { id:s.id, tabId:s.tabId, canonicalUrl:s.page?.url() || s.canonicalUrl, title: s.title || '', status:s.status, error:s.error, verification:s.verification, createdAt:new Date(s.createdAt).toISOString(), lastUsed:new Date(s.lastUsed).toISOString(), console:s.console.slice(-80), network:s.network.slice(-120), downloads:s.downloads.slice(0,50), capacity:this.capacity() };
+    return { id:s.id, tabId:s.tabId, jobId:s.jobId, canonicalUrl:s.page?.url() || s.canonicalUrl, title: s.title || '', status:s.status, error:s.error, verification:s.verification, createdAt:new Date(s.createdAt).toISOString(), lastUsed:new Date(s.lastUsed).toISOString(), console:s.console.slice(-80), network:s.network.slice(-120), downloads:s.downloads.slice(0,50), capacity:this.capacity() };
   }
 
   status() {

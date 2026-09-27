@@ -56,6 +56,21 @@ const CFG = Object.freeze({
   robotQueueCapacity: numberEnv("ROBOT_QUEUE_CAPACITY", 8, 2, 32),
   robotStealBatch: numberEnv("ROBOT_STEAL_BATCH", 2, 1, 8),
   robotStealOnIdle: boolEnv("ROBOT_STEAL_ON_IDLE", true),
+  robotBundleSize: numberEnv("ROBOT_BUNDLE_SIZE", 4, 1, 8),
+  robotDispatchBatch: numberEnv("ROBOT_DISPATCH_BATCH", 1024, 64, 8192),
+  robotHelpMaxInFlight: numberEnv("ROBOT_HELP_MAX_INFLIGHT", 64, 1, 256),
+  adaptiveHostConcurrency: boolEnv("ADAPTIVE_HOST_CONCURRENCY", true),
+  minPerHostConcurrency: numberEnv("MIN_PER_HOST_CONCURRENCY", 2, 1, 32),
+  hostSuccessRamp: numberEnv("HOST_SUCCESS_RAMP", 4, 1, 100),
+  hostErrorPenalty: numberEnv("HOST_ERROR_PENALTY", 2, 1, 10),
+  criticalResourceBudget: numberEnv("CRITICAL_RESOURCE_BUDGET", 48, 8, 256),
+  maxBrowserDiscovered: numberEnv("MAX_BROWSER_DISCOVERED", 2500, 100, 20000),
+  maxBrowserDiscoveredHosts: numberEnv("MAX_BROWSER_DISCOVERED_HOSTS", 24, 2, 100),
+  maxDiscoveryPerPage: numberEnv("MAX_DISCOVERY_PER_PAGE", 5000, 100, 20000),
+  maxScriptDiscovery: numberEnv("MAX_SCRIPT_DISCOVERY", 4000, 100, 20000),
+  maxJsonUrlDiscovery: numberEnv("MAX_JSON_URL_DISCOVERY", 2000, 50, 10000),
+  maxBroadScanChars: numberEnv("MAX_BROAD_SCAN_CHARS", 1500000, 10000, 10000000),
+  maxSrcsetCandidates: numberEnv("MAX_SRCSET_CANDIDATES", 100, 10, 500),
   browserMaxActiveFetches: numberEnv("BROWSER_MAX_ACTIVE_FETCHES", 24, 1, 64),
   browserPerHostConcurrency: numberEnv("BROWSER_PER_HOST_CONCURRENCY", 8, 1, 32),
   browserEnabled: boolEnv("BROWSER_ENABLED", true),
@@ -114,14 +129,16 @@ const CFG = Object.freeze({
   proxyWarmConcurrency: numberEnv("PROXY_WARM_CONCURRENCY", 12, 1, 64),
   proxyWarmLimit: numberEnv("PROXY_WARM_LIMIT", 64, 1, 256),
   proxyWarmPerHost: numberEnv("PROXY_WARM_PER_HOST", 3, 1, 16),
-  userAgent: process.env.VEYRA_USER_AGENT || "VeyraBrowseCrawler/8.6 (+https://github.com/HomekidChud/VeyraServer)",
+  sitemapConcurrency: numberEnv("SITEMAP_CONCURRENCY", 8, 1, 32),
+  initialResourceBudget: numberEnv("INITIAL_RESOURCE_BUDGET", 64, 16, 256),
+  userAgent: process.env.VEYRA_USER_AGENT || "VeyraBrowseCrawler/8.8.2 (+https://github.com/HomekidChud/VeyraServer)",
   frontendOrigins: csvEnv("FRONTEND_ORIGIN", ["*"]),
   searchProvider: enumEnv("SEARCH_PROVIDER", "local", ["auto", "local", "brave", "bing", "custom", "none"]),
   searchEndpoint: process.env.SEARCH_ENDPOINT || "",
   searchApiKey: process.env.SEARCH_API_KEY || "",
   customSearchAuth: process.env.SEARCH_AUTH_HEADER || "",
-  maxIndexDocs: numberEnv("MAX_INDEX_DOCS", 20000, 100, 100000),
-  maxIndexTextChars: numberEnv("MAX_INDEX_TEXT_CHARS", 8000, 1000, 50000),
+  maxIndexDocs: numberEnv("MAX_INDEX_DOCS", 50000, 100, 100000),
+  maxIndexTextChars: numberEnv("MAX_INDEX_TEXT_CHARS", 12000, 1000, 50000),
   maxSearchQueryTerms: numberEnv("MAX_SEARCH_QUERY_TERMS", 20, 1, 64),
   indexSeeds: csvEnv("INDEX_SEEDS", []),
   indexSeedCrawl: boolEnv("INDEX_SEED_CRAWL", true),
@@ -189,7 +206,29 @@ class Semaphore {
 const fetchSemaphore = new Semaphore(CFG.maxActiveFetches);
 const proxyWarmSemaphore = new Semaphore(CFG.proxyWarmConcurrency);
 
-const browserEngine = new BrowserEngine(CFG, assertPublicUrl, (level, source, message) => serverLog(level, source, message));
+const browserEngine = new BrowserEngine(
+  CFG,
+  assertPublicUrl,
+  (level, source, message) => serverLog(level, source, message),
+  (session, row) => {
+    try {
+      if (!session?.jobId || !row?.url) return;
+      const job = jobs.get(session.jobId);
+      if (!job || job.done || job.stopRequested) return;
+      const u = normalizeUrl(row.url);
+      if (!u) return;
+      job.browserDiscoveredCount = Number(job.browserDiscoveredCount || 0);
+      job.browserDiscoveredHosts ||= new Set();
+      const h = hostOf(u);
+      if (job.browserDiscoveredCount >= CFG.maxBrowserDiscovered) return;
+      if (!job.browserDiscoveredHosts.has(h) && job.browserDiscoveredHosts.size >= CFG.maxBrowserDiscoveredHosts) return;
+      job.browserDiscoveredHosts.add(h);
+      job.browserDiscoveredCount += 1;
+      const hint = row.resourceType === 'document' ? 'html' : row.resourceType === 'stylesheet' ? 'css' : row.resourceType === 'script' ? 'js' : row.resourceType === 'image' ? 'image' : row.resourceType === 'font' ? 'font' : row.resourceType === 'media' ? 'media' : typeFor(u);
+      addLink(job, u, hint, session.canonicalUrl || job.root, row.resourceType === 'document' ? 'browser-navigation' : 'browser-network');
+    } catch {}
+  }
+);
 const browserEngineTimer = setInterval(() => browserEngine.expireIdle().catch(() => {}), 30000);
 browserEngineTimer.unref?.();
 
@@ -545,6 +584,16 @@ function typeFor(url, hint = "") {
 function sameOrigin(a, b) {
   try { return new URL(a).origin === new URL(b).origin; } catch { return false; }
 }
+function sameRedirectHost(a, b) {
+  try {
+    const ah = new URL(a).hostname.toLowerCase().replace(/^www\./, "");
+    const bh = new URL(b).hostname.toLowerCase().replace(/^www\./, "");
+    return ah === bh;
+  } catch { return false; }
+}
+function crawlOriginAllowed(job, url) {
+  try { return job.crawlOrigins?.has(new URL(url).origin) || false; } catch { return false; }
+}
 function hostOf(url) { try { return new URL(url).hostname.toLowerCase(); } catch { return ""; } }
 function pathOf(url) { try { const u = new URL(url); return `${u.pathname || "/"}${u.search || ""}`; } catch { return String(url || ""); } }
 function linkKey(type, url) { return `${type}|${url}`; }
@@ -765,7 +814,7 @@ async function fetchBuffer(url, opts = {}) {
           break;
         }
         if (retryableStatus(response.status) && attempt < (opts.retries ?? CFG.maxRetries)) {
-          lastError = new Error(`HTTP ${response.status}`);
+          lastError = Object.assign(new Error(`HTTP ${response.status}`), { status: response.status });
           retriesUsed += 1;
           await sleep(backoffMs(attempt, retryAfterMs(response.headers)));
           continue;
@@ -868,32 +917,44 @@ function detectChallenge(body, contentType, status, headers = {}) {
 // Priority frontier avoids array shift() re-indexing and supports bounded, per-host scheduling.
 class PriorityFrontier {
   constructor(maxSize) {
-    this.maxSize = maxSize;
+    this.maxSize = Math.max(1, Number(maxSize) || 1);
     this.seen = new Set();
+    this.queued = new Set();
     this.hosts = new Map();
     this.hostHeap = [];
     this.seq = 0;
     this.blockedScratch = [];
   }
   get size() { let n = 0; for (const bucket of this.hosts.values()) n += bucket.heap.length; return n; }
-  #greater(a, b) { return a.priority > b.priority || (a.priority === b.priority && a.seq < b.seq); }
+  #greater(a, b) {
+    return a.priority > b.priority || (a.priority === b.priority && (a.notBefore || 0) < (b.notBefore || 0)) ||
+      (a.priority === b.priority && (a.notBefore || 0) === (b.notBefore || 0) && a.seq < b.seq);
+  }
   #up(heap, i) { while (i > 0) { const p = (i - 1) >> 1; if (!this.#greater(heap[i], heap[p])) break; [heap[i], heap[p]] = [heap[p], heap[i]]; i = p; } }
   #down(heap, i) { for (;;) { const l = i * 2 + 1, r = l + 1; let best = i; if (l < heap.length && this.#greater(heap[l], heap[best])) best = l; if (r < heap.length && this.#greater(heap[r], heap[best])) best = r; if (best === i) break; [heap[i], heap[best]] = [heap[best], heap[i]]; i = best; } }
   #pushNode(bucket, node) { bucket.heap.push(node); this.#up(bucket.heap, bucket.heap.length - 1); }
   #popNode(bucket) { const top = bucket.heap[0], last = bucket.heap.pop(); if (bucket.heap.length) { bucket.heap[0] = last; this.#down(bucket.heap, 0); } return top; }
   #pushHostRef(bucket) { const ref = { host: bucket.host, node: bucket.heap[0], seq: ++this.seq }; this.hostHeap.push(ref); this.#up(this.hostHeap, this.hostHeap.length - 1); }
   #popHostRef() { const top = this.hostHeap[0], last = this.hostHeap.pop(); if (this.hostHeap.length) { this.hostHeap[0] = last; this.#down(this.hostHeap, 0); } return top; }
-  add(item, priority, key) {
-    if (this.size >= this.maxSize || this.seen.has(key)) return false;
-    this.seen.add(key);
+  #insert(item, priority, key, notBefore = 0) {
     const host = hostOf(item.url) || '(unknown)';
-    const node = { item, priority: Number(priority) || 0, seq: ++this.seq, host };
+    const node = { item, priority: Number(priority) || 0, seq: ++this.seq, host, notBefore: Number(notBefore) || 0 };
     let bucket = this.hosts.get(host);
     if (!bucket) { bucket = { host, heap: [] }; this.hosts.set(host, bucket); }
     const wasEmpty = bucket.heap.length === 0;
     this.#pushNode(bucket, node);
     if (wasEmpty || bucket.heap[0] === node) this.#pushHostRef(bucket);
+    this.queued.add(key);
     return true;
+  }
+  add(item, priority, key) {
+    if (!item || !key || this.size >= this.maxSize || this.seen.has(key)) return false;
+    this.seen.add(key);
+    return this.#insert(item, priority, key, item.notBefore || 0);
+  }
+  requeue(item, priority, key, notBefore = 0) {
+    if (!item || !key || this.size >= this.maxSize || this.queued.has(key)) return false;
+    return this.#insert({ ...item, notBefore }, priority, key, notBefore);
   }
   takeNext(activeHosts, perHostLimit, hostCooldowns) {
     if (!this.hostHeap.length) return null;
@@ -903,16 +964,27 @@ class PriorityFrontier {
     while (this.hostHeap.length) {
       const ref = this.#popHostRef();
       const bucket = this.hosts.get(ref.host);
-      if (!bucket || !bucket.heap.length || bucket.heap[0] !== ref.node) continue; // stale host-head ref
+      if (!bucket || !bucket.heap.length || bucket.heap[0] !== ref.node) continue;
+      const node = bucket.heap[0];
       const active = activeHosts.get(ref.host) || 0;
+      const limit = typeof perHostLimit === "function" ? Math.max(1, Number(perHostLimit(ref.host)) || 1) : Math.max(1, Number(perHostLimit) || 1);
       const cooldown = hostCooldowns.get(ref.host) || 0;
-      if (active >= perHostLimit || cooldown > nowMs) { blocked.push(ref); continue; }
+      if (active >= limit || cooldown > nowMs || (node.notBefore || 0) > nowMs) { blocked.push(ref); continue; }
       selected = this.#popNode(bucket);
+      this.queued.delete(`${selected.item.type}|${selected.item.url}`);
       if (bucket.heap.length) this.#pushHostRef(bucket); else this.hosts.delete(ref.host);
       break;
     }
-    for (const ref of blocked) this.hostHeap.push(ref), this.#up(this.hostHeap, this.hostHeap.length - 1);
+    for (const ref of blocked) { this.hostHeap.push(ref); this.#up(this.hostHeap, this.hostHeap.length - 1); }
     return selected?.item || null;
+  }
+  nextReadyAt() {
+    let soonest = 0;
+    for (const bucket of this.hosts.values()) {
+      const n = bucket.heap[0];
+      if (n?.notBefore && (!soonest || n.notBefore < soonest)) soonest = n.notBefore;
+    }
+    return soonest;
   }
   snapshot() {
     const items = [];
@@ -920,22 +992,29 @@ class PriorityFrontier {
     return items.sort((a,b) => this.#greater(a,b) ? -1 : this.#greater(b,a) ? 1 : 0).map(x => x.item);
   }
 }
-
 function pathDepth(url) { try { return new URL(url).pathname.split("/").filter(Boolean).length; } catch { return 0; } }
 function crawlPriority(url, kind, reason = "discovered") {
   let score = kind === "html" ? 70 : 35;
+  if (kind === "css" || kind === "js" || kind === "font") score += 12;
+  if (kind === "image") score += 6;
   const depth = pathDepth(url);
   score -= Math.min(24, depth * 4);
   const u = new URL(url);
-  if (reason === "root") score += 1000;
-  if (reason === "sitemap") score += 250;
-  if (reason === "canonical") score += 180;
-  if (reason === "navigation") score += 100;
+  const r = String(reason || "").toLowerCase();
+  if (r === "root") score += 1000;
+  if (r === "sitemap") score += 250;
+  if (r === "canonical") score += 180;
+  if (r === "navigation") score += 100;
+  if (r === "browser-network" || r === "dynamic") score += 140;
+  if (r === "preload" || r === "modulepreload" || r === "render-critical") score += 260;
+  if (r === "critical-image") score += 210;
+  if (r === "api") score += 150;
+  if (r === "lazy") score += 40;
+  if (r === "metadata") score += 55;
   if (u.searchParams.size) score -= Math.min(20, u.searchParams.size * 3);
   if (/(?:calendar|day|month|page)=[^&]+/i.test(u.search)) score -= 15;
   return score;
 }
-
 // Robots handling is conservative: use the most-specific matching user-agent group and support Crawl-delay.
 function parseRobots(text) {
   const groups = [];
@@ -1018,6 +1097,7 @@ async function loadSitemaps(job) {
     normalizeUrl("/sitemap_index.xml", job.root)
   ].filter(Boolean))];
   const seen = new Set();
+  const pendingSet = new Set(pending);
   let files = 0, urls = 0;
   async function processSitemap(sm) {
     if (seen.has(sm) || files >= CFG.maxSitemapFiles || urls >= CFG.maxSitemapUrls || job.stopRequested) return;
@@ -1028,14 +1108,14 @@ async function loadSitemaps(job) {
       const xml = r.body.toString("utf8");
       for (const match of xml.matchAll(/<loc>\s*([^<]+?)\s*<\/loc>/gi)) {
         const u = normalizeUrl(match[1], sm); if (!u) continue;
-        if (/\.xml(?:$|\?)/i.test(u) && /sitemap/i.test(u)) { if (!seen.has(u) && pending.length < 250) pending.push(u); continue; }
-        if (sameOrigin(u, job.root)) { addLink(job, u, "html", sm, "sitemap"); urls += 1; }
+        if (/\.xml(?:$|\?)/i.test(u) && /sitemap/i.test(u)) { if (!seen.has(u) && !pendingSet.has(u) && pending.length < 250) { pending.push(u); pendingSet.add(u); } continue; }
+        if (crawlOriginAllowed(job, u)) { addLink(job, u, "html", sm, "sitemap"); urls += 1; }
         if (urls >= CFG.maxSitemapUrls) break;
       }
     } catch (e) { jobLog(job, "debug", `Sitemap failed: ${sm} — ${e.message}`); }
   }
   while (pending.length && files < CFG.maxSitemapFiles && urls < CFG.maxSitemapUrls && !job.stopRequested) {
-    const batch = pending.splice(0, 4);
+    const batch = pending.splice(0, CFG.sitemapConcurrency);
     await Promise.allSettled(batch.map(processSitemap));
   }
   if (files) jobLog(job, "info", `Sitemap pass: ${files} file(s), ${urls} URL(s) discovered.`);
@@ -1132,7 +1212,7 @@ function injectRuntime(html, original, sid = "") {
   try{const nativeXhrOpen=XMLHttpRequest.prototype.open,nativeXhrSend=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(method,url,...rest){this.__veyraMethod=method;this.__veyraTarget=resolve(url);this.__veyraStarted=0;return nativeXhrOpen.call(this,method,shouldProxy(this.__veyraTarget)?proxy('resource',this.__veyraTarget):url,...rest)};XMLHttpRequest.prototype.send=function(body){this.__veyraStarted=performance.now();this.addEventListener('loadend',()=>net(this.__veyraMethod||'GET',this.__veyraTarget||'',this.status,performance.now()-this.__veyraStarted,this.status>=200&&this.status<400),{once:true});return nativeXhrSend.call(this,body)}}catch{}
   try{const NativeEventSource=window.EventSource;if(NativeEventSource)window.EventSource=function(url,options){const target=resolve(url);return new NativeEventSource(shouldProxy(target)?proxy('resource',target):url,options)}}catch{}
   try{const nativeBeacon=navigator.sendBeacon&&navigator.sendBeacon.bind(navigator);if(nativeBeacon)navigator.sendBeacon=function(url,data){try{const target=resolve(url);if(shouldProxy(target)){let body=data;let type='text/plain;charset=UTF-8';if(typeof Blob!=='undefined'&&data instanceof Blob)type=data.type||type;void fetch(proxy('resource',target),{method:'POST',body,keepalive:true,headers:{'content-type':type}});return true}}catch{}return nativeBeacon(url,data)}}catch{}
-  function submitTarget(form,submitter){try{return canonicalizeMaybeProxy((submitter&&submitter.getAttribute('formaction'))||form.getAttribute('action')||virtualUrl)}catch{return null}}
+  function submitTarget(form,submitter){try{return canonicalizeMaybeProxy((submitter&&submitter.getAttribute('data-veyra-formaction'))||(submitter&&submitter.getAttribute('formaction'))||form.getAttribute('data-veyra-action')||form.getAttribute('action')||virtualUrl)}catch{return null}}
   function emitGetForm(form,submitter,source){const target=submitTarget(form,submitter);if(!target)return false;const method=String(form.method||'get').toUpperCase();if(method!=='GET')return false;const fd=new FormData(form,submitter||undefined);const u=new URL(target);for(const [k,v] of fd.entries())if(typeof v==='string')u.searchParams.append(k,v);emit(source||'form.submit',u.href);return true}
   try{const nativeFormSubmit=HTMLFormElement.prototype.submit;HTMLFormElement.prototype.submit=function(){try{if(emitGetForm(this,null,'form.submit'))return;const target=submitTarget(this,null);const method=String(this.method||'get').toUpperCase();if(target&&method==='POST'){const fd=new FormData(this);const entries=[];for(const [k,v] of fd.entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});return;}}catch{}return nativeFormSubmit.call(this)}}catch{}
   try{const nativeRequestSubmit=HTMLFormElement.prototype.requestSubmit;if(nativeRequestSubmit)HTMLFormElement.prototype.requestSubmit=function(submitter){try{if(emitGetForm(this,submitter,'form.requestSubmit'))return;const target=submitTarget(this,submitter);const method=String(this.method||'get').toUpperCase();if(target&&method==='POST'){const entries=[];for(const [k,v] of new FormData(this,submitter).entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});return;}}catch{}return nativeRequestSubmit.call(this,submitter)}}catch{}
@@ -1175,23 +1255,47 @@ function injectRuntime(html, original, sid = "") {
 }
 function rewriteHtml(html, base, sid = "") {
   const $ = cheerio.load(String(html || ""), { decodeEntities: false });
+  const declaredBase = $("base[href]").first().attr("href");
+  const effectiveBase = resolveNavigation(declaredBase, base) || base;
   $("base").remove();
   $("meta[http-equiv]").filter((_, el) => String($(el).attr("http-equiv") || "").toLowerCase() === "content-security-policy").remove();
-  $("a[href],area[href]").each((_, el) => { const u = resolveNavigation($(el).attr("href"), base); if (u) $(el).attr("href", makeViewUrl(u, sid)); });
-  $("form[action]").each((_, el) => { const u = resolveNavigation($(el).attr("action"), base); if (u) $(el).attr("action", makeViewUrl(u, sid)); });
-  $("iframe[src]").each((_, el) => { const u = resolveNavigation($(el).attr("src"), base); if (u) $(el).attr("src", makeViewUrl(u, sid)); });
-  $("object[data]").each((_, el) => { const u = resolveResource($(el).attr("data"), base); if (u) $(el).attr("data", makeResourceUrl(u, base, sid)); });
+  $("a[href],area[href]").each((_, el) => { const u = resolveNavigation($(el).attr("href"), effectiveBase); if (u) $(el).attr("href", makeViewUrl(u, sid)); });
+  $("form[action]").each((_, el) => {
+    const raw = $(el).attr("action");
+    const u = resolveNavigation(raw, effectiveBase);
+    if (!u) return;
+    const method = String($(el).attr("method") || "get").toUpperCase();
+    // GET form submissions replace the URL query component during native form
+    // submission. Putting /api/view?url=... in a GET form action therefore drops
+    // the embedded target and produces /api/view?query=... -> INVALID_URL.
+    // Keep the canonical action and let the injected Veyra runtime intercept the
+    // submission; preserve the canonical target explicitly for that runtime.
+    $(el).attr("data-veyra-action", u);
+    if (method === "POST") $(el).attr("action", makeViewUrl(u, sid));
+    else $(el).attr("action", u);
+  });
+  $("[formaction]").each((_, el) => {
+    const raw = $(el).attr("formaction");
+    const u = resolveNavigation(raw, effectiveBase);
+    if (!u) return;
+    $(el).attr("data-veyra-formaction", u);
+    // Do not rewrite formaction itself; the runtime submit/click intercept chooses
+    // the canonical target and Veyra's parent handles the navigation/form request.
+    $(el).attr("formaction", u);
+  });
+  $("iframe[src]").each((_, el) => { const u = resolveNavigation($(el).attr("src"), effectiveBase); if (u) $(el).attr("src", makeViewUrl(u, sid)); });
+  $("object[data]").each((_, el) => { const u = resolveResource($(el).attr("data"), effectiveBase); if (u) $(el).attr("data", makeResourceUrl(u, effectiveBase, sid)); });
   $("link[href]").each((_, el) => {
     const rel = String($(el).attr("rel") || "").toLowerCase();
     if (rel.includes("canonical")) return;
-    const raw = $(el).attr("href"); const u = resolveResource(raw, base); if (u) { $(el).attr("href", makeResourceUrl(u, base, sid)); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); }
+    const raw = $(el).attr("href"); const u = resolveResource(raw, effectiveBase); if (u) { $(el).attr("href", makeResourceUrl(u, effectiveBase, sid)); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); }
   });
-  $("script[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), base); if (u) { $(el).attr("src", makeResourceUrl(u, base, sid)); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); } });
+  $("script[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), effectiveBase); if (u) { $(el).attr("src", makeResourceUrl(u, effectiveBase, sid)); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); } });
   for (const tag of ["img", "source", "audio", "input", "embed"]) {
-    $(`${tag}[src]`).each((_, el) => { const u = resolveResource($(el).attr("src"), base); if (u) $(el).attr("src", makeResourceUrl(u, base, sid)); });
+    $(`${tag}[src]`).each((_, el) => { const u = resolveResource($(el).attr("src"), effectiveBase); if (u) $(el).attr("src", makeResourceUrl(u, effectiveBase, sid)); });
   }
-  $("video[poster]").each((_, el) => { const u = resolveResource($(el).attr("poster"), base); if (u) $(el).attr("poster", makeResourceUrl(u, base, sid)); });
-  $("track[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), base); if (u) $(el).attr("src", makeResourceUrl(u, base, sid)); });
+  $("video[poster]").each((_, el) => { const u = resolveResource($(el).attr("poster"), effectiveBase); if (u) $(el).attr("poster", makeResourceUrl(u, effectiveBase, sid)); });
+  $("track[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), effectiveBase); if (u) $(el).attr("src", makeResourceUrl(u, effectiveBase, sid)); });
   // Do not use CSS selectors containing xlink:href here: css-select/Cheerio can
   // throw on the escaped namespace syntax for otherwise valid SVG documents.
   // Walk the SVG elements directly and inspect both href forms.
@@ -1200,22 +1304,22 @@ function rewriteHtml(html, base, sid = "") {
     const rawXlink = $(el).attr("xlink:href");
     const attr = rawHref != null ? "href" : (rawXlink != null ? "xlink:href" : null);
     if (!attr) return;
-    const u = resolveResource($(el).attr(attr) || "", base);
-    if (u) $(el).attr(attr, makeResourceUrl(u, base, sid));
+    const u = resolveResource($(el).attr(attr) || "", effectiveBase);
+    if (u) $(el).attr(attr, makeResourceUrl(u, effectiveBase, sid));
   });
-  $("[imagesrcset]").each((_, el) => $(el).attr("imagesrcset", rewriteSrcset($(el).attr("imagesrcset"), base, sid)));
+  $("[imagesrcset]").each((_, el) => $(el).attr("imagesrcset", rewriteSrcset($(el).attr("imagesrcset"), effectiveBase, sid)));
   for (const attr of ["data-src", "data-original", "data-lazy-src"]) {
-    $(`[${attr}]`).each((_, el) => { const u = resolveResource($(el).attr(attr), base); if (u) $(el).attr(attr, makeResourceUrl(u, base, sid)); });
+    $(`[${attr}]`).each((_, el) => { const u = resolveResource($(el).attr(attr), effectiveBase); if (u) $(el).attr(attr, makeResourceUrl(u, effectiveBase, sid)); });
   }
-  $(`[data-srcset]`).each((_, el) => $(el).attr("data-srcset", rewriteSrcset($(el).attr("data-srcset"), base, sid)));
-  $("track[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), base); if (u) $(el).attr("src", makeResourceUrl(u, base, sid)); });
-  $("[srcset]").each((_, el) => $(el).attr("srcset", rewriteSrcset($(el).attr("srcset"), base, sid)));
+  $(`[data-srcset]`).each((_, el) => $(el).attr("data-srcset", rewriteSrcset($(el).attr("data-srcset"), effectiveBase, sid)));
+  $("track[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), effectiveBase); if (u) $(el).attr("src", makeResourceUrl(u, effectiveBase, sid)); });
+  $("[srcset]").each((_, el) => $(el).attr("srcset", rewriteSrcset($(el).attr("srcset"), effectiveBase, sid)));
   $("meta[http-equiv='refresh'],meta[http-equiv='Refresh']").each((_, el) => {
     const raw = $(el).attr("content") || ""; const m = raw.match(/^(\s*\d+\s*;\s*url\s*=\s*)(.+)$/i); if (!m) return;
-    const u = resolveNavigation(m[2].trim().replace(/^['"]|['"]$/g, ""), base); if (u) $(el).attr("content", `${m[1]}${makeViewUrl(u, sid)}`);
+    const u = resolveNavigation(m[2].trim().replace(/^['"]|['"]$/g, ""), effectiveBase); if (u) $(el).attr("content", `${m[1]}${makeViewUrl(u, sid)}`);
   });
-  $("style").each((_, el) => $(el).html(rewriteCssText($(el).html() || "", base)));
-  $("[style]").each((_, el) => $(el).attr("style", rewriteCssText($(el).attr("style") || "", base)));
+  $("style").each((_, el) => $(el).html(rewriteCssText($(el).html() || "", effectiveBase)));
+  $("[style]").each((_, el) => $(el).attr("style", rewriteCssText($(el).attr("style") || "", effectiveBase)));
   return injectRuntime($.html(), base, sid);
 }
 
@@ -1412,30 +1516,73 @@ function searchIndexStats() {
 function addLink(job, rawUrl, hint, source, reason = "discovered") {
   const u = normalizeUrl(rawUrl, source || job.root); if (!u) return false;
   const type = typeFor(u, hint);
-  if (type === "html" && !sameOrigin(u, job.root)) return false;
+  const internal = crawlOriginAllowed(job, u);
   const key = linkKey(type, u);
   if (job.discovered.has(key) || job.links.length >= CFG.maxLinks) return false;
   job.discovered.add(key);
-  const record = { url: u, path: pathOf(u), type, source: source || job.root, internal: sameOrigin(u, job.root), captured: false, requestedUrl: u, redirectChain: [], priority: crawlPriority(u, type === "html" ? "html" : type, reason) };
+  const priority = crawlPriority(u, type === "html" ? "html" : type, reason);
+  const record = { url: u, path: pathOf(u), type, source: source || job.root, internal, captured: false, requestedUrl: u, redirectChain: [], priority, reason };
   job.links.push(record); job.counts.links += 1;
+
+  // Record external links for the Links inspector, but only crawl same-origin
+  // HTML pages. Non-HTML resources can be fetched when discovered from the page.
+  if (type === "html" && !internal) return true;
   if (type === "html") {
     if (job.pagesDiscovered >= CFG.maxPages || !robotsAllowed(u, job.robots)) return true;
     job.pagesDiscovered += 1;
-    job.pageFrontier.add({ url: u, type, source: source || null, reason }, record.priority, key);
-  } else {
-    if (job.resourcesScheduled >= CFG.maxResources) return true;
-    job.resourcesScheduled += 1;
-    job.resourceFrontier.add({ url: u, type, source: source || null, reason }, record.priority, key);
+    job.pageFrontier.add({ url: u, type, source: source || null, reason, priority }, priority, key);
+    return true;
   }
+  if (job.resourcesScheduled >= CFG.maxResources) return true;
+  job.resourcesScheduled += 1;
+  const critical = ["preload", "modulepreload", "render-critical", "critical-image", "browser-network", "api"].includes(String(reason).toLowerCase()) ||
+    (type === "css" && /(stylesheet)/i.test(String(reason))) ||
+    (type === "js" && /(script|module)/i.test(String(reason)));
+  const item = { url: u, type, source: source || null, reason, priority, critical };
+  const frontier = critical && job.criticalResourceFrontier.size < CFG.criticalResourceBudget ? job.criticalResourceFrontier : job.resourceFrontier;
+  frontier.add(item, priority + (critical ? 180 : 0), key);
   return true;
 }
 function discoverCss(job, text, base) {
   const src = String(text || "");
   let m;
   const urlRe = /url\(\s*(["']?)([^"')]+)\1\s*\)/gi;
-  while ((m = urlRe.exec(src))) addLink(job, m[2], "asset", base);
+  while ((m = urlRe.exec(src))) addLink(job, m[2], "asset", base, "css-url");
   const importRe = /@import\s+(?:url\(\s*)?(["'])([^"']+)\1/gi;
-  while ((m = importRe.exec(src))) addLink(job, m[2], "css", base);
+  while ((m = importRe.exec(src))) addLink(job, m[2], "css", base, "css-import");
+}
+function discoverJsonUrls(job, text, base) {
+  const src = String(text || "").slice(0, CFG.maxJsonUrlDiscovery * 80);
+  let found = 0;
+  const addCandidate = (raw, hint = "data", reason = "json-discovered") => {
+    if (found >= CFG.maxJsonUrlDiscovery) return;
+    const value = String(raw || "").trim().replace(/^['"]|['"]$/g, "");
+    if (!value || /^data:|^blob:/i.test(value)) return;
+    const likely = /^https?:\/\//i.test(value) || /^\/\//.test(value) || /^\/(?:api|graphql|trpc|_next|wp-json|rest|rpc|v\d+|search)(?:\/|\?|$)/i.test(value) || /^(?:\.\.?\/)/.test(value);
+    if (!likely) return;
+    const before = job.links.length;
+    addLink(job, value, hint, base, reason);
+    if (job.links.length !== before) found += 1;
+  };
+  // First try structured JSON/JSON-LD. This is safer and more complete than
+  // looking only for a few hard-coded property names.
+  try {
+    const parsed = JSON.parse(src);
+    const walk = (value, depth = 0, keyHint = "") => {
+      if (found >= CFG.maxJsonUrlDiscovery || depth > 8) return;
+      if (typeof value === "string") {
+        const hint = /image|logo|icon|thumbnail|poster|avatar/i.test(keyHint) ? "image" : /video|audio|media|stream/i.test(keyHint) ? "media" : /css|style/i.test(keyHint) ? "css" : /script|js|module/i.test(keyHint) ? "js" : /url|href|link|page|canonical|alternate|endpoint|api/i.test(keyHint) ? "html" : "data";
+        addCandidate(value, hint, /api|endpoint|graphql|trpc/i.test(keyHint) ? "api" : "json-discovered");
+      } else if (Array.isArray(value)) for (const item of value) walk(item, depth + 1, keyHint);
+      else if (value && typeof value === "object") for (const [k, v] of Object.entries(value).slice(0, 500)) walk(v, depth + 1, k);
+    };
+    walk(parsed, 0, "root");
+  } catch {}
+  // Fallback catches JSON embedded in JS/config blobs and HTML-escaped URL strings.
+  for (const m of src.matchAll(/(?:"|'|`)(https?:\/\/[^"'`\s<>\\]+|\/\/(?:[^"'`\s<>\\]+)|\/(?:api|graphql|trpc|_next|wp-json|rest|rpc|v\d+)(?:[^"'`\s<>\\]*))(?:"|'|`)/gi)) {
+    addCandidate(m[1], /\/images?\//i.test(m[1]) ? "image" : /\/api\/|graphql|trpc/i.test(m[1]) ? "data" : typeFor(m[1]));
+    if (found >= CFG.maxJsonUrlDiscovery) break;
+  }
 }
 function discoverJs(job, text, base) {
   const src = String(text || "");
@@ -1445,96 +1592,190 @@ function discoverJs(job, text, base) {
     /\bexport\s+[^"'`]*?\s+from\s+["'`]([^"'`]+)["'`]/g,
     /\bfetch\s*\(\s*["'`]([^"'`]+)["'`]/g,
     /\b(?:axios|got|request)\.(?:get|post|put|patch|delete)\s*\(\s*["'`]([^"'`]+)["'`]/gi,
+    /\b(?:new\s+)?EventSource\s*\(\s*["'`]([^"'`]+)["'`]/gi,
+    /\bsendBeacon\s*\(\s*["'`]([^"'`]+)["'`]/gi,
+    /\bXMLHttpRequest\b[\s\S]{0,160}?\.open\s*\(\s*["'`][A-Z]+["'`]\s*,\s*["'`]([^"'`]+)["'`]/gi,
     /\burl\s*:\s*["'`]([^"'`]+)["'`]/g,
-    /\b(?:endpoint|apiUrl|baseUrl|graphqlEndpoint)\s*[:=]\s*["'`]([^"'`]+)["'`]/gi,
+    /\b(?:endpoint|apiUrl|baseUrl|graphqlEndpoint|manifestUrl|playlistUrl|imageUrl|thumbnailUrl|videoUrl)\s*[:=]\s*["'`]([^"'`]+)["'`]/gi,
     /\b(?:window\.open|location(?:\.assign|\.replace)?|location\.href)\s*=?\s*["'`]([^"'`]+)["'`]/g,
-    /["'`]((?:https?:)?\/\/(?:[^"'`\s]+)|\/(?:api|graphql|_next\/data|trpc)(?:\/|[^"'`\s]*))/gi
+    /new\s+URL\s*\(\s*["'`]([^"'`]+)["'`]/g,
+    /["'`]((?:https?:)?\/\/[^"'`\s]+|\/(?:api|graphql|trpc|_next\/data|wp-json|rest|rpc)(?:\/|[^"'`\s]*))["'`]/gi
   ];
-  for (const re of patterns) for (const m of src.matchAll(re)) {
-    const raw = m[1];
-    const hint = /(?:api|graphql|_next\/data|trpc|\.json(?:$|[?#]))/i.test(raw) ? "data" : typeFor(raw);
-    addLink(job, raw, hint, base, "script-discovered");
+  let found = 0;
+  for (const re of patterns) {
+    for (const m of src.matchAll(re)) {
+      if (found >= CFG.maxScriptDiscovery) return;
+      const raw = m[1];
+      const hint = /(?:api|graphql|trpc|wp-json|rest|rpc|\.json(?:$|[?#]))/i.test(raw) ? "data" : typeFor(raw);
+      const before = job.links.length;
+      addLink(job, raw, hint, base, /api|graphql|trpc/i.test(raw) ? "api" : "script-discovered");
+      if (job.links.length !== before) found += 1;
+    }
   }
+  discoverJsonUrls(job, src, base);
 }
 function discoverLinkHeader(job, header, base) {
   const raw = String(header || "");
-  for (const part of raw.split(/,(?=<)/)) {
-    const m = part.match(/<([^>]+)>\s*(.*)$/); if (!m) continue; const rel = String(m[2] || "");
+  for (const part of raw.split(/,(?=\s*<)/)) {
+    const m = part.match(/<([^>]+)>\s*(.*)$/); if (!m) continue;
+    const params = String(m[2] || "");
     const u = resolveResource(m[1], base); if (!u) continue;
-    const hint = /rel\s*=\s*["'][^"']*preload[^"']*["']/i.test(rel) && /as\s*=\s*["']script["']/i.test(rel) ? "js" : /as\s*=\s*["']font["']/i.test(rel) ? "font" : /as\s*=\s*["']image["']/i.test(rel) ? "image" : /as\s*=\s*["']video|audio["']/i.test(rel) ? "media" : typeFor(u);
-    addLink(job, u, hint, base, "http-link");
+    const rel = (params.match(/\brel\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s;]+))/i)?.slice(1).find(Boolean) || "").toLowerCase();
+    const as = (params.match(/\bas\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s;]+))/i)?.slice(1).find(Boolean) || "").toLowerCase();
+    const hint = as === "script" ? "js" : as === "style" ? "css" : as === "font" ? "font" : as === "image" ? "image" : /video|audio/.test(as) ? "media" : typeFor(u);
+    const reason = rel.includes("preload") || rel.includes("modulepreload") ? "preload" : rel.includes("canonical") ? "canonical" : "http-link";
+    addLink(job, u, hint, base, reason);
   }
 }
 function discoverDataText(job, text, base) {
   const src = String(text || "");
-  for (const m of src.matchAll(/(?:https?:\/\/[^\s"'<>\\]+|\/(?:api|graphql|trpc|_next\/data)(?:[/?#][^\s"'<>\\]*)?)/gi)) {
-    const raw = m[0].replace(/[),.;]+$/g, ""); addLink(job, raw, "data", base, "data-discovered");
+  discoverJsonUrls(job, src, base);
+  let seen = 0;
+  for (const m of src.matchAll(/(?:https?:\/\/[^\s"'<>\\]+|\/\/(?:[^\s"'<>\\]+)|\/(?:api|graphql|trpc|_next\/data|wp-json|rest|rpc|v\d+)(?:[/?#][^\s"'<>\\]*)?)/gi)) {
+    if (seen >= CFG.maxJsonUrlDiscovery) break;
+    const raw = m[0].replace(/[),.;]+$/g, "");
+    const hint = /\/images?\/|\.(?:png|jpe?g|gif|webp|svg)(?:$|[?#])/i.test(raw) ? "image" : /\.(?:m3u8|mpd|mp4|webm)(?:$|[?#])|video|audio/i.test(raw) ? "media" : /api|graphql|trpc|wp-json|rest|rpc/i.test(raw) ? "data" : typeFor(raw);
+    const before = job.links.length;
+    addLink(job, raw, hint, base, /api|graphql|trpc|wp-json|rest|rpc/i.test(raw) ? "api" : "data-discovered");
+    if (job.links.length !== before) seen += 1;
   }
-  if (/application\/(?:json|ld\+json)|text\/(?:plain|xml)/i.test(src.slice(0,200))) discoverJs(job, src, base);
 }
 
-function discoverHtml(job, text, base) {
+function discoverHtml(job, text, base, depth = 0) {
   const $ = cheerio.load(String(text || ""), { decodeEntities: false });
+  const rawBase = $("base[href]").first().attr("href");
+  const effectiveBase = resolveNavigation(rawBase, base) || base;
   const addSet = (raw, hint, reason = "discovered") => {
-    String(raw || "").split(/,|\s+/).map(x => x.trim()).filter(Boolean).forEach(x => {
-      const first = x.replace(/^["']|["']$/g, "");
-      if (first && !/^\d+(?:px|w|x)$/i.test(first)) addLink(job, first, hint, base, reason);
-    });
+    const parts = String(raw || "").split(/,\s*/);
+    let count = 0;
+    for (const candidate of parts) {
+      const bits = candidate.trim().split(/\s+/); if (!bits[0]) continue;
+      const first = bits[0].replace(/^['"]|['"]$/g, "");
+      if (first && !/^data:|^blob:/i.test(first) && !/^\d+(?:px|w|x)$/i.test(first)) { addLink(job, first, hint, effectiveBase, reason); if (++count >= CFG.maxSrcsetCandidates) break; }
+    }
   };
-  $("a[href],area[href]").each((_, el) => addLink(job, $(el).attr("href"), "html", base, "navigation"));
+  $("a[href],area[href]").each((_, el) => addLink(job, $(el).attr("href"), "html", effectiveBase, "navigation"));
   $("link[href]").each((_, el) => {
     const rel = String($(el).attr("rel") || "").toLowerCase();
     const as = String($(el).attr("as") || "").toLowerCase();
-    let hint = rel.includes("stylesheet") ? "css" : as === "script" ? "js" : as === "image" ? "image" : as === "font" ? "font" : as === "video" || as === "audio" ? "media" : rel.includes("manifest") ? "manifest" : rel.includes("canonical") || rel.includes("alternate") ? "html" : "asset";
-    addLink(job, $(el).attr("href"), hint, base, rel.includes("canonical") ? "canonical" : rel.includes("preload") || rel.includes("modulepreload") ? "preload" : "discovered");
+    let hint = rel.includes("stylesheet") ? "css" : as === "script" ? "js" : as === "style" ? "css" : as === "image" ? "image" : as === "font" ? "font" : /video|audio/.test(as) ? "media" : rel.includes("manifest") ? "manifest" : (rel.includes("canonical") || rel.includes("alternate") || rel.includes("amphtml")) ? "html" : typeFor($(el).attr("href"));
+    const reason = rel.includes("preload") ? "preload" : rel.includes("modulepreload") ? "modulepreload" : rel.includes("canonical") ? "canonical" : "link";
+    addLink(job, $(el).attr("href"), hint, effectiveBase, reason);
   });
-  $("script[src]").each((_, el) => addLink(job, $(el).attr("src"), "js", base));
-  $("iframe[src],frame[src]").each((_, el) => addLink(job, $(el).attr("src"), "html", base));
-  $("img[src]").each((_, el) => addLink(job, $(el).attr("src"), "image", base));
-  $("img[data-src],img[data-original],img[data-lazy-src]").each((_, el) => {
-    for (const attr of ["data-src","data-original","data-lazy-src"]) if ($(el).attr(attr)) addLink(job, $(el).attr(attr), "image", base, "lazy");
+  $("script[src]").each((_, el) => addLink(job, $(el).attr("src"), "js", effectiveBase, "script"));
+  $("script:not([src])").each((_, el) => {
+    const type = String($(el).attr("type") || "").toLowerCase();
+    if (type.includes("ld+json") || type.includes("json")) discoverJsonUrls(job, $(el).text(), effectiveBase);
+    else discoverJs(job, $(el).text(), effectiveBase);
   });
-  $("img,source,video,audio,iframe,script,link").each((_, el) => {
-    for (const attr of ["data-url","data-href","data-src","data-original","data-lazy","data-lazy-src"]) {
-      const raw = $(el).attr(attr); if (!raw || /^data:image|^data:video|^blob:/i.test(raw)) continue;
-      addLink(job, raw, typeFor(raw, $(el).prop("tagName") === "IMG" ? "image" : "asset"), base, "data-attribute");
+  $("iframe[src],frame[src]").each((_, el) => addLink(job, $(el).attr("src"), "html", effectiveBase, "frame"));
+  $("iframe[srcdoc]").each((_, el) => { if (depth < 1) discoverHtml(job, $(el).attr("srcdoc"), effectiveBase, depth + 1); });
+  $("img[src]").each((_, el) => addLink(job, $(el).attr("src"), "image", effectiveBase, "image"));
+  $("img,source,video,audio,iframe,script,link,input,object,embed").each((_, el) => {
+    const tag = String(el.tagName || "").toLowerCase();
+    for (const attr of Object.keys(el.attribs || {})) {
+      const value = $(el).attr(attr);
+      if (!value || /^data:|^blob:/i.test(value)) continue;
+      const name = attr.toLowerCase();
+      const interesting = /^(?:href|src|action|poster|data|cite|background|longdesc|profile|manifest|formaction|content)$/.test(name) || /^(?:data-|ng-|v-).*(?:src|href|url|image|video|audio|poster|endpoint|api|route|manifest|file|media)/i.test(name);
+      if (!interesting) continue;
+      const isMeta = tag === "meta" || tag === "link";
+      if (name === "content" && !isMeta) continue;
+      const hint = /image|icon|poster|thumbnail/i.test(name) ? "image" : /video|audio|media/i.test(name) ? "media" : /css|style/i.test(name) ? "css" : /script|module|js/i.test(name) ? "js" : /api|endpoint|graphql|trpc/i.test(name) ? "data" : tag === "a" || tag === "area" || name === "action" || name === "formaction" ? "html" : typeFor(value);
+      const reason = /api|endpoint|graphql|trpc/i.test(name) ? "api" : /lazy|data-src|data-original|data-lazy/i.test(name) ? "lazy" : "data-attribute";
+      addLink(job, value, hint, effectiveBase, reason);
     }
   });
   $("picture source[src],picture source[srcset],source[src],source[srcset]").each((_, el) => {
-    if ($(el).attr("src")) addLink(job, $(el).attr("src"), typeFor($(el).attr("src"), "asset"), base);
-    if ($(el).attr("srcset")) addSet($(el).attr("srcset"), "image");
+    if ($(el).attr("src")) addLink(job, $(el).attr("src"), typeFor($(el).attr("src"), "image"), effectiveBase, "source");
+    if ($(el).attr("srcset")) addSet($(el).attr("srcset"), "image", "srcset");
   });
-  $("video[src],audio[src]").each((_, el) => addLink(job, $(el).attr("src"), "media", base));
-  $("video[poster]").each((_, el) => addLink(job, $(el).attr("poster"), "image", base));
-  $("track[src]").each((_, el) => addLink(job, $(el).attr("src"), "data", base));
-  $("input[src]").each((_, el) => addLink(job, $(el).attr("src"), "asset", base));
-  $("embed[src]").each((_, el) => addLink(job, $(el).attr("src"), "asset", base));
-  $("object[data]").each((_, el) => addLink(job, $(el).attr("data"), "asset", base));
+  $("img[srcset],source[srcset]").each((_, el) => addSet($(el).attr("srcset"), "image", "srcset"));
+  $("video[src]").each((_, el) => addLink(job, $(el).attr("src"), "media", effectiveBase, "media"));
+  $("audio[src]").each((_, el) => addLink(job, $(el).attr("src"), "media", effectiveBase, "media"));
+  $("video[poster]").each((_, el) => addLink(job, $(el).attr("poster"), "image", effectiveBase, "critical-image"));
+  $("track[src]").each((_, el) => addLink(job, $(el).attr("src"), "data", effectiveBase, "track"));
+  $("object[data]").each((_, el) => addLink(job, $(el).attr("data"), "asset", effectiveBase, "object"));
+  $("object param[value]").each((_, el) => addLink(job, $(el).attr("value"), typeFor($(el).attr("value")), effectiveBase, "object-param"));
+  $("embed[src]").each((_, el) => addLink(job, $(el).attr("src"), "asset", effectiveBase, "embed"));
   $("svg image,svg use").each((_, el) => {
     const raw = $(el).attr("href") || $(el).attr("xlink:href") || "";
-    addLink(job, raw.split("#")[0], "image", base, "svg-reference");
+    addLink(job, raw.split("#")[0], "image", effectiveBase, "svg-reference");
   });
-  $("meta[property='og:image'],meta[property='og:image:url'],meta[name='twitter:image'],meta[name='twitter:image:src'],meta[itemprop='image'],meta[name='msapplication-tileimage'],meta[property='og:logo']").each((_, el) => addLink(job, $(el).attr("content"), "image", base, "metadata"));
-  $("meta[name='twitter:player'],meta[property='og:video'],meta[property='og:video:url'],meta[property='og:audio']").each((_, el) => addLink(job, $(el).attr("content"), "media", base, "metadata"));
-  $("link[rel~='icon'],link[rel~='apple-touch-icon'],link[rel~='mask-icon']").each((_, el) => addLink(job, $(el).attr("href"), "image", base, "icon"));
-  $("link[rel~='manifest']").each((_, el) => addLink(job, $(el).attr("href"), "asset", base));
-  $("form[action],form[formaction]").each((_, el) => addLink(job, $(el).attr("action") || $(el).attr("formaction"), "html", base, "navigation"));
-  $("[formaction]").each((_, el) => addLink(job, $(el).attr("formaction"), "html", base, "navigation"));
-  $("link[rel='canonical']").each((_, el) => addLink(job, $(el).attr("href"), "html", base, "canonical"));
-  $("meta[http-equiv='refresh']").each((_, el) => {
-    const raw = String($(el).attr("content") || ""); const m = raw.match(/url\s*=\s*(.+)$/i); if (m) addLink(job, m[1].trim().replace(/^["']|["']$/g, ""), "html", base, "navigation");
+  $("meta[property],meta[name],meta[itemprop]").each((_, el) => {
+    const key = String($(el).attr("property") || $(el).attr("name") || $(el).attr("itemprop") || "").toLowerCase();
+    const content = $(el).attr("content"); if (!content) return;
+    if (/image|logo|thumbnail|icon/.test(key)) addLink(job, content, "image", effectiveBase, "metadata");
+    else if (/video|audio|player|stream/.test(key)) addLink(job, content, "media", effectiveBase, "metadata");
+    else if (/url|canonical|alternate/.test(key)) addLink(job, content, "html", effectiveBase, "metadata");
   });
-  $("[srcset],[imagesrcset],[data-srcset]").each((_, el) => addSet($(el).attr("srcset") || $(el).attr("imagesrcset") || $(el).attr("data-srcset"), "image"));
-  $("style").each((_, el) => discoverCss(job, $(el).text(), base));
-  $("[style]").each((_, el) => discoverCss(job, $(el).attr("style") || "", base));
-  $("template").each((_, el) => {
-    const inner = String($(el).html() || ""); if (inner) discoverHtml(job, inner, base);
+  $("link[rel~='icon'],link[rel~='apple-touch-icon'],link[rel~='mask-icon']").each((_, el) => addLink(job, $(el).attr("href"), "image", effectiveBase, "icon"));
+  $("form[action],form[formaction],button[formaction],input[formaction]").each((_, el) => addLink(job, $(el).attr("action") || $(el).attr("formaction"), "html", effectiveBase, "navigation"));
+  $("meta[http-equiv]").each((_, el) => {
+    const kind = String($(el).attr("http-equiv") || "").toLowerCase();
+    if (kind === "refresh") { const m = String($(el).attr("content") || "").match(/url\s*=\s*(.+)$/i); if (m) addLink(job, m[1].trim().replace(/^['"]|['"]$/g, ""), "html", effectiveBase, "navigation"); }
   });
-  // Script/data URL heuristics catch same-origin JSON/GraphQL endpoints and
-  // static resources that aren't represented by DOM tags. This is discovery,
-  // not execution or security bypassing.
-  discoverJs(job, String(text || ""), base);
+  $("template,noscript").each((_, el) => { if (depth < 1) { const inner = String($(el).html() || ""); if (inner) discoverHtml(job, inner, effectiveBase, depth + 1); } });
+  $("style").each((_, el) => discoverCss(job, $(el).text(), effectiveBase));
+  $(["[style]"].join(",")).each((_, el) => discoverCss(job, $(el).attr("style") || "", effectiveBase));
+  // Expanded lazy/resource discovery. Modern frameworks often hide the real URL
+  // in data-srcset/data-background/data-video/data-api and import maps rather than
+  // standard src/href attributes.
+  $("[data-srcset],[data-lazy-srcset],[data-image-srcset]").each((_, el) => {
+    for (const name of ["data-srcset", "data-lazy-srcset", "data-image-srcset"]) {
+      const value = $(el).attr(name); if (value) addSet(value, "image", "lazy-srcset");
+    }
+  });
+  $("[data-src],[data-lazy-src],[data-original],[data-original-src],[data-image],[data-image-src],[data-background],[data-background-image],[data-bg]").each((_, el) => {
+    for (const name of ["data-src","data-lazy-src","data-original","data-original-src","data-image","data-image-src","data-background","data-background-image","data-bg"]) {
+      const value = $(el).attr(name); if (value) {
+        const hint = /background|image/i.test(name) ? "image" : /video|media/i.test(name) ? "media" : typeFor(value);
+        addLink(job, value, hint, effectiveBase, "lazy-attribute");
+      }
+    }
+  });
+  $("link[as='fetch'],link[as='script'],link[as='style'],link[as='font'],link[as='image'],link[as='video'],link[as='audio']").each((_, el) => {
+    const href = $(el).attr("href"); if (!href) return;
+    const as = String($(el).attr("as") || "").toLowerCase();
+    addLink(job, href, as === "script" ? "js" : as === "style" ? "css" : as === "font" ? "font" : as === "image" ? "image" : /video|audio/.test(as) ? "media" : "data", effectiveBase, "preload-runtime");
+  });
+  $("script[type='importmap'],script[type='application/importmap']").each((_, el) => discoverJsonUrls(job, $(el).text(), effectiveBase));
+
+  // Broad bounded lexical scan. This is intentionally a discovery fallback, not
+  // a blind crawler: addLink still applies normalization, dedupe, crawl-origin,
+  // robots, page/resource and global limits.
+  const rawPage = String(text || "").slice(0, CFG.maxBroadScanChars);
+  let broadFound = 0;
+  const urlPattern = /(?:https?:\/\/[^\s<>"'`\\]+|\/\/(?:[^\s<>"'`\\]+)|\/(?:api|graphql|trpc|_next(?:\/data)?|wp-json|rest|rpc|search|v\d+)(?:[/?#][^\s<>"'`\\]*)?)/gi;
+  for (const m of rawPage.matchAll(urlPattern)) {
+    if (broadFound >= CFG.maxDiscoveryPerPage) break;
+    const raw = String(m[0] || "").replace(/[),.;]+$/g, "");
+    const hint = /\.(?:png|jpe?g|gif|webp|svg|avif|ico)(?:$|[?#])/i.test(raw) || /\/(?:images?|img|icons?)\//i.test(raw) ? "image"
+      : /(?:\.m3u8|\.mpd|\.mp4|\.webm|\.mov|\.m4v)(?:$|[?#])/i.test(raw) ? "media"
+      : /(?:api|graphql|trpc|wp-json|rest|rpc|_next\/data)/i.test(raw) ? "data"
+      : typeFor(raw);
+    const before = job.links.length;
+    addLink(job, raw, hint, effectiveBase, "broad-scan");
+    if (job.links.length !== before) broadFound += 1;
+  }
+
+  // Last-pass attribute scan: catches framework-specific resource attributes that
+  // are not known by name, but only schedules values that look like URLs.
+  let attrCount = 0;
+  $("*").each((_, el) => {
+    if (attrCount >= CFG.maxDiscoveryPerPage) return false;
+    for (const [name, value] of Object.entries(el.attribs || {})) {
+      if (attrCount >= CFG.maxDiscoveryPerPage) break;
+      const v = String(value || "").trim();
+      if (!v || /^data:|^blob:/i.test(v) || v.length > 2000) continue;
+      if (/^(?:https?:)?\/\//i.test(v) || /^\/?(?:\.\.?\/)/.test(v) || /^\/(?:api|graphql|trpc|_next|wp-json|rest|rpc)(?:\/|\?|$)/i.test(v)) {
+        const hint = /image|img|icon|thumbnail/i.test(name) ? "image" : /video|audio|media/i.test(name) ? "media" : /api|graphql|trpc|endpoint/i.test(name) ? "data" : typeFor(v);
+        const before = job.links.length; addLink(job, v, hint, effectiveBase, "attribute-scan"); if (job.links.length !== before) attrCount += 1;
+      }
+    }
+  });
 }
+
 function discoverMediaManifest(job, text, base) {
   const src=String(text||'');
   const isHls=/^#EXTM3U/m.test(src)||/mpegurl|\.m3u8(?:$|[?#])/i.test(base);
@@ -1552,9 +1793,11 @@ function createJob(root) {
   const id = crypto.randomUUID();
   return {
     id, root, url: root, createdAt: now(), finishedAt: null, done: false, stopRequested: false, status: "queued", statusText: "Queued",
-    pageFrontier: new PriorityFrontier(CFG.maxPendingQueue), resourceFrontier: new PriorityFrontier(CFG.maxPendingQueue), visited: new Set(), discovered: new Set(),
+    pageFrontier: new PriorityFrontier(CFG.maxPendingQueue), resourceFrontier: new PriorityFrontier(CFG.maxPendingQueue), criticalResourceFrontier: new PriorityFrontier(Math.min(CFG.maxPendingQueue, CFG.criticalResourceBudget * 4)), visited: new Set(), discovered: new Set(), retryCounts: new Map(),
     resources: [], links: [], logs: [], logSeq: 0, sourceDir: path.join(ROOT, id), sourceFiles: 0, textBytesStored: 0,
-    activeWorkers: 0, activeHtmlWorkers: 0, activeAssetWorkers: 0, processed: 0, pagesDiscovered: 0, resourcesScheduled: 0,
+    activeWorkers: 0, activeHtmlWorkers: 0, activeAssetWorkers: 0, processed: 0, pagesDiscovered: 0, resourcesScheduled: 0, sitemapLoading: false, browserDiscoveredCount: 0, browserDiscoveredHosts: new Set(),
+    crawlOrigins: new Set([new URL(root).origin]),
+    hostPolicy: new Map(),
     robots: null, robotsReady: false, sitemaps: new Set(), challengeHosts: new Set(), hostActive: new Map(), hostCooldowns: new Map(), hostLastRequested: new Map(), hostFailures: new Map(), hostDelayMs: 0, stopReason: null,
     counts: { htmlPages: 0, css: 0, js: 0, data: 0, assets: 0, links: 0, bytesScanned: 0, bytesStored: 0, bytesDiscarded: 0, requestCount: 0, retries: 0, challenges: 0, errors: 0 },
     controller: new AbortController(),
@@ -1564,7 +1807,7 @@ function createJob(root) {
   };
 }
 function publicJob(job) {
-  const queued = job.pageFrontier.size + job.resourceFrontier.size;
+  const queued = job.criticalResourceFrontier.size + job.pageFrontier.size + job.resourceFrontier.size;
   return {
     id: job.id, url: job.url, createdAt: job.createdAt, finishedAt: job.finishedAt, done: job.done,
     status: job.status, statusText: job.statusText, stopRequested: job.stopRequested,
@@ -1574,9 +1817,9 @@ function publicJob(job) {
     limits: { globalConcurrency: CFG.maxActiveFetches, crawlerRobots: CFG.logicalRobots, logicalRobots: CFG.logicalRobots, maxActiveFetches: CFG.maxActiveFetches, perHostConcurrency: CFG.perHostConcurrency, maxPages: CFG.maxPages, maxResources: CFG.maxResources, maxLinks: CFG.maxLinks, maxScanBytes: CFG.maxScanBytes },
     searchIndex: searchIndexStats(),
     robotsLoaded: job.robotsReady, sitemapsFound: job.sitemaps.size, sourceFiles: job.sourceFiles, textBytesStored: job.textBytesStored,
-    resourceCount: job.resources.length, linkCount: job.links.length, logs: job.logs.slice(-120),
+    resourceCount: job.resources.length, linkCount: job.links.length, browserDiscovered: job.browserDiscoveredCount || 0, browserDiscoveredHosts: job.browserDiscoveredHosts?.size || 0, criticalQueue: job.criticalResourceFrontier.size, logs: job.logs.slice(-120),
     robotMesh: job.robotPool ? { summary: job.robotPool.report(1).summary } : null,
-    queue: { pages: job.pageFrontier.snapshot().slice(0, 50), resources: job.resourceFrontier.snapshot().slice(0, 50) }
+    queue: { critical: job.criticalResourceFrontier.snapshot().slice(0, 50), pages: job.pageFrontier.snapshot().slice(0, 50), resources: job.resourceFrontier.snapshot().slice(0, 50) }
   };
 }
 function crawlLimitForContentType(contentType) {
@@ -1587,11 +1830,36 @@ function crawlLimitForContentType(contentType) {
   return CFG.maxProxyOtherBytes;
 }
 
+function hostConcurrencyLimit(job, host) {
+  const ceiling = CFG.perHostConcurrency;
+  if (!CFG.adaptiveHostConcurrency) return ceiling;
+  const state = job.hostPolicy.get(host) || { limit: ceiling, successes: 0, errors: 0 };
+  state.limit = Math.max(CFG.minPerHostConcurrency, Math.min(ceiling, Number(state.limit) || ceiling));
+  job.hostPolicy.set(host, state);
+  return state.limit;
+}
+function noteHostSuccess(job, host) {
+  if (!CFG.adaptiveHostConcurrency) return;
+  const state = job.hostPolicy.get(host) || { limit: CFG.perHostConcurrency, successes: 0, errors: 0 };
+  state.successes += 1;
+  state.errors = Math.max(0, state.errors - 1);
+  if (state.successes % CFG.hostSuccessRamp === 0) state.limit = Math.min(CFG.perHostConcurrency, state.limit + 1);
+  job.hostPolicy.set(host, state);
+}
+function noteHostError(job, host) {
+  if (!CFG.adaptiveHostConcurrency) return;
+  const state = job.hostPolicy.get(host) || { limit: CFG.perHostConcurrency, successes: 0, errors: 0 };
+  state.errors += 1;
+  state.successes = 0;
+  if (state.errors % CFG.hostErrorPenalty === 0) state.limit = Math.max(CFG.minPerHostConcurrency, state.limit - 1);
+  job.hostPolicy.set(host, state);
+}
+
 async function processItem(job, item) {
   if (job.stopRequested) return;
   const key = linkKey(item.type, item.url); if (job.visited.has(key)) return;
   job.visited.add(key);
-  if (item.type === "html" && (!sameOrigin(item.url, job.root) || !robotsAllowed(item.url, job.robots))) return;
+  if (item.type === "html" && (!crawlOriginAllowed(job, item.url) || !robotsAllowed(item.url, job.robots))) return;
   if (job.counts.bytesScanned >= CFG.maxScanBytes) { job.stopRequested = true; job.stopReason = "scan-byte-limit"; return; }
   const host = hostOf(item.url);
   if (job.challengeHosts.has(host)) return;
@@ -1609,7 +1877,9 @@ async function processItem(job, item) {
     if (r.truncated || r.tooLarge) { job.counts.bytesDiscarded += r.bytes; jobLog(job, "warn", `Response skipped after size limit: ${item.url}`); return; }
     if (job.counts.bytesScanned > CFG.maxScanBytes) { job.stopRequested = true; job.stopReason = "scan-byte-limit"; return; }
     const lower = r.contentType.toLowerCase();
-    if (r.linkHeader) discoverLinkHeader(job, r.linkHeader, r.finalUrl || item.url);
+    const finalUrl = r.finalUrl || item.url;
+    if (finalUrl && sameRedirectHost(finalUrl, item.url)) { try { job.crawlOrigins.add(new URL(finalUrl).origin); } catch {} }
+    if (r.linkHeader) discoverLinkHeader(job, r.linkHeader, finalUrl);
     const challenge = detectChallenge(r.body.toString("utf8"), r.contentType, r.status, { server: r.serverHeader, "cf-mitigated": r.cfMitigated });
     if (challenge) {
       job.counts.challenges += 1;
@@ -1649,7 +1919,7 @@ async function processItem(job, item) {
     };
     job.resources.push(resource);
     const link = job.links.find(x => x.url === item.url || x.url === resource.url); if (link) { link.captured = true; link.redirectChain = resource.redirectChain; link.url = resource.url; }
-    job.hostFailures.set(host, 0); job.hostCooldowns.delete(host);
+    job.hostFailures.set(host, 0); job.hostCooldowns.delete(host); noteHostSuccess(job, host);
     if (type === "html") {
       job.counts.htmlPages += 1; indexDocument(resource.url, text); discoverHtml(job, text, resource.url);
       job.counts.bytesStored += Math.min(r.bytes, CFG.maxTextBytesPerResource);
@@ -1674,9 +1944,22 @@ async function processItem(job, item) {
     job.counts.errors += 1;
     const failures = (job.hostFailures.get(host) || 0) + 1;
     job.hostFailures.set(host, failures);
+    noteHostError(job, host);
+    const status = Number(e?.status || String(e?.message || "").match(/HTTP (\d+)/)?.[1] || 0);
     const backoff = Math.min(CFG.maxHostBackoffMs, CFG.hostBackoffMs * 2 ** Math.min(5, failures - 1));
-    job.hostCooldowns.set(host, Date.now() + backoff);
-    jobLog(job, "error", `Fetch failed ${item.url} — ${e.name || "Error"}: ${e.message}`, { retryClass: statusRetryClass(Number(String(e.message).match(/HTTP (\d+)/)?.[1] || 0)) });
+    if (status === 429 || status === 503 || status === 502 || status === 504 || status === 500 || /timed out|fetch failed|ECONN|ENOTFOUND|EAI_AGAIN/i.test(String(e?.message || ""))) {
+      job.hostCooldowns.set(host, Date.now() + backoff);
+      const retryKey = key;
+      const retryCount = (job.retryCounts.get(retryKey) || 0) + 1;
+      if (retryCount <= CFG.maxRetries && !job.stopRequested) {
+        job.retryCounts.set(retryKey, retryCount);
+        job.visited.delete(retryKey);
+        const targetFrontier = item.critical ? job.criticalResourceFrontier : item.type === "html" ? job.pageFrontier : job.resourceFrontier;
+        targetFrontier.requeue({ ...item }, Number(item.priority || crawlPriority(item.url, item.type, item.reason || "retry")) - retryCount * 4, retryKey, Date.now() + backoff);
+        jobLog(job, "debug", `Transient failure; task requeued (${retryCount}/${CFG.maxRetries}): ${item.url}`, { status, retryAtMs: backoff });
+      }
+    }
+    jobLog(job, status === 429 ? "warn" : "error", `Fetch failed ${item.url} — ${e.name || "Error"}: ${e.message}`, { retryClass: statusRetryClass(status) });
   } finally { job.processed += 1; }
 }
 class CooperativeRobotPool {
@@ -1770,25 +2053,18 @@ class CooperativeRobotPool {
   }
   busyRobots() { return this.robots.filter(r => r.activeTasks > 0 || r.queue.length > 0); }
   pendingLocal() { return this.totalQueued; }
-  totalPending() { return this.pendingLocal() + this.job.pageFrontier.size + this.job.resourceFrontier.size; }
+  totalPending() { return this.pendingLocal() + this.job.criticalResourceFrontier.size + this.job.pageFrontier.size + this.job.resourceFrontier.size + (this.job.sitemapLoading ? 1 : 0); }
   active() { return this.activePromises.size; }
   chooseFrontierTask() {
-    if (!this.job.pageFrontier.size && !this.job.resourceFrontier.size) return null;
-    // Keep document navigation ahead of secondary assets while still serving assets
-    // aggressively once the page frontier is short.
-    let type = "html";
-    if (!this.job.pageFrontier.size) type = "asset";
-    else if (this.job.resourceFrontier.size > this.job.pageFrontier.size * 2) type = "asset";
-    let item = type === "html"
-      ? this.job.pageFrontier.takeNext(this.job.hostActive, CFG.perHostConcurrency, this.job.hostCooldowns)
-      : this.job.resourceFrontier.takeNext(this.job.hostActive, CFG.perHostConcurrency, this.job.hostCooldowns);
-    if (!item) {
-      const other = type === "html" ? "asset" : "html";
-      item = other === "html"
-        ? this.job.pageFrontier.takeNext(this.job.hostActive, CFG.perHostConcurrency, this.job.hostCooldowns)
-        : this.job.resourceFrontier.takeNext(this.job.hostActive, CFG.perHostConcurrency, this.job.hostCooldowns);
+    if (this.job.criticalResourceFrontier.size) {
+      const item = this.job.criticalResourceFrontier.takeNext(this.job.hostActive, host => hostConcurrencyLimit(this.job, host), this.job.hostCooldowns);
+      if (item) return item;
     }
-    return item || null;
+    if (this.job.pageFrontier.size) {
+      const item = this.job.pageFrontier.takeNext(this.job.hostActive, host => hostConcurrencyLimit(this.job, host), this.job.hostCooldowns);
+      if (item) return item;
+    }
+    return this.job.resourceFrontier.takeNext(this.job.hostActive, host => hostConcurrencyLimit(this.job, host), this.job.hostCooldowns) || null;
   }
   chooseReceiver() {
     // Load buckets make 1,000 logical robots cheap: selecting a receiver is O(1-ish)
@@ -1803,39 +2079,43 @@ class CooperativeRobotPool {
     }
     return null;
   }
+  nextReceiver() {
+    // Pull from the lowest-load bucket instead of scanning/sorting the entire
+    // 1,000-robot fleet on every dispatch cycle.
+    for (let load = 0; load < this.taskCapacity; load++) {
+      const bucket = this.loadBuckets[load];
+      if (!bucket?.size) continue;
+      for (const robot of bucket) {
+        if (robot.activeTasks < this.activeCapacity && robot.queue.length < this.taskCapacity) return robot;
+      }
+    }
+    return null;
+  }
   assignGlobalTasks() {
     let assigned = 0;
-    const candidates = [];
-    const n = this.count;
-    for (let i = 0; i < n; i++) {
-      const idx = (this.worksetCursor + i) % n; const r = this.robots[idx];
-      if (r.activeTasks < this.activeCapacity || r.queue.length < this.taskCapacity) candidates.push(r);
-    }
-    candidates.sort((a,b) => this.load(a) - this.load(b) || a.lastActionAt - b.lastActionAt);
-    const selected = candidates.slice(0, this.worksetSize);
-    if (selected.length) this.worksetCursor = (this.worksetCursor + selected.length) % n;
-    while (assigned < CFG.maxActiveFetches * 2 && this.job.pageFrontier.size) {
-      let moved = false;
-      for (const robot of selected) {
-        if (robot.queue.length >= this.taskCapacity) continue;
-        const item = this.job.pageFrontier.takeNext(this.job.hostActive, CFG.perHostConcurrency, this.job.hostCooldowns); if (!item) break;
-        robot.queue.push(item); this.totalQueued += 1; robot.lastActionAt = now(); this.markShareable(robot); this.updateLoadBucket(robot); assigned += 1; moved = true;
-        if (assigned >= CFG.maxActiveFetches * 2) break;
+    const target = Math.min(CFG.robotDispatchBatch, Math.max(CFG.maxActiveFetches * 4, 64));
+    while (assigned < target) {
+      const robot = this.nextReceiver();
+      if (!robot) break;
+      let bundled = 0;
+      const bundleTarget = Math.min(CFG.robotBundleSize, this.taskCapacity - robot.queue.length);
+      while (bundled < bundleTarget && assigned < target) {
+        const item = this.chooseFrontierTask();
+        if (!item) break;
+        robot.queue.push(item);
+        this.totalQueued += 1;
+        robot.lastActionAt = now();
+        bundled += 1;
+        assigned += 1;
       }
-      if (!moved) break;
-    }
-    while (assigned < CFG.maxActiveFetches * 2 && this.job.resourceFrontier.size) {
-      let moved = false;
-      for (const robot of selected) {
-        if (robot.queue.length >= this.taskCapacity) continue;
-        const item = this.job.resourceFrontier.takeNext(this.job.hostActive, CFG.perHostConcurrency, this.job.hostCooldowns); if (!item) break;
-        robot.queue.push(item); this.totalQueued += 1; robot.lastActionAt = now(); this.markShareable(robot); this.updateLoadBucket(robot); assigned += 1; moved = true;
-        if (assigned >= CFG.maxActiveFetches * 2) break;
-      }
-      if (!moved) break;
+      this.updateLoadBucket(robot);
+      this.markShareable(robot);
+      this.updateStatus(robot);
+      if (!bundled) break;
     }
     return assigned;
   }
+
   decideHelp(target, requester) {
     const backlog = target.queue.length;
     const healthy = target.errors < Math.max(3, target.completed / 25 + 1);
@@ -1849,10 +2129,13 @@ class CooperativeRobotPool {
   }
   async requestHelp(requester) {
     if (!CFG.robotHelpEnabled || !CFG.robotStealOnIdle || requester.helpRequests >= 1000 || requester.activeTasks >= this.activeCapacity || requester.queue.length > 0) return false;
-    const candidates = [...this.helpCandidates]
-      .filter(r => r.id !== requester.id && r.queue.length >= CFG.robotHelpThreshold)
-      .sort((a, b) => b.queue.length - a.queue.length || b.activeTasks - a.activeTasks || a.errors - b.errors)
-      .slice(0, CFG.robotHelpScanLimit);
+    const candidates = [];
+    for (const r of this.helpCandidates) {
+      if (r.id === requester.id || r.queue.length < CFG.robotHelpThreshold) continue;
+      candidates.push(r);
+      if (candidates.length >= CFG.robotHelpScanLimit) break;
+    }
+    candidates.sort((a, b) => b.queue.length - a.queue.length || b.activeTasks - a.activeTasks || a.errors - b.errors);
     if (!candidates.length) return false;
     requester.helpRequests += 1;
     this.event("help-requested", { requester: requester.id, candidates: candidates.map(r => ({ id: r.id, queuedTasks: r.queue.length })) });
@@ -1918,7 +2201,7 @@ class CooperativeRobotPool {
   startTask(robot, item) {
     if (!item || robot.activeTasks >= this.activeCapacity) return false;
     const taskHost = hostOf(item.url);
-    if ((this.job.hostActive.get(taskHost) || 0) >= CFG.perHostConcurrency) return false;
+    if ((this.job.hostActive.get(taskHost) || 0) >= hostConcurrencyLimit(this.job, taskHost)) return false;
     const cooldownUntil = this.job.hostCooldowns.get(taskHost) || 0;
     if (cooldownUntil > Date.now()) return false;
     const helped = !!item._helped;
@@ -2013,7 +2296,7 @@ class CooperativeRobotPool {
       multitaskingRobots: this.multitaskingRobotCount,
       idleRobots: this.idleRobotCount,
       queuedRobotTasks: this.pendingLocal(), globalPageQueue: this.job.pageFrontier.size, globalResourceQueue: this.job.resourceFrontier.size,
-      networkActive: this.active(), networkLimit: CFG.maxActiveFetches,
+      networkActive: this.active(), networkLimit: CFG.maxActiveFetches, perHostCeiling: CFG.perHostConcurrency, adaptiveHostConcurrency: CFG.adaptiveHostConcurrency,
       helpRequests: this.robots.reduce((n,r) => n + r.helpRequests, 0), helpAccepted: this.robots.reduce((n,r) => n + r.helpAccepted, 0),
       helpDeclined: this.robots.reduce((n,r) => n + r.helpDeclined, 0), helpGiven: this.robots.reduce((n,r) => n + r.helpGiven, 0)
     };
@@ -2048,7 +2331,10 @@ async function runCrawl(job) {
   job.robotPool = new CooperativeRobotPool(job);
   try {
     await loadRobots(job);
-    if (!job.stopRequested) await loadSitemaps(job);
+    if (!job.stopRequested) {
+      job.sitemapLoading = true;
+      void loadSitemaps(job).catch(e => jobLog(job, "debug", `Sitemap pass failed: ${e.message}`)).finally(() => { job.sitemapLoading = false; });
+    }
     job.status = "crawling"; job.statusText = `Crawling with ${CFG.logicalRobots.toLocaleString()} cooperative robots…`;
     await job.robotPool.run();
     job.done = true; job.finishedAt = now();
@@ -2166,8 +2452,9 @@ app.post('/api/browser/session', async (req, res) => {
   if (!CFG.browserEnabled) return respondError(res, 503, 'Browser engine is disabled.', 'BROWSER_ENGINE_UNAVAILABLE');
   try {
     const tabId = String(req.body?.tabId || '').slice(0, 100);
+    const jobId = String(req.body?.jobId || '').slice(0, 100);
     const url = normalizeUrl(String(req.body?.url || ''));
-    const session = await browserEngine.create(tabId, url);
+    const session = await browserEngine.create(tabId, url, jobId);
     res.json({ ok: true, session });
   } catch (e) { respondError(res, e.code === 'BROWSER_CAPACITY' ? 503 : 502, e.message, e.code || 'BROWSER_ENGINE_ERROR'); }
 });
@@ -2185,7 +2472,7 @@ app.get("/health", (req, res) => res.json({ ok: true, service: "veyra", uptimeSe
 app.get("/api/debug/system", (req, res) => {
   const mem = process.memoryUsage();
   const idx = searchIndexStats();
-  res.json({ time: now(), uptimeSec: Math.round(process.uptime()), startedAt: new Date(serverStartedAt).toISOString(), nodeVersion: process.version, platform: process.platform, processRole: CFG.processRole, memory: { rss: mem.rss, heapUsed: mem.heapUsed, heapTotal: mem.heapTotal, external: mem.external }, jobs: { total: jobs.size, active: [...jobs.values()].filter(j => !j.done).length, done: [...jobs.values()].filter(j => j.done).length }, proxyCacheEntries: proxyCache.size, searchCacheEntries: searchCache.size, network: { crawlerActive: fetchSemaphore.active, crawlerQueued: fetchSemaphore.queued, crawlerLimit: CFG.maxActiveFetches, logicalRobots: CFG.logicalRobots, warmActive: proxyWarmSemaphore.active, warmQueued: proxyWarmSemaphore.queued, warmLimit: CFG.proxyWarmConcurrency, warmLogicalRobots: CFG.proxyWarmRobots, browserActive: browserScheduler.active, browserQueued: browserScheduler.queue.length, browserLimit: CFG.browserMaxActiveFetches, browserPerHost: CFG.browserPerHostConcurrency }, browser: { ...browserScheduler.status(), sessions: browserEngine.status().sessions, pages: browserEngine.status().pages, contexts: browserEngine.status().contexts, maxSessions: browserEngine.status().maxSessions, maxPages: browserEngine.status().maxPages, maxContexts: browserEngine.status().maxContexts, sessionList: browserEngine.status().sessionList, proxySessions: proxySessions.size, cacheEntries: proxyCache.size }, searchIndexEntries: idx.documents, searchIndexTerms: idx.terms, searchIndexDomains: idx.domains, requestsLogged: requestLog.length, logs: serverLogs.length });
+  res.json({ time: now(), uptimeSec: Math.round(process.uptime()), startedAt: new Date(serverStartedAt).toISOString(), nodeVersion: process.version, platform: process.platform, processRole: CFG.processRole, memory: { rss: mem.rss, heapUsed: mem.heapUsed, heapTotal: mem.heapTotal, external: mem.external }, jobs: { total: jobs.size, active: [...jobs.values()].filter(j => !j.done).length, done: [...jobs.values()].filter(j => j.done).length }, proxyCacheEntries: proxyCache.size, searchCacheEntries: searchCache.size, network: { crawlerActive: fetchSemaphore.active, crawlerQueued: fetchSemaphore.queued, crawlerLimit: CFG.maxActiveFetches, logicalRobots: CFG.logicalRobots, warmActive: proxyWarmSemaphore.active, warmQueued: proxyWarmSemaphore.queued, warmLimit: CFG.proxyWarmConcurrency, warmLogicalRobots: CFG.proxyWarmRobots, browserActive: browserScheduler.active, browserQueued: browserScheduler.queue.length, browserLimit: CFG.browserMaxActiveFetches, browserPerHost: CFG.browserPerHostConcurrency }, browser: { ...browserScheduler.status(), sessions: browserEngine.status().sessions, pages: browserEngine.status().pages, contexts: browserEngine.status().contexts, maxSessions: browserEngine.status().maxSessions, maxPages: browserEngine.status().maxPages, maxContexts: browserEngine.status().maxContexts, sessionList: browserEngine.status().sessionList, proxySessions: proxySessions.size, cacheEntries: proxyCache.size }, hostPolicies: [...jobs.values()].reduce((n,j)=>n+(j.hostPolicy?.size||0),0), searchIndexEntries: idx.documents, searchIndexTerms: idx.terms, searchIndexDomains: idx.domains, requestsLogged: requestLog.length, logs: serverLogs.length });
 });
 app.get("/api/debug/config", (req, res) => res.json({ ...CFG, searchApiKey: undefined }));
 app.get("/api/debug/jobs", (req, res) => res.json({ jobs: [...jobs.values()].sort((a,b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)).map(publicJob) }));
@@ -2231,21 +2518,38 @@ app.get("/api/search", async (req, res) => {
 
 function extractWarmUrls(html, base, sid) {
   const $ = cheerio.load(String(html || ""), { decodeEntities: false });
-  const out = new Set();
-  const add = raw => { const u = resolveResource(raw, base); if (u) out.add(u); };
+  const out = new Map();
+  const add = (raw, priority = 20) => { const u = resolveResource(raw, base); if (!u) return; const current = out.get(u); if (!current || priority > current.priority) out.set(u, { url: u, priority }); };
   $("link[href]").each((_, el) => {
     const rel = String($(el).attr("rel") || "").toLowerCase();
-    if (rel.includes("stylesheet") || rel.includes("preload") || rel.includes("modulepreload") || rel.includes("icon") || rel.includes("manifest")) add($(el).attr("href"));
+    const as = String($(el).attr("as") || "").toLowerCase();
+    if (rel.includes("stylesheet")) add($(el).attr("href"), 120);
+    else if (rel.includes("modulepreload")) add($(el).attr("href"), 115);
+    else if (rel.includes("preload")) add($(el).attr("href"), as === "font" ? 118 : as === "script" ? 112 : as === "image" ? 108 : 100);
+    else if (rel.includes("icon") || rel.includes("manifest")) add($(el).attr("href"), 65);
   });
-  $("script[src]").each((_, el) => add($(el).attr("src")));
-  $("img[src],source[src],video[poster],audio[src],input[src],embed[src]").each((_, el) => add($(el).attr(el.name === "video" ? "poster" : "src")));
-  $("[srcset]").each((_, el) => { const first = String($(el).attr("srcset") || "").split(",")[0]?.trim().split(/\s+/)[0]; if (first) add(first); });
-  $("[imagesrcset],[data-src],[data-original],[data-lazy-src]").each((_, el) => {
-    const attr = $(el).attr("imagesrcset") != null ? "imagesrcset" : ($(el).attr("data-src") != null ? "data-src" : ($(el).attr("data-original") != null ? "data-original" : "data-lazy-src"));
-    const raw = $(el).attr(attr) || "";
-    add(attr.endsWith("srcset") ? raw.split(",")[0]?.trim().split(/\s+/)[0] : raw);
+  $("script[src]").each((_, el) => add($(el).attr("src"), String($(el).attr("type") || "").toLowerCase() === "module" ? 108 : 92));
+  $("img[src]").each((_, el) => add($(el).attr("src"), 86));
+  $("video[poster]").each((_, el) => add($(el).attr("poster"), 72));
+  $("source[src]").each((_, el) => add($(el).attr("src"), 55));
+  $("track[src]").each((_, el) => add($(el).attr("src"), 35));
+  $("[srcset]").each((_, el) => {
+    const raw = String($(el).attr("srcset") || "");
+    const first = raw.split(/,\s*/)[0]?.trim().split(/\s+/)[0];
+    if (first) add(first, 82);
   });
-  return [...out].slice(0, Math.min(CFG.proxyWarmLimit, 256)).map(url => ({ url, sid }));
+  $("[imagesrcset]").each((_, el) => {
+    const first = String($(el).attr("imagesrcset") || "").split(/,\s*/)[0]?.trim().split(/\s+/)[0];
+    if (first) add(first, 88);
+  });
+  $("[data-src],[data-original],[data-lazy-src]").each((_, el) => {
+    const raw = $(el).attr("data-src") || $(el).attr("data-original") || $(el).attr("data-lazy-src");
+    add(raw, 58);
+  });
+  return [...out.values()]
+    .sort((a, b) => b.priority - a.priority)
+    .slice(0, Math.min(CFG.proxyWarmLimit, 256))
+    .map(item => ({ ...item, sid }));
 }
 async function warmPageResources(html, base, sid) {
   if (CFG.proxyWarmLimit <= 0) return;
@@ -2262,7 +2566,7 @@ async function warmPageResources(html, base, sid) {
       let release = null;
       try {
         release = await proxyWarmSemaphore.acquire();
-        await fetchCached(item.url, { sessionId: item.sid, referrer: base, accept: "text/css,application/javascript,image/avif,image/webp,image/apng,image/svg+xml,image/*,font/*,video/*,audio/*,*/*;q=0.05", limit: CFG.maxTextBytesPerResource, timeout: CFG.requestTimeoutMs });
+        await fetchCached(item.url, { sessionId: item.sid, referrer: base, accept: "text/css,application/javascript,image/avif,image/webp,image/apng,image/svg+xml,image/*,font/*,*/*;q=0.05", limitForContentType: crawlLimitForContentType, limit: CFG.maxTextBytesPerResource, timeout: CFG.requestTimeoutMs, retries: 1 });
       } catch {} finally {
         if (release) release();
         hostActive.set(host, Math.max(0, (hostActive.get(host) || 1) - 1));
@@ -2339,6 +2643,12 @@ function forwardProxyBrowserHeaders(req, targetUrl, sourceUrl, mode, baseHeaders
   return out;
 }
 
+function proxyRefererCanonical(req) {
+  const raw = String(req.get("Referer") || req.get("referer") || "").trim();
+  if (!raw) return null;
+  return normalizeUrl(raw);
+}
+
 function proxyAcceptForResource(req, mode) {
   if (req.get("Accept")) return String(req.get("Accept")).slice(0, 1000);
   return mode === "view"
@@ -2356,7 +2666,7 @@ function looksLikeApiResource(url, accept = "", method = "GET") {
 }
 
 async function proxyRequest(req, res, mode) {
-  const canonical = firstValidUrl([req.query.url, req.query.target, req.query.u], req.get('Origin') || undefined);
+  const canonical = firstValidUrl([req.query.url, req.query.target, req.query.u], req.get('Origin') || undefined) || proxyRefererCanonical(req);
   const download = String(req.query.download || "") === "1";
   if (!canonical) return respondError(res, 400, "Missing or invalid public HTTP(S) URL.", "INVALID_URL");
   await assertPublicUrl(canonical);
@@ -2547,6 +2857,21 @@ const STATUS_VAR_DEFS = [
   { group: "Robot mesh", key: "robotQueueCapacity", label: "Robot local queue capacity", kind: "number", names: ["ROBOT_QUEUE_CAPACITY"], fallback: 8, min: 2, max: 32 },
   { group: "Robot mesh", key: "robotStealBatch", label: "Help steal batch", kind: "number", names: ["ROBOT_STEAL_BATCH"], fallback: 4, min: 1, max: 8 },
   { group: "Robot mesh", key: "robotStealOnIdle", label: "Idle robots request help", kind: "bool", names: ["ROBOT_STEAL_ON_IDLE"], fallback: true },
+  { group: "Robot mesh", key: "robotBundleSize", label: "Tasks bundled/robot", kind: "number", names: ["ROBOT_BUNDLE_SIZE"], fallback: 4, min: 1, max: 8 },
+  { group: "Robot mesh", key: "robotDispatchBatch", label: "Robot dispatch batch", kind: "number", names: ["ROBOT_DISPATCH_BATCH"], fallback: 1024, min: 64, max: 8192 },
+  { group: "Robot mesh", key: "robotHelpMaxInFlight", label: "Help requests in flight", kind: "number", names: ["ROBOT_HELP_MAX_INFLIGHT"], fallback: 64, min: 1, max: 256 },
+  { group: "Crawler concurrency", key: "adaptiveHostConcurrency", label: "Adaptive per-host concurrency", kind: "bool", names: ["ADAPTIVE_HOST_CONCURRENCY"], fallback: true },
+  { group: "Crawler concurrency", key: "minPerHostConcurrency", label: "Minimum per-host concurrency", kind: "number", names: ["MIN_PER_HOST_CONCURRENCY"], fallback: 2, min: 1, max: 32 },
+  { group: "Crawler concurrency", key: "criticalResourceBudget", label: "Critical resource budget", kind: "number", names: ["CRITICAL_RESOURCE_BUDGET"], fallback: 48, min: 8, max: 256 },
+  { group: "Crawler discovery", key: "maxDiscoveryPerPage", label: "Max discovered URLs/page", kind: "number", names: ["MAX_DISCOVERY_PER_PAGE"], fallback: 5000, min: 100, max: 20000 },
+  { group: "Crawler discovery", key: "maxScriptDiscovery", label: "Max script URL discoveries", kind: "number", names: ["MAX_SCRIPT_DISCOVERY"], fallback: 4000, min: 100, max: 20000 },
+  { group: "Crawler discovery", key: "maxJsonUrlDiscovery", label: "Max JSON URL discoveries", kind: "number", names: ["MAX_JSON_URL_DISCOVERY"], fallback: 2000, min: 50, max: 10000 },
+  { group: "Crawler discovery", key: "maxBroadScanChars", label: "Broad scan characters/page", kind: "number", names: ["MAX_BROAD_SCAN_CHARS"], fallback: 1500000, min: 10000, max: 10000000 },
+  { group: "Crawler discovery", key: "maxSrcsetCandidates", label: "Max srcset candidates", kind: "number", names: ["MAX_SRCSET_CANDIDATES"], fallback: 100, min: 10, max: 500 },
+  { group: "Crawler discovery", key: "maxBrowserDiscovered", label: "Max browser-discovered URLs", kind: "number", names: ["MAX_BROWSER_DISCOVERED"], fallback: 2500, min: 100, max: 20000 },
+  { group: "Crawler discovery", key: "maxBrowserDiscoveredHosts", label: "Max browser-discovered hosts", kind: "number", names: ["MAX_BROWSER_DISCOVERED_HOSTS"], fallback: 24, min: 2, max: 100 },
+  { group: "Crawler discovery", key: "sitemapConcurrency", label: "Sitemap concurrency", kind: "number", names: ["SITEMAP_CONCURRENCY"], fallback: 8, min: 1, max: 32 },
+  { group: "Browser warming", key: "initialResourceBudget", label: "Initial resource warm budget", kind: "number", names: ["INITIAL_RESOURCE_BUDGET"], fallback: 64, min: 16, max: 256 },
   { group: "Crawler concurrency", key: "maxActiveFetches", label: "Active network fetch slots", kind: "number", names: ["MAX_ACTIVE_FETCHES", "MAX_GLOBAL_CONCURRENCY"], fallback: 128, min: 1, max: 256, note: "This is the real simultaneous upstream-request ceiling; CRAWLER_ROBOTS is a larger logical fleet." },
   { group: "Crawler concurrency", key: "perHostConcurrency", label: "Per-host concurrency", kind: "number", names: ["CRAWLER_PER_HOST_CONCURRENCY", "MAX_PER_HOST_CONCURRENCY"], fallback: 8, min: 1, max: 32, note: "Per-origin safety cap; robots.txt Crawl-delay still applies." },
   { group: "Crawler cooperation", key: "robotTaskCapacity", label: "Tasks queued/robot", kind: "number", names: ["ROBOT_TASK_CAPACITY"], fallback: 4, min: 1, max: 16 },
@@ -2557,6 +2882,17 @@ const STATUS_VAR_DEFS = [
   { group: "Crawler cooperation", key: "robotHelpScanLimit", label: "Robots inspected/request", kind: "number", names: ["ROBOT_HELP_SCAN_LIMIT"], fallback: 24, min: 1, max: 128 },
   { group: "Browser engine", key: "browserMaxActiveFetches", label: "Browser fetch slots", kind: "number", names: ["BROWSER_MAX_ACTIVE_FETCHES"], fallback: 24, min: 1, max: 64 },
   { group: "Browser engine", key: "browserPerHostConcurrency", label: "Browser per-host concurrency", kind: "number", names: ["BROWSER_PER_HOST_CONCURRENCY"], fallback: 8, min: 1, max: 32 },
+  { group: "Browser engine", key: "browserEnabled", label: "Browser engine enabled", kind: "bool", names: ["BROWSER_ENABLED"], fallback: true },
+  { group: "Browser engine", key: "browserBackend", label: "Browser backend", kind: "enum", names: ["BROWSER_BACKEND"], fallback: "local", allowed: ["local", "remote"] },
+  { group: "Browser engine", key: "browserBackendUrl", label: "Remote browser backend URL", kind: "string", names: ["BROWSER_BACKEND_URL"], fallback: "" },
+  { group: "Browser engine", key: "browserHeadless", label: "Browser headless", kind: "bool", names: ["BROWSER_HEADLESS"], fallback: true },
+  { group: "Browser engine", key: "maxBrowserSessions", label: "Max browser sessions", kind: "number", names: ["MAX_BROWSER_SESSIONS"], fallback: 2, min: 1, max: 16 },
+  { group: "Browser engine", key: "maxBrowserPages", label: "Max browser pages", kind: "number", names: ["MAX_BROWSER_PAGES"], fallback: 4, min: 1, max: 32 },
+  { group: "Browser engine", key: "maxBrowserContexts", label: "Max browser contexts", kind: "number", names: ["MAX_BROWSER_CONTEXTS"], fallback: 4, min: 1, max: 16 },
+  { group: "Browser engine", key: "browserIdleTimeoutMs", label: "Browser idle timeout (ms)", kind: "number", names: ["BROWSER_IDLE_TIMEOUT_MS"], fallback: 300000, min: 10000, max: 86400000 },
+  { group: "Browser engine", key: "browserSessionTtlMs", label: "Browser session TTL (ms)", kind: "number", names: ["BROWSER_SESSION_TTL_MS"], fallback: 1800000, min: 60000, max: 86400000 },
+  { group: "Browser engine", key: "browserNavigationTimeoutMs", label: "Browser navigation timeout (ms)", kind: "number", names: ["BROWSER_NAVIGATION_TIMEOUT_MS"], fallback: 30000, min: 5000, max: 120000 },
+  { group: "Browser engine", key: "browserPageTimeoutMs", label: "Browser page timeout (ms)", kind: "number", names: ["BROWSER_PAGE_TIMEOUT_MS"], fallback: 30000, min: 5000, max: 120000 },
   { group: "Security / DNS", key: "dnsCacheTtlMs", label: "DNS public-result cache TTL (ms)", kind: "number", names: ["DNS_CACHE_TTL_MS"], fallback: 5000, min: 0, max: 60000 },
   { group: "Crawl limits", key: "maxActiveJobs", label: "Max active jobs", kind: "number", names: ["MAX_ACTIVE_JOBS"], fallback: 3, min: 1, max: 20 },
   { group: "Crawl limits", key: "maxPendingQueue", label: "Max pending queue", kind: "number", names: ["MAX_PENDING_QUEUE"], fallback: 1500, min: 50, max: 20000 },
