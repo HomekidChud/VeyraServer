@@ -96,3 +96,23 @@ The proxy endpoint `/api/download` now marks the response as an attachment and e
 ### Browser/API compatibility (v8.6)
 
 The proxy forwards a bounded allow-list of public web-app compatibility headers used by modern JavaScript APIs (including YouTube/Google-style `x-youtube-*` / `x-goog-*` client headers and browser client hints). Cookies and Authorization headers remain separately controlled and are never blindly forwarded. API-like browser requests receive higher priority and a larger bounded request-body allowance.
+
+## v8.7 hybrid browser engine
+
+Veyra now has three separate foreground/background modes:
+
+1. `FAST_PROXY` — the existing HTTP/HTML rewriting path for simple pages.
+2. `BROWSER_ENGINE` — isolated Playwright/Chromium sessions for JavaScript-heavy pages and pages whose runtime needs real browser APIs/storage.
+3. `CRAWLER` — background discovery/indexing, never the foreground browser runtime.
+
+The capability probe uses HTML/runtime signals rather than a hostname allow-list. Browser sessions have isolated Playwright contexts/pages, real cookies/storage/IndexedDB/service-worker state, browser console/network telemetry, downloads metadata, user-visible verification state, and SSRF validation on browser network requests.
+
+### Browser engine deployment
+
+The Playwright package is included in `server/package.json`, but Chromium itself must be installed in the Render build environment. For a local backend run `npx playwright install chromium` after `npm install`.
+
+If Chromium cannot be launched, Veyra reports `BROWSER_ENGINE_UNAVAILABLE` and falls back to `FAST_PROXY`; it does not pretend the browser engine is available.
+
+The current static frontend uses a bounded remote-browser viewport backed by Chromium screenshots and input forwarding. This provides actual page execution and user interaction without placing a remote website inside Veyra's canonical iframe. Full native media streaming, OS-level browser chrome, and arbitrary popup-to-tab promotion remain deployment-specific limitations.
+
+Security verification is user-assisted only. Veyra detects verification pages, keeps the same browser context alive, shows the actual rendered page, and lets the user interact. It does not solve, bypass, spoof, or automate anti-bot challenges.

@@ -7,6 +7,7 @@ const net = require("net");
 const fs = require("fs");
 const fsp = fs.promises;
 const path = require("path");
+const { BrowserEngine } = require("./browser-engine");
 
 const app = express();
 const PORT = numberEnv("PORT", 10000, 1, 65535);
@@ -57,6 +58,17 @@ const CFG = Object.freeze({
   robotStealOnIdle: boolEnv("ROBOT_STEAL_ON_IDLE", true),
   browserMaxActiveFetches: numberEnv("BROWSER_MAX_ACTIVE_FETCHES", 24, 1, 64),
   browserPerHostConcurrency: numberEnv("BROWSER_PER_HOST_CONCURRENCY", 8, 1, 32),
+  browserEnabled: boolEnv("BROWSER_ENABLED", true),
+  browserHeadless: boolEnv("BROWSER_HEADLESS", true),
+  maxBrowserSessions: numberEnv("MAX_BROWSER_SESSIONS", 2, 1, 16),
+  maxBrowserPages: numberEnv("MAX_BROWSER_PAGES", 4, 1, 32),
+  maxBrowserContexts: numberEnv("MAX_BROWSER_CONTEXTS", 4, 1, 16),
+  browserIdleTimeoutMs: numberEnv("BROWSER_IDLE_TIMEOUT_MS", 300000, 10000, 86400000),
+  browserSessionTtlMs: numberEnv("BROWSER_SESSION_TTL_MS", 1800000, 60000, 86400000),
+  browserNavigationTimeoutMs: numberEnv("BROWSER_NAVIGATION_TIMEOUT_MS", 30000, 5000, 120000),
+  browserPageTimeoutMs: numberEnv("BROWSER_PAGE_TIMEOUT_MS", 30000, 5000, 120000),
+  browserBackend: enumEnv("BROWSER_BACKEND", "local", ["local", "remote"]),
+  browserBackendUrl: process.env.BROWSER_BACKEND_URL || "",
   dnsCacheTtlMs: numberEnv("DNS_CACHE_TTL_MS", 5000, 0, 60000),
   maxPendingQueue: numberEnv("MAX_PENDING_QUEUE", 1500, 50, 20000),
   maxPages: numberEnv("MAX_PAGES", 10000, 1, 100000),
@@ -176,6 +188,10 @@ class Semaphore {
 }
 const fetchSemaphore = new Semaphore(CFG.maxActiveFetches);
 const proxyWarmSemaphore = new Semaphore(CFG.proxyWarmConcurrency);
+
+const browserEngine = new BrowserEngine(CFG, assertPublicUrl, (level, source, message) => serverLog(level, source, message));
+const browserEngineTimer = setInterval(() => browserEngine.expireIdle().catch(() => {}), 30000);
+browserEngineTimer.unref?.();
 
 // Foreground browser scheduler. This is intentionally independent from the
 // crawler scheduler so page navigation cannot be starved by background work.
@@ -2057,12 +2073,59 @@ async function pumpIndexSeeds() {
   }
 }
 
+// Hybrid browser-engine control plane. The browser engine is deliberately
+// independent from crawler jobs and the HTML rewriting proxy.
+function browserCapabilitySignals(html = "", headers = {}) {
+  const text = String(html || "");
+  const lower = text.toLowerCase();
+  const scriptCount = (text.match(/<script\b/gi) || []).length;
+  const moduleCount = (text.match(/type\s*=\s*["']module["']/gi) || []).length;
+  const fetchSignals = (text.match(/fetch\s*\(|xmlhttprequest|websocket|eventsource|indexeddb|localstorage|sessionstorage|serviceworker|history\.pushstate|history\.replacestate/gi) || []).length;
+  const shellSignals = /<div[^>]+(?:id|class)=["'][^"']*(?:root|app|__next|__nuxt|svelte)[^"']*["'][^>]*>\s*<\/div>/i.test(text) || text.replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '').replace(/<[^>]+>/g, ' ').trim().length < 500;
+  const spa = /__next|__nuxt|webpack|vite|react|angular|vue|svelte|ng-version/i.test(text);
+  const heavy = scriptCount >= CFG.proxyJsHeavyThreshold || moduleCount > 0 || fetchSignals >= 3 || spa || shellSignals;
+  return { scriptCount, moduleCount, fetchSignals, spa, shellSignals, heavy, contentType: headers['content-type'] || headers['Content-Type'] || '' };
+}
+
+app.post('/api/browser/capability', async (req, res) => {
+  const raw = normalizeUrl(String(req.body?.url || ''));
+  if (!raw) return respondError(res, 400, 'Invalid URL.', 'INVALID_URL');
+  try {
+    await assertPublicUrl(raw);
+    const result = await fetchCached(raw, { accept: 'text/html,application/xhtml+xml', limit: Math.min(CFG.maxProxyTextBytes, 1024 * 1024), timeout: CFG.requestTimeoutMs, retries: 0, referrer: '' });
+    const signals = browserCapabilitySignals(result.body?.toString('utf8') || '', { 'content-type': result.contentType });
+    const mode = signals.heavy ? 'BROWSER_ENGINE' : 'FAST_PROXY';
+    res.json({ ok: true, url: result.finalUrl || raw, mode, signals, status: result.status, contentType: result.contentType });
+  } catch (e) {
+    res.json({ ok: true, url: raw, mode: 'BROWSER_ENGINE', reason: 'capability_probe_failed', error: e.message });
+  }
+});
+
+app.get('/api/browser/status', (req, res) => res.json({ ok: true, ...browserEngine.status(), config: { backend: CFG.browserBackend, enabled: CFG.browserEnabled, headless: CFG.browserHeadless, maxSessions: CFG.maxBrowserSessions, maxPages: CFG.maxBrowserPages, maxContexts: CFG.maxBrowserContexts } }));
+app.post('/api/browser/session', async (req, res) => {
+  if (!CFG.browserEnabled) return respondError(res, 503, 'Browser engine is disabled.', 'BROWSER_ENGINE_UNAVAILABLE');
+  try {
+    const tabId = String(req.body?.tabId || '').slice(0, 100);
+    const url = normalizeUrl(String(req.body?.url || ''));
+    const session = await browserEngine.create(tabId, url);
+    res.json({ ok: true, session });
+  } catch (e) { respondError(res, e.code === 'BROWSER_CAPACITY' ? 503 : 502, e.message, e.code || 'BROWSER_ENGINE_ERROR'); }
+});
+app.get('/api/browser/session/:id', (req, res) => { try { res.json({ ok:true, session: browserEngine.public(browserEngine.get(req.params.id)) }); } catch(e) { respondError(res,404,e.message,e.code||'BROWSER_SESSION_NOT_FOUND'); } });
+app.post('/api/browser/session/:id/navigate', async (req,res) => { try { const s=browserEngine.get(req.params.id); const session=await browserEngine.navigateSession(s, normalizeUrl(String(req.body?.url||''))); res.json({ok:true,session}); } catch(e) { respondError(res,502,e.message,e.code||'BROWSER_NAVIGATION_ERROR'); } });
+app.post('/api/browser/session/:id/input', async (req,res) => { try { const session=await browserEngine.input(req.params.id, req.body || {}); res.json({ok:true,session}); } catch(e) { respondError(res,400,e.message,'BROWSER_INPUT_ERROR'); } });
+app.post('/api/browser/session/:id/history', async (req,res) => { try { const session=await browserEngine.history(req.params.id, String(req.body?.direction||'reload')); res.json({ok:true,session}); } catch(e) { respondError(res,400,e.message,'BROWSER_HISTORY_ERROR'); } });
+app.post('/api/browser/session/:id/inspect', async (req,res) => { try { const data=await browserEngine.inspect(req.params.id, req.body?.x, req.body?.y); res.json({ok:true,data}); } catch(e) { respondError(res,400,e.message,'BROWSER_INSPECT_ERROR'); } });
+app.post('/api/browser/session/:id/stop', async (req,res) => { try { const session=await browserEngine.stopNavigation(req.params.id); res.json({ok:true,session}); } catch(e) { respondError(res,400,e.message,'BROWSER_STOP_ERROR'); } });
+app.delete('/api/browser/session/:id', async (req,res) => { try { await browserEngine.stop(req.params.id); res.json({ok:true}); } catch(e) { respondError(res,404,e.message,e.code||'BROWSER_SESSION_NOT_FOUND'); } });
+app.get('/api/browser/session/:id/screenshot', async (req,res) => { try { const png=await browserEngine.screenshot(req.params.id); if(!png) return respondError(res,503,'Screenshot unavailable.','BROWSER_SCREENSHOT_ERROR'); res.setHeader('content-type','image/png'); res.setHeader('cache-control','no-store'); res.send(png); } catch(e) { respondError(res,404,e.message,e.code||'BROWSER_SCREENSHOT_ERROR'); } });
+
 // Health and debug.
 app.get("/health", (req, res) => res.json({ ok: true, service: "veyra", uptimeSec: Math.round(process.uptime()), activeJobs: [...jobs.values()].filter(j => !j.done).length, processRole: CFG.processRole }));
 app.get("/api/debug/system", (req, res) => {
   const mem = process.memoryUsage();
   const idx = searchIndexStats();
-  res.json({ time: now(), uptimeSec: Math.round(process.uptime()), startedAt: new Date(serverStartedAt).toISOString(), nodeVersion: process.version, platform: process.platform, processRole: CFG.processRole, memory: { rss: mem.rss, heapUsed: mem.heapUsed, heapTotal: mem.heapTotal, external: mem.external }, jobs: { total: jobs.size, active: [...jobs.values()].filter(j => !j.done).length, done: [...jobs.values()].filter(j => j.done).length }, proxyCacheEntries: proxyCache.size, searchCacheEntries: searchCache.size, network: { crawlerActive: fetchSemaphore.active, crawlerQueued: fetchSemaphore.queued, crawlerLimit: CFG.maxActiveFetches, logicalRobots: CFG.logicalRobots, warmActive: proxyWarmSemaphore.active, warmQueued: proxyWarmSemaphore.queued, warmLimit: CFG.proxyWarmConcurrency, warmLogicalRobots: CFG.proxyWarmRobots, browserActive: browserScheduler.active, browserQueued: browserScheduler.queue.length, browserLimit: CFG.browserMaxActiveFetches, browserPerHost: CFG.browserPerHostConcurrency }, browser: { ...browserScheduler.status(), sessions: proxySessions.size, cacheEntries: proxyCache.size }, searchIndexEntries: idx.documents, searchIndexTerms: idx.terms, searchIndexDomains: idx.domains, requestsLogged: requestLog.length, logs: serverLogs.length });
+  res.json({ time: now(), uptimeSec: Math.round(process.uptime()), startedAt: new Date(serverStartedAt).toISOString(), nodeVersion: process.version, platform: process.platform, processRole: CFG.processRole, memory: { rss: mem.rss, heapUsed: mem.heapUsed, heapTotal: mem.heapTotal, external: mem.external }, jobs: { total: jobs.size, active: [...jobs.values()].filter(j => !j.done).length, done: [...jobs.values()].filter(j => j.done).length }, proxyCacheEntries: proxyCache.size, searchCacheEntries: searchCache.size, network: { crawlerActive: fetchSemaphore.active, crawlerQueued: fetchSemaphore.queued, crawlerLimit: CFG.maxActiveFetches, logicalRobots: CFG.logicalRobots, warmActive: proxyWarmSemaphore.active, warmQueued: proxyWarmSemaphore.queued, warmLimit: CFG.proxyWarmConcurrency, warmLogicalRobots: CFG.proxyWarmRobots, browserActive: browserScheduler.active, browserQueued: browserScheduler.queue.length, browserLimit: CFG.browserMaxActiveFetches, browserPerHost: CFG.browserPerHostConcurrency }, browser: { ...browserScheduler.status(), sessions: browserEngine.status().sessions, pages: browserEngine.status().pages, contexts: browserEngine.status().contexts, maxSessions: browserEngine.status().maxSessions, maxPages: browserEngine.status().maxPages, maxContexts: browserEngine.status().maxContexts, sessionList: browserEngine.status().sessionList, proxySessions: proxySessions.size, cacheEntries: proxyCache.size }, searchIndexEntries: idx.documents, searchIndexTerms: idx.terms, searchIndexDomains: idx.domains, requestsLogged: requestLog.length, logs: serverLogs.length });
 });
 app.get("/api/debug/config", (req, res) => res.json({ ...CFG, searchApiKey: undefined }));
 app.get("/api/debug/jobs", (req, res) => res.json({ jobs: [...jobs.values()].sort((a,b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)).map(publicJob) }));
@@ -2495,6 +2558,16 @@ const STATUS_VAR_DEFS = [
   { group: "Search index", key: "indexRefreshMs", label: "Index refresh interval (ms)", kind: "number", names: ["INDEX_REFRESH_MS"], fallback: 6 * 60 * 60 * 1000, min: 0, max: 30 * 24 * 60 * 60 * 1000 },
   { group: "Search index", key: "indexSnapshotEnabled", label: "Index snapshot enabled", kind: "bool", names: ["INDEX_SNAPSHOT_ENABLED"], fallback: false },
   { group: "Search index", key: "indexSnapshotPath", label: "Index snapshot path", kind: "string", names: ["INDEX_SNAPSHOT_PATH"], fallback: "/tmp/veyra-search-index.json" },
+  { group: "Browser engine", key: "browserEnabled", label: "Browser engine enabled", kind: "bool", names: ["BROWSER_ENABLED"], fallback: true },
+  { group: "Browser engine", key: "browserHeadless", label: "Chromium headless", kind: "bool", names: ["BROWSER_HEADLESS"], fallback: true },
+  { group: "Browser engine", key: "browserBackend", label: "Browser backend", kind: "enum", names: ["BROWSER_BACKEND"], fallback: "local", allowed: ["local", "remote"] },
+  { group: "Browser engine", key: "maxBrowserSessions", label: "Max browser sessions", kind: "number", names: ["MAX_BROWSER_SESSIONS"], fallback: 2, min: 1, max: 16 },
+  { group: "Browser engine", key: "maxBrowserPages", label: "Max browser pages", kind: "number", names: ["MAX_BROWSER_PAGES"], fallback: 4, min: 1, max: 32 },
+  { group: "Browser engine", key: "maxBrowserContexts", label: "Max browser contexts", kind: "number", names: ["MAX_BROWSER_CONTEXTS"], fallback: 4, min: 1, max: 16 },
+  { group: "Browser engine", key: "browserIdleTimeoutMs", label: "Browser idle timeout (ms)", kind: "number", names: ["BROWSER_IDLE_TIMEOUT_MS"], fallback: 300000, min: 10000, max: 86400000 },
+  { group: "Browser engine", key: "browserSessionTtlMs", label: "Browser session TTL (ms)", kind: "number", names: ["BROWSER_SESSION_TTL_MS"], fallback: 1800000, min: 60000, max: 86400000 },
+  { group: "Browser engine", key: "browserNavigationTimeoutMs", label: "Browser navigation timeout (ms)", kind: "number", names: ["BROWSER_NAVIGATION_TIMEOUT_MS"], fallback: 30000, min: 5000, max: 120000 },
+  { group: "Browser engine", key: "browserPageTimeoutMs", label: "Browser page timeout (ms)", kind: "number", names: ["BROWSER_PAGE_TIMEOUT_MS"], fallback: 30000, min: 5000, max: 120000 },
   { group: "Misc", key: "browserRenderFallback", label: "Browser render fallback", kind: "bool", names: ["BROWSER_RENDER_FALLBACK"], fallback: false },
   { group: "Misc", key: "sortQueryParams", label: "Normalize/sort query params", kind: "bool", names: ["NORMALIZE_SORT_QUERY_PARAMS"], fallback: false }
 ];
@@ -2575,6 +2648,7 @@ function buildStatusReport() {
       warn: issues.filter(i => i.severity === "warn").length,
       info: issues.filter(i => i.severity === "info").length
     },
+    browser: browserEngine.status(),
     issues,
     groups: STATUS_VAR_DEFS.reduce((acc, def) => { (acc[def.group] ||= []).push(byKey[def.key]); return acc; }, {}),
     unrecognizedVars: unrecognized,
@@ -2621,6 +2695,13 @@ async function load(){
     '<span class="pill info">'+d.counts.info+' info</span>'+
     '<span class="pill ok">'+d.crawlerRobotsInEffect+' logical robots · '+d.maxActiveFetchesInEffect+' network slots · '+d.perHostConcurrencyInEffect+'/host</span>';
   let html = '';
+  html += '<section><h2>Real Browser Engine</h2><table><tbody>'+
+    '<tr><td>Enabled</td><td>'+esc(String(d.browser.enabled))+'</td></tr>'+
+    '<tr><td>Available</td><td>'+esc(String(d.browser.available))+'</td></tr>'+
+    '<tr><td>Sessions</td><td>'+esc(d.browser.sessions+' / '+d.browser.maxSessions)+'</td></tr>'+
+    '<tr><td>Pages</td><td>'+esc(d.browser.pages+' / '+d.browser.maxPages)+'</td></tr>'+
+    '<tr><td>Contexts</td><td>'+esc(d.browser.contexts+' / '+d.browser.maxContexts)+'</td></tr>'+
+    '</tbody></table></section>';
   html += '<section><h2>Issues</h2>';
   if (!d.issues.length) html += '<p class="empty">No configuration issues detected.</p>';
   else html += d.issues.map(i => '<div class="issue '+i.severity+'"><span class="badge '+i.severity+'">'+i.severity+'</span><div>'+esc(i.message)+'</div></div>').join('');
