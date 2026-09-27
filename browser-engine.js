@@ -70,8 +70,27 @@ class BrowserEngine {
             '--disable-component-update',
             '--disable-default-apps',
             '--disable-sync',
-            '--no-first-run'
+            '--no-first-run',
+            ...(this.cfg.leanMode ? [
+              '--disable-gpu',
+              '--disable-extensions',
+              '--disable-print-preview'
+            ] : [])
           ]
+        });
+        const launchedBrowser = this.browser;
+        launchedBrowser.on?.('disconnected', () => {
+          if (this.browser !== launchedBrowser) return;
+          const lost = [...this.sessions.values()];
+          this.browser = null;
+          this.playwright = null;
+          this.sessions.clear();
+          for (const session of lost) {
+            session.status = 'ERROR';
+            session.error = 'Chromium disconnected unexpectedly.';
+            session.screenshot = null;
+          }
+          if (lost.length) this.log('warn', 'BROWSER', `Chromium disconnected unexpectedly; cleared ${lost.length} browser session(s).`);
         });
         this.log('info', 'BROWSER', 'Chromium browser engine started.');
         return this.browser;
@@ -164,22 +183,28 @@ class BrowserEngine {
 
       // DevTools bridge + console eval must work on sites with strict CSP.
       contextOptions.bypassCSP = true;
-      const context = await browser.newContext(contextOptions);
-      await context.route('**/*', async route => {
-        const targetUrl = route.request().url();
-        try {
-          const u = new URL(targetUrl);
-          if (/^(https?|wss?):$/i.test(u.protocol)) {
-            const check = u.protocol === 'wss:' ? `https://${u.host}${u.pathname}${u.search}` : targetUrl;
-            await this.assertPublicUrl(check);
+      let context = null;
+      let page = null;
+      try {
+        context = await browser.newContext(contextOptions);
+        await context.route('**/*', async route => {
+          const targetUrl = route.request().url();
+          try {
+            const u = new URL(targetUrl);
+            if (/^(https?|wss?):$/i.test(u.protocol)) {
+              const check = u.protocol === 'wss:' ? `https://${u.host}${u.pathname}${u.search}` : targetUrl;
+              await this.assertPublicUrl(check);
+            }
+          } catch (e) {
+            if (/^(https?|wss?):/i.test(targetUrl)) return route.abort('blockedbyclient');
           }
-        } catch (e) {
-          if (/^(https?|wss?):/i.test(targetUrl)) return route.abort('blockedbyclient');
-        }
-        return route.continue();
-      });
-
-      const page = await context.newPage();
+          return route.continue();
+        });
+        page = await context.newPage();
+      } catch (e) {
+        await context?.close().catch(() => {});
+        throw e;
+      }
       const sid = id('bs');
       const session = {
         id: sid,
@@ -226,6 +251,12 @@ class BrowserEngine {
   attachPage(session, page) {
     page.on('console', msg => this.pushConsole(session, msg.type(), msg.text()));
     page.on('pageerror', err => this.pushConsole(session, 'error', err?.message || String(err)));
+    page.on?.('crash', () => {
+      session.status = 'ERROR';
+      session.error = 'Chromium page crashed.';
+      session.screenshot = null;
+      this.pushConsole(session, 'error', 'Chromium page crashed; the page will be recovered on the next navigation.');
+    });
     page.on('requestfailed', req => this.pushNetwork(session, {
       type: 'requestfailed', method: req.method(), url: sanitizeUrl(req.url()), error: req.failure()?.errorText || 'request failed', resourceType: req.resourceType()
     }));
@@ -295,14 +326,19 @@ class BrowserEngine {
     session.navigationActive = true;
     session.error = '';
     session.verification = null;
+    session.screenshot = null;
     session.lastUsed = Date.now();
     try {
+      // Commit is enough to establish the navigation without waiting for a
+      // JavaScript-heavy application to finish every subresource. We then give
+      // the page short best-effort paint windows. This avoids 30s dead waits on
+      // sites such as YouTube while still capturing a useful interactive page.
       const response = await session.page.goto(url, {
-        waitUntil: 'domcontentloaded',
+        waitUntil: 'commit',
         timeout: this.cfg.browserNavigationTimeoutMs
       });
-      if (!options.fast) await session.page.waitForLoadState('load', { timeout: Math.min(10000, this.cfg.browserPageTimeoutMs) }).catch(() => {});
-      else await Promise.race([session.page.waitForLoadState('load').catch(() => {}), new Promise(r => setTimeout(r, 1800))]);
+      await session.page.waitForLoadState('domcontentloaded', { timeout: Math.min(8000, this.cfg.browserPageTimeoutMs) }).catch(() => {});
+      await session.page.waitForLoadState('load', { timeout: options.fast ? 1800 : Math.min(4000, this.cfg.browserPageTimeoutMs) }).catch(() => {});
       session.canonicalUrl = safeUrl(session.page.url()) || url;
       session.title = await session.page.title().catch(() => '');
       const challenge = await this.detectVerification(session.page);
@@ -315,6 +351,11 @@ class BrowserEngine {
       if (response && response.status() >= 400 && !challenge) session.error = `HTTP ${response.status()}`;
       await this.capture(session, true);
       return this.public(session);
+    } catch (e) {
+      session.status = 'ERROR';
+      session.error = e?.message || 'Chromium navigation failed.';
+      session.screenshot = null;
+      throw Object.assign(new Error(session.error), { code: e?.code || (/timeout/i.test(session.error) ? 'BROWSER_NAVIGATION_TIMEOUT' : 'BROWSER_NAVIGATION_ERROR'), cause: e });
     } finally {
       session.navigationActive = false;
       session.lastUsed = Date.now();

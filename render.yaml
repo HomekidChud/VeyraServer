@@ -1,3 +1,4 @@
+# Veyra 8.16.2
 services:
   - type: web
     name: VeyraServer
@@ -40,4 +41,19 @@ services:
         value: "true"
       # Safe warm-up cap: media is never downloaded by the warm phase.
       - key: PROXY_WARM_MAX_BINARY_BYTES
+        value: "786432"
+      # 8.16.2 Free-plan stability guardrails (keep proxy-first and prevent browser/crawler contention).
+      - key: CRAWLER_PAGE_HARD_MS
+        value: "5000"
+      - key: PROXY_WARM_HARD_MS
+        value: "3500"
+      - key: BROWSER_NAVIGATION_TIMEOUT_MS
+        value: "15000"
+      - key: BROWSER_PAGE_TIMEOUT_MS
+        value: "10000"
+      - key: MAX_BROWSER_PAGES
+        value: "1"
+      - key: BROWSER_MAX_ACTIVE_FETCHES
+        value: "4"
+      - key: MONGODB_CACHE_BODY_MAX_BYTES
         value: "786432"

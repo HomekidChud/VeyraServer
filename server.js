@@ -134,8 +134,8 @@ const CFG = Object.freeze({
   maxBrowserContexts: Math.min(numberEnv("MAX_BROWSER_CONTEXTS", P.browserContexts, 1, 16), P.browserContexts),
   browserIdleTimeoutMs: numberEnv("BROWSER_IDLE_TIMEOUT_MS", LEAN_MODE ? 90000 : 300000, 10000, 86400000),
   browserSessionTtlMs: numberEnv("BROWSER_SESSION_TTL_MS", 1800000, 60000, 86400000),
-  browserNavigationTimeoutMs: numberEnv("BROWSER_NAVIGATION_TIMEOUT_MS", 30000, 5000, 120000),
-  browserPageTimeoutMs: numberEnv("BROWSER_PAGE_TIMEOUT_MS", 30000, 5000, 120000),
+  browserNavigationTimeoutMs: numberEnv("BROWSER_NAVIGATION_TIMEOUT_MS", LEAN_MODE ? 20000 : 30000, 5000, 120000),
+  browserPageTimeoutMs: numberEnv("BROWSER_PAGE_TIMEOUT_MS", LEAN_MODE ? 12000 : 30000, 5000, 120000),
   browserEvictIdleOnCapacity: boolEnv("BROWSER_EVICT_IDLE_ON_CAPACITY", true),
   browserEvictMinIdleMs: numberEnv("BROWSER_EVICT_MIN_IDLE_MS", 60000, 10000, 86400000),
   browserBackend: enumEnv("BROWSER_BACKEND", "local", ["local", "remote"]),
@@ -173,7 +173,7 @@ const CFG = Object.freeze({
   maxProxyBodyBytes: numberEnv("MAX_PROXY_BODY_BYTES", 4 * 1024 * 1024, 64 * 1024, 32 * 1024 * 1024),
   maxProxyTextBytes: numberEnv("MAX_PROXY_TEXT_BYTES", 8 * 1024 * 1024, 256 * 1024, 32 * 1024 * 1024),
   maxProxyImageBytes: numberEnv("MAX_PROXY_IMAGE_BYTES", LEAN_MODE ? 2 * MB : 16 * 1024 * 1024, 256 * 1024, 64 * 1024 * 1024),
-  maxProxyMediaBytes: numberEnv("MAX_PROXY_MEDIA_BYTES", LEAN_MODE ? 1 * MB : 32 * 1024 * 1024, 512 * 1024, 128 * 1024 * 1024),
+  maxProxyMediaBytes: numberEnv("MAX_PROXY_MEDIA_BYTES", LEAN_MODE ? 4 * MB : 32 * 1024 * 1024, 512 * 1024, 128 * 1024 * 1024),
   maxProxyOtherBytes: numberEnv("MAX_PROXY_OTHER_BYTES", LEAN_MODE ? 2 * MB : 16 * 1024 * 1024, 256 * 1024, 64 * 1024 * 1024),
   maxFormBodyBytes: numberEnv("MAX_FORM_BODY_BYTES", 1 * 1024 * 1024, 16 * 1024, 8 * 1024 * 1024),
   maxDownloadBytes: numberEnv("MAX_DOWNLOAD_BYTES", 64 * 1024 * 1024, 256 * 1024, 256 * 1024 * 1024),
@@ -183,9 +183,12 @@ const CFG = Object.freeze({
   maxSessionCookies: numberEnv("MAX_SESSION_COOKIES", 50, 5, 500),
   proxyWarmRobots: Math.min(numberEnv("PROXY_WARM_ROBOTS", P.proxyWarmRobots, 1, 1000), P.proxyWarmRobots),
   proxyWarmConcurrency: Math.min(numberEnv("PROXY_WARM_CONCURRENCY", P.proxyWarmConcurrency, 1, 64), P.proxyWarmConcurrency),
-  proxyWarmLimit: numberEnv("PROXY_WARM_LIMIT", LEAN_MODE ? 64 : 128, 1, 256),
-  proxyWarmPerHost: numberEnv("PROXY_WARM_PER_HOST", 4, 1, 16),
-  proxyCriticalPreloadLimit: numberEnv("PROXY_CRITICAL_PRELOAD_LIMIT", 24, 4, 40),
+  proxyWarmLimit: numberEnv("PROXY_WARM_LIMIT", LEAN_MODE ? 24 : 128, 1, 256),
+  proxyWarmPerHost: numberEnv("PROXY_WARM_PER_HOST", LEAN_MODE ? 2 : 4, 1, 16),
+  proxyCriticalPreloadLimit: numberEnv("PROXY_CRITICAL_PRELOAD_LIMIT", LEAN_MODE ? 12 : 24, 4, 40),
+  proxyWarmHardMs: numberEnv("PROXY_WARM_HARD_MS", LEAN_MODE ? 3500 : 10000, 1500, 30000),
+  mediaRequestTimeoutMs: numberEnv("MEDIA_REQUEST_TIMEOUT_MS", 20000, 3000, 120000),
+  mediaBodyTimeoutMs: numberEnv("MEDIA_BODY_TIMEOUT_MS", 12000, 2000, 120000),
   proxyInlineWarmScanChars: numberEnv("PROXY_INLINE_WARM_SCAN_CHARS", 800000, 10000, 3000000),
   proxyWarmMaxBinaryBytes: numberEnv("PROXY_WARM_MAX_BINARY_BYTES", 768 * 1024, 64 * 1024, 4 * 1024 * 1024),
   sitemapConcurrency: Math.min(numberEnv("SITEMAP_CONCURRENCY", P.sitemapConcurrency, 1, 32), P.sitemapConcurrency),
@@ -231,9 +234,10 @@ const CFG = Object.freeze({
   // Page-acceleration crawler: intentionally bounded so a single page is warmed
   // quickly instead of turning the user's short browsing session into a full-site crawl.
   crawlerPageAccelerator: boolEnv("CRAWLER_PAGE_ACCELERATOR", true),
-  crawlerPageWarmMs: numberEnv("CRAWLER_PAGE_WARM_MS", 8000, 2000, 60000),
-  crawlerPageMaxResources: numberEnv("CRAWLER_PAGE_MAX_RESOURCES", LEAN_MODE ? 96 : 128, 16, 2000),
-  crawlerPageMinPerHostConcurrency: numberEnv("CRAWLER_PAGE_MIN_PER_HOST_CONCURRENCY", 4, 1, 32),
+  crawlerPageWarmMs: numberEnv("CRAWLER_PAGE_WARM_MS", LEAN_MODE ? 3500 : 8000, 1500, 60000),
+  crawlerPageHardMs: numberEnv("CRAWLER_PAGE_HARD_MS", LEAN_MODE ? 5000 : 10000, 2000, 60000),
+  crawlerPageMaxResources: numberEnv("CRAWLER_PAGE_MAX_RESOURCES", LEAN_MODE ? 48 : 128, 16, 2000),
+  crawlerPageMinPerHostConcurrency: numberEnv("CRAWLER_PAGE_MIN_PER_HOST_CONCURRENCY", LEAN_MODE ? 2 : 4, 1, 32),
   vpnEnabled: boolEnv("VPN_ENABLED", false),
   vpnMode: enumEnv("VPN_MODE", "proxy", ["proxy", "auto", "wireguard"]),
   vpnKillSwitch: boolEnv("VPN_KILL_SWITCH", true),
@@ -383,6 +387,7 @@ function effectiveCrawlerConcurrency(job = null) {
   // Chromium has its own request scheduler; do not unnecessarily throttle the
   // fast page-accelerator lane just because the combined mode has a browser tab.
   if (!job?.pageAccelerator && browserEngine && browserEngine.status().sessions > 0) limit = Math.min(limit, CFG.browserCrawlerConcurrency);
+  if (job?.pageAccelerator && CFG.leanMode && browserEngine && browserEngine.status().sessions > 0) limit = Math.min(limit, 1);
   if (runtimeGuard.pressure) limit = Math.min(limit, Math.max(1, Math.floor(limit / 2)));
   if (runtimeGuard.critical) limit = 1;
   return Math.max(1, limit);
@@ -1036,7 +1041,7 @@ function oversizeStream(response, head, reader) {
     cancel() { if (taken) return; taken = true; try { (reader ? reader.cancel() : response.body?.cancel())?.catch?.(() => {}); } catch {} }
   };
 }
-async function readBodyLimited(response, limit, keepStream = false) {
+async function readBodyLimited(response, limit, keepStream = false, bodyTimeoutMs = CFG.bodyTimeoutMs, signal = null) {
   const len = Number(response.headers.get("content-length"));
   if (Number.isFinite(len) && len > limit) {
     if (keepStream && response.body) return { body: Buffer.alloc(0), bytes: len, truncated: true, tooLarge: true, stream: oversizeStream(response, [], null) };
@@ -1045,14 +1050,16 @@ async function readBodyLimited(response, limit, keepStream = false) {
   }
   const reader = response.body?.getReader();
   if (!reader) {
-    const buf = Buffer.from(await withTimeout(response.arrayBuffer(), CFG.bodyTimeoutMs, "Response body timed out."));
+    if (signal?.aborted) throw Object.assign(new Error("Operation cancelled."), { code: "OPERATION_CANCELLED" });
+    const buf = Buffer.from(await withTimeout(response.arrayBuffer(), bodyTimeoutMs, "Response body timed out."));
     return { body: buf.subarray(0, limit), bytes: buf.length, truncated: buf.length > limit, tooLarge: buf.length > limit };
   }
   const chunks = [];
   let total = 0;
   let truncated = false;
   while (true) {
-    const { done, value } = await withTimeout(reader.read(), CFG.bodyTimeoutMs, "Response body timed out.");
+    if (signal?.aborted) { try { await reader.cancel(); } catch {} throw Object.assign(new Error("Operation cancelled."), { code: "OPERATION_CANCELLED" }); }
+    const { done, value } = await withTimeout(reader.read(), bodyTimeoutMs, "Response body timed out.");
     if (done) break;
     const chunk = Buffer.from(value);
     const keep = Math.max(0, Math.min(chunk.length, limit - total));
@@ -1090,6 +1097,12 @@ async function fetchBuffer(url, opts = {}) {
     for (let attempt = 0; attempt <= (opts.retries ?? CFG.maxRetries); attempt++) {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), opts.timeout ?? CFG.requestTimeoutMs);
+      const upstreamSignal = opts.signal;
+      const onAbort = () => controller.abort();
+      if (upstreamSignal) {
+        if (upstreamSignal.aborted) throw Object.assign(new Error("Operation cancelled."), { code: "OPERATION_CANCELLED" });
+        upstreamSignal.addEventListener("abort", onAbort, { once: true });
+      }
       try {
         const reqHeaders = new Headers(headers);
         if (sessionId) {
@@ -1119,6 +1132,7 @@ async function fetchBuffer(url, opts = {}) {
         });
         if (sessionId) storeSetCookies(sessionId, current, response);
         clearTimeout(timer);
+        if (upstreamSignal) upstreamSignal.removeEventListener("abort", onAbort);
         if (response.status === 304) {
           if (cached) return { ...cached.response, status: cached.response.status || 200, revalidated: true, redirectChain };
           // No local cached copy to revalidate against (e.g. cache evicted between the
@@ -1143,7 +1157,7 @@ async function fetchBuffer(url, opts = {}) {
         }
         const contentType = response.headers.get("content-type") || "";
         const bodyLimit = typeof opts.limitForContentType === "function" ? opts.limitForContentType(contentType, response.headers) : limit;
-        const body = await readBodyLimited(response, bodyLimit, !!opts.streamOversize);
+        const body = await readBodyLimited(response, bodyLimit, !!opts.streamOversize, opts.bodyTimeoutMs ?? CFG.bodyTimeoutMs, upstreamSignal);
         return {
           ok: response.ok,
           status: response.status,
@@ -1175,6 +1189,10 @@ async function fetchBuffer(url, opts = {}) {
         };
       } catch (e) {
         clearTimeout(timer);
+        if (upstreamSignal) upstreamSignal.removeEventListener("abort", onAbort);
+        // The caller can cancel a crawler/background request without turning it into
+        // a misleading upstream network failure.
+        if (e?.code === "OPERATION_CANCELLED" || upstreamSignal?.aborted) throw Object.assign(new Error("Operation cancelled."), { code: "OPERATION_CANCELLED" });
         // The VPN kill switch is a deliberate block, not a flaky network: surface it.
         const vpnCause = e?.cause?.code && String(e.cause.code).startsWith("VPN_") ? e.cause : (String(e?.code || "").startsWith("VPN_") ? e : null);
         if (vpnCause) throw Object.assign(new Error(vpnCause.message), { code: vpnCause.code, status: vpnCause.code === "VPN_KILL_SWITCH" ? 503 : 502, upstreamCode: vpnCause.code, upstreamPhase: 'vpn', upstreamMessage: vpnCause.message });
@@ -2321,7 +2339,7 @@ function createJob(root, options = {}) {
   const id = crypto.randomUUID();
   const pageAccelerator = !!options.pageAccelerator;
   return {
-    id, root, url: root, createdAt: now(), pageAccelerator, warmDeadlineAt: pageAccelerator ? Date.now() + CFG.crawlerPageWarmMs : 0, fastPhaseComplete: false, finishedAt: null, done: false, stopRequested: false, status: "queued", statusText: "Queued",
+    id, root, url: root, createdAt: now(), pageAccelerator, warmDeadlineAt: pageAccelerator ? Date.now() + CFG.crawlerPageWarmMs : 0, pageAcceleratorHardDeadlineAt: pageAccelerator ? Date.now() + CFG.crawlerPageHardMs : 0, fastPhaseComplete: false, finishedAt: null, done: false, stopRequested: false, status: "queued", statusText: "Queued",
     pageFrontier: new PriorityFrontier(CFG.maxPendingQueue), resourceFrontier: new PriorityFrontier(CFG.maxPendingQueue), criticalResourceFrontier: new PriorityFrontier(Math.min(CFG.maxPendingQueue, CFG.criticalResourceBudget * 4)), visited: new Set(), discovered: new Set(), retryCounts: new Map(),
     resources: [], links: [], logs: [], logSeq: 0, sourceDir: path.join(ROOT, id), sourceFiles: 0, textBytesStored: 0,
     activeWorkers: 0, activeHtmlWorkers: 0, activeAssetWorkers: 0, processed: 0, pagesDiscovered: 0, resourcesScheduled: 0, crossOriginResources: 0, sitemapLoading: false, browserDiscoveredCount: 0, browserDiscoveredHosts: new Set(),
@@ -2447,7 +2465,7 @@ async function processItem(job, item) {
   const accept = item.type === "html" ? "text/html,application/xhtml+xml,application/xml,text/plain;q=0.4,*/*;q=0.05" : "text/css,application/javascript,text/javascript,application/json,image/avif,image/webp,image/apng,image/svg+xml,image/*,font/*,video/*,audio/*,*/*;q=0.05";
   try {
     job.counts.requestCount += 1;
-    const r = await fetchResourceProbe(item, { accept, limit: CFG.maxTextBytesPerResource, limitForContentType: crawlLimitForContentType, timeout: CFG.requestTimeoutMs, retries: CFG.maxRetries, referrer: item.source || "", dnsCache: job.dnsCache });
+    const r = await fetchResourceProbe(item, { accept, limit: CFG.maxTextBytesPerResource, limitForContentType: crawlLimitForContentType, timeout: job.pageAccelerator ? Math.min(CFG.requestTimeoutMs, LEAN_MODE ? 3500 : 8000) : CFG.requestTimeoutMs, retries: job.pageAccelerator ? Math.min(1, CFG.maxRetries) : CFG.maxRetries, referrer: item.source || "", dnsCache: job.dnsCache, signal: job.controller.signal, bodyTimeoutMs: job.pageAccelerator ? Math.min(CFG.bodyTimeoutMs, LEAN_MODE ? 4000 : 8000) : CFG.bodyTimeoutMs });
     job.counts.bytesScanned += r.bytes;
     if (r.retries) job.counts.retries += r.retries;
     if (r.truncated || r.tooLarge) { job.counts.bytesDiscarded += r.bytes; jobLog(job, "warn", `Response skipped after size limit: ${item.url}`); return; }
@@ -2883,11 +2901,28 @@ class CooperativeRobotPool {
   async run() {
     this.running = true;
     while (!this.job.stopRequested) {
+      if (this.job.pageAccelerator && this.job.pageAcceleratorHardDeadlineAt && Date.now() >= this.job.pageAcceleratorHardDeadlineAt) {
+        this.job.fastPhaseComplete = true;
+        this.job.stopRequested = true;
+        this.job.stopReason = "page-warm-deadline";
+        this.job.warmDeadlineAt = 0;
+        try { this.job.controller.abort(); } catch {}
+        this.job.statusText = "Page accelerator time budget reached; stopping background work.";
+        this.event("page-accelerator-hard-stop", { hardMs: CFG.crawlerPageHardMs });
+        break;
+      }
       if (this.job.pageAccelerator && this.job.warmDeadlineAt && Date.now() >= this.job.warmDeadlineAt) {
         this.job.fastPhaseComplete = true;
         this.job.warmDeadlineAt = 0;
-        this.job.statusText = "Critical page resources warmed; finishing required assets in the background…";
-        this.event("page-critical-phase-complete", { warmMs: CFG.crawlerPageWarmMs });
+        if (!this.job.pageAcceleratorHardDeadlineAt || Date.now() >= this.job.pageAcceleratorHardDeadlineAt) {
+          this.job.stopRequested = true;
+          this.job.stopReason = "page-warm-deadline";
+          try { this.job.controller.abort(); } catch {}
+          this.job.statusText = "Page accelerator time budget reached; stopping background work.";
+          this.event("page-accelerator-stopped", { warmMs: CFG.crawlerPageWarmMs, hardMs: CFG.crawlerPageHardMs });
+          break;
+        }
+        this.job.statusText = "Critical page resources warmed; finishing only in-flight requests…";
       }
       if (!this.job.robotsReady) { await sleep(5); continue; }
       if (this.job.counts.bytesScanned >= CFG.maxScanBytes) { this.job.stopRequested = true; this.job.stopReason = "scan-byte-limit"; break; }
@@ -2933,6 +2968,7 @@ async function runCrawl(job) {
     if (job.status === "challenge") job.statusText = "Security verification required; crawl stopped.";
     else if (job.stopRequested && job.stopReason === "scan-byte-limit") { job.status = "done"; job.statusText = `Scan budget reached (${bytesLabel(CFG.maxScanBytes)}).`; }
     else if (job.stopRequested && job.stopReason === "resource-limit") { job.status = "done"; job.statusText = `Resource safety limit reached (${CFG.maxResources.toLocaleString()}).`; }
+    else if (job.pageAccelerator && job.stopReason === "page-warm-deadline") { job.status = "done"; job.statusText = `Page accelerator budget reached — ${job.processed.toLocaleString()} resources processed.`; }
     else if (job.pageAccelerator && job.fastPhaseComplete) { job.status = "done"; job.statusText = `Required page assets finished — ${job.processed.toLocaleString()} resources scanned.`; }
     else if (job.stopRequested && job.stopReason === "abandoned") { job.status = "stopped"; job.statusText = "Stopped automatically — nobody has checked this crawl for a while (CRAWL_ABANDON_MS)."; }
     else if (job.stopRequested && job.stopReason === "shutdown") { job.status = "stopped"; job.statusText = "Stopped — server is shutting down."; }
@@ -3296,11 +3332,13 @@ app.put('/api/config', (req, res) => {
 
 app.get('/api/browser/status', (req, res) => res.json({ ok: true, ...browserEngine.status(), config: { backend: CFG.browserBackend, enabled: CFG.browserEnabled, headless: CFG.browserHeadless, maxSessions: CFG.maxBrowserSessions, maxPages: CFG.maxBrowserPages, maxContexts: CFG.maxBrowserContexts } }));
 async function warmRenderedBrowserPage(browserSessionId, sid) {
+  const controller = new AbortController();
+  const hardTimer = setTimeout(() => controller.abort(), Math.max(500, CFG.proxyWarmHardMs));
   try {
     const rendered = await browserEngine.renderedContent(browserSessionId, 1800);
-    if (rendered.html && rendered.url) void warmPageResources(rendered.html, rendered.url, sid);
+    if (rendered.html && rendered.url) void warmPageResources(rendered.html, rendered.url, sid, controller.signal);
     const session = browserEngine.sessions.get(browserSessionId);
-    if (!session) return;
+    if (!session || controller.signal.aborted) return;
     const observed = new Map();
     for (const row of session.network.slice(-160)) {
       if (String(row.method || 'GET').toUpperCase() !== 'GET' || Number(row.status || 0) >= 400) continue;
@@ -3308,181 +3346,50 @@ async function warmRenderedBrowserPage(browserSessionId, sid) {
       if (!/script|stylesheet|fetch|xhr|image|font|media|manifest|texttrack/.test(type)) continue;
       const u = normalizeUrl(row.url || '');
       if (!u || observed.has(u)) continue;
-      let priority = /document/.test(type) ? 140 : /stylesheet|script/.test(type) ? 125 : /fetch|xhr/.test(type) ? 118 : /font/.test(type) ? 105 : /image|media/.test(type) ? 90 : 70;
-      observed.set(u, { url: u, priority, sid, requestHeaders: row.requestHeaders || {} });
-      if (observed.size >= Math.min(96, CFG.proxyWarmLimit)) break;
+      const priority = /stylesheet|script/.test(type) ? 125 : /fetch|xhr/.test(type) ? 118 : /font/.test(type) ? 105 : /image|media/.test(type) ? 90 : 70;
+      observed.set(u, { url: u, priority, sid, requestHeaders: row.requestHeaders || {}, type });
+      if (observed.size >= Math.min(64, CFG.proxyWarmLimit)) break;
     }
-    if (observed.size) {
-      const rows = [...observed.values()].sort((a,b) => b.priority - a.priority);
-      const hostActive = new Map(); let cursor = 0;
-      const worker = async () => {
-        while (cursor < rows.length) {
-          const item = rows[cursor++];
-          const host = hostOf(item.url);
-          while ((hostActive.get(host) || 0) >= CFG.proxyWarmPerHost) await sleep(2);
-          hostActive.set(host, (hostActive.get(host)||0)+1);
-          try {
-            const warmType = warmTypeForUrl(item.url, item.type === 'stylesheet' ? 'css' : item.type === 'script' ? 'js' : item.type);
-            const common = { sessionId: sid, referrer: rendered.url, headers: item.requestHeaders || {}, accept: '*/*', timeout: Math.min(CFG.requestTimeoutMs, 10000), retries: 0, limitForContentType: crawlLimitForContentType };
-            if (warmType === 'media') { await fetchCached(item.url, { ...common, method: 'HEAD', limit: 16 * 1024 }); }
-            else if (warmType === 'image' || warmType === 'font') {
-              const head = await fetchCached(item.url, { ...common, method: 'HEAD', limit: 16 * 1024 });
-              const length = Number(String(head.contentLength || '').split(',')[0]) || 0;
-              if (!length || length <= CFG.proxyWarmMaxBinaryBytes) await fetchCached(item.url, { ...common, limit: CFG.maxTextBytesPerResource });
-            } else {
-              await fetchCached(item.url, { ...common, limit: CFG.maxTextBytesPerResource });
-            }
-          } catch {} finally {
-            hostActive.set(host,Math.max(0,(hostActive.get(host)||1)-1));
+    if (!observed.size) return;
+    const rows = [...observed.values()].sort((a, b) => b.priority - a.priority);
+    const hostActive = new Map();
+    let cursor = 0;
+    const worker = async () => {
+      while (!controller.signal.aborted && cursor < rows.length) {
+        const item = rows[cursor++];
+        const host = hostOf(item.url);
+        while (!controller.signal.aborted && (hostActive.get(host) || 0) >= CFG.proxyWarmPerHost) await sleep(2);
+        if (controller.signal.aborted) break;
+        hostActive.set(host, (hostActive.get(host) || 0) + 1);
+        try {
+          const warmType = warmTypeForUrl(item.url, item.type);
+          const common = {
+            sessionId: sid, referrer: rendered.url, headers: item.requestHeaders || {}, accept: '*/*',
+            timeout: Math.min(CFG.requestTimeoutMs, 7000), bodyTimeoutMs: Math.min(CFG.bodyTimeoutMs, 7000),
+            retries: 0, limitForContentType: crawlLimitForContentType, signal: controller.signal
+          };
+          if (warmType === 'media') {
+            await fetchCached(item.url, { ...common, method: 'HEAD', limit: 16 * 1024, noCache: true });
+          } else if (warmType === 'image' || warmType === 'font') {
+            const head = await fetchCached(item.url, { ...common, method: 'HEAD', limit: 16 * 1024 });
+            const length = Number(String(head.contentLength || '').split(',')[0]) || 0;
+            if (!length || length <= CFG.proxyWarmMaxBinaryBytes) await fetchCached(item.url, { ...common, limit: CFG.maxTextBytesPerResource });
+          } else {
+            await fetchCached(item.url, { ...common, limit: CFG.maxTextBytesPerResource });
           }
+        } catch {} finally {
+          hostActive.set(host, Math.max(0, (hostActive.get(host) || 1) - 1));
         }
-      };
-      await Promise.allSettled(Array.from({length: Math.min(CFG.proxyWarmConcurrency, rows.length)}, worker));
-    }
-  } catch (e) { serverLog('debug', 'BROWSER', `Rendered page warm-up skipped: ${e.message}`); }
+      }
+    };
+    await Promise.allSettled(Array.from({ length: Math.min(CFG.proxyWarmConcurrency, rows.length) }, worker));
+  } catch (e) {
+    if (e?.code !== 'OPERATION_CANCELLED' && e?.name !== 'AbortError') serverLog('debug', 'BROWSER', `Rendered page warm-up skipped: ${e.message}`);
+  } finally {
+    clearTimeout(hardTimer);
+    if (!controller.signal.aborted) controller.abort();
+  }
 }
-
-app.post('/api/browser/session', async (req, res) => {
-  if (!CFG.browserEnabled) return respondError(res, 503, 'Browser engine is disabled.', 'BROWSER_ENGINE_UNAVAILABLE');
-  try {
-    const tabId = String(req.body?.tabId || '').slice(0, 100);
-    const jobId = String(req.body?.jobId || '').slice(0, 100);
-    const url = normalizeUrl(String(req.body?.url || ''));
-    const sid = normalizeSessionId(req.body?.proxySessionId || req.body?.sid);
-    if (sessionManager.checkLimit(sid)) return respondError(res, 410, 'This Veyra session reached its time limit and was deleted.', 'SESSION_EXPIRED');
-    const proxySession = sessionRecord(sid);
-    const wantedVpn = String(req.body?.vpnProfileId || '');
-    if (wantedVpn && vpnManager.enabled && !vpnManager.profileForSession(sid)) { try { vpnManager.connect(sid, wantedVpn); proxySession.vpnProfileId = wantedVpn; } catch {} }
-    const proxy = await vpnManager.playwrightProxy(sid);
-    const vpnProfileId = vpnManager.profileForSession(sid)?.id || null;
-    const vpnProfile = proxy ? { id: vpnProfileId, profileId: vpnProfileId, proxy, contextHints: vpnManager.browserContextHints(sid) } : null;
-    const session = await browserEngine.create(tabId, url, jobId, vpnProfile, { proxySessionId: sid, fastStart: !!req.body?.fastStart });
-    sessionManager.linkBrowser(sid, session.id);
-    res.json({ ok: true, session });
-    void warmRenderedBrowserPage(session.id, sid);
-  } catch (e) {
-    if (e.code === 'BROWSER_CAPACITY') return respondError(res, 409, e.message, e.code);
-    respondError(res, e.code === 'INVALID_URL' ? 400 : 502, e.message, e.code || 'BROWSER_ENGINE_ERROR');
-  }
-});
-app.get('/api/browser/session/:id', (req, res) => { try { res.json({ ok:true, session: browserEngine.public(browserEngine.get(req.params.id)) }); } catch(e) { respondError(res,404,e.message,e.code||'BROWSER_SESSION_NOT_FOUND'); } });
-app.post('/api/browser/session/:id/navigate', async (req,res) => { try { const s=browserEngine.get(req.params.id); const target = firstValidUrl([req.body?.url, req.body?.target, req.body?.u], s?.page?.url?.() || undefined); if (!target) return respondError(res,400,'Missing or invalid public HTTP(S) URL.','INVALID_URL'); const session=await browserEngine.navigateSession(s, target, { fast: !!req.body?.fastStart }); res.json({ok:true,session}); void warmRenderedBrowserPage(session.id, s.proxySessionId || ''); } catch(e) { respondError(res,e.code==='INVALID_URL'?400:502,e.message,e.code||'BROWSER_NAVIGATION_ERROR'); } });
-app.post('/api/browser/session/:id/input', async (req,res) => { try { const session=await browserEngine.input(req.params.id, req.body || {}); res.json({ok:true,session}); } catch(e) { respondError(res,400,e.message,'BROWSER_INPUT_ERROR'); } });
-app.post('/api/browser/session/:id/history', async (req,res) => { try { const session=await browserEngine.history(req.params.id, String(req.body?.direction||'reload')); res.json({ok:true,session}); } catch(e) { respondError(res,400,e.message,'BROWSER_HISTORY_ERROR'); } });
-app.post('/api/browser/session/:id/inspect', async (req,res) => { try { const data=await browserEngine.inspect(req.params.id, req.body?.x, req.body?.y); res.json({ok:true,data}); } catch(e) { respondError(res,400,e.message,'BROWSER_INSPECT_ERROR'); } });
-app.post('/api/browser/session/:id/stop', async (req,res) => { try { const session=await browserEngine.stopNavigation(req.params.id); res.json({ok:true,session}); } catch(e) { respondError(res,400,e.message,'BROWSER_STOP_ERROR'); } });
-app.delete('/api/browser/session/:id', async (req,res) => { try { await browserEngine.stop(req.params.id); res.json({ok:true}); } catch(e) { respondError(res,404,e.message,e.code||'BROWSER_SESSION_NOT_FOUND'); } });
-// DevTools for BROWSER_ENGINE tabs: same bridge API, evaluated inside Chromium.
-const DEVTOOLS_BRIDGE_FN = require("./devtools-bridge").source;
-app.post('/api/browser/session/:id/devtools', async (req, res) => {
-  try {
-    const s = browserEngine.get(req.params.id);
-    if (!s?.page) return respondError(res, 404, 'Browser session not found.', 'BROWSER_SESSION_NOT_FOUND');
-    const method = String(req.body?.method || '').slice(0, 60);
-    if (!/^[a-z]+\.[A-Za-z]+$/.test(method)) return respondError(res, 400, 'Invalid DevTools method.', 'DEVTOOLS_BAD_METHOD');
-    if (method === 'logs.get') return res.json({ ok: true, result: { console: s.console.slice(-300), network: s.network.slice(-400) } });
-    s.lastUsed = Date.now();
-    const result = await Promise.race([
-      s.page.evaluate(async ({ src, method, params }) => {
-        if (!window.__veyraDevtools) (0, eval)('(' + src + ')')(null, {});
-        const r = await window.__veyraDevtools.call(method, params);
-        return JSON.parse(JSON.stringify(r === undefined ? null : r));
-      }, { src: DEVTOOLS_BRIDGE_FN, method, params: req.body?.params || {} }),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('DevTools call timed out.')), 8000))
-    ]);
-    res.json({ ok: true, result });
-  } catch (e) { respondError(res, 500, e.message, 'DEVTOOLS_ERROR'); }
-});
-app.get('/api/browser/session/:id/screenshot', async (req,res) => { try { const png=await browserEngine.screenshot(req.params.id); if(!png) return respondError(res,503,'Screenshot unavailable.','BROWSER_SCREENSHOT_ERROR'); res.setHeader('content-type','image/png'); res.setHeader('cache-control','no-store'); res.send(png); } catch(e) { respondError(res,404,e.message,e.code||'BROWSER_SCREENSHOT_ERROR'); } });
-
-// Health and debug.
-const healthPayload = () => ({ ok: true, service: "veyra", version: VEYRA_VERSION, plan: CFG.plan, leanMode: CFG.leanMode, mongo: mongoStore.status(), sleeping: sessionManager.sleeping, sessions: sessionManager.size, crawlers: { running: activeCrawlCount(), queued: crawlQueue.length, max: effectiveMaxActiveJobs() }, uptimeSec: Math.round(process.uptime()), activeJobs: [...jobs.values()].filter(j => !j.done).length, processRole: CFG.processRole, resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb, crawlerFetchLimit: effectiveCrawlerConcurrency(), logicalRobots: CFG.logicalRobots, vpn: vpnManager.status() });
-app.get("/health", (req, res) => res.json(healthPayload()));
-app.get("/api/shield", (req, res) => res.json({ ok: true, ...shield.status() }));
-app.get("/api/health", (req, res) => res.json(healthPayload()));
-// DevTools bridge script (loaded on demand by the injected page runtime).
-const DEVTOOLS_BRIDGE = (() => { const src = fs.readFileSync(path.join(__dirname, "devtools-bridge.js"), "utf8"); return src.slice(0, src.indexOf("if (typeof module")) + "\nwindow.installVeyraDevtools = installVeyraDevtools;\n"; })();
-const DEVTOOLS_BRIDGE_ETAG = `"${crypto.createHash("sha1").update(DEVTOOLS_BRIDGE).digest("hex").slice(0, 16)}"`;
-app.get("/api/devtools/bridge.js", (req, res) => {
-  res.setHeader("Content-Type", "application/javascript; charset=utf-8");
-  res.setHeader("Cache-Control", "public, max-age=600");
-  res.setHeader("ETag", DEVTOOLS_BRIDGE_ETAG);
-  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
-  if (req.get("if-none-match") === DEVTOOLS_BRIDGE_ETAG) return res.status(304).end();
-  res.send(DEVTOOLS_BRIDGE);
-});
-// Admin-only diagnostics (client-log stays open: every tab reports errors there).
-app.use("/api/debug", (req, res, next) => (req.path === "/client-log" ? next() : requireAdmin(req, res, next)));
-app.get("/api/debug/system", (req, res) => {
-  const mem = process.memoryUsage();
-  const idx = searchIndexStats();
-  res.json({ time: now(), uptimeSec: Math.round(process.uptime()), startedAt: new Date(serverStartedAt).toISOString(), nodeVersion: process.version, platform: process.platform, processRole: CFG.processRole, resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb, memory: { rss: mem.rss, heapUsed: mem.heapUsed, heapTotal: mem.heapTotal, external: mem.external }, jobs: { total: jobs.size, active: [...jobs.values()].filter(j => !j.done).length, done: [...jobs.values()].filter(j => j.done).length }, proxyCacheEntries: proxyCache.size, fetchInflight: fetchInflight.size, mongo: mongoStore.status(), searchCacheEntries: searchCache.size, network: { crawlerActive: fetchSemaphore.active, crawlerQueued: fetchSemaphore.queued, crawlerLimit: effectiveCrawlerConcurrency(), configuredCrawlerLimit: CFG.maxActiveFetches, requestedCrawlerLimit: CFG.requestedMaxActiveFetches, logicalRobots: CFG.logicalRobots, warmActive: proxyWarmSemaphore.active, warmQueued: proxyWarmSemaphore.queued, warmLimit: CFG.proxyWarmConcurrency, warmLogicalRobots: CFG.proxyWarmRobots, browserActive: browserScheduler.active, browserQueued: browserScheduler.queue.length, browserLimit: CFG.browserMaxActiveFetches, browserPerHost: CFG.browserPerHostConcurrency }, vpn: vpnManager.status(), browser: { ...browserScheduler.status(), sessions: browserEngine.status().sessions, pages: browserEngine.status().pages, contexts: browserEngine.status().contexts, maxSessions: browserEngine.status().maxSessions, maxPages: browserEngine.status().maxPages, maxContexts: browserEngine.status().maxContexts, sessionList: browserEngine.status().sessionList, proxySessions: proxySessions.size, cacheEntries: proxyCache.size }, hostPolicies: [...jobs.values()].reduce((n,j)=>n+(j.hostPolicy?.size||0),0), searchIndexEntries: idx.documents, searchIndexTerms: idx.terms, searchIndexDomains: idx.domains, requestsLogged: requestLog.length, logs: serverLogs.length });
-});
-app.get("/api/debug/config", (req, res) => res.json({ ...CFG, searchApiKey: undefined }));
-app.get("/api/debug/jobs", (req, res) => res.json({ jobs: [...jobs.values()].sort((a,b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)).map(publicJob) }));
-app.get("/api/debug/requests", (req, res) => { const limit = Math.min(CFG.maxRequestLog, Math.max(1, Number(req.query.limit || 200))); res.json({ requests: requestLog.slice(-limit).reverse() }); });
-app.get("/api/search/stats", (req, res) => { res.json({ ok: true, ...searchIndexStats(), crawlJobs: [...jobs.values()].filter(j => !j.done).length, activeIndexSeeds: [...jobs.values()].filter(j => !j.done && CFG.indexSeeds.includes(j.root)).length }); });
-app.get("/api/search/suggest", (req, res) => { const q = String(req.query.q || "").slice(0, 80); const limit = Math.min(12, Math.max(1, Number(req.query.limit || 8) || 8)); res.json({ ok: true, query: q, suggestions: localSearchSuggestions(q, limit) }); });
-app.get("/api/debug/logs", (req, res) => {
-  const limit = Math.min(CFG.maxServerLog, Math.max(1, Number(req.query.limit || 200)));
-  const source = String(req.query.source || "all");
-  const level = String(req.query.level || "all");
-  const all = source === "browser" ? clientLogs.map(x => ({ ...x, source: "BROWSER" })) : source === "server" ? serverLogs.map(x => ({ ...x, source: "SERVER" })) : [...serverLogs.map(x => ({ ...x, source: "SERVER" })), ...clientLogs.map(x => ({ ...x, source: "BROWSER" }))];
-  const rows = all.filter(x => level === "all" || x.level === level).sort((a,b) => Date.parse(a.time || 0) - Date.parse(b.time || 0)).slice(-limit).reverse();
-  res.json({ logs: rows });
-});
-app.post("/api/debug/client-log", (req, res) => {
-  const events = Array.isArray(req.body?.events) ? req.body.events.slice(0, 50) : [req.body];
-  for (const x of events) {
-    if (!x || typeof x !== "object") continue;
-    clientLogAdd({
-      time: String(x.time || now()).slice(0, 40), level: String(x.level || "info").slice(0, 20), source: "BROWSER",
-      message: String(x.message || "").slice(0, 2000), url: sanitizeLogUrl(x.url || x.pageUrl || ""), pageUrl: sanitizeLogUrl(x.pageUrl || ""),
-      line: Number(x.line) || null, column: Number(x.column) || null, stack: String(x.stack || "").slice(0, 5000), tabId: String(x.tabId || "").slice(0, 100), jobId: String(x.jobId || "").slice(0, 100), requestId: String(x.requestId || "").slice(0, 100)
-    });
-  }
-  res.json({ ok: true, stored: events.length });
-});
-
-const WEB_SEARCH_UA = process.env.WEB_SEARCH_USER_AGENT || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
-const webSearch = createWebSearch({
-  log: (level, source, message) => serverLog(level, source, message),
-  fetchText: async (url, { accept } = {}) => {
-    const r = await fetchBuffer(url, { headers: { "accept-language": "en-GB,en;q=0.8" }, accept: accept || "text/html", userAgent: WEB_SEARCH_UA, limit: 2 * 1024 * 1024, timeout: 9000, retries: 0 });
-    return { ok: r.status >= 200 && r.status < 300, status: r.status, text: r.body ? r.body.toString("utf8") : "", finalUrl: r.finalUrl };
-  }
-});
-// Web results for Veyra's own results page: Google (official API, if keys are
-// configured) -> DuckDuckGo -> Bing. Never proxies a search engine's UI.
-app.get("/api/search/web", async (req, res) => {
-  const started = performance.now();
-  const query = String(req.query.q || "").trim();
-  if (!query) return respondError(res, 400, "Search query is empty.", "SEARCH_EMPTY");
-  if (query.length > CFG.maxSearchQueryChars) return respondError(res, 400, "Search query is too long.", "SEARCH_QUERY_TOO_LONG");
-  const offset = Math.max(0, Math.min(90, Number(req.query.offset || 0) || 0));
-  const engine = String(req.query.engine || "").toLowerCase().replace(/[^a-z]/g, "").slice(0, 20);
-  const lang = String(req.query.lang || "").toLowerCase().replace(/[^a-z]/g, "").slice(0, 5);
-  try {
-    const r = await webSearch.search(query, { offset, engine, lang });
-    res.json({ ok: true, query, offset, responseTimeMs: Math.round((performance.now() - started) * 10) / 10, ...r });
-  } catch (e) { respondError(res, 502, e.message, "WEB_SEARCH_ERROR"); }
-});
-
-app.get("/api/search", async (req, res) => {
-  const started = performance.now();
-  const query = String(req.query.q || "").trim();
-  const offset = Math.max(0, Math.min(100000, Number(req.query.offset || 0) || 0));
-  const limit = Math.max(1, Math.min(CFG.maxSearchResults, Number(req.query.limit || 10) || 10));
-  if (!query) return respondError(res, 400, "Search query is empty.", "SEARCH_EMPTY");
-  if (query.length > CFG.maxSearchQueryChars) return respondError(res, 400, "Search query is too long.", "SEARCH_QUERY_TOO_LONG");
-  try {
-    const result = await searchService(query, offset, limit);
-    res.json({ ok: true, query, provider: result.provider, total: result.total, offset, limit, responseTimeMs: Math.round((performance.now() - started) * 10) / 10, cached: !!result.cached, indexSize: result.indexSize ?? result.indexStats?.documents ?? searchIndex.size, indexStats: result.indexStats || searchIndexStats(), terms: result.terms || [], filters: result.filters || {}, results: result.results, disabled: !!result.disabled });
-  } catch (e) {
-    const status = e.code === "SEARCH_NOT_CONFIGURED" ? 503 : 502;
-    respondError(res, status, e.message, e.code || "SEARCH_PROVIDER_ERROR", { indexStats: searchIndexStats() });
-  }
-});
 
 function warmTypeForUrl(url, hintedType = "") {
   const hint = String(hintedType || "").toLowerCase();
@@ -3578,53 +3485,69 @@ function extractWarmUrls(html, base, sid) {
     .map(item => ({ ...item, sid }));
 }
 
-async function warmPageResources(html, base, sid) {
-  if (CFG.proxyWarmLimit <= 0) return;
+async function warmPageResources(html, base, sid, externalSignal = null) {
+  if (CFG.proxyWarmLimit <= 0 || !html || !base) return;
   const candidates = extractWarmUrls(html, base, sid);
   if (!candidates.length) return;
-  const hostActive = new Map();
-  const queue = candidates.map((item, index) => ({ ...item, index })).sort((a, b) => b.priority - a.priority || a.index - b.index);
-  let cursor = 0;
-  const next = () => queue[cursor++];
-  const worker = async () => {
-    while (true) {
-      const item = next();
-      if (!item) return;
-      const host = hostOf(item.url);
-      while ((hostActive.get(host) || 0) >= CFG.proxyWarmPerHost) await sleep(2);
-      hostActive.set(host, (hostActive.get(host) || 0) + 1);
-      let release = null;
-      try {
-        release = await proxyWarmSemaphore.acquire();
-        const common = {
-          sessionId: item.sid,
-          referrer: base,
-          accept: item.type === "css" ? "text/css,*/*;q=0.05" : item.type === "js" ? "application/javascript,text/javascript,*/*;q=0.05" : item.type === "font" ? "font/*,*/*;q=0.05" : item.type === "image" ? "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.05" : "*/*;q=0.05",
-          limitForContentType: crawlLimitForContentType,
-          timeout: item.priority >= 100 ? Math.min(CFG.requestTimeoutMs, 10000) : Math.min(CFG.requestTimeoutMs, 12000),
-          retries: item.priority >= 100 ? 0 : 1
-        };
-        // Never download video/audio during the page warm phase. A video poster or
-        // manifest is useful; multi-megabyte media should be fetched only when the
-        // page/player actually asks for it.
-        if (item.type === "media") {
-          await fetchCached(item.url, { ...common, method: "HEAD", limit: 16 * 1024 });
-          continue;
+
+  const controller = new AbortController();
+  const onExternalAbort = () => controller.abort();
+  if (externalSignal) {
+    if (externalSignal.aborted) return;
+    externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+  }
+  const hardTimer = setTimeout(() => controller.abort(), Math.max(500, CFG.proxyWarmHardMs));
+
+  try {
+    const hostActive = new Map();
+    const queue = candidates.map((item, index) => ({ ...item, index })).sort((a, b) => b.priority - a.priority || a.index - b.index);
+    let cursor = 0;
+    const next = () => queue[cursor++];
+    const worker = async () => {
+      while (!controller.signal.aborted) {
+        const item = next();
+        if (!item) return;
+        const host = hostOf(item.url);
+        while (!controller.signal.aborted && (hostActive.get(host) || 0) >= CFG.proxyWarmPerHost) await sleep(2);
+        if (controller.signal.aborted) return;
+        hostActive.set(host, (hostActive.get(host) || 0) + 1);
+        let release = null;
+        try {
+          release = await proxyWarmSemaphore.acquire(controller.signal);
+          const common = {
+            sessionId: item.sid, referrer: base,
+            accept: item.type === 'css' ? 'text/css,*/*;q=0.05' : item.type === 'js' ? 'application/javascript,text/javascript,*/*;q=0.05' : item.type === 'font' ? 'font/*,*/*;q=0.05' : item.type === 'image' ? 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.05' : '*/*;q=0.05',
+            limitForContentType: crawlLimitForContentType,
+            timeout: Math.min(CFG.requestTimeoutMs, 6000),
+            bodyTimeoutMs: Math.min(CFG.bodyTimeoutMs, 6000),
+            retries: item.priority >= 100 ? 0 : 1,
+            signal: controller.signal
+          };
+          if (item.type === 'media') {
+            await fetchCached(item.url, { ...common, method: 'HEAD', limit: 16 * 1024, noCache: true });
+            continue;
+          }
+          if (item.type === 'image' || item.type === 'font') {
+            const head = await fetchCached(item.url, { ...common, method: 'HEAD', limit: 16 * 1024 });
+            const length = Number(String(head.contentLength || '').split(',')[0]) || 0;
+            if (length && length > CFG.proxyWarmMaxBinaryBytes) continue;
+          }
+          await fetchCached(item.url, { ...common, limit: CFG.maxTextBytesPerResource });
+        } catch (e) {
+          if (e?.code === 'OPERATION_CANCELLED' || e?.name === 'AbortError') return;
+        } finally {
+          if (release) release();
+          hostActive.set(host, Math.max(0, (hostActive.get(host) || 1) - 1));
         }
-        if (item.type === "image" || item.type === "font") {
-          const head = await fetchCached(item.url, { ...common, method: "HEAD", limit: 16 * 1024 });
-          const length = Number(String(head.contentLength || "").split(",")[0]) || 0;
-          if (length && length > CFG.proxyWarmMaxBinaryBytes) continue;
-        }
-        await fetchCached(item.url, { ...common, limit: CFG.maxTextBytesPerResource });
-      } catch {} finally {
-        if (release) release();
-        hostActive.set(host, Math.max(0, (hostActive.get(host) || 1) - 1));
       }
-    }
-  };
-  const workerCount = Math.min(CFG.proxyWarmConcurrency, CFG.proxyWarmRobots, candidates.length);
-  await Promise.allSettled(Array.from({ length: workerCount }, worker));
+    };
+    const workerCount = Math.min(CFG.proxyWarmConcurrency, CFG.proxyWarmRobots, candidates.length, CFG.leanMode ? 2 : candidates.length);
+    await Promise.allSettled(Array.from({ length: Math.max(1, workerCount) }, worker));
+  } finally {
+    clearTimeout(hardTimer);
+    if (externalSignal) externalSignal.removeEventListener('abort', onExternalAbort);
+    if (!controller.signal.aborted) controller.abort();
+  }
 }
 
 
@@ -3750,6 +3673,7 @@ async function streamOversizeResponse(req, res, result, ctx) {
   if (ctx.download) res.setHeader("content-disposition", `attachment; filename="${safeDownloadFilename(result.finalUrl || ctx.canonical, type)}"`);
   if (result.contentRange) res.setHeader("content-range", result.contentRange);
   if (result.acceptRanges) res.setHeader("accept-ranges", result.acceptRanges);
+  if (result.contentLength) res.setHeader("content-length", result.contentLength);
   if (result.etag) res.setHeader("ETag", result.etag);
   if (result.lastModified) res.setHeader("Last-Modified", result.lastModified);
   res.setHeader("X-Veyra-Canonical-URL", result.finalUrl || ctx.canonical);
@@ -3802,6 +3726,9 @@ async function proxyRequest(req, res, mode) {
   await assertPublicUrl(canonical);
   const accept = proxyAcceptForResource(req, mode);
   const method = req.method.toUpperCase();
+  const mediaRequest = mode === "resource" && (
+    !!req.get("Range") || /video|audio/i.test(accept) || /googlevideo\.com/i.test(canonical) || /videoplayback/i.test(canonical)
+  );
   if (!safeMethod(method)) return respondError(res, 405, "Unsupported proxy method.", "PROXY_METHOD_NOT_ALLOWED");
   const body = method === "GET" || method === "HEAD" ? undefined : (() => {
     if (Buffer.isBuffer(req.body)) return req.body.length ? req.body : undefined;
@@ -3846,10 +3773,10 @@ async function proxyRequest(req, res, mode) {
   try {
     const browserKey = `${method} ${canonical}|ref=${referrer}|sid=${sid}|range=${headers.range || ""}|body=${body ? require("crypto").createHash("sha1").update(body).digest("hex") : ""}`;
     const browserPriority = mode === "view" ? 1000 : (looksLikeApiResource(canonical, accept, method) ? 980 : (/css|javascript|font|svg/i.test(accept) ? 900 : /image/i.test(accept) ? 800 : 700));
-    const requestLimit = looksLikeApiResource(canonical, accept, method) ? CFG.proxyApiBodyBytes : CFG.maxProxyBodyBytes;
-    const retries = looksLikeApiResource(canonical, accept, method) ? CFG.proxyApiRetries : CFG.maxRetries;
+    const requestLimit = mediaRequest ? CFG.maxProxyMediaBytes : (looksLikeApiResource(canonical, accept, method) ? CFG.proxyApiBodyBytes : CFG.maxProxyBodyBytes);
+    const retries = mediaRequest ? 1 : (looksLikeApiResource(canonical, accept, method) ? CFG.proxyApiRetries : CFG.maxRetries);
     const requestUserAgent = req.get("User-Agent") ? String(req.get("User-Agent")).slice(0, 2000) : "";
-    const result = await browserScheduler.request(browserKey, () => fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, requestId: req.veyraRequestId, userAgent: requestUserAgent || undefined, limit: requestLimit, retries, limitForContentType, noCache: method !== "GET", streamOversize: mode === "resource" }), { priority: browserPriority, host: hostOf(canonical), url: canonical });
+    const result = await browserScheduler.request(browserKey, () => fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, requestId: req.veyraRequestId, userAgent: requestUserAgent || undefined, limit: requestLimit, retries, limitForContentType, noCache: method !== "GET" || mediaRequest, timeout: mediaRequest ? CFG.mediaRequestTimeoutMs : CFG.requestTimeoutMs, bodyTimeoutMs: mediaRequest ? CFG.mediaBodyTimeoutMs : CFG.bodyTimeoutMs, streamOversize: mode === "resource" }), { priority: browserPriority + (mediaRequest ? 30 : 0), host: hostOf(canonical), url: canonical });
   // Oversize bodies are streamed straight through (constant memory) instead of
   // buffered. Top-level non-HTML documents (a big image, PDF, video opened
   // directly) stream as well; only HTML must be buffered for rewriting.
@@ -3900,7 +3827,7 @@ async function proxyRequest(req, res, mode) {
   if (result.lastModified) res.setHeader("Last-Modified", result.lastModified);
   const outputStatus = (result.status >= 300 && result.status < 400) ? 200 : result.status;
   const transformedText = (mode === "view" && /html|xhtml|^$/i.test(result.contentType || "")) || (mode === "resource" && /(?:text\/css|javascript|ecmascript)/i.test(result.contentType || ""));
-  if (result.contentLength && !transformedText && !result.truncated && outputStatus !== 200) res.setHeader("content-length", result.contentLength);
+  if (result.contentLength && !transformedText && !result.truncated) res.setHeader("content-length", result.contentLength);
   res.status(outputStatus).send(payload);
   if (mode === "view" && !result.truncated && !result.tooLarge && /html|xhtml|^$/i.test(result.contentType || "")) {
     void warmPageResources(result.body.toString("utf8"), result.finalUrl || canonical, sid);
@@ -3942,7 +3869,11 @@ app.get("/api/view", async (req, res) => { try { await proxyRequest(req, res, "v
   respondError(res, e.code === "VPN_KILL_SWITCH" ? 503 : 502, `Veyra could not load this page: ${message}`, publicCode, { requestId: req.veyraRequestId, legacyCode: "PROXY_VIEW_ERROR", upstreamCode, upstreamPhase: e.upstreamPhase || null });
 } });
 app.post("/api/view", async (req, res) => { try { await proxyRequest(req, res, "view"); } catch (e) { respondError(res, 502, `Veyra could not submit this form: ${e.message}`, "PROXY_FORM_ERROR", { requestId: req.veyraRequestId }); } });
-app.get("/api/resource", async (req, res) => { try { await proxyRequest(req, res, "resource"); } catch (e) { respondError(res, 502, `Veyra resource error: ${e.message}`, "PROXY_RESOURCE_ERROR", { requestId: req.veyraRequestId }); } });
+app.get("/api/resource", async (req, res) => { try { await proxyRequest(req, res, "resource"); } catch (e) {
+  const upstreamCode = e.upstreamCode || networkErrorCode(e) || null;
+  const code = /^UPSTREAM_[A-Z0-9_]+$/.test(String(e.code || "")) ? e.code : "PROXY_RESOURCE_ERROR";
+  respondError(res, e.code === "VPN_KILL_SWITCH" ? 503 : 502, `Veyra resource error: ${e.upstreamMessage || e.message}`, code, { requestId: req.veyraRequestId, upstreamCode, upstreamPhase: e.upstreamPhase || null, targetHost: e.upstreamHost || hostOf(req.query?.url || "") });
+} });
 app.get("/api/download", async (req, res) => { try { req.query.download = "1"; await proxyRequest(req, res, "resource"); } catch (e) { respondError(res, 502, `Veyra download error: ${e.message}`, "DOWNLOAD_ERROR", { requestId: req.veyraRequestId }); } });
 app.post("/api/resource", async (req, res) => { try { await proxyRequest(req, res, "resource"); } catch (e) { respondError(res, 502, `Veyra resource request failed: ${e.message}`, "PROXY_RESOURCE_POST_ERROR", { requestId: req.veyraRequestId }); } });
 for (const method of ["put","patch","delete","head"]) app[method]("/api/resource", async (req,res)=>{ try { await proxyRequest(req,res,"resource"); } catch(e) { respondError(res,502,`Veyra resource ${method.toUpperCase()} request failed: ${e.message}`,"PROXY_RESOURCE_METHOD_ERROR",{requestId:req.veyraRequestId}); } });
@@ -4077,6 +4008,11 @@ const STATUS_VAR_DEFS = [
   { group: "Crawler discovery", key: "maxSrcsetCandidates", label: "Max srcset candidates", kind: "number", names: ["MAX_SRCSET_CANDIDATES"], fallback: 100, min: 10, max: 500 },
   { group: "Crawler discovery", key: "maxBrowserDiscovered", label: "Max browser-discovered URLs", kind: "number", names: ["MAX_BROWSER_DISCOVERED"], fallback: 2500, min: 100, max: 20000 },
   { group: "Crawler discovery", key: "maxBrowserDiscoveredHosts", label: "Max browser-discovered hosts", kind: "number", names: ["MAX_BROWSER_DISCOVERED_HOSTS"], fallback: 24, min: 2, max: 100 },
+  { group: "Page accelerator", key: "crawlerPageWarmMs", label: "Page accelerator warm window (ms)", kind: "number", names: ["CRAWLER_PAGE_WARM_MS"], fallback: 3500, min: 1500, max: 60000 },
+  { group: "Page accelerator", key: "crawlerPageHardMs", label: "Page accelerator hard wall (ms)", kind: "number", names: ["CRAWLER_PAGE_HARD_MS"], fallback: 5000, min: 2000, max: 60000 },
+  { group: "Page accelerator", key: "proxyWarmHardMs", label: "Proxy warm hard wall (ms)", kind: "number", names: ["PROXY_WARM_HARD_MS"], fallback: 3500, min: 1500, max: 30000 },
+  { group: "Media", key: "mediaRequestTimeoutMs", label: "Media request timeout (ms)", kind: "number", names: ["MEDIA_REQUEST_TIMEOUT_MS"], fallback: 20000, min: 3000, max: 120000 },
+  { group: "Media", key: "mediaBodyTimeoutMs", label: "Media body timeout (ms)", kind: "number", names: ["MEDIA_BODY_TIMEOUT_MS"], fallback: 12000, min: 2000, max: 120000 },
   { group: "Crawler discovery", key: "sitemapConcurrency", label: "Sitemap concurrency", kind: "number", names: ["SITEMAP_CONCURRENCY"], fallback: 8, min: 1, max: 32 },
   { group: "Browser warming", key: "initialResourceBudget", label: "Initial resource warm budget", kind: "number", names: ["INITIAL_RESOURCE_BUDGET"], fallback: 64, min: 16, max: 256 },
   { group: "Crawler concurrency", key: "maxActiveFetches", label: "Active network fetch slots", kind: "number", names: ["MAX_ACTIVE_FETCHES", "MAX_GLOBAL_CONCURRENCY"], fallback: 128, min: 1, max: 256, note: "This is the real simultaneous upstream-request ceiling; CRAWLER_ROBOTS is a larger logical fleet." },

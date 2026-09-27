@@ -1,10 +1,10 @@
-## Veyra 8.16.0
+## Veyra 8.16.2
 
 ## Content-complete adaptive page loading
 
 Browsing crawls are bounded page accelerators. They do not expand same-origin navigation links during first-page acceleration. Critical assets receive bounded preload hints, inline script/style asset literals are warmed without executing page code, and crawler discovery is deferred until the page is usable.
 
-# Veyra Browser backend v8.16.0 — OmniCrawler / hybrid browser
+# Veyra Browser backend v8.16.2 — OmniCrawler / hybrid browser
 
 This release keeps the existing Express proxy, crawler, search index, browser scheduler, and browser-engine architecture and strengthens the scheduling/discovery path in place.
 

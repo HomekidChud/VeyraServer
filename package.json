@@ -1,6 +1,6 @@
 {
   "name": "veyra-browse-crawler",
-  "version": "8.16.0",
+  "version": "8.16.3",
   "private": true,
   "description": "Veyra Browser API, adaptive proxy/browser engine, page resource acceleration, search service, and diagnostics.",
   "main": "server.js",
@@ -9,7 +9,9 @@
     "prestart": "node ensure-browser.js",
     "build": "npx playwright install chromium && node install-wireproxy.js",
     "dev": "node --watch server.js",
-    "config": "node config.js"
+    "config": "node config.js",
+    "test:static": "node tests/e2e-hardening-static.mjs",
+    "test:youtube-compat": "node tests/youtube-compat-static.mjs"
   },
   "engines": {
     "node": ">=20"

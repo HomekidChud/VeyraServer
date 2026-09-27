@@ -49,7 +49,7 @@ const RENDER_PLANS = {
 // Legacy resource profiles (kept so RESOURCE_PROFILE=free|balanced|high still works).
 const LEGACY_CAPS = {
   free: {
-    maxActiveFetches: 10, browserMaxActiveFetches: 6, browserSessions: 1, browserPages: 2, browserContexts: 2,
+    maxActiveFetches: 10, browserMaxActiveFetches: 4, browserSessions: 1, browserPages: 1, browserContexts: 1,
     maxPendingQueue: 600, maxPages: 2500, maxResources: 6000, maxLinks: 30000, maxCacheEntries: 50,
     maxIndexDocs: 5000, maxCrossOriginResources: 250, sitemapConcurrency: 2, maxSitemapFiles: 20,
     proxyWarmConcurrency: 4, proxyWarmRobots: 16, browserCrawlerConcurrency: 3,
@@ -100,9 +100,9 @@ function capsFor(ramMb, cpu) {
   const out = { ...base };
   out.maxActiveFetches = Math.max(10, Math.min(Math.round(cpu * 40 + gb * 6), Math.round(gb * 40)));
   out.browserSessions = ramMb <= 512 ? 1 : ramMb <= 2048 ? 2 : ramMb <= 4096 ? 4 : ramMb <= 8192 ? 6 : 8;
-  out.browserPages = out.browserSessions * 2;
+  out.browserPages = ramMb <= 512 ? 1 : out.browserSessions * 2;
   out.browserContexts = out.browserSessions;
-  out.browserMaxActiveFetches = clamp(Math.round(6 + cpu * 6), 6, 64);
+  out.browserMaxActiveFetches = ramMb <= 512 ? 4 : clamp(Math.round(6 + cpu * 6), 6, 64);
   out.browserCrawlerConcurrency = clamp(Math.round(cpu * 6), 3, 64);
   // Parse workers keep HTML/JS parsing off the main thread so proxying stays
   // responsive while crawling. 512 MB instances cannot afford extra isolates.
