@@ -1131,6 +1131,10 @@ function detectChallenge(body, contentType, status, headers = {}) {
   ].filter(re => re.test(text)).length;
   const titleLike = /<title>\s*(?:just a moment|attention required|security verification|verify you are human)/i.test(text);
   const headerSignal = /challenge/i.test(String(headers["cf-mitigated"] || "")) || /challenge/i.test(String(headers["server"] || ""));
+  // Google's "unusual traffic" / reCAPTCHA wall (served to datacenter IPs such as Render's).
+  if (/unusual traffic from your computer network/.test(text) || (/\/sorry\/index/.test(String(headers.finalUrl || "")) && /captcha/.test(text))) {
+    return { type: "unusual-traffic", status, signals: signals + 1, provider: "google" };
+  }
   if (titleLike || (signals >= 2 && (status === 403 || status === 429 || status === 503 || text.length < 150000)) || (headerSignal && signals >= 1)) {
     return { type: "security-verification", status, signals };
   }
@@ -1357,9 +1361,21 @@ function makeGetFormProxyAction(url, sid) {
   return `/api/form-get/${token}/${safeSid}`;
 }
 
-function challengeFallbackHtml(url, info) {
+function challengeFallbackHtml(url, info, sid = "") {
   const safe = escapeHtml(url);
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Veyra verification fallback</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#10151d;color:#eaf0f6;font:15px/1.5 system-ui,sans-serif}.card{max-width:650px;margin:24px;padding:32px;background:#171e28;border:1px solid #303a48;border-radius:18px;box-shadow:0 20px 60px #0008}.ey{font-size:11px;letter-spacing:.15em;text-transform:uppercase;color:#86a9d5}.card h1{font-size:26px;margin:10px 0}.card p{color:#aab5c4}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px}.actions a{display:inline-block;padding:10px 15px;border-radius:9px;text-decoration:none}.primary{background:#4b82c9;color:#fff}.secondary{border:1px solid #3a4657;color:#dce5ef}</style></head><body><main class="card"><div class="ey">Veyra Browser</div><h1>This site requires its own security verification</h1><p>Veyra's server proxy detected a security or bot-verification page (${escapeHtml(info?.type || "verification")}). It was not indexed as site content and Veyra will not attempt to bypass the site's security controls.</p><div class="actions"><a class="primary" href="${safe}" target="_blank" rel="noopener noreferrer">Open site directly</a><a class="secondary" href="${makeViewUrl(url)}">Retry through Veyra</a></div></main></body></html>`;
+  let query = "";
+  try { const u = new URL(url); const cont = u.searchParams.get("continue"); const src = cont ? new URL(cont) : u; query = src.searchParams.get("q") || src.searchParams.get("query") || ""; } catch {}
+  const google = info?.type === "unusual-traffic";
+  const title = google ? "Google is asking for a captcha" : "This site requires its own security verification";
+  const why = google
+    ? "Google blocks searches that come from cloud servers like the one Veyra runs on, and its captcha can't be completed through a proxy. This isn't something Veyra can bypass. Connecting Veyra VPN to a residential exit usually avoids it."
+    : `Veyra's server proxy detected a security or bot-verification page (${escapeHtml(info?.type || "verification")}). It was not indexed as site content and Veyra will not attempt to bypass the site's security controls.`;
+  const alt = query ? [
+    ["Bing", `https://www.bing.com/search?q=${encodeURIComponent(query)}`],
+    ["Brave Search", `https://search.brave.com/search?q=${encodeURIComponent(query)}`],
+    ["DuckDuckGo", `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`]
+  ].map(([n, h]) => `<a class="secondary" href="${escapeHtml(makeViewUrl(h, sid))}">Search “${escapeHtml(query)}” on ${n}</a>`).join("") : "";
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#10151d;color:#eaf0f6;font:15px/1.5 system-ui,sans-serif}.card{max-width:650px;margin:24px;padding:32px;background:#171e28;border:1px solid #303a48;border-radius:18px;box-shadow:0 20px 60px #0008}.ey{font-size:11px;letter-spacing:.15em;text-transform:uppercase;color:#86a9d5}.card h1{font-size:26px;margin:10px 0}.card p{color:#aab5c4}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px}.actions a{display:inline-block;padding:10px 15px;border-radius:9px;text-decoration:none}.primary{background:#4b82c9;color:#fff}.secondary{border:1px solid #3a4657;color:#dce5ef}.secondary:hover{background:#1f2835}</style></head><body><main class="card"><div class="ey">Veyra Browser</div><h1>${escapeHtml(title)}</h1><p>${why}</p><div class="actions">${alt}<a class="primary" href="${safe}" target="_blank" rel="noopener noreferrer">Open directly in a new tab</a><a class="secondary" href="${escapeHtml(makeViewUrl(url, sid))}">Retry through Veyra</a></div></main></body></html>`;
 }
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m])); }
 
@@ -3421,8 +3437,26 @@ async function streamOversizeResponse(req, res, result, ctx) {
   if (!res.writableEnded) res.end();
 }
 
+// Query params that belong to the proxy itself. Anything else on /api/view?url=… was
+// appended by the page (e.g. Google's JS check does location.replace(location.href+"&sei=…")),
+// so it is really part of the target URL. Dropping it caused infinite reload loops.
+const PROXY_OWN_PARAMS = new Set(["url", "target", "u", "sid", "from", "download"]);
+function mergeStrayProxyParams(req, canonical) {
+  if (!canonical || !req.originalUrl) return canonical;
+  let extra;
+  try { extra = new URL(req.originalUrl, "http://x").searchParams; } catch { return canonical; }
+  let target; try { target = new URL(canonical); } catch { return canonical; }
+  let changed = false;
+  for (const [k, v] of extra) {
+    if (PROXY_OWN_PARAMS.has(k) || /^__veyra/i.test(k)) continue;
+    if (target.searchParams.getAll(k).includes(v)) continue;
+    target.searchParams.set(k, v); changed = true;
+  }
+  return changed ? target.href : canonical;
+}
+
 async function proxyRequest(req, res, mode) {
-  const canonical = firstValidUrl([req.query.url, req.query.target, req.query.u], req.get('Origin') || undefined) || proxyRefererCanonical(req);
+  const canonical = mergeStrayProxyParams(req, firstValidUrl([req.query.url, req.query.target, req.query.u], req.get('Origin') || undefined)) || proxyRefererCanonical(req);
   const download = String(req.query.download || "") === "1";
   if (!canonical) return respondError(res, 400, "Missing or invalid public HTTP(S) URL.", "INVALID_URL");
   await assertPublicUrl(canonical);
@@ -3484,11 +3518,11 @@ async function proxyRequest(req, res, mode) {
     ...(result.contentRange ? { "content-range": result.contentRange } : {}),
     ...(result.acceptRanges ? { "accept-ranges": result.acceptRanges } : {})
   };
-  const challenge = mode === "view" ? detectChallenge(result.body.toString("utf8"), result.contentType, result.status, { server: result.serverHeader, "cf-mitigated": result.cfMitigated }) : null;
+  const challenge = mode === "view" ? detectChallenge(result.body.toString("utf8"), result.contentType, result.status, { server: result.serverHeader, "cf-mitigated": result.cfMitigated, finalUrl: result.finalUrl }) : null;
   if (challenge) {
     res.setHeader("X-Veyra-Challenge", "true");
     res.setHeader("X-Veyra-Canonical-URL", canonical);
-    return res.status(200).type("html").send(challengeFallbackHtml(canonical, challenge));
+    return res.status(200).type("html").send(challengeFallbackHtml(canonical, challenge, sid));
   }
   if (mode === "resource" && /javascript|ecmascript/i.test(result.contentType || "")) noteScriptDir(sid, result.finalUrl || canonical);
   let payload = result.body;
@@ -4148,4 +4182,4 @@ const __workerOps = {
   discover: (text, kind, base, contentType) => collectDiscovery(text, kind, base, contentType)
 };
 
-module.exports = { app, CFG, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions };
+module.exports = { app, mergeStrayProxyParams, detectChallenge, CFG, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions };

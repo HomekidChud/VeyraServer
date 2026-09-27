@@ -132,6 +132,19 @@ const check = async (name, fn) => { await fn(); passed += 1; console.log(`ok - $
       assert.ok(scripts.length >= 1, "runtime script injected");
       for (const code of scripts) new Function(code);
     });
+    await check("proxy: params a page appends to the proxy URL are merged into the target (Google sei loop)", async () => {
+      const { mergeStrayProxyParams } = require("./server.js");
+      const req = { originalUrl: "/api/view?url=" + encodeURIComponent("https://www.google.com/search?q=hi") + "&sid=abc&sei=XYZ&from=x" };
+      assert.strictEqual(mergeStrayProxyParams(req, "https://www.google.com/search?q=hi"), "https://www.google.com/search?q=hi&sei=XYZ");
+      const same = { originalUrl: "/api/view?url=" + encodeURIComponent("https://a.test/?q=1") + "&sid=abc" };
+      assert.strictEqual(mergeStrayProxyParams(same, "https://a.test/?q=1"), "https://a.test/?q=1");
+    });
+    await check("proxy: Google unusual-traffic wall is detected as a challenge", async () => {
+      const { detectChallenge } = require("./server.js");
+      const c = detectChallenge("<html><body>Our systems have detected unusual traffic from your computer network.</body></html>", "text/html", 429, {});
+      assert.strictEqual(c && c.type, "unusual-traffic");
+      assert.strictEqual(detectChallenge("<html><body>hello</body></html>", "text/html", 200, {}), null);
+    });
   } finally {
     child.kill("SIGTERM");
   }

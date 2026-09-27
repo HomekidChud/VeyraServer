@@ -20,7 +20,7 @@ ok('oversize resources stream instead of 413', s.includes('function streamOversi
 ok('relative-path fallback route exists', s.includes('function proxiedPageFromReferer') && s.includes('resolveEscapedChunk'));
 
 const html = injectRuntime('<html><head></head><body></body></html>', 'https://github.com/microsoft/playwright', 'sid1');
-const code = (html.match(/<script>([\s\S]*?)<\/script>/) || [])[1];
+const code = (html.match(/<script(?: data-veyra-runtime)?>([\s\S]*?)<\/script>/) || [])[1];
 ok('runtime script injected', !!code);
 let parseErr = null; try { new vm.Script(code); } catch (e) { parseErr = e; }
 ok(`injected runtime parses${parseErr ? ' (' + parseErr.message + ')' : ''}`, !parseErr);
