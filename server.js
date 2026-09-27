@@ -3589,21 +3589,33 @@ app.get("/api/download", async (req, res) => { try { req.query.download = "1"; a
 app.post("/api/resource", async (req, res) => { try { await proxyRequest(req, res, "resource"); } catch (e) { respondError(res, 502, `Veyra resource request failed: ${e.message}`, "PROXY_RESOURCE_POST_ERROR", { requestId: req.veyraRequestId }); } });
 for (const method of ["put","patch","delete","head"]) app[method]("/api/resource", async (req,res)=>{ try { await proxyRequest(req,res,"resource"); } catch(e) { respondError(res,502,`Veyra resource ${method.toUpperCase()} request failed: ${e.message}`,"PROXY_RESOURCE_METHOD_ERROR",{requestId:req.veyraRequestId}); } });
 
+const OPEN_ENGINE_MODES = new Set(["auto", "proxy", "crawler", "browser", "combined"]);
+function normalizeOpenEngineMode(value) {
+  const raw = String(value || "auto").trim().toLowerCase();
+  return OPEN_ENGINE_MODES.has(raw) ? raw : "auto";
+}
+function shouldStartCrawlerForEngineMode(mode) {
+  return mode === "auto" || mode === "crawler" || mode === "combined";
+}
+
 app.post("/api/open", async (req, res) => {
   try {
     const root = normalizeUrl(String(req.body?.url || "")); if (!root) return respondError(res, 400, "Please provide a valid public HTTP(S) URL.", "INVALID_URL");
     await assertPublicUrl(root);
+    const engineMode = normalizeOpenEngineMode(req.body?.engineMode);
+    const crawlerEnabled = shouldStartCrawlerForEngineMode(engineMode);
     const oldId = activeByRoot.get(root); const old = oldId && jobs.get(oldId);
-    if (old && !old.done && !old.stopRequested) return res.status(202).json({ jobId: old.id, url: root, viewUrl: makeViewUrl(root) });
+    if (crawlerEnabled && old && !old.done && !old.stopRequested) return res.status(202).json({ jobId: old.id, url: root, viewUrl: makeViewUrl(root), engineMode, crawlerEnabled: true });
     const openSid = String(req.body?.sessionId || req.body?.sid || "");
     if (openSid && sessionManager.checkLimit(openSid)) return respondError(res, 410, "This Veyra session reached its time limit and was deleted.", "SESSION_EXPIRED");
+    if (!crawlerEnabled) return res.status(200).json({ ok: true, jobId: null, url: root, viewUrl: makeViewUrl(root), state: "disabled", engineMode, crawlerEnabled: false });
     const job = createJob(root);
     if (/^[A-Za-z0-9_-]{16,80}$/.test(openSid)) job.sessionId = openSid;
     let state;
     try { state = scheduleCrawl(job); } catch (e) { return respondError(res, 503, e.message, e.code || "CRAWLER_CAPACITY_BUSY", { maxActiveJobs: effectiveMaxActiveJobs(), queued: crawlQueue.length }); }
     jobs.set(job.id, job); activeByRoot.set(root, job.id);
     jobLog(job, "info", state === "running" ? "Background crawl started." : `Background crawl queued (position ${job.queuePosition}).`);
-    res.status(202).json({ jobId: job.id, url: root, viewUrl: makeViewUrl(root), state: "queued", scheduler: state, queuePosition: job.queuePosition || 0 });
+    res.status(202).json({ jobId: job.id, url: root, viewUrl: makeViewUrl(root), state: "queued", scheduler: state, queuePosition: job.queuePosition || 0, engineMode, crawlerEnabled: true });
   } catch (e) { respondError(res, 400, e.message, "OPEN_FAILED"); }
 });
 

@@ -5,6 +5,7 @@ services:
     plan: free
     buildCommand: npm install && npx playwright install chromium && node install-wireproxy.js
     startCommand: npm start
+    healthCheckPath: /health
     envVars:
       - key: NODE_VERSION
         value: "20"

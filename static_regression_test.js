@@ -10,6 +10,8 @@ ok('background sitemap loading', s.includes('void loadSitemaps(job)'));
 ok('browser discoveries return to crawler', s.includes('job.browserDiscoveredCount') && s.includes('browser-network'));
 ok('broad page scan exists', s.includes('broad-scan') && s.includes('MAX_BROAD_SCAN_CHARS'));
 ok('GET form actions preserve target', s.includes('data-veyra-action') && s.includes('GET form submissions replace the URL query component'));
+ok('explicit engine modes exist', s.includes('OPEN_ENGINE_MODES') && s.includes('engineMode') && s.includes('crawlerEnabled'));
+ok('proxy-only mode can skip crawler', s.includes('state: "disabled"') && s.includes('shouldStartCrawlerForEngineMode'));
 ok('proxy referrer recovery is validated', s.includes('function proxyRefererCanonical') && s.includes('proxyRefererCanonical(req)'));
 
 ok('retryable crawl failures requeue', s.includes('targetFrontier.requeue'));
