@@ -1,6 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const s = fs.readFileSync(path.join(__dirname, 'server.js'), 'utf8');
+const vpnJs = fs.readFileSync(path.join(__dirname, 'vpn.js'), 'utf8');
 function ok(name, cond) { if (!cond) throw new Error(`FAIL ${name}`); console.log('PASS', name); }
 ok('logical robot bundle config exists', s.includes('ROBOT_BUNDLE_SIZE'));
 ok('adaptive host policy exists', s.includes('hostConcurrencyLimit(job, host)') && s.includes('noteHostSuccess(job, host)') && s.includes('noteHostError(job, host)'));
@@ -16,6 +17,9 @@ ok('page accelerator skips navigation expansion', s.includes('job.pageAccelerato
 ok('combined mode preserves crawler concurrency', s.includes('!job?.pageAccelerator && browserEngine'));
 ok('seed crawl cannot hijack page accelerator', s.includes('!CFG.crawlerPageAccelerator || old.pageAccelerator'));
 ok('proxy-only mode can skip crawler', s.includes('state: "disabled"') && s.includes('shouldStartCrawlerForEngineMode'));
+ok('browse crawler opens use bounded page accelerator', s.includes('const job = createJob(root, { pageAccelerator: CFG.crawlerPageAccelerator });'));
+ok('critical asset preload pipeline exists', s.includes('criticalPreloadHtml') && s.includes('preloadCandidates') && s.includes('PROXY_CRITICAL_PRELOAD_LIMIT'));
+ok('inline asset warm scan exists', s.includes('extractInlineWarmUrls') && s.includes('PROXY_INLINE_WARM_SCAN_CHARS'));
 ok('proxy referrer recovery is validated', s.includes('function proxyRefererCanonical') && s.includes('proxyRefererCanonical(req)'));
 
 ok('retryable crawl failures requeue', s.includes('targetFrontier.requeue'));
@@ -24,4 +28,7 @@ ok('status includes new robot bundle configuration', s.includes('robotBundleSize
 ok('browser binary ensure script is wired', fs.existsSync(path.join(__dirname, 'ensure-browser.js')) && fs.existsSync(path.join(__dirname, 'render.yaml')));
 const pkg = JSON.parse(fs.readFileSync(path.join(__dirname,'package.json'),'utf8'));
 ok('prestart browser ensure is wired', pkg.scripts && pkg.scripts.prestart === 'node ensure-browser.js');
+ok('VPN scheduled rotation exists', vpnJs.includes('VPN_ROTATION_INTERVAL_MS') && vpnJs.includes('this.rotationIntervalMs'));
+ok('VPN different-IP guard exists', vpnJs.includes('rotationSameIpGuard') && vpnJs.includes('oldHealth?.exitIp'));
+ok('VPN rotation rate limit exists', vpnJs.includes('VPN_ROTATION_MIN_GAP_MS') && vpnJs.includes('VPN_ROTATION_RATE_LIMIT'));
 console.log('Veyra static regression checks passed');

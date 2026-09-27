@@ -168,11 +168,13 @@ const CFG = Object.freeze({
   maxSessionCookies: numberEnv("MAX_SESSION_COOKIES", 50, 5, 500),
   proxyWarmRobots: Math.min(numberEnv("PROXY_WARM_ROBOTS", P.proxyWarmRobots, 1, 1000), P.proxyWarmRobots),
   proxyWarmConcurrency: Math.min(numberEnv("PROXY_WARM_CONCURRENCY", P.proxyWarmConcurrency, 1, 64), P.proxyWarmConcurrency),
-  proxyWarmLimit: numberEnv("PROXY_WARM_LIMIT", 64, 1, 256),
-  proxyWarmPerHost: numberEnv("PROXY_WARM_PER_HOST", 3, 1, 16),
+  proxyWarmLimit: numberEnv("PROXY_WARM_LIMIT", 96, 1, 256),
+  proxyWarmPerHost: numberEnv("PROXY_WARM_PER_HOST", 4, 1, 16),
+  proxyCriticalPreloadLimit: numberEnv("PROXY_CRITICAL_PRELOAD_LIMIT", 18, 4, 40),
+  proxyInlineWarmScanChars: numberEnv("PROXY_INLINE_WARM_SCAN_CHARS", 800000, 10000, 3000000),
   sitemapConcurrency: Math.min(numberEnv("SITEMAP_CONCURRENCY", P.sitemapConcurrency, 1, 32), P.sitemapConcurrency),
   initialResourceBudget: numberEnv("INITIAL_RESOURCE_BUDGET", 64, 16, 256),
-  userAgent: process.env.VEYRA_USER_AGENT || "VeyraBrowseCrawler/8.14.3 (+https://github.com/HomekidChud/VeyraServer)",
+  userAgent: process.env.VEYRA_USER_AGENT || "VeyraBrowseCrawler/8.14.6 (+https://github.com/HomekidChud/VeyraServer)",
   frontendOrigins: csvEnv("FRONTEND_ORIGIN", ["*"]),
   // Canonical Veyra frontend URL used for safe diagnostics hand-off when /status
   // is opened directly without the Authorization/admin header. A direct browser
@@ -1703,6 +1705,15 @@ function rewriteHtml(html, base, sid = "") {
   });
   $("style").each((_, el) => $(el).html(rewriteCssText($(el).html() || "", effectiveBase)));
   $("[style]").each((_, el) => $(el).attr("style", rewriteCssText($(el).attr("style") || "", effectiveBase)));
+
+  // Hint the browser to start the highest-value rewritten assets before it reaches
+  // their original tags. This never blocks the HTML response and remains bounded.
+  const preloadCandidates = extractWarmUrls(html, effectiveBase, sid).filter(item => item.priority >= 72);
+  if (preloadCandidates.length) {
+    const preloadMarkup = criticalPreloadHtml(preloadCandidates, effectiveBase, sid);
+    if (preloadMarkup) $("head").first().prepend(preloadMarkup);
+  }
+
   return injectRuntime($.html(), base, sid);
 }
 
@@ -3178,7 +3189,7 @@ function configEditAllowed(req) {
 function runtimeConfigSummary() {
   return {
     plan: CFG.plan, resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb,
-    crawlers: { maxActiveJobs: CFG.maxActiveJobs, effectiveMaxActiveJobs: effectiveMaxActiveJobs(), running: activeCrawlCount(), queued: crawlQueue.length, queueMax: CFG.crawlQueueMax, abandonMs: CFG.crawlAbandonMs, robotsPerCrawl: CFG.logicalRobots, maxActiveFetches: CFG.maxActiveFetches, perHostConcurrency: CFG.perHostConcurrency, pageAccelerator: CFG.crawlerPageAccelerator, pageWarmMs: CFG.crawlerPageWarmMs, pageWarmMaxResources: CFG.crawlerPageMaxResources },
+    crawlers: { maxActiveJobs: CFG.maxActiveJobs, effectiveMaxActiveJobs: effectiveMaxActiveJobs(), running: activeCrawlCount(), queued: crawlQueue.length, queueMax: CFG.crawlQueueMax, abandonMs: CFG.crawlAbandonMs, robotsPerCrawl: CFG.logicalRobots, maxActiveFetches: CFG.maxActiveFetches, perHostConcurrency: CFG.perHostConcurrency, pageAccelerator: CFG.crawlerPageAccelerator, pageWarmMs: CFG.crawlerPageWarmMs, pageWarmMaxResources: CFG.crawlerPageMaxResources, proxyWarmLimit: CFG.proxyWarmLimit, proxyWarmConcurrency: CFG.proxyWarmConcurrency, proxyWarmPerHost: CFG.proxyWarmPerHost, proxyCriticalPreloadLimit: CFG.proxyCriticalPreloadLimit },
     workers: workerPool ? workerPool.report() : { size: 0, mode: 'inline', configured: CFG.parseWorkers },
     sessions: { maxSessions: CFG.maxProxySessions, idleTtlMs: CFG.sessionIdleTtlMs, maxAgeMs: CFG.sessionMaxAgeMs, maxCookieBytes: CFG.sessionMaxCookieBytes, serverIdleSleepMs: CFG.serverIdleSleepMs },
     browser: { maxSessions: CFG.maxBrowserSessions, maxPages: CFG.maxBrowserPages, keepWarm: CFG.browserKeepWarm, warmIdleMs: CFG.browserWarmIdleMs },
@@ -3323,6 +3334,38 @@ app.get("/api/search", async (req, res) => {
   }
 });
 
+function extractInlineWarmUrls($, base, add) {
+  let scanned = 0;
+  const scanText = (text, priority = 40) => {
+    const src = String(text || "").slice(0, CFG.proxyInlineWarmScanChars);
+    scanned += src.length;
+    const re = /(?:https?:\/\/[^\s"'`<>\)]+|(?:\/|\.\.?\/)[A-Za-z0-9_~:%@+\-./?=#&;]+\.(?:js|mjs|css|json|wasm|woff2?|ttf|otf|png|jpe?g|webp|avif|svg|ico|mp4|webm)(?:\?[^\s"'`<>\)]*)?)/gi;
+    let m;
+    while ((m = re.exec(src)) && scanned <= CFG.proxyInlineWarmScanChars * 2) add(m[0], priority);
+  };
+  $("style").each((_, el) => scanText($(el).html() || "", 82));
+  $("script:not([src])").each((_, el) => scanText($(el).html() || "", 76));
+}
+
+function criticalPreloadHtml(candidates, base, sid) {
+  const seen = new Set();
+  const rows = [];
+  for (const item of candidates) {
+    if (!item?.url || seen.has(item.url) || rows.length >= CFG.proxyCriticalPreloadLimit) continue;
+    seen.add(item.url);
+    const p = String(item.url).toLowerCase().split("?")[0];
+    let as = "fetch", attrs = "";
+    if (item.type === "css" || /\.css$/i.test(p)) as = "style";
+    else if (item.type === "js" || /\.(?:js|mjs|cjs)$/i.test(p)) as = "script";
+    else if (item.type === "font" || /\.(?:woff2?|ttf|otf|eot)$/i.test(p)) { as = "font"; attrs = " crossorigin"; }
+    else if (item.type === "image" || /\.(?:avif|bmp|gif|ico|jpe?g|png|svg|webp|apng)$/i.test(p)) as = "image";
+    else continue;
+    const href = makeResourceUrl(item.url, base, sid);
+    rows.push(`<link rel="preload" href="${escapeHtml(href)}" as="${as}"${attrs} fetchpriority="high">`);
+  }
+  return rows.join("");
+}
+
 function extractWarmUrls(html, base, sid) {
   const $ = cheerio.load(String(html || ""), { decodeEntities: false });
   const out = new Map();
@@ -3353,6 +3396,9 @@ function extractWarmUrls(html, base, sid) {
     const raw = $(el).attr("data-src") || $(el).attr("data-original") || $(el).attr("data-lazy-src");
     add(raw, 58);
   });
+  // Inline application code frequently declares chunks, fonts, images and API
+  // assets needed for first render. Scan literals only; never execute the page.
+  extractInlineWarmUrls($, base, (raw, priority) => add(raw, priority));
   return [...out.values()]
     .sort((a, b) => b.priority - a.priority)
     .slice(0, Math.min(CFG.proxyWarmLimit, 256))
@@ -3361,19 +3407,29 @@ function extractWarmUrls(html, base, sid) {
 async function warmPageResources(html, base, sid) {
   if (CFG.proxyWarmLimit <= 0) return;
   const candidates = extractWarmUrls(html, base, sid);
+  if (!candidates.length) return;
   const hostActive = new Map();
+  const queue = candidates.map((item, index) => ({ ...item, index })).sort((a, b) => b.priority - a.priority || a.index - b.index);
   let cursor = 0;
-  const next = () => candidates[cursor++];
+  const next = () => queue[cursor++];
   const worker = async () => {
     while (true) {
       const item = next(); if (!item) return;
       const host = hostOf(item.url);
-      while ((hostActive.get(host) || 0) >= CFG.proxyWarmPerHost) await sleep(5);
+      while ((hostActive.get(host) || 0) >= CFG.proxyWarmPerHost) await sleep(2);
       hostActive.set(host, (hostActive.get(host) || 0) + 1);
       let release = null;
       try {
         release = await proxyWarmSemaphore.acquire();
-        await fetchCached(item.url, { sessionId: item.sid, referrer: base, accept: "text/css,application/javascript,image/avif,image/webp,image/apng,image/svg+xml,image/*,font/*,*/*;q=0.05", limitForContentType: crawlLimitForContentType, limit: CFG.maxTextBytesPerResource, timeout: CFG.requestTimeoutMs, retries: 1 });
+        await fetchCached(item.url, {
+          sessionId: item.sid,
+          referrer: base,
+          accept: item.type === "css" ? "text/css,*/*;q=0.05" : item.type === "js" ? "application/javascript,text/javascript,*/*;q=0.05" : "image/avif,image/webp,image/apng,image/svg+xml,image/*,font/*,*/*;q=0.05",
+          limitForContentType: crawlLimitForContentType,
+          limit: CFG.maxTextBytesPerResource,
+          timeout: item.priority >= 100 ? Math.min(CFG.requestTimeoutMs, 10000) : Math.min(CFG.requestTimeoutMs, 12000),
+          retries: item.priority >= 100 ? 0 : 1
+        });
       } catch {} finally {
         if (release) release();
         hostActive.set(host, Math.max(0, (hostActive.get(host) || 1) - 1));
@@ -3383,6 +3439,7 @@ async function warmPageResources(html, base, sid) {
   const workerCount = Math.min(CFG.proxyWarmConcurrency, CFG.proxyWarmRobots, candidates.length);
   await Promise.allSettled(Array.from({ length: workerCount }, worker));
 }
+
 
 function safeDownloadFilename(url, contentType = "") {
   let base = "download";
@@ -3708,7 +3765,9 @@ app.post("/api/open", async (req, res) => {
     const openSid = String(req.body?.sessionId || req.body?.sid || "");
     if (openSid && sessionManager.checkLimit(openSid)) return respondError(res, 410, "This Veyra session reached its time limit and was deleted.", "SESSION_EXPIRED");
     if (!crawlerEnabled) return res.status(200).json({ ok: true, jobId: null, url: root, viewUrl: makeViewUrl(root), state: "disabled", engineMode, crawlerEnabled: false });
-    const job = createJob(root);
+    // Browsing opens are bounded page accelerators, never site-wide crawls.
+    // Keep discovery useful without letting one page consume the whole session.
+    const job = createJob(root, { pageAccelerator: CFG.crawlerPageAccelerator });
     if (/^[A-Za-z0-9_-]{16,80}$/.test(openSid)) job.sessionId = openSid;
     let state;
     try { state = scheduleCrawl(job); } catch (e) { return respondError(res, 503, e.message, e.code || "CRAWLER_CAPACITY_BUSY", { maxActiveJobs: effectiveMaxActiveJobs(), queued: crawlQueue.length }); }
@@ -3852,6 +3911,9 @@ const STATUS_VAR_DEFS = [
   { group: "VPN", key: "vpnProxyBypass", label: "VPN proxy bypass", kind: "string", names: ["VPN_PROXY_BYPASS"], fallback: "" },
   { group: "VPN", key: "vpnProfilesJson", label: "VPN profiles JSON", kind: "string", names: ["VPN_PROFILES_JSON"], fallback: "", secret: true },
   { group: "VPN", key: "vpnCrawlerProfile", label: "VPN crawler profile", kind: "string", names: ["VPN_CRAWLER_PROFILE"], fallback: "" },
+  { group: "VPN", key: "vpnRotationIntervalMs", label: "VPN automatic rotation interval (ms)", kind: "number", names: ["VPN_ROTATION_INTERVAL_MS"], fallback: 0, min: 0, max: 86400000 },
+  { group: "VPN", key: "vpnRotationSameIpGuard", label: "Avoid reusing known exit IPs during rotation", kind: "bool", names: ["VPN_ROTATION_SAME_IP_GUARD"], fallback: true },
+  { group: "VPN", key: "vpnRotationMinGapMs", label: "VPN rotation minimum gap (ms)", kind: "number", names: ["VPN_ROTATION_MIN_GAP_MS"], fallback: 60000, min: 10000, max: 86400000 },
   { group: "Browser engine", key: "browserMaxActiveFetches", label: "Browser fetch slots", kind: "number", names: ["BROWSER_MAX_ACTIVE_FETCHES"], fallback: 24, min: 1, max: 64 },
   { group: "Browser engine", key: "browserPerHostConcurrency", label: "Browser per-host concurrency", kind: "number", names: ["BROWSER_PER_HOST_CONCURRENCY"], fallback: 8, min: 1, max: 32 },
   { group: "Browser engine", key: "browserEnabled", label: "Browser engine enabled", kind: "bool", names: ["BROWSER_ENABLED"], fallback: true },
@@ -3899,7 +3961,9 @@ const STATUS_VAR_DEFS = [
   { group: "Proxy warming", key: "proxyWarmRobots", label: "Proxy warm logical robots", kind: "number", names: ["PROXY_WARM_ROBOTS"], fallback: 64, min: 1, max: 1000 },
   { group: "Proxy warming", key: "proxyWarmConcurrency", label: "Proxy warm network slots", kind: "number", names: ["PROXY_WARM_CONCURRENCY"], fallback: 12, min: 1, max: 64 },
   { group: "Proxy warming", key: "proxyWarmLimit", label: "Resources warmed/page", kind: "number", names: ["PROXY_WARM_LIMIT"], fallback: 64, min: 1, max: 256 },
-  { group: "Proxy warming", key: "proxyWarmPerHost", label: "Warm per-host concurrency", kind: "number", names: ["PROXY_WARM_PER_HOST"], fallback: 3, min: 1, max: 16 },
+  { group: "Proxy warming", key: "proxyWarmPerHost", label: "Warm per-host concurrency", kind: "number", names: ["PROXY_WARM_PER_HOST"], fallback: 4, min: 1, max: 16 },
+  { group: "Proxy warming", key: "proxyCriticalPreloadLimit", label: "Critical preloads/page", kind: "number", names: ["PROXY_CRITICAL_PRELOAD_LIMIT"], fallback: 18, min: 4, max: 40 },
+  { group: "Proxy warming", key: "proxyInlineWarmScanChars", label: "Inline asset scan chars", kind: "number", names: ["PROXY_INLINE_WARM_SCAN_CHARS"], fallback: 800000, min: 10000, max: 3000000 },
   { group: "Cache & logs", key: "maxProxyCacheEntries", label: "Max proxy cache entries", kind: "number", names: ["MAX_CACHE_ENTRIES"], fallback: 200, min: 10, max: 5000 },
   { group: "Cache & logs", key: "searchCacheMs", label: "Search cache TTL (ms)", kind: "number", names: ["SEARCH_CACHE_TTL_MS"], fallback: 30000, min: 0, max: 600000 },
   { group: "Cache & logs", key: "maxSearchCacheEntries", label: "Max search cache entries", kind: "number", names: ["MAX_SEARCH_CACHE_ENTRIES"], fallback: 100, min: 10, max: 5000 },

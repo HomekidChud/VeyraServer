@@ -360,6 +360,9 @@ class VpnManager {
     this.wgIdleMs = envNum(env, "VPN_WG_IDLE_MS", 10 * 60 * 1000, 30000, 86400000);
     this.defaultProfileId = String(env.VPN_DEFAULT_PROFILE || "").trim();
     this.crawlerProfileId = String(env.VPN_CRAWLER_PROFILE || "").trim();
+    this.rotationIntervalMs = envNum(env, "VPN_ROTATION_INTERVAL_MS", 0, 0, 86400000);
+    this.rotationSameIpGuard = envBool(env, "VPN_ROTATION_SAME_IP_GUARD", true);
+    this.rotationMinGapMs = envNum(env, "VPN_ROTATION_MIN_GAP_MS", 60000, 10000, 86400000);
     this.profiles = new Map();
     this.health = new Map();
     this.connections = new Map();
@@ -446,7 +449,8 @@ class VpnManager {
     const seq = prev ? prev.seq : 0;
     this.connections.set(sid, {
       sid, profileId: profile.id, requested: requested || "auto", region: opts.region || "", group: opts.group || profile.group,
-      connectedAt: Date.now(), lastUsed: Date.now(), seq, stickyTag: this.stickyTag(sid, seq), requests: 0, failovers: 0
+      connectedAt: Date.now(), lastUsed: Date.now(), seq, stickyTag: this.stickyTag(sid, seq), requests: 0, failovers: 0,
+      lastRotatedAt: Date.now(), rotationCount: 0
     });
     this.resetSessionAgent(sid);
     if (this.health.get(profile.id)?.checkedAt === 0) void this.checkProfile(profile.id).catch(() => {});
@@ -458,24 +462,46 @@ class VpnManager {
     this.resetSessionAgent(sid);
     return { connected: false, sessionId: sid, profile: null };
   }
-  rotate(sessionId) {
+  rotate(sessionId, opts = {}) {
     const sid = String(sessionId || "").trim();
     const conn = this.connections.get(sid);
     if (!conn) throw vpnError("This session is not connected to the VPN.", "VPN_NOT_CONNECTED");
+    const now = Date.now();
+    if (now - (conn.lastRotatedAt || 0) < this.rotationMinGapMs && !opts.force) {
+      throw vpnError("VPN exit rotation is rate-limited to protect the tunnel and session stability.", "VPN_ROTATION_RATE_LIMIT");
+    }
+    const oldProfile = this.profiles.get(conn.profileId);
+    const oldHealth = oldProfile ? this.health.get(oldProfile.id) : null;
     conn.seq += 1;
     conn.stickyTag = this.stickyTag(sid, conn.seq);
-    const current = this.profiles.get(conn.profileId);
-    const others = this.pickProfile({ region: conn.region, group: conn.group, exclude: [conn.profileId] });
-    // Rotating credentials ({session} in the username) gives a new exit on the
-    // same provider; otherwise move to the next healthy profile in the pool.
-    if (!(current && /\{session\}|\{rand\}/.test(current.username + current.password)) && others) conn.profileId = others.id;
+    const exclude = [conn.profileId];
+    let others = this.pickProfile({ region: conn.region, group: conn.group, exclude });
+    if (this.rotationSameIpGuard && oldHealth?.exitIp) {
+      const differentIp = [...this.profiles.values()]
+        .filter(p => !exclude.includes(p.id) && this.isUsable(p.id))
+        .filter(p => { const h = this.health.get(p.id); return !h?.exitIp || h.exitIp !== oldHealth.exitIp; })
+        .sort((a,b) => (this.health.get(a.id)?.latencyMs ?? 9999) - (this.health.get(b.id)?.latencyMs ?? 9999));
+      if (differentIp.length) others = differentIp[crypto.randomInt(differentIp.length)];
+    }
+    // Rotating credentials ({session} / {rand}) requests a fresh identity from
+    // the same provider. Otherwise move to a different configured exit. A new
+    // public IP is only guaranteed when the upstream provider supplies one.
+    if (oldProfile && /\{session\}|\{rand\}/.test(oldProfile.username + oldProfile.password)) {
+      conn.profileId = oldProfile.id;
+    } else if (others && typeof others === "object") {
+      conn.profileId = others.id;
+    }
+    conn.lastRotatedAt = now;
+    conn.rotationCount = (conn.rotationCount || 0) + 1;
     this.resetSessionAgent(sid);
-    return { rotated: true, sessionId: sid, profile: this.publicProfile(this.profiles.get(conn.profileId)) };
+    const profile = this.profiles.get(conn.profileId);
+    this.log("info", "VPN", `Rotated VPN exit for session ${sid.slice(0, 8)}… to ${profile?.id || "unknown"}.`);
+    return { rotated: true, sessionId: sid, profile: this.publicProfile(profile), rotationCount: conn.rotationCount, previousProfileId: oldProfile?.id || null };
   }
   sessionInfo(sessionId) {
     const conn = this.connections.get(String(sessionId || ""));
     if (!conn) return { connected: false, alwaysOn: this.alwaysOn && this.enabledForUse() };
-    return { connected: true, profile: this.publicProfile(this.profiles.get(conn.profileId)), requested: conn.requested, region: conn.region, connectedAt: new Date(conn.connectedAt).toISOString(), lastUsed: new Date(conn.lastUsed).toISOString(), requests: conn.requests, failovers: conn.failovers, killSwitch: this.killSwitch };
+    return { connected: true, profile: this.publicProfile(this.profiles.get(conn.profileId)), requested: conn.requested, region: conn.region, connectedAt: new Date(conn.connectedAt).toISOString(), lastUsed: new Date(conn.lastUsed).toISOString(), requests: conn.requests, failovers: conn.failovers, rotation: { enabled: this.rotationIntervalMs > 0, intervalMs: this.rotationIntervalMs, count: conn.rotationCount || 0, lastRotatedAt: conn.lastRotatedAt ? new Date(conn.lastRotatedAt).toISOString() : null }, killSwitch: this.killSwitch };
   }
   profileForSession(sessionId) {
     const conn = this.connections.get(String(sessionId || ""));
@@ -642,6 +668,17 @@ class VpnManager {
     const now = Date.now();
     // Drop idle VPN sessions and their pooled connections.
     for (const [sid, conn] of this.connections) if (sid !== "__crawler__" && now - conn.lastUsed > this.sessionIdleMs) this.disconnect(sid);
+    // Optional scheduled exit rotation. This changes the outbound identity of a
+    // live session without extending its session lifetime. We never rotate the
+    // crawler pseudo-session automatically. A real new IP depends on the configured
+    // upstream provider exposing distinct exits.
+    if (this.enabled && this.rotationIntervalMs > 0) {
+      for (const [sid, conn] of this.connections) {
+        if (sid === "__crawler__") continue;
+        if (now - (conn.lastRotatedAt || conn.connectedAt) < this.rotationIntervalMs) continue;
+        try { this.rotate(sid, { force: true }); } catch (e) { this.log("warn", "VPN", `Scheduled rotation skipped for ${sid.slice(0, 8)}…: ${e.code || e.message}`); }
+      }
+    }
     // Health checks only while something is using the VPN (keeps idle Render quiet).
     const inUse = new Set([...this.connections.values()].map(c => c.profileId));
     if (this.enabled && this.healthIntervalMs > 0 && inUse.size) {
@@ -730,7 +767,7 @@ class VpnManager {
     return {
       enabled: this.enabled, mode: this.mode, configured: this.profiles.size > 0, killSwitch: this.killSwitch, failover: this.failover, alwaysOn: this.alwaysOn,
       split: { bypass: this.bypass, only: this.only }, profiles: this.list(), connections: this.connections.size, defaultProfile: this.defaultProfileId || null,
-      crawlerProfile: this.crawlerProfileId || null, wireproxy: this.wireproxyBin ? "installed" : "missing", gateway: this.gateway ? "listening" : "idle",
+      crawlerProfile: this.crawlerProfileId || null, rotation: { enabled: this.rotationIntervalMs > 0, intervalMs: this.rotationIntervalMs, sameIpGuard: this.rotationSameIpGuard }, wireproxy: this.wireproxyBin ? "installed" : "missing", gateway: this.gateway ? "listening" : "idle",
       healthIntervalMs: this.healthIntervalMs, stats: { ...this.stats }
     };
   }
