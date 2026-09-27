@@ -2119,6 +2119,15 @@ app.post('/api/browser/session/:id/inspect', async (req,res) => { try { const da
 app.post('/api/browser/session/:id/stop', async (req,res) => { try { const session=await browserEngine.stopNavigation(req.params.id); res.json({ok:true,session}); } catch(e) { respondError(res,400,e.message,'BROWSER_STOP_ERROR'); } });
 app.delete('/api/browser/session/:id', async (req,res) => { try { await browserEngine.stop(req.params.id); res.json({ok:true}); } catch(e) { respondError(res,404,e.message,e.code||'BROWSER_SESSION_NOT_FOUND'); } });
 app.get('/api/browser/session/:id/screenshot', async (req,res) => { try { const png=await browserEngine.screenshot(req.params.id); if(!png) return respondError(res,503,'Screenshot unavailable.','BROWSER_SCREENSHOT_ERROR'); res.setHeader('content-type','image/png'); res.setHeader('cache-control','no-store'); res.send(png); } catch(e) { respondError(res,404,e.message,e.code||'BROWSER_SCREENSHOT_ERROR'); } });
+app.get('/api/browser/session/:id/download/:downloadId', (req,res) => {
+  try {
+    const session = browserEngine.get(req.params.id);
+    const item = session.downloads.find(x => x.id === req.params.downloadId);
+    if (!item || item.state !== 'complete' || !item.path) return respondError(res,404,'Browser download is not ready.','BROWSER_DOWNLOAD_NOT_READY');
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(item.filename || 'download')}`);
+    res.sendFile(item.path, err => { if (err && !res.headersSent) respondError(res,404,'Browser download file is unavailable.','BROWSER_DOWNLOAD_GONE'); });
+  } catch(e) { respondError(res,404,e.message,e.code||'BROWSER_DOWNLOAD_ERROR'); }
+});
 
 // Health and debug.
 app.get("/health", (req, res) => res.json({ ok: true, service: "veyra", uptimeSec: Math.round(process.uptime()), activeJobs: [...jobs.values()].filter(j => !j.done).length, processRole: CFG.processRole }));

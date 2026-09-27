@@ -1,6 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 const s = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
+const be = fs.readFileSync(path.join(__dirname, "browser-engine.js"), "utf8");
 function ok(msg, cond){ if(!cond) throw new Error(msg); console.log("PASS", msg); }
 ok("proxy compatibility flags exist", s.includes("PROXY_FORWARD_COMPAT_HEADERS") && s.includes("PROXY_FORWARD_CLIENT_HINTS"));
 ok("YouTube client headers are forwarded", s.includes("x-youtube-client-name") && s.includes("x-youtube-client-version"));
@@ -11,4 +12,7 @@ ok("API requests receive higher priority", s.includes("looksLikeApiResource(cano
 ok("duplicate activeWorkers increment removed", !s.includes("this.job.activeWorkers += 1;\n      this.job.activeWorkers += 1;"));
 ok("BrowserTaskScheduler class is defined", /class BrowserTaskScheduler\s*\{/.test(s));
 ok("browser scheduler instance is initialized", /const browserScheduler = new BrowserTaskScheduler\(/.test(s));
+ok("requestfailed URL sanitizer is callable", !s.includes("sanitizeUrl(req.url)()"));
+ok("browser session TTL is enforced", be.includes("this.cfg.browserSessionTtlMs"));
+ok("popup page capacity is enforced", be.includes("maxBrowserPages"));
 

@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: veyraserver
+    runtime: node
+    buildCommand: npm install && npx playwright install chromium
+    startCommand: npm start
