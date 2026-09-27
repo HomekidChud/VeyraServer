@@ -36,15 +36,10 @@ class BrowserEngine {
         this.playwright = require('playwright');
         let executable = '';
         try { executable = this.playwright.chromium.executablePath(); } catch {}
-        if ((!executable || !fs.existsSync(executable)) && this.cfg.browserAutoInstall !== false) {
-          const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx';
-          this.log('info', 'BROWSER', 'Chromium executable missing; attempting one-time Playwright browser installation.');
-          try { execFileSync(npx, ['playwright', 'install', 'chromium'], { stdio: 'inherit', timeout: 180000 }); }
-          catch (installError) { this.log('warn', 'BROWSER', `Chromium auto-install failed: ${installError.message}`); }
-        }
+        if (!executable || !fs.existsSync(executable)) throw Object.assign(new Error('Chromium executable is not installed in the deployment image. Run npx playwright install chromium during the Render build.'), { code: 'BROWSER_ENGINE_UNAVAILABLE' });
         this.browser = await this.playwright.chromium.launch({
           headless: this.cfg.browserHeadless !== false,
-          args: ['--disable-dev-shm-usage']
+          args: ['--disable-dev-shm-usage','--disable-background-networking','--disable-component-update','--disable-default-apps','--disable-sync','--no-first-run']
         });
         this.log('info', 'BROWSER', 'Chromium browser engine started.');
         return this.browser;
@@ -234,7 +229,12 @@ class BrowserEngine {
     const s = this.get(sid); s.status = 'CLOSED';
     await s.context.close().catch(() => {});
     this.sessions.delete(String(sid));
-    if (!this.sessions.size && this.browser) { /* keep browser warm; contexts are isolated */ }
+    if (!this.sessions.size && this.browser && !this.cfg.browserKeepWarm) {
+      await this.browser.close().catch(() => {});
+      this.browser = null;
+      this.playwright = null;
+      this.log('info', 'BROWSER', 'Chromium browser engine stopped after the last session closed.');
+    }
     return { ok: true };
   }
 

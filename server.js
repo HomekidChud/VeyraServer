@@ -7,6 +7,7 @@ const net = require("net");
 const fs = require("fs");
 const fsp = fs.promises;
 const path = require("path");
+const os = require("os");
 const { BrowserEngine } = require("./browser-engine");
 
 const app = express();
@@ -38,13 +39,67 @@ function enumEnv(name, fallback, allowed) {
   return allowed.includes(raw) ? raw : fallback;
 }
 
+
+function detectCgroupMemoryLimitBytes() {
+  const candidates = ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"];
+  for (const file of candidates) {
+    try {
+      const raw = fs.readFileSync(file, "utf8").trim();
+      if (!raw || raw === "max") continue;
+      const n = Number(raw);
+      if (Number.isFinite(n) && n > 64 * 1024 * 1024 && n < 1024 * 1024 * 1024 * 1024) return n;
+    } catch {}
+  }
+  const hint = Number(process.env.MEMORY_LIMIT_MB);
+  if (Number.isFinite(hint) && hint > 0) return hint * 1024 * 1024;
+  return 0;
+}
+function detectedMemoryMb() { const b = detectCgroupMemoryLimitBytes(); return b ? Math.round(b / 1024 / 1024) : 0; }
+function detectResourceProfile() {
+  const explicit = String(process.env.RESOURCE_PROFILE || "auto").trim().toLowerCase();
+  if (["free","balanced","high"].includes(explicit)) return explicit;
+  const mb = detectedMemoryMb();
+  if (mb && mb <= 768) return "free";
+  if (mb && mb <= 2048) return "balanced";
+  return "high";
+}
+function capForProfile(profile, values) {
+  return values[profile] ?? values.balanced;
+}
+const RESOURCE_PROFILE = detectResourceProfile();
+const MEMORY_LIMIT_MB = detectedMemoryMb();
+const PROFILE_CAPS = {
+  free: {
+    maxActiveFetches: 10, browserMaxActiveFetches: 6, browserSessions: 1, browserPages: 2, browserContexts: 2,
+    maxPendingQueue: 600, maxPages: 2500, maxResources: 6000, maxLinks: 30000, maxCacheEntries: 50,
+    maxIndexDocs: 5000, maxCrossOriginResources: 250, sitemapConcurrency: 2, maxSitemapFiles: 20,
+    proxyWarmConcurrency: 4, proxyWarmRobots: 16, browserCrawlerConcurrency: 3,
+    maxTextBytesPerResource: 1024 * 1024, maxImageBytes: 6 * 1024 * 1024, maxMediaBytes: 8 * 1024 * 1024
+  },
+  balanced: {
+    maxActiveFetches: 32, browserMaxActiveFetches: 12, browserSessions: 2, browserPages: 4, browserContexts: 4,
+    maxPendingQueue: 1200, maxPages: 10000, maxResources: 20000, maxLinks: 100000, maxCacheEntries: 150,
+    maxIndexDocs: 20000, maxCrossOriginResources: 500, sitemapConcurrency: 4, maxSitemapFiles: 50,
+    proxyWarmConcurrency: 8, proxyWarmRobots: 32, browserCrawlerConcurrency: 8,
+    maxTextBytesPerResource: 2 * 1024 * 1024, maxImageBytes: 12 * 1024 * 1024, maxMediaBytes: 24 * 1024 * 1024
+  },
+  high: {
+    maxActiveFetches: 128, browserMaxActiveFetches: 24, browserSessions: 4, browserPages: 8, browserContexts: 4,
+    maxPendingQueue: 3000, maxPages: 25000, maxResources: 50000, maxLinks: 250000, maxCacheEntries: 500,
+    maxIndexDocs: 50000, maxCrossOriginResources: 1000, sitemapConcurrency: 8, maxSitemapFiles: 100,
+    proxyWarmConcurrency: 12, proxyWarmRobots: 64, browserCrawlerConcurrency: 16,
+    maxTextBytesPerResource: 2 * 1024 * 1024, maxImageBytes: 16 * 1024 * 1024, maxMediaBytes: 32 * 1024 * 1024
+  }
+};
+const P = PROFILE_CAPS[RESOURCE_PROFILE];
 const CFG = Object.freeze({
   processRole: enumEnv("PROCESS_ROLE", "web", ["web", "worker", "all"]),
   // CRAWLER_ROBOTS is the logical crawler fleet. Actual simultaneous network
   // fetches are bounded independently by MAX_ACTIVE_FETCHES.
   logicalRobots: numberEnv("CRAWLER_ROBOTS", 1000, 1, 1000),
-  maxActiveFetches: numberEnv("MAX_ACTIVE_FETCHES", numberEnv("MAX_GLOBAL_CONCURRENCY", 128, 1, 256), 1, 256),
-  globalConcurrency: numberEnv("MAX_ACTIVE_FETCHES", numberEnv("MAX_GLOBAL_CONCURRENCY", 128, 1, 256), 1, 256),
+  requestedMaxActiveFetches: numberEnv("MAX_ACTIVE_FETCHES", numberEnv("MAX_GLOBAL_CONCURRENCY", P.maxActiveFetches, 1, 256), 1, 256),
+  maxActiveFetches: Math.min(numberEnv("MAX_ACTIVE_FETCHES", numberEnv("MAX_GLOBAL_CONCURRENCY", P.maxActiveFetches, 1, 256), 1, 256), P.maxActiveFetches),
+  globalConcurrency: Math.min(numberEnv("MAX_ACTIVE_FETCHES", numberEnv("MAX_GLOBAL_CONCURRENCY", P.maxActiveFetches, 1, 256), 1, 256), P.maxActiveFetches),
   perHostConcurrency: numberEnv("CRAWLER_PER_HOST_CONCURRENCY", numberEnv("MAX_PER_HOST_CONCURRENCY", 8, 1, 32), 1, 32),
   robotTaskCapacity: numberEnv("ROBOT_TASK_CAPACITY", 4, 1, 16),
   robotActiveTasks: numberEnv("ROBOT_ACTIVE_TASKS", 4, 1, 8),
@@ -65,19 +120,19 @@ const CFG = Object.freeze({
   hostErrorPenalty: numberEnv("HOST_ERROR_PENALTY", 2, 1, 10),
   criticalResourceBudget: numberEnv("CRITICAL_RESOURCE_BUDGET", 48, 8, 256),
   maxBrowserDiscovered: numberEnv("MAX_BROWSER_DISCOVERED", 2500, 100, 20000),
-  maxBrowserDiscoveredHosts: numberEnv("MAX_BROWSER_DISCOVERED_HOSTS", 24, 2, 100),
+  maxBrowserDiscoveredHosts: Math.min(numberEnv("MAX_BROWSER_DISCOVERED_HOSTS", 24, 2, 100), P.maxCrossOriginResources > 0 ? 100 : 2),
   maxDiscoveryPerPage: numberEnv("MAX_DISCOVERY_PER_PAGE", 5000, 100, 20000),
   maxScriptDiscovery: numberEnv("MAX_SCRIPT_DISCOVERY", 4000, 100, 20000),
   maxJsonUrlDiscovery: numberEnv("MAX_JSON_URL_DISCOVERY", 2000, 50, 10000),
   maxBroadScanChars: numberEnv("MAX_BROAD_SCAN_CHARS", 1500000, 10000, 10000000),
   maxSrcsetCandidates: numberEnv("MAX_SRCSET_CANDIDATES", 100, 10, 500),
-  browserMaxActiveFetches: numberEnv("BROWSER_MAX_ACTIVE_FETCHES", 24, 1, 64),
+  browserMaxActiveFetches: Math.min(numberEnv("BROWSER_MAX_ACTIVE_FETCHES", P.browserMaxActiveFetches, 1, 64), P.browserMaxActiveFetches),
   browserPerHostConcurrency: numberEnv("BROWSER_PER_HOST_CONCURRENCY", 8, 1, 32),
   browserEnabled: boolEnv("BROWSER_ENABLED", true),
   browserHeadless: boolEnv("BROWSER_HEADLESS", true),
-  maxBrowserSessions: numberEnv("MAX_BROWSER_SESSIONS", 2, 1, 16),
-  maxBrowserPages: numberEnv("MAX_BROWSER_PAGES", 4, 1, 32),
-  maxBrowserContexts: numberEnv("MAX_BROWSER_CONTEXTS", 4, 1, 16),
+  maxBrowserSessions: Math.min(numberEnv("MAX_BROWSER_SESSIONS", P.browserSessions, 1, 16), P.browserSessions),
+  maxBrowserPages: Math.min(numberEnv("MAX_BROWSER_PAGES", P.browserPages, 1, 32), P.browserPages),
+  maxBrowserContexts: Math.min(numberEnv("MAX_BROWSER_CONTEXTS", P.browserContexts, 1, 16), P.browserContexts),
   browserIdleTimeoutMs: numberEnv("BROWSER_IDLE_TIMEOUT_MS", 300000, 10000, 86400000),
   browserSessionTtlMs: numberEnv("BROWSER_SESSION_TTL_MS", 1800000, 60000, 86400000),
   browserNavigationTimeoutMs: numberEnv("BROWSER_NAVIGATION_TIMEOUT_MS", 30000, 5000, 120000),
@@ -85,12 +140,12 @@ const CFG = Object.freeze({
   browserBackend: enumEnv("BROWSER_BACKEND", "local", ["local", "remote"]),
   browserBackendUrl: process.env.BROWSER_BACKEND_URL || "",
   dnsCacheTtlMs: numberEnv("DNS_CACHE_TTL_MS", 5000, 0, 60000),
-  maxPendingQueue: numberEnv("MAX_PENDING_QUEUE", 1500, 50, 20000),
-  maxPages: numberEnv("MAX_PAGES", 10000, 1, 100000),
-  maxResources: numberEnv("MAX_RESOURCES", 20000, 1, 250000),
-  maxLinks: numberEnv("MAX_LINKS", 100000, 100, 1000000),
+  maxPendingQueue: Math.min(numberEnv("MAX_PENDING_QUEUE", P.maxPendingQueue, 50, 20000), P.maxPendingQueue),
+  maxPages: Math.min(numberEnv("MAX_PAGES", P.maxPages, 1, 100000), P.maxPages),
+  maxResources: Math.min(numberEnv("MAX_RESOURCES", P.maxResources, 1, 250000), P.maxResources),
+  maxLinks: Math.min(numberEnv("MAX_LINKS", P.maxLinks, 100, 1000000), P.maxLinks),
   maxScanBytes: numberEnv("MAX_SCAN_BYTES", 512 * 1024 * 1024, 1024 * 1024, 8 * 1024 * 1024 * 1024),
-  maxTextBytesPerResource: numberEnv("MAX_TEXT_BYTES_PER_RESOURCE", 2 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024),
+  maxTextBytesPerResource: Math.min(numberEnv("MAX_TEXT_BYTES_PER_RESOURCE", P.maxTextBytesPerResource, 64 * 1024, 16 * 1024 * 1024), P.maxTextBytesPerResource),
   maxSourceFiles: numberEnv("MAX_SOURCE_FILES", 20000, 100, 250000),
   requestTimeoutMs: numberEnv("REQUEST_TIMEOUT_MS", 15000, 1000, 120000),
   bodyTimeoutMs: numberEnv("BODY_TIMEOUT_MS", 15000, 1000, 120000),
@@ -102,7 +157,7 @@ const CFG = Object.freeze({
   maxHostBackoffMs: numberEnv("MAX_HOST_BACKOFF_MS", 30000, 1000, 300000),
   robotsTimeoutMs: numberEnv("ROBOTS_TIMEOUT_MS", 8000, 1000, 60000),
   sitemapTimeoutMs: numberEnv("SITEMAP_TIMEOUT_MS", 12000, 1000, 60000),
-  maxSitemapFiles: numberEnv("MAX_SITEMAP_FILES", 50, 1, 1000),
+  maxSitemapFiles: Math.min(numberEnv("MAX_SITEMAP_FILES", P.maxSitemapFiles, 1, 1000), P.maxSitemapFiles),
   maxSitemapUrls: numberEnv("MAX_SITEMAP_URLS", 50000, 100, 500000),
   maxJobAgeMs: numberEnv("MAX_JOB_AGE_MS", 60 * 60 * 1000, 60 * 1000, 24 * 60 * 60 * 1000),
   proxyCacheMs: numberEnv("CACHE_TTL_MS", 10000, 0, 300000),
@@ -121,15 +176,15 @@ const CFG = Object.freeze({
   maxProxyOtherBytes: numberEnv("MAX_PROXY_OTHER_BYTES", 16 * 1024 * 1024, 256 * 1024, 64 * 1024 * 1024),
   maxFormBodyBytes: numberEnv("MAX_FORM_BODY_BYTES", 1 * 1024 * 1024, 16 * 1024, 8 * 1024 * 1024),
   maxDownloadBytes: numberEnv("MAX_DOWNLOAD_BYTES", 64 * 1024 * 1024, 256 * 1024, 256 * 1024 * 1024),
-  maxCacheBodyBytes: numberEnv("MAX_CACHE_BODY_BYTES", 4 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024),
+  maxCacheBodyBytes: Math.min(numberEnv("MAX_CACHE_BODY_BYTES", RESOURCE_PROFILE === "free" ? 1024 * 1024 : 4 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024), RESOURCE_PROFILE === "free" ? 1024 * 1024 : 4 * 1024 * 1024),
   proxySessionTtlMs: numberEnv("PROXY_SESSION_TTL_MS", 30 * 60 * 1000, 60 * 1000, 24 * 60 * 60 * 1000),
   maxProxySessions: numberEnv("MAX_PROXY_SESSIONS", 500, 10, 5000),
   maxSessionCookies: numberEnv("MAX_SESSION_COOKIES", 50, 5, 500),
-  proxyWarmRobots: numberEnv("PROXY_WARM_ROBOTS", 64, 1, 1000),
-  proxyWarmConcurrency: numberEnv("PROXY_WARM_CONCURRENCY", 12, 1, 64),
+  proxyWarmRobots: Math.min(numberEnv("PROXY_WARM_ROBOTS", P.proxyWarmRobots, 1, 1000), P.proxyWarmRobots),
+  proxyWarmConcurrency: Math.min(numberEnv("PROXY_WARM_CONCURRENCY", P.proxyWarmConcurrency, 1, 64), P.proxyWarmConcurrency),
   proxyWarmLimit: numberEnv("PROXY_WARM_LIMIT", 64, 1, 256),
   proxyWarmPerHost: numberEnv("PROXY_WARM_PER_HOST", 3, 1, 16),
-  sitemapConcurrency: numberEnv("SITEMAP_CONCURRENCY", 8, 1, 32),
+  sitemapConcurrency: Math.min(numberEnv("SITEMAP_CONCURRENCY", P.sitemapConcurrency, 1, 32), P.sitemapConcurrency),
   initialResourceBudget: numberEnv("INITIAL_RESOURCE_BUDGET", 64, 16, 256),
   userAgent: process.env.VEYRA_USER_AGENT || "VeyraBrowseCrawler/8.8.2 (+https://github.com/HomekidChud/VeyraServer)",
   frontendOrigins: csvEnv("FRONTEND_ORIGIN", ["*"]),
@@ -137,7 +192,7 @@ const CFG = Object.freeze({
   searchEndpoint: process.env.SEARCH_ENDPOINT || "",
   searchApiKey: process.env.SEARCH_API_KEY || "",
   customSearchAuth: process.env.SEARCH_AUTH_HEADER || "",
-  maxIndexDocs: numberEnv("MAX_INDEX_DOCS", 50000, 100, 100000),
+  maxIndexDocs: Math.min(numberEnv("MAX_INDEX_DOCS", P.maxIndexDocs, 100, 100000), P.maxIndexDocs),
   maxIndexTextChars: numberEnv("MAX_INDEX_TEXT_CHARS", 12000, 1000, 50000),
   maxSearchQueryTerms: numberEnv("MAX_SEARCH_QUERY_TERMS", 20, 1, 64),
   indexSeeds: csvEnv("INDEX_SEEDS", []),
@@ -151,13 +206,16 @@ const CFG = Object.freeze({
   proxyForwardCompatHeaders: boolEnv("PROXY_FORWARD_COMPAT_HEADERS", true),
   proxyForwardClientHints: boolEnv("PROXY_FORWARD_CLIENT_HINTS", true),
   proxyApiBodyBytes: numberEnv("PROXY_API_BODY_BYTES", 4 * 1024 * 1024, 64 * 1024, 32 * 1024 * 1024),
-  proxyJsHeavyThreshold: numberEnv("PROXY_JS_HEAVY_THRESHOLD", 3, 1, 20),
+  proxyJsHeavyThreshold: numberEnv("PROXY_JS_HEAVY_THRESHOLD", 4, 1, 20),
   proxyApiRetries: numberEnv("PROXY_API_RETRIES", 1, 0, 3),
+  resourceProfile: RESOURCE_PROFILE,
+  memoryLimitMb: MEMORY_LIMIT_MB,
+  browserCrawlerConcurrency: P.browserCrawlerConcurrency,
+  browserKeepWarm: boolEnv("BROWSER_KEEP_WARM", RESOURCE_PROFILE !== "free"),
   filterTemplateUrls: boolEnv("FILTER_TEMPLATE_URLS", true),
   maxDiscoveredUrlLength: numberEnv("MAX_DISCOVERED_URL_LENGTH", 4096, 256, 20000),
-  maxCrossOriginResources: numberEnv("MAX_CROSS_ORIGIN_RESOURCES", 750, 0, 10000),
+  maxCrossOriginResources: Math.min(numberEnv("MAX_CROSS_ORIGIN_RESOURCES", P.maxCrossOriginResources, 0, 10000), P.maxCrossOriginResources),
   skipLowValueThirdParty: boolEnv("SKIP_LOW_VALUE_THIRD_PARTY", true),
-  browserAutoInstall: boolEnv("BROWSER_AUTO_INSTALL", true),
   playwrightBrowsersPath: process.env.PLAYWRIGHT_BROWSERS_PATH || "0"
 });
 
@@ -211,6 +269,20 @@ class Semaphore {
 }
 const fetchSemaphore = new Semaphore(CFG.maxActiveFetches);
 const proxyWarmSemaphore = new Semaphore(CFG.proxyWarmConcurrency);
+const runtimeGuard = { pressure: false, critical: false, lastNotice: 0 };
+function effectiveCrawlerConcurrency() {
+  let limit = CFG.maxActiveFetches;
+  if (browserEngine && browserEngine.status().sessions > 0) limit = Math.min(limit, CFG.browserCrawlerConcurrency);
+  if (runtimeGuard.pressure) limit = Math.min(limit, Math.max(1, Math.floor(limit / 2)));
+  if (runtimeGuard.critical) limit = 1;
+  return Math.max(1, limit);
+}
+function clearHotCachesForPressure() {
+  const clearSome = (map, maxKeep = 10) => { while (map.size > maxKeep) map.delete(map.keys().next().value); };
+  clearSome(proxyCache, Math.min(10, CFG.maxCacheEntries));
+  clearSome(searchCache, 10);
+  while (dnsPublicCache && dnsPublicCache.size > 500) dnsPublicCache.delete(dnsPublicCache.keys().next().value);
+}
 
 const browserEngine = new BrowserEngine(
   CFG,
@@ -237,6 +309,28 @@ const browserEngine = new BrowserEngine(
 );
 const browserEngineTimer = setInterval(() => browserEngine.expireIdle().catch(() => {}), 30000);
 browserEngineTimer.unref?.();
+const runtimeMemoryLimitBytes = MEMORY_LIMIT_MB ? MEMORY_LIMIT_MB * 1024 * 1024 : 0;
+const memoryGuardTimer = setInterval(() => {
+  try {
+    const rss = process.memoryUsage().rss;
+    if (!runtimeMemoryLimitBytes) return;
+    const ratio = rss / runtimeMemoryLimitBytes;
+    const prev = runtimeGuard.pressure;
+    runtimeGuard.pressure = ratio >= 0.78;
+    runtimeGuard.critical = ratio >= 0.90;
+    if (runtimeGuard.pressure) clearHotCachesForPressure();
+    if (runtimeGuard.critical) {
+      for (const job of jobs.values()) if (!job.done) job.backgroundPaused = true;
+    } else if (ratio < 0.70) {
+      for (const job of jobs.values()) if (!job.done) job.backgroundPaused = false;
+    }
+    if ((runtimeGuard.pressure !== prev || runtimeGuard.critical) && Date.now() - runtimeGuard.lastNotice > 10000) {
+      runtimeGuard.lastNotice = Date.now();
+      serverLog(runtimeGuard.critical ? "warn" : "info", "SYSTEM", `Memory governor: RSS ${Math.round(rss/1024/1024)}MB / ${MEMORY_LIMIT_MB}MB; crawler concurrency now ${effectiveCrawlerConcurrency()}.`);
+    }
+  } catch {}
+}, 2000);
+memoryGuardTimer.unref?.();
 
 // Foreground browser scheduler. This is intentionally independent from the
 // crawler scheduler so page navigation cannot be starved by background work.
@@ -1858,7 +1952,7 @@ function createJob(root) {
     activeWorkers: 0, activeHtmlWorkers: 0, activeAssetWorkers: 0, processed: 0, pagesDiscovered: 0, resourcesScheduled: 0, crossOriginResources: 0, sitemapLoading: false, browserDiscoveredCount: 0, browserDiscoveredHosts: new Set(),
     crawlOrigins: new Set([new URL(root).origin]),
     hostPolicy: new Map(),
-    robots: null, robotsReady: false, sitemaps: new Set(), challengeHosts: new Set(), hostActive: new Map(), hostCooldowns: new Map(), hostLastRequested: new Map(), hostFailures: new Map(), hostDelayMs: 0, stopReason: null,
+    robots: null, robotsReady: false, sitemaps: new Set(), challengeHosts: new Set(), hostActive: new Map(), hostCooldowns: new Map(), hostLastRequested: new Map(), hostFailures: new Map(), hostDelayMs: 0, stopReason: null, backgroundPaused: false,
     counts: { htmlPages: 0, css: 0, js: 0, data: 0, assets: 0, links: 0, bytesScanned: 0, bytesStored: 0, bytesDiscarded: 0, requestCount: 0, retries: 0, challenges: 0, errors: 0 },
     controller: new AbortController(),
     dnsCache: new Map(),
@@ -1873,7 +1967,7 @@ function publicJob(job) {
     status: job.status, statusText: job.statusText, stopRequested: job.stopRequested,
     maxUrls: CFG.maxResources, maxScanBytes: CFG.maxScanBytes, elapsedMs: Date.now() - Date.parse(job.createdAt),
     counts: { ...job.counts, processed: job.processed, queued, active: job.activeWorkers },
-    workers: { html: { active: job.activeHtmlWorkers, max: CFG.maxActiveFetches, queued: job.pageFrontier.size }, asset: { active: job.activeAssetWorkers, max: CFG.maxActiveFetches, queued: job.resourceFrontier.size }, logicalRobots: job.robotFleet || CFG.logicalRobots, networkSlots: CFG.maxActiveFetches, availableNetworkSlots: fetchSemaphore.available, queuedNetworkWaiters: fetchSemaphore.queued },
+    workers: { html: { active: job.activeHtmlWorkers, max: CFG.maxActiveFetches, queued: job.pageFrontier.size }, asset: { active: job.activeAssetWorkers, max: CFG.maxActiveFetches, queued: job.resourceFrontier.size }, logicalRobots: job.robotFleet || CFG.logicalRobots, networkSlots: effectiveCrawlerConcurrency(), configuredNetworkSlots: CFG.maxActiveFetches, availableNetworkSlots: fetchSemaphore.available, queuedNetworkWaiters: fetchSemaphore.queued },
     limits: { globalConcurrency: CFG.maxActiveFetches, crawlerRobots: CFG.logicalRobots, logicalRobots: CFG.logicalRobots, maxActiveFetches: CFG.maxActiveFetches, perHostConcurrency: CFG.perHostConcurrency, maxPages: CFG.maxPages, maxResources: CFG.maxResources, maxLinks: CFG.maxLinks, maxScanBytes: CFG.maxScanBytes, maxCrossOriginResources: CFG.maxCrossOriginResources },
     searchIndex: searchIndexStats(),
     robotsLoaded: job.robotsReady, sitemapsFound: job.sitemaps.size, sourceFiles: job.sourceFiles, textBytesStored: job.textBytesStored,
@@ -1915,6 +2009,17 @@ function noteHostError(job, host) {
   job.hostPolicy.set(host, state);
 }
 
+async function fetchResourceProbe(item, opts) {
+  const binary = ["image","media","font","asset"].includes(item.type) && !item.critical;
+  if (!binary) return fetchCached(item.url, opts);
+  // Background indexing does not need to retain whole binary bodies. Probe with HEAD,
+  // then fall back to a small byte range when HEAD is unsupported.
+  const headOpts = { ...opts, method: "HEAD", body: undefined, retries: Math.min(1, opts.retries ?? 0) };
+  const head = await fetchCached(item.url, headOpts);
+  if (head.status >= 200 && head.status < 400 && (head.contentType || head.contentLength)) return head;
+  const rangeOpts = { ...opts, method: "GET", range: "bytes=0-65535", limit: 64 * 1024, limitForContentType: () => 64 * 1024, retries: Math.min(1, opts.retries ?? 0) };
+  return fetchCached(item.url, rangeOpts);
+}
 async function processItem(job, item) {
   if (job.stopRequested) return;
   const key = linkKey(item.type, item.url); if (job.visited.has(key)) return;
@@ -1931,7 +2036,7 @@ async function processItem(job, item) {
   const accept = item.type === "html" ? "text/html,application/xhtml+xml,application/xml,text/plain;q=0.4,*/*;q=0.05" : "text/css,application/javascript,text/javascript,application/json,image/avif,image/webp,image/apng,image/svg+xml,image/*,font/*,video/*,audio/*,*/*;q=0.05";
   try {
     job.counts.requestCount += 1;
-    const r = await fetchCached(item.url, { accept, limit: CFG.maxTextBytesPerResource, limitForContentType: crawlLimitForContentType, timeout: CFG.requestTimeoutMs, retries: CFG.maxRetries, referrer: item.source || "", dnsCache: job.dnsCache });
+    const r = await fetchResourceProbe(item, { accept, limit: CFG.maxTextBytesPerResource, limitForContentType: crawlLimitForContentType, timeout: CFG.requestTimeoutMs, retries: CFG.maxRetries, referrer: item.source || "", dnsCache: job.dnsCache });
     job.counts.bytesScanned += r.bytes;
     if (r.retries) job.counts.retries += r.retries;
     if (r.truncated || r.tooLarge) { job.counts.bytesDiscarded += r.bytes; jobLog(job, "warn", `Response skipped after size limit: ${item.url}`); return; }
@@ -2155,7 +2260,8 @@ class CooperativeRobotPool {
   }
   assignGlobalTasks() {
     let assigned = 0;
-    const target = Math.min(CFG.robotDispatchBatch, Math.max(CFG.maxActiveFetches * 4, 64));
+    const runtimeLimit = effectiveCrawlerConcurrency();
+    const target = Math.min(CFG.robotDispatchBatch, Math.max(runtimeLimit * 4, 32));
     while (assigned < target) {
       const robot = this.nextReceiver();
       if (!robot) break;
@@ -2320,7 +2426,7 @@ class CooperativeRobotPool {
     for (let load = 0; load < this.loadBuckets.length && this.activePromises.size < CFG.maxActiveFetches; load++) {
       const robots = [...(this.loadBuckets[load] || [])];
       for (const robot of robots) {
-        while (robot.activeTasks < this.activeCapacity && robot.queue.length && this.activePromises.size < CFG.maxActiveFetches) {
+        while (robot.activeTasks < this.activeCapacity && robot.queue.length && this.activePromises.size < effectiveCrawlerConcurrency()) {
           const item = robot.queue.shift();
           this.totalQueued = Math.max(0, this.totalQueued - 1);
           this.updateLoadBucket(robot); this.markShareable(robot);
@@ -2328,7 +2434,7 @@ class CooperativeRobotPool {
           else { robot.queue.unshift(item); this.totalQueued += 1; this.updateLoadBucket(robot); this.markShareable(robot); break; }
         }
         this.updateStatus(robot);
-        if (this.activePromises.size >= CFG.maxActiveFetches) break;
+        if (this.activePromises.size >= effectiveCrawlerConcurrency()) break;
       }
     }
     return started;
@@ -2372,6 +2478,11 @@ class CooperativeRobotPool {
       this.assignGlobalTasks();
       this.rebalanceLocals();
       this.startAvailable();
+      if (runtimeGuard.critical || job.backgroundPaused) {
+        if (!this.activePromises.size) { await sleep(250); continue; }
+        await Promise.race(this.activePromises);
+        continue;
+      }
       if (!this.activePromises.size) {
         if (!this.totalPending()) break;
         await sleep(8);
@@ -2461,9 +2572,10 @@ async function searchService(query, offset, limit) {
   return value;
 }
 const indexSeedState = new Map();
+function effectiveMaxActiveJobs() { return Math.min(numberEnv("MAX_ACTIVE_JOBS", RESOURCE_PROFILE === "free" ? 1 : 3, 1, 20), RESOURCE_PROFILE === "free" ? 1 : 20); }
 async function pumpIndexSeeds() {
   if (!CFG.indexSeedCrawl || !CFG.indexSeeds.length) return;
-  const maxActive = numberEnv("MAX_ACTIVE_JOBS", 3, 1, 20);
+  const maxActive = effectiveMaxActiveJobs();
   const activeCount = [...jobs.values()].filter(j => !j.done && !j.stopRequested).length;
   if (activeCount >= maxActive) return;
   for (const raw of CFG.indexSeeds.slice(0, 50)) {
@@ -2491,7 +2603,9 @@ function browserCapabilitySignals(html = "", headers = {}) {
   const fetchSignals = (text.match(/fetch\s*\(|xmlhttprequest|websocket|eventsource|indexeddb|localstorage|sessionstorage|serviceworker|history\.pushstate|history\.replacestate/gi) || []).length;
   const shellSignals = /<div[^>]+(?:id|class)=["'][^"']*(?:root|app|__next|__nuxt|svelte)[^"']*["'][^>]*>\s*<\/div>/i.test(text) || text.replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '').replace(/<[^>]+>/g, ' ').trim().length < 500;
   const spa = /__next|__nuxt|webpack|vite|react|angular|vue|svelte|ng-version/i.test(text);
-  const heavy = scriptCount >= CFG.proxyJsHeavyThreshold || moduleCount > 0 || fetchSignals >= 3 || spa || shellSignals;
+  const scriptHeavy = scriptCount >= CFG.proxyJsHeavyThreshold && (fetchSignals >= 1 || moduleCount > 0 || shellSignals);
+  const spaHeavy = spa && (fetchSignals >= 2 || shellSignals || moduleCount > 0);
+  const heavy = shellSignals || fetchSignals >= 4 || scriptHeavy || spaHeavy;
   return { scriptCount, moduleCount, fetchSignals, spa, shellSignals, heavy, contentType: headers['content-type'] || headers['Content-Type'] || '' };
 }
 
@@ -2530,11 +2644,11 @@ app.delete('/api/browser/session/:id', async (req,res) => { try { await browserE
 app.get('/api/browser/session/:id/screenshot', async (req,res) => { try { const png=await browserEngine.screenshot(req.params.id); if(!png) return respondError(res,503,'Screenshot unavailable.','BROWSER_SCREENSHOT_ERROR'); res.setHeader('content-type','image/png'); res.setHeader('cache-control','no-store'); res.send(png); } catch(e) { respondError(res,404,e.message,e.code||'BROWSER_SCREENSHOT_ERROR'); } });
 
 // Health and debug.
-app.get("/health", (req, res) => res.json({ ok: true, service: "veyra", uptimeSec: Math.round(process.uptime()), activeJobs: [...jobs.values()].filter(j => !j.done).length, processRole: CFG.processRole }));
+app.get("/health", (req, res) => res.json({ ok: true, service: "veyra", uptimeSec: Math.round(process.uptime()), activeJobs: [...jobs.values()].filter(j => !j.done).length, processRole: CFG.processRole, resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb, crawlerFetchLimit: effectiveCrawlerConcurrency(), logicalRobots: CFG.logicalRobots }));
 app.get("/api/debug/system", (req, res) => {
   const mem = process.memoryUsage();
   const idx = searchIndexStats();
-  res.json({ time: now(), uptimeSec: Math.round(process.uptime()), startedAt: new Date(serverStartedAt).toISOString(), nodeVersion: process.version, platform: process.platform, processRole: CFG.processRole, memory: { rss: mem.rss, heapUsed: mem.heapUsed, heapTotal: mem.heapTotal, external: mem.external }, jobs: { total: jobs.size, active: [...jobs.values()].filter(j => !j.done).length, done: [...jobs.values()].filter(j => j.done).length }, proxyCacheEntries: proxyCache.size, searchCacheEntries: searchCache.size, network: { crawlerActive: fetchSemaphore.active, crawlerQueued: fetchSemaphore.queued, crawlerLimit: CFG.maxActiveFetches, logicalRobots: CFG.logicalRobots, warmActive: proxyWarmSemaphore.active, warmQueued: proxyWarmSemaphore.queued, warmLimit: CFG.proxyWarmConcurrency, warmLogicalRobots: CFG.proxyWarmRobots, browserActive: browserScheduler.active, browserQueued: browserScheduler.queue.length, browserLimit: CFG.browserMaxActiveFetches, browserPerHost: CFG.browserPerHostConcurrency }, browser: { ...browserScheduler.status(), sessions: browserEngine.status().sessions, pages: browserEngine.status().pages, contexts: browserEngine.status().contexts, maxSessions: browserEngine.status().maxSessions, maxPages: browserEngine.status().maxPages, maxContexts: browserEngine.status().maxContexts, sessionList: browserEngine.status().sessionList, proxySessions: proxySessions.size, cacheEntries: proxyCache.size }, hostPolicies: [...jobs.values()].reduce((n,j)=>n+(j.hostPolicy?.size||0),0), searchIndexEntries: idx.documents, searchIndexTerms: idx.terms, searchIndexDomains: idx.domains, requestsLogged: requestLog.length, logs: serverLogs.length });
+  res.json({ time: now(), uptimeSec: Math.round(process.uptime()), startedAt: new Date(serverStartedAt).toISOString(), nodeVersion: process.version, platform: process.platform, processRole: CFG.processRole, resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb, memory: { rss: mem.rss, heapUsed: mem.heapUsed, heapTotal: mem.heapTotal, external: mem.external }, jobs: { total: jobs.size, active: [...jobs.values()].filter(j => !j.done).length, done: [...jobs.values()].filter(j => j.done).length }, proxyCacheEntries: proxyCache.size, searchCacheEntries: searchCache.size, network: { crawlerActive: fetchSemaphore.active, crawlerQueued: fetchSemaphore.queued, crawlerLimit: effectiveCrawlerConcurrency(), configuredCrawlerLimit: CFG.maxActiveFetches, requestedCrawlerLimit: CFG.requestedMaxActiveFetches, logicalRobots: CFG.logicalRobots, warmActive: proxyWarmSemaphore.active, warmQueued: proxyWarmSemaphore.queued, warmLimit: CFG.proxyWarmConcurrency, warmLogicalRobots: CFG.proxyWarmRobots, browserActive: browserScheduler.active, browserQueued: browserScheduler.queue.length, browserLimit: CFG.browserMaxActiveFetches, browserPerHost: CFG.browserPerHostConcurrency }, browser: { ...browserScheduler.status(), sessions: browserEngine.status().sessions, pages: browserEngine.status().pages, contexts: browserEngine.status().contexts, maxSessions: browserEngine.status().maxSessions, maxPages: browserEngine.status().maxPages, maxContexts: browserEngine.status().maxContexts, sessionList: browserEngine.status().sessionList, proxySessions: proxySessions.size, cacheEntries: proxyCache.size }, hostPolicies: [...jobs.values()].reduce((n,j)=>n+(j.hostPolicy?.size||0),0), searchIndexEntries: idx.documents, searchIndexTerms: idx.terms, searchIndexDomains: idx.domains, requestsLogged: requestLog.length, logs: serverLogs.length });
 });
 app.get("/api/debug/config", (req, res) => res.json({ ...CFG, searchApiKey: undefined }));
 app.get("/api/debug/jobs", (req, res) => res.json({ jobs: [...jobs.values()].sort((a,b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)).map(publicJob) }));
@@ -2828,7 +2942,7 @@ app.post("/api/open", async (req, res) => {
     const oldId = activeByRoot.get(root); const old = oldId && jobs.get(oldId);
     if (old && !old.done && !old.stopRequested) return res.status(202).json({ jobId: old.id, url: root, viewUrl: makeViewUrl(root) });
     const activeCount = [...jobs.values()].filter(j => !j.done && !j.stopRequested).length;
-    if (activeCount >= numberEnv("MAX_ACTIVE_JOBS", 3, 1, 20)) return respondError(res, 503, "Crawler capacity is busy; try again shortly.", "CRAWLER_CAPACITY_BUSY");
+    if (activeCount >= effectiveMaxActiveJobs()) return respondError(res, 503, "Crawler capacity is busy; try again shortly.", "CRAWLER_CAPACITY_BUSY");
     const job = createJob(root); jobs.set(job.id, job); activeByRoot.set(root, job.id);
     jobLog(job, "info", "Background crawl queued.");
     runCrawl(job).catch(e => { job.done = true; job.finishedAt = now(); job.status = "error"; job.statusText = e.message; jobLog(job, "error", e.stack || e.message); });
@@ -2911,6 +3025,8 @@ const STATUS_VAR_DEFS = [
   { group: "Core service", key: "port", label: "Port", kind: "number", names: ["PORT"], fallback: 10000, min: 1, max: 65535, note: "Render supplies this automatically; only set it manually for local runs." },
   { group: "Core service", key: "processRole", label: "Process role", kind: "enum", names: ["PROCESS_ROLE"], fallback: "web", allowed: ["web", "worker", "all"] },
   { group: "Core service", key: "logLevel", label: "Log level", kind: "enum", names: ["SERVER_LOG_LEVEL"], fallback: "info", allowed: ["error", "warn", "info", "debug"] },
+  { group: "Core service", key: "resourceProfile", label: "Resource profile", kind: "enum", names: ["RESOURCE_PROFILE"], fallback: "auto", allowed: ["auto", "free", "balanced", "high"] },
+  { group: "Core service", key: "memoryLimitMb", label: "Memory limit (MB)", kind: "number", names: ["MEMORY_LIMIT_MB"], fallback: detectedMemoryMb() || 0, min: 0, max: 262144 },
   { group: "Frontend / CORS", key: "frontendOrigin", label: "Allowed frontend origin(s)", kind: "csv", names: ["FRONTEND_ORIGIN"], fallback: ["*"] },
   { group: "Frontend / CORS", key: "publicApiOrigin", label: "Public API origin (for rewritten pages)", kind: "string", names: ["PUBLIC_API_ORIGIN"], fallback: "" },
   { group: "Frontend / CORS", key: "userAgent", label: "Crawler user agent", kind: "string", names: ["VEYRA_USER_AGENT"], fallback: "VeyraBrowseCrawler/8.0 (+https://github.com/)" },
@@ -2942,6 +3058,17 @@ const STATUS_VAR_DEFS = [
   { group: "Crawler cooperation", key: "robotHelpThreshold", label: "Help backlog threshold", kind: "number", names: ["ROBOT_HELP_THRESHOLD"], fallback: 2, min: 1, max: 16 },
   { group: "Crawler cooperation", key: "robotHelpCooldownMs", label: "Help cooldown (ms)", kind: "number", names: ["ROBOT_HELP_COOLDOWN_MS"], fallback: 250, min: 0, max: 10000 },
   { group: "Crawler cooperation", key: "robotHelpScanLimit", label: "Robots inspected/request", kind: "number", names: ["ROBOT_HELP_SCAN_LIMIT"], fallback: 24, min: 1, max: 128 },
+  { group: "Crawler concurrency", key: "hostSuccessRamp", label: "Host success ramp", kind: "number", names: ["HOST_SUCCESS_RAMP"], fallback: 4, min: 1, max: 100 },
+  { group: "Crawler concurrency", key: "hostErrorPenalty", label: "Host error penalty", kind: "number", names: ["HOST_ERROR_PENALTY"], fallback: 2, min: 1, max: 10 },
+  { group: "Crawler discovery", key: "maxCrossOriginResources", label: "Max cross-origin resources", kind: "number", names: ["MAX_CROSS_ORIGIN_RESOURCES"], fallback: 250, min: 0, max: 10000 },
+  { group: "Crawler discovery", key: "filterTemplateUrls", label: "Filter template URLs", kind: "bool", names: ["FILTER_TEMPLATE_URLS"], fallback: true },
+  { group: "Crawler discovery", key: "maxDiscoveredUrlLength", label: "Max discovered URL length", kind: "number", names: ["MAX_DISCOVERED_URL_LENGTH"], fallback: 4096, min: 256, max: 20000 },
+  { group: "Crawler discovery", key: "skipLowValueThirdParty", label: "Skip low-value third party", kind: "bool", names: ["SKIP_LOW_VALUE_THIRD_PARTY"], fallback: true },
+  { group: "Proxy", key: "proxyForwardCompatHeaders", label: "Forward compatibility headers", kind: "bool", names: ["PROXY_FORWARD_COMPAT_HEADERS"], fallback: true },
+  { group: "Proxy", key: "proxyForwardClientHints", label: "Forward client hints", kind: "bool", names: ["PROXY_FORWARD_CLIENT_HINTS"], fallback: true },
+  { group: "Proxy", key: "proxyApiBodyBytes", label: "API body limit", kind: "number", names: ["PROXY_API_BODY_BYTES"], fallback: 4194304, min: 65536, max: 33554432 },
+  { group: "Proxy", key: "proxyApiRetries", label: "API retries", kind: "number", names: ["PROXY_API_RETRIES"], fallback: 1, min: 0, max: 3 },
+  { group: "Proxy", key: "proxyJsHeavyThreshold", label: "JS-heavy threshold", kind: "number", names: ["PROXY_JS_HEAVY_THRESHOLD"], fallback: 4, min: 1, max: 20 },
   { group: "Browser engine", key: "browserMaxActiveFetches", label: "Browser fetch slots", kind: "number", names: ["BROWSER_MAX_ACTIVE_FETCHES"], fallback: 24, min: 1, max: 64 },
   { group: "Browser engine", key: "browserPerHostConcurrency", label: "Browser per-host concurrency", kind: "number", names: ["BROWSER_PER_HOST_CONCURRENCY"], fallback: 8, min: 1, max: 32 },
   { group: "Browser engine", key: "browserEnabled", label: "Browser engine enabled", kind: "bool", names: ["BROWSER_ENABLED"], fallback: true },
@@ -2955,6 +3082,8 @@ const STATUS_VAR_DEFS = [
   { group: "Browser engine", key: "browserSessionTtlMs", label: "Browser session TTL (ms)", kind: "number", names: ["BROWSER_SESSION_TTL_MS"], fallback: 1800000, min: 60000, max: 86400000 },
   { group: "Browser engine", key: "browserNavigationTimeoutMs", label: "Browser navigation timeout (ms)", kind: "number", names: ["BROWSER_NAVIGATION_TIMEOUT_MS"], fallback: 30000, min: 5000, max: 120000 },
   { group: "Browser engine", key: "browserPageTimeoutMs", label: "Browser page timeout (ms)", kind: "number", names: ["BROWSER_PAGE_TIMEOUT_MS"], fallback: 30000, min: 5000, max: 120000 },
+  { group: "Browser engine", key: "browserKeepWarm", label: "Keep Chromium warm", kind: "bool", names: ["BROWSER_KEEP_WARM"], fallback: false },
+  { group: "Browser engine", key: "playwrightBrowsersPath", label: "Playwright browsers path", kind: "string", names: ["PLAYWRIGHT_BROWSERS_PATH"], fallback: "0" },
   { group: "Security / DNS", key: "dnsCacheTtlMs", label: "DNS public-result cache TTL (ms)", kind: "number", names: ["DNS_CACHE_TTL_MS"], fallback: 5000, min: 0, max: 60000 },
   { group: "Crawl limits", key: "maxActiveJobs", label: "Max active jobs", kind: "number", names: ["MAX_ACTIVE_JOBS"], fallback: 3, min: 1, max: 20 },
   { group: "Crawl limits", key: "maxPendingQueue", label: "Max pending queue", kind: "number", names: ["MAX_PENDING_QUEUE"], fallback: 1500, min: 50, max: 20000 },
@@ -3025,6 +3154,8 @@ const STATUS_VAR_DEFS = [
   { group: "Browser engine", key: "browserSessionTtlMs", label: "Browser session TTL (ms)", kind: "number", names: ["BROWSER_SESSION_TTL_MS"], fallback: 1800000, min: 60000, max: 86400000 },
   { group: "Browser engine", key: "browserNavigationTimeoutMs", label: "Browser navigation timeout (ms)", kind: "number", names: ["BROWSER_NAVIGATION_TIMEOUT_MS"], fallback: 30000, min: 5000, max: 120000 },
   { group: "Browser engine", key: "browserPageTimeoutMs", label: "Browser page timeout (ms)", kind: "number", names: ["BROWSER_PAGE_TIMEOUT_MS"], fallback: 30000, min: 5000, max: 120000 },
+  { group: "Browser engine", key: "browserKeepWarm", label: "Keep Chromium warm", kind: "bool", names: ["BROWSER_KEEP_WARM"], fallback: false },
+  { group: "Browser engine", key: "playwrightBrowsersPath", label: "Playwright browsers path", kind: "string", names: ["PLAYWRIGHT_BROWSERS_PATH"], fallback: "0" },
   { group: "Misc", key: "browserRenderFallback", label: "Browser render fallback", kind: "bool", names: ["BROWSER_RENDER_FALLBACK"], fallback: false },
   { group: "Misc", key: "sortQueryParams", label: "Normalize/sort query params", kind: "bool", names: ["NORMALIZE_SORT_QUERY_PARAMS"], fallback: false }
 ];
@@ -3076,6 +3207,7 @@ function buildStatusReport() {
   if (process.env.CRAWLER_PER_HOST_CONCURRENCY && process.env.MAX_PER_HOST_CONCURRENCY && process.env.CRAWLER_PER_HOST_CONCURRENCY !== process.env.MAX_PER_HOST_CONCURRENCY) addIssue("info", `Both CRAWLER_PER_HOST_CONCURRENCY (${process.env.CRAWLER_PER_HOST_CONCURRENCY}) and legacy MAX_PER_HOST_CONCURRENCY (${process.env.MAX_PER_HOST_CONCURRENCY}) are set with different values — CRAWLER_PER_HOST_CONCURRENCY wins.`);
 
   if (byKey.indexSeedCrawl.effective && (!Array.isArray(byKey.indexSeeds.effective) || byKey.indexSeeds.effective.length === 0)) addIssue("info", "INDEX_SEED_CRAWL is on but INDEX_SEEDS is empty — there's nothing to auto-seed yet; the index will only grow as people browse pages through Veyra.");
+  if (CFG.resourceProfile === "free" && CFG.requestedMaxActiveFetches > CFG.maxActiveFetches) addIssue("info", `Resource profile "free" reduced MAX_ACTIVE_FETCHES from ${CFG.requestedMaxActiveFetches} to ${CFG.maxActiveFetches} to protect the instance memory budget.`);
 
   for (const v of vars) if (v.status === "invalid") addIssue("error", `${v.name}="${v.raw}" is invalid for ${v.label} — the server silently fell back to the default (${JSON.stringify(v.effective)}). Fix or remove this variable.`);
   for (const v of vars) if (v.status === "clamped") addIssue("warn", `${v.name}="${v.raw}" for ${v.label} is outside the allowed range — clamped to ${v.effective}.`);
@@ -3092,6 +3224,7 @@ function buildStatusReport() {
   return {
     generatedAt: new Date().toISOString(),
     uptimeSec: Math.round(process.uptime()),
+    runtime: { resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb, requestedCrawlerFetches: CFG.requestedMaxActiveFetches, configuredCrawlerFetches: CFG.maxActiveFetches, effectiveCrawlerFetches: effectiveCrawlerConcurrency(), browserKeepWarm: CFG.browserKeepWarm },
     processRole: byKey.processRole.effective,
     port: byKey.port.effective,
     crawlerRobotsInEffect: byKey.logicalRobots.effective,

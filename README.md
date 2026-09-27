@@ -47,3 +47,8 @@ npm test
 npm run test:urls
 npm run test:all
 ```
+
+
+## v8.10.0 stability profile
+
+On constrained Render instances, RESOURCE_PROFILE=free keeps the 1000 logical robot scheduler but clamps actual network concurrency and browser capacity. Chromium is installed during the Render build command, not during a live request. Check /status for resourceProfile, memoryLimitMb, configuredCrawlerLimit, requestedCrawlerLimit, and crawlerLimit.

@@ -1,27 +1,10 @@
-const { execFileSync } = require('child_process');
 const { createRequire } = require('module');
 const fs = require('fs');
-
-if (String(process.env.SKIP_PLAYWRIGHT_INSTALL || '').trim().toLowerCase() === 'true') {
-  console.log('[VEYRA] SKIP_PLAYWRIGHT_INSTALL=true; skipping Chromium ensure.');
-  process.exit(0);
-}
-let playwright;
 try {
-  playwright = createRequire(__filename)('playwright');
-} catch (e) {
-  console.warn('[VEYRA] Playwright is unavailable during startup ensure:', e.message);
-  process.exit(0);
-}
-try {
+  const playwright = createRequire(__filename)('playwright');
   const exe = playwright.chromium.executablePath();
-  if (exe && fs.existsSync(exe)) process.exit(0);
-} catch {}
-const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx';
-try {
-  console.log('[VEYRA] Chromium executable missing; installing Playwright Chromium...');
-  execFileSync(npx, ['playwright', 'install', 'chromium'], { stdio: 'inherit' });
-  console.log('[VEYRA] Chromium installed.');
+  if (exe && fs.existsSync(exe)) { console.log('[VEYRA] Chromium executable present.'); process.exit(0); }
+  console.warn('[VEYRA] Chromium executable is missing. Browser engine will be unavailable until the build installs Chromium.');
 } catch (e) {
-  console.warn('[VEYRA] Chromium install failed; BROWSER_ENGINE will remain unavailable:', e.message);
+  console.warn('[VEYRA] Playwright/Chromium check failed:', e.message);
 }
