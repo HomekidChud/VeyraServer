@@ -152,6 +152,8 @@ class BrowserEngine {
         if (vpnProfile.bypass) contextOptions.proxy.bypass = vpnProfile.bypass;
       }
 
+      // DevTools bridge + console eval must work on sites with strict CSP.
+      contextOptions.bypassCSP = true;
       const context = await browser.newContext(contextOptions);
       await context.route('**/*', async route => {
         const targetUrl = route.request().url();

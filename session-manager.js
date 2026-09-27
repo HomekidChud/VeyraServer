@@ -17,13 +17,19 @@ class SessionManager {
     this.idleTtlMs = opts.idleTtlMs || 30 * 60 * 1000;
     this.hardTtlMs = opts.hardTtlMs || 24 * 60 * 60 * 1000;
     this.maxCookieBytes = opts.maxCookieBytes || 128 * 1024;
-    this.sweepMs = opts.sweepMs || 30000;
+    // Hard wall-clock lifetime of a browsing session (0 = disabled). When it
+    // elapses the session is deleted and its id is tombstoned so it can't be reused.
+    this.timeLimitMs = Math.max(0, Number(opts.timeLimitMs || 0));
+    this.sweepMs = opts.sweepMs || (this.timeLimitMs ? Math.min(30000, Math.max(2000, Math.floor(this.timeLimitMs / 8))) : 30000);
+    this.tombstones = new Map();
+    this.maxTombstones = opts.maxTombstones || 20000;
+    this.tombstoneTtlMs = opts.tombstoneTtlMs || 6 * 60 * 60 * 1000;
     this.serverIdleMs = opts.serverIdleMs ?? 10 * 60 * 1000;
     this.log = opts.log || (() => {});
     this.now = opts.now || (() => Date.now());
     this.sessions = new Map();
     this.hooks = { expire: [], sleep: [], wake: [] };
-    this.stats = { created: 0, expiredIdle: 0, expiredCap: 0, expiredPressure: 0, closedByClient: 0, sleeps: 0, wakes: 0 };
+    this.stats = { created: 0, expiredLimit: 0, expiredIdle: 0, expiredCap: 0, expiredPressure: 0, closedByClient: 0, sleeps: 0, wakes: 0 };
     this.lastActivity = this.now();
     this.sleeping = false;
     this.timer = null;
@@ -52,11 +58,20 @@ class SessionManager {
   touch(sid) {
     const t = this.now();
     let rec = this.sessions.get(sid);
+    if (rec && this.timeLimitMs && t - rec.createdAt >= this.timeLimitMs) {
+      this.expire(sid, "limit");
+      rec = null;
+    }
     if (rec && (t - rec.lastUsed > this.idleTtlMs || t - rec.createdAt > this.hardTtlMs)) {
       this.expire(sid, "idle");
       rec = null;
     }
     if (!rec) {
+      if (this.isTerminated(sid)) {
+        const err = new Error("This Veyra session reached its time limit and was deleted. Start a new session.");
+        err.code = "SESSION_EXPIRED"; err.status = 410;
+        throw err;
+      }
       rec = { id: sid, createdAt: t, lastUsed: t, cookies: new Map(), vpnProfileId: null, browserSessions: new Set(), requests: 0, bytesOut: 0 };
       this.sessions.set(sid, rec);
       this.stats.created += 1;
@@ -70,6 +85,35 @@ class SessionManager {
     return rec;
   }
   peek(sid) { return this.sessions.get(sid) || null; }
+
+  // Create a brand-new session and report its deadline.
+  create(sid) {
+    if (this.sessions.has(sid) || this.isTerminated(sid)) throw Object.assign(new Error("Session id already used."), { code: "SESSION_EXISTS", status: 409 });
+    const rec = this.touch(sid);
+    rec.requests = 0;
+    return rec;
+  }
+  expiresAt(rec) { return this.timeLimitMs ? rec.createdAt + this.timeLimitMs : null; }
+  remainingMs(rec) { return this.timeLimitMs ? Math.max(0, rec.createdAt + this.timeLimitMs - this.now()) : null; }
+  isTerminated(sid) {
+    const at = this.tombstones.get(sid);
+    if (at == null) return false;
+    if (this.now() - at > this.tombstoneTtlMs) { this.tombstones.delete(sid); return false; }
+    return true;
+  }
+  // True when sid is (now) past its time limit. Expires it on the spot.
+  checkLimit(sid) {
+    if (!sid) return false;
+    if (this.isTerminated(sid)) return true;
+    const rec = this.sessions.get(sid);
+    if (rec && this.timeLimitMs && this.now() - rec.createdAt >= this.timeLimitMs) { this.expire(sid, "limit"); return true; }
+    return false;
+  }
+  tombstone(sid) {
+    this.tombstones.delete(sid);
+    this.tombstones.set(sid, this.now());
+    while (this.tombstones.size > this.maxTombstones) this.tombstones.delete(this.tombstones.keys().next().value);
+  }
   has(sid) { return this.sessions.has(sid); }
   get size() { return this.sessions.size; }
 
@@ -101,7 +145,9 @@ class SessionManager {
     const rec = this.sessions.get(sid);
     if (!rec) return false;
     this.sessions.delete(sid);
-    if (reason === "idle") this.stats.expiredIdle += 1;
+    if (reason === "limit" || reason === "client") this.tombstone(sid);
+    if (reason === "limit") this.stats.expiredLimit += 1;
+    else if (reason === "idle") this.stats.expiredIdle += 1;
     else if (reason === "cap") this.stats.expiredCap += 1;
     else if (reason === "pressure") this.stats.expiredPressure += 1;
     else if (reason === "client") this.stats.closedByClient += 1;
@@ -115,6 +161,10 @@ class SessionManager {
   async sweep() {
     const t = this.now();
     let n = 0;
+    if (this.timeLimitMs) {
+      for (const [sid, rec] of [...this.sessions]) if (t - rec.createdAt >= this.timeLimitMs) { this.expire(sid, "limit"); n += 1; }
+      for (const [sid, at] of this.tombstones) { if (t - at <= this.tombstoneTtlMs) break; this.tombstones.delete(sid); }
+    }
     // Map is LRU-ordered, so stop at the first session that is still fresh.
     for (const [sid, rec] of this.sessions) {
       if (t - rec.lastUsed <= this.idleTtlMs && t - rec.createdAt <= this.hardTtlMs) break;
@@ -145,9 +195,10 @@ class SessionManager {
     let cookies = 0, browsers = 0, oldest = 0;
     for (const rec of this.sessions.values()) { cookies += rec.cookies.size; browsers += rec.browserSessions.size; oldest = Math.max(oldest, t - rec.createdAt); }
     return {
-      active: this.sessions.size, max: this.maxSessions, idleTtlMs: this.idleTtlMs, hardTtlMs: this.hardTtlMs,
+      active: this.sessions.size, max: this.maxSessions, timeLimitMs: this.timeLimitMs, tombstones: this.tombstones.size, idleTtlMs: this.idleTtlMs, hardTtlMs: this.hardTtlMs,
       cookies, browserSessions: browsers, oldestSessionAgeMs: oldest,
-      sleeping: this.sleeping, serverIdleMs: this.serverIdleMs, idleForMs: t - this.lastActivity, stats: { ...this.stats }
+      sleeping: this.sleeping, serverIdleMs: this.serverIdleMs, idleForMs: t - this.lastActivity, stats: { ...this.stats },
+      sessions: [...this.sessions.entries()].slice(-100).reverse().map(([id, rec]) => ({ id: id.slice(0, 8) + "…", ageMs: t - rec.createdAt, remainingMs: this.remainingMs(rec), requests: rec.requests || 0, cookies: rec.cookies.size, browserSessions: rec.browserSessions.size, userId: rec.userId ? String(rec.userId).slice(0, 8) : null }))
     };
   }
 }

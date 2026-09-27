@@ -1,6 +1,6 @@
 {
   "name": "veyra-browse-crawler",
-  "version": "8.12.0",
+  "version": "8.13.0",
   "private": true,
   "description": "Veyra Browser API, high-throughput crawler, page proxy, search service, and diagnostics.",
   "main": "server.js",
@@ -8,7 +8,8 @@
     "start": "node server.js",
     "test": "node test.js",
     "test:urls": "node url_regression_test.js",
-    "test:all": "node test.js && node url_regression_test.js && node regression_test.js && node google_form_regression_test.js && node static_regression_test.js && node browser_vpn_regression_test.js && node proxy_header_regression_test.js && node vpn_regression_test.js && node capacity_regression_test.js",
+    "test:all": "node test.js && node url_regression_test.js && node regression_test.js && node google_form_regression_test.js && node static_regression_test.js && node browser_vpn_regression_test.js && node proxy_header_regression_test.js && node vpn_regression_test.js && node capacity_regression_test.js && node auth_session_regression_test.js",
+    "test:auth": "node auth_session_regression_test.js",
     "prestart": "node ensure-browser.js",
     "build": "npx playwright install chromium && node install-wireproxy.js",
     "dev": "node --watch server.js",

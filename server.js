@@ -11,6 +11,7 @@ const os = require("os");
 const { BrowserEngine } = require("./browser-engine");
 const { VpnManager } = require("./vpn");
 const { SessionManager } = require("./session-manager");
+const { AuthStore } = require("./auth");
 const { WorkerPool } = require("./worker-pool");
 const { isMainThread } = require("worker_threads");
 // parse-worker.js loads this file inside worker threads to reuse the pure
@@ -171,7 +172,7 @@ const CFG = Object.freeze({
   proxyWarmPerHost: numberEnv("PROXY_WARM_PER_HOST", 3, 1, 16),
   sitemapConcurrency: Math.min(numberEnv("SITEMAP_CONCURRENCY", P.sitemapConcurrency, 1, 32), P.sitemapConcurrency),
   initialResourceBudget: numberEnv("INITIAL_RESOURCE_BUDGET", 64, 16, 256),
-  userAgent: process.env.VEYRA_USER_AGENT || "VeyraBrowseCrawler/8.12.0 (+https://github.com/HomekidChud/VeyraServer)",
+  userAgent: process.env.VEYRA_USER_AGENT || "VeyraBrowseCrawler/8.13.0 (+https://github.com/HomekidChud/VeyraServer)",
   frontendOrigins: csvEnv("FRONTEND_ORIGIN", ["*"]),
   searchProvider: enumEnv("SEARCH_PROVIDER", "local", ["auto", "local", "brave", "bing", "custom", "none"]),
   searchEndpoint: process.env.SEARCH_ENDPOINT || "",
@@ -216,6 +217,16 @@ const CFG = Object.freeze({
   // Session manager.
   sessionIdleTtlMs: numberEnv("SESSION_IDLE_TTL_MS", numberEnv("PROXY_SESSION_TTL_MS", P.sessionIdleMs, 60 * 1000, 24 * 60 * 60 * 1000), 60 * 1000, 24 * 60 * 60 * 1000),
   sessionMaxAgeMs: numberEnv("SESSION_MAX_AGE_MS", 24 * 60 * 60 * 1000, 10 * 60 * 1000, 7 * 24 * 60 * 60 * 1000),
+  // Wall-clock lifetime of a browsing session. When it runs out the session is
+  // deleted (cookies, VPN tunnel, Chromium context, crawl jobs). 0 disables.
+  // Debug / dev / status endpoints need an admin account or VEYRA_ADMIN_TOKEN.
+  adminGate: boolEnv("VEYRA_ADMIN_GATE", true),
+  sessionTimeLimitMs: numberEnv("SESSION_TIME_LIMIT_MS", 2 * 60 * 1000, 0, 7 * 24 * 60 * 60 * 1000),
+  authSecret: process.env.VEYRA_AUTH_SECRET || "",
+  authDataDir: process.env.VEYRA_DATA_DIR || path.join(__dirname, "data"),
+  authAllowSignup: boolEnv("VEYRA_ALLOW_SIGNUP", true),
+  authTokenTtlMs: numberEnv("VEYRA_AUTH_TOKEN_TTL_MS", 7 * 24 * 60 * 60 * 1000, 10 * 60 * 1000, 90 * 24 * 60 * 60 * 1000),
+  adminEmails: String(process.env.VEYRA_ADMIN_EMAILS || "").split(",").map(x => x.trim().toLowerCase()).filter(Boolean),
   sessionMaxCookieBytes: numberEnv("SESSION_MAX_COOKIE_BYTES", 128 * 1024, 4 * 1024, 4 * 1024 * 1024),
   serverIdleSleepMs: numberEnv("SERVER_IDLE_SLEEP_MS", 10 * 60 * 1000, 0, 24 * 60 * 60 * 1000),
   browserWarmIdleMs: numberEnv("BROWSER_WARM_IDLE_MS", 15 * 60 * 1000, 0, 24 * 60 * 60 * 1000),
@@ -238,8 +249,8 @@ const allowedOrigins = CFG.frontendOrigins.includes("*") ? true : CFG.frontendOr
 app.use(cors({
   origin: allowedOrigins,
   methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Accept", "X-Veyra-Request-ID", "X-Requested-With", "X-CSRF-Token", "X-XSRF-Token", "DNT", "Cache-Control", "Pragma", "Range"],
-  exposedHeaders: ["X-Veyra-Request-ID", "X-Veyra-Canonical-URL", "X-Veyra-Challenge", "X-Veyra-Content-Type", "X-Veyra-Session-ID"]
+  allowedHeaders: ["Content-Type", "Accept", "X-Veyra-Request-ID", "X-Requested-With", "Authorization", "X-Veyra-Admin-Token", "X-CSRF-Token", "X-XSRF-Token", "DNT", "Cache-Control", "Pragma", "Range"],
+  exposedHeaders: ["X-Veyra-Request-ID", "X-Veyra-Canonical-URL", "X-Veyra-Challenge", "X-Veyra-Content-Type", "X-Veyra-Session-ID", "X-Veyra-Session-Expires"]
 }));
 // Proxy routes receive the page's request body byte-for-byte (JSON, protobuf,
 // text, gzip-compressed payloads, etc.) so it can be relayed upstream unchanged.
@@ -260,11 +271,17 @@ const activeByRoot = new Map();
 const proxyCache = new Map();
 const searchCache = new Map();
 const sessionManager = new SessionManager({
-  maxSessions: CFG.maxProxySessions, idleTtlMs: CFG.sessionIdleTtlMs, hardTtlMs: CFG.sessionMaxAgeMs,
+  maxSessions: CFG.maxProxySessions, idleTtlMs: CFG.sessionIdleTtlMs, hardTtlMs: CFG.sessionMaxAgeMs, timeLimitMs: CFG.sessionTimeLimitMs,
   maxCookieBytes: CFG.sessionMaxCookieBytes, serverIdleMs: CFG.serverIdleSleepMs,
-  log: (level, source, message) => serverLog(level, source, message)
+  log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
 });
 const proxySessions = sessionManager.sessions;
+const authStore = new AuthStore({
+  dataDir: CFG.authDataDir, secret: CFG.authSecret, tokenTtlMs: CFG.authTokenTtlMs,
+  adminEmails: CFG.adminEmails, allowSignup: CFG.authAllowSignup,
+  // Deferred: AuthStore loads users synchronously before the log buffer below is initialised.
+  log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
+});
 
 class Semaphore {
   constructor(limit) { this.limit = Math.max(1, limit); this.active = 0; this.waiters = []; }
@@ -351,8 +368,11 @@ const workerPool = (!IS_THREAD_WORKER && CFG.parseWorkers > 0 && (require.main =
   : null;
 
 // Session lifecycle hooks: an expired/closed session releases everything it held.
-sessionManager.on("expire", (sid) => {
+sessionManager.on("expire", (sid, rec, reason) => {
   try { vpnManager.disconnect?.(sid); } catch {}
+  // Crawl jobs started by this session stop with it.
+  try { for (const j of jobs.values()) if (j.sessionId === sid && !j.done && !j.stopRequested) { if (!j.started) dequeueCrawl(j); j.stopRequested = true; j.stopReason = `session-${reason}`; } } catch {}
+  if (reason === "limit") serverLog("info", "SESSION", `Session ${sid.slice(0, 8)}… reached its ${Math.round(CFG.sessionTimeLimitMs / 1000)}s time limit and was deleted.`);
   try { scriptDirsBySession.delete(sid); } catch {}
   return browserEngine.stopForProxySession?.(sid);
 });
@@ -643,6 +663,29 @@ app.use((req, res, next) => {
 
 function respondError(res, status, message, code, extra = {}) {
   res.status(status).json({ error: String(message), code: String(code), ...extra });
+}
+// Compact ad/tracker host list for the "Tracker blocker" extension (suffix match).
+const TRACKER_HOSTS = new Set(("doubleclick.net googlesyndication.com googleadservices.com google-analytics.com googletagservices.com adservice.google.com " +
+  "pagead2.googlesyndication.com analytics.google.com stats.g.doubleclick.net adnxs.com adsrvr.org amazon-adsystem.com criteo.com criteo.net " +
+  "taboola.com outbrain.com scorecardresearch.com quantserve.com hotjar.com hotjar.io mouseflow.com fullstory.com clarity.ms " +
+  "moatads.com rubiconproject.com pubmatic.com openx.net casalemedia.com smartadserver.com yieldmo.com media.net sharethrough.com " +
+  "adform.net bidswitch.net 3lift.com teads.tv zedo.com revcontent.com mgid.com popads.net propellerads.com exoclick.com " +
+  "facebook.net connect.facebook.net ads-twitter.com analytics.twitter.com ads.linkedin.com px.ads.linkedin.com bat.bing.com " +
+  "branch.io appsflyer.com adjust.com segment.io segment.com mixpanel.com amplitude.com newrelic.com nr-data.net " +
+  "chartbeat.com chartbeat.net parsely.com krxd.net bluekai.com demdex.net omtrdc.net everesttech.net tapad.com").split(/\s+/));
+function isTrackerHost(host) {
+  let h = String(host || "").toLowerCase();
+  while (h.includes(".")) { if (TRACKER_HOSTS.has(h)) return true; h = h.slice(h.indexOf(".") + 1); }
+  return false;
+}
+function sendSessionExpired(req, res, mode, sid) {
+  res.setHeader("Cache-Control", "no-store");
+  if (mode !== "view") return respondError(res, 410, "This Veyra session reached its time limit and was deleted.", "SESSION_EXPIRED", { sessionId: sid });
+  const limit = Math.round(CFG.sessionTimeLimitMs / 1000);
+  res.status(410).type("html").send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Session ended</title>
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0e1014;color:#e8eaee;font:15px/1.5 system-ui,sans-serif}main{max-width:420px;padding:32px;text-align:center}h1{font-size:20px;margin:0 0 8px}p{color:#9aa1ad;margin:0}</style></head>
+<body><main><h1>Session ended</h1><p>Veyra sessions last ${limit >= 60 ? `${Math.round(limit / 60)} minute${limit >= 120 ? "s" : ""}` : `${limit} seconds`}. This one has been deleted along with its cookies and history. Start a new session to keep browsing.</p></main>
+<script>try{top.postMessage({type:"veyra:session-expired",sessionId:${JSON.stringify(sid)}},"*")}catch(e){}</script></body></html>`);
 }
 function safeMethod(method) { return ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"].includes(String(method || "").toUpperCase()); }
 
@@ -1358,7 +1401,7 @@ function rewriteSrcset(raw, base, sid = "") {
   }).join(", ");
 }
 function injectRuntime(html, original, sid = "") {
-  const code = `<script>(function(){
+  const code = `<script data-veyra-runtime>(function(){
   const CANONICAL=${JSON.stringify(original)};
   const SESSION_ID=${JSON.stringify(sid)};
   const API_ORIGIN=${JSON.stringify(process.env.PUBLIC_API_ORIGIN || "")};
@@ -1402,7 +1445,11 @@ function injectRuntime(html, original, sid = "") {
   function proxy(kind,u){const prefix=API_ORIGIN || location.origin;const base=prefix+(kind==='view'?'/api/view?url=':'/api/resource?url=')+encodeURIComponent(u);const from=encodeURIComponent(new URL(virtualUrl).href);return kind==='view'?base+'&sid='+encodeURIComponent(SESSION_ID):base+'&from='+from+'&sid='+encodeURIComponent(SESSION_ID)}
   function topPost(msg){try{window.top.postMessage(msg,'*')}catch{}}
   function emit(source,url,extra){if(!url)return;topPost({type:'veyra:navigate',url,source,sessionId:SESSION_ID,...extra})}
-  function net(method,url,status,ms,ok){topPost({type:'veyra:browser-network',sessionId:SESSION_ID,pageUrl:virtualUrl,method:String(method||'GET').toUpperCase(),url:String(url||''),status:status||0,duration:Math.round(ms||0),ok:!!ok})}
+  let netSeq=0;
+  function hdrObj(h){const o={};try{if(!h)return o;if(typeof h.forEach==='function'&&!Array.isArray(h)){h.forEach((v,k)=>{o[k]=String(v).slice(0,2000)});return o}if(Array.isArray(h)){for(const [k,v] of h)o[String(k).toLowerCase()]=String(v).slice(0,2000);return o}for(const k of Object.keys(h))o[k.toLowerCase()]=String(h[k]).slice(0,2000)}catch{}return o}
+  function xhrHeaders(x){const o={};try{for(const line of String(x.getAllResponseHeaders()||'').split(/\\r?\\n/)){const i=line.indexOf(':');if(i>0)o[line.slice(0,i).trim().toLowerCase()]=line.slice(i+1).trim().slice(0,2000)}}catch{}return o}
+  function net(method,url,status,ms,ok,resp,extra){const id=SESSION_ID.slice(0,6)+'-'+(++netSeq);let responseHeaders={},size=0,mime='';try{if(resp&&typeof resp.getAllResponseHeaders==='function'){responseHeaders=xhrHeaders(resp);try{size=resp.responseType===''||resp.responseType==='text'?String(resp.responseText||'').length:(resp.response&&resp.response.byteLength)||0}catch{}}else if(resp&&resp.headers){responseHeaders=hdrObj(resp.headers)}mime=responseHeaders['x-veyra-content-type']||responseHeaders['content-type']||'';if(!size)size=Number(responseHeaders['content-length']||0)||0;const b=window.__veyraDevtools;if(b&&b.captureBodies&&resp&&resp.headers&&typeof resp.clone==='function')b.recordBody(id,resp);if(b&&b.captureBodies&&resp&&typeof resp.getAllResponseHeaders==='function'){try{const t=resp.responseType===''||resp.responseType==='text'?String(resp.responseText||''):null;if(t!=null)b.recordBody(id,{headers:{get:k=>responseHeaders[String(k).toLowerCase()]||''},clone:()=>({text:()=>Promise.resolve(t)})})}catch{}}}catch{}
+    topPost({type:'veyra:browser-network',id,sessionId:SESSION_ID,pageUrl:virtualUrl,method:String(method||'GET').toUpperCase(),url:String(url||''),status:status||0,duration:Math.round(ms||0),ok:!!ok,startedAt:Date.now()-Math.round(ms||0),mime,size,responseHeaders,blocked:responseHeaders['x-veyra-blocked']||'',...(extra||{})})}
   function canonicalizeMaybeProxy(href){try{const raw=unwrap(href);if(!raw)return null;const u=toVirtual(raw);if(!/^https?:$/.test(u.protocol))return null;return u.href}catch{return null}}
   const HP=(typeof History!=='undefined'&&History.prototype)||null;
   const nativeReplaceState=HP?HP.replaceState:history.replaceState;
@@ -1429,11 +1476,11 @@ function injectRuntime(html, original, sid = "") {
   }catch{}
   try{navigator.serviceWorker&&navigator.serviceWorker.register&&(navigator.serviceWorker.register=()=>Promise.reject(new Error('Service workers are disabled inside the Veyra proxy.')))}catch{}
   const nativeFetch=window.fetch;if(nativeFetch)window.fetch=function(input,init){
-    const started=performance.now(); const method=String(init&&init.method||input&&input.method||'GET').toUpperCase(); const original=realUrl(input); let target='';
-    try{target=resolve(input);if(shouldProxy(target)){const ok=r=>{net(method,target,r.status,performance.now()-started,r.ok);return r},bad=e=>{net(method,target,0,performance.now()-started,false);throw e};const dest=proxy('resource',target);if(typeof Request!=='undefined'&&input instanceof Request){const src=input;const hasBody=!/^(GET|HEAD)$/i.test(src.method)&&!(init&&'body' in init);return (hasBody?src.clone().arrayBuffer():Promise.resolve(undefined)).then(buf=>{const opts={method:src.method,headers:src.headers,credentials:src.credentials,cache:src.cache,redirect:src.redirect,integrity:src.integrity,signal:src.signal};if(buf&&buf.byteLength)opts.body=buf;if(src.keepalive&&!(buf&&buf.byteLength>60000))opts.keepalive=true;return nativeFetch(dest,Object.assign(opts,init||{}))}).then(ok,bad)}if(init&&init.body&&typeof ReadableStream!=='undefined'&&init.body instanceof ReadableStream){return new Response(init.body).arrayBuffer().then(buf=>{const o=Object.assign({},init,{body:buf});delete o.duplex;return nativeFetch(dest,o)}).then(ok,bad)}return nativeFetch(dest,init).then(ok,bad);}}catch{}
-    return nativeFetch(input,init).then(r=>{net(method,target||original,r.status,performance.now()-started,r.ok);return r},e=>{net(method,target||original,0,performance.now()-started,false);throw e});
+    const started=performance.now(); const method=String(init&&init.method||input&&input.method||'GET').toUpperCase(); const original=realUrl(input); let target=''; let reqX={initiator:'fetch'};try{reqX.requestHeaders=hdrObj(init&&init.headers||(typeof Request!=='undefined'&&input instanceof Request?input.headers:null));if(init&&typeof init.body==='string')reqX.requestBody=init.body.slice(0,20000)}catch{}
+    try{target=resolve(input);if(shouldProxy(target)){const ok=r=>{net(method,target,r.status,performance.now()-started,r.ok,r,reqX);return r},bad=e=>{net(method,target,0,performance.now()-started,false,null,{...reqX,error:String(e&&e.message||e)});throw e};const dest=proxy('resource',target);if(typeof Request!=='undefined'&&input instanceof Request){const src=input;const hasBody=!/^(GET|HEAD)$/i.test(src.method)&&!(init&&'body' in init);return (hasBody?src.clone().arrayBuffer():Promise.resolve(undefined)).then(buf=>{const opts={method:src.method,headers:src.headers,credentials:src.credentials,cache:src.cache,redirect:src.redirect,integrity:src.integrity,signal:src.signal};if(buf&&buf.byteLength)opts.body=buf;if(src.keepalive&&!(buf&&buf.byteLength>60000))opts.keepalive=true;return nativeFetch(dest,Object.assign(opts,init||{}))}).then(ok,bad)}if(init&&init.body&&typeof ReadableStream!=='undefined'&&init.body instanceof ReadableStream){return new Response(init.body).arrayBuffer().then(buf=>{const o=Object.assign({},init,{body:buf});delete o.duplex;return nativeFetch(dest,o)}).then(ok,bad)}return nativeFetch(dest,init).then(ok,bad);}}catch{}
+    return nativeFetch(input,init).then(r=>{net(method,target||original,r.status,performance.now()-started,r.ok,r,reqX);return r},e=>{net(method,target||original,0,performance.now()-started,false,null,{...reqX,error:String(e&&e.message||e)});throw e});
   };
-  try{const nativeXhrOpen=XMLHttpRequest.prototype.open,nativeXhrSend=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(method,url,...rest){this.__veyraMethod=method;this.__veyraTarget=resolve(url);this.__veyraStarted=0;return nativeXhrOpen.call(this,method,shouldProxy(this.__veyraTarget)?proxy('resource',this.__veyraTarget):url,...rest)};XMLHttpRequest.prototype.send=function(body){this.__veyraStarted=performance.now();this.addEventListener('loadend',()=>net(this.__veyraMethod||'GET',this.__veyraTarget||'',this.status,performance.now()-this.__veyraStarted,this.status>=200&&this.status<400),{once:true});return nativeXhrSend.call(this,body)}}catch{}
+  try{const nativeXhrOpen=XMLHttpRequest.prototype.open,nativeXhrSend=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(method,url,...rest){this.__veyraMethod=method;this.__veyraTarget=resolve(url);this.__veyraStarted=0;return nativeXhrOpen.call(this,method,shouldProxy(this.__veyraTarget)?proxy('resource',this.__veyraTarget):url,...rest)};XMLHttpRequest.prototype.send=function(body){this.__veyraStarted=performance.now();const x=this;this.addEventListener('loadend',()=>net(x.__veyraMethod||'GET',x.__veyraTarget||'',x.status,performance.now()-x.__veyraStarted,x.status>=200&&x.status<400,x,{initiator:'xhr',requestHeaders:x.__veyraReqHeaders||{},requestBody:typeof body==='string'?body.slice(0,20000):undefined}),{once:true});return nativeXhrSend.call(this,body)};const nativeSetHeader=XMLHttpRequest.prototype.setRequestHeader;XMLHttpRequest.prototype.setRequestHeader=function(k,v){try{(this.__veyraReqHeaders||(this.__veyraReqHeaders={}))[String(k).toLowerCase()]=String(v).slice(0,2000)}catch{}return nativeSetHeader.call(this,k,v)}}catch{}
   try{const NativeEventSource=window.EventSource;if(NativeEventSource)window.EventSource=function(url,options){const target=resolve(url);return new NativeEventSource(shouldProxy(target)?proxy('resource',target):url,options)}}catch{}
   try{const nativeBeacon=navigator.sendBeacon&&navigator.sendBeacon.bind(navigator);if(nativeBeacon)navigator.sendBeacon=function(url,data){try{const target=resolve(url);if(shouldProxy(target)){let body=data;let type='text/plain;charset=UTF-8';if(typeof Blob!=='undefined'&&data instanceof Blob)type=data.type||type;void fetch(proxy('resource',target),{method:'POST',body,keepalive:true,headers:{'content-type':type}});return true}}catch{}return nativeBeacon(url,data)}}catch{}
   function submitTarget(form,submitter){try{return canonicalizeMaybeProxy((submitter&&submitter.getAttribute('data-veyra-formaction'))||(submitter&&submitter.getAttribute('formaction'))||form.getAttribute('data-veyra-action')||form.getAttribute('action')||virtualUrl)}catch{return null}}
@@ -1441,7 +1488,9 @@ function injectRuntime(html, original, sid = "") {
   try{const nativeFormSubmit=HTMLFormElement.prototype.submit;HTMLFormElement.prototype.submit=function(){try{if(emitGetForm(this,null,'form.submit'))return;const target=submitTarget(this,null);const method=String(this.method||'get').toUpperCase();if(target&&method==='POST'){const fd=new FormData(this);const entries=[];for(const [k,v] of fd.entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});return;}}catch{}return nativeFormSubmit.call(this)}}catch{}
   try{const nativeRequestSubmit=HTMLFormElement.prototype.requestSubmit;if(nativeRequestSubmit)HTMLFormElement.prototype.requestSubmit=function(submitter){try{if(emitGetForm(this,submitter,'form.requestSubmit'))return;const target=submitTarget(this,submitter);const method=String(this.method||'get').toUpperCase();if(target&&method==='POST'){const entries=[];for(const [k,v] of new FormData(this,submitter).entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});return;}}catch{}return nativeRequestSubmit.call(this,submitter)}}catch{}
   try{const nativeOpen=window.open;window.open=function(url,target,features){const u=canonicalizeMaybeProxy(url);if(u){topPost({type:'veyra:open',url:u,sessionId:SESSION_ID});return null}return nativeOpen.call(window,url,target,features)}}catch{}
-  try{['log','info','debug','warn','error'].forEach(level=>{const native=console[level].bind(console);console[level]=(...args)=>{native(...args);topPost({type:'veyra:page-console',level,sessionId:SESSION_ID,message:args.map(x=>typeof x==='string'?x:(()=>{try{return JSON.stringify(x)}catch{return String(x)}})()).join(' '),pageUrl:virtualUrl})}})}catch{}
+  function fmtArg(x,d){d=d||0;if(typeof x==='string')return x;if(x instanceof Error)return (x.name||'Error')+': '+x.message+(x.stack?'\\n'+String(x.stack).split('\\n').slice(1,6).join('\\n'):'');if(typeof Node!=='undefined'&&x instanceof Node)return x.nodeType===1?'<'+x.tagName.toLowerCase()+(x.id?'#'+x.id:'')+(x.className&&typeof x.className==='string'?'.'+x.className.trim().split(/\\s+/).slice(0,3).join('.'):'')+'>':x.nodeName;if(typeof x==='function')return 'ƒ '+(x.name||'anonymous')+'()';try{const seen=new WeakSet();return JSON.stringify(x,(k,v)=>{if(typeof v==='object'&&v){if(seen.has(v))return '[Circular]';seen.add(v)}if(typeof v==='function')return 'ƒ';if(typeof v==='bigint')return String(v)+'n';return v})||String(x)}catch{return String(x)}}
+  let consoleBudget=400,consoleWindow=Date.now();
+  try{['log','info','debug','warn','error','trace','dir','table','assert','group','groupCollapsed','groupEnd','count','timeEnd'].forEach(level=>{if(typeof console[level]!=='function')return;const native=console[level].bind(console);console[level]=(...args)=>{native(...args);if(level==='assert'){if(args[0])return;args=['Assertion failed:',...args.slice(1)]}const now=Date.now();if(now-consoleWindow>2000){consoleWindow=now;consoleBudget=400}if(--consoleBudget<0)return;let stack='';if(level==='trace'||level==='error'){try{stack=String(new Error().stack||'').split('\\n').slice(2,9).join('\\n')}catch{}}let msg='';try{msg=args.map(x=>fmtArg(x)).join(' ')}catch{}topPost({type:'veyra:page-console',level:level==='assert'?'error':level,sessionId:SESSION_ID,message:msg.slice(0,20000),stack,time:now,pageUrl:virtualUrl})}})}catch{}
   window.addEventListener('error',e=>topPost({type:'veyra:page-error',level:'error',sessionId:SESSION_ID,message:e.message||'Resource error',url:e.filename||'',line:e.lineno||null,column:e.colno||null,stack:e.error&&e.error.stack||'',pageUrl:virtualUrl}),true);
   window.addEventListener('unhandledrejection',e=>topPost({type:'veyra:page-error',level:'error',sessionId:SESSION_ID,message:e.reason&&e.reason.message||String(e.reason||'Unhandled rejection'),stack:e.reason&&e.reason.stack||'',pageUrl:virtualUrl}),true);
   let inspectMode=false, inspectLast=0, inspectSelected=null;
@@ -1449,6 +1498,29 @@ function injectRuntime(html, original, sid = "") {
   function inspectData(el){if(!el||el.nodeType!==1)return null;const rect=el.getBoundingClientRect();const attrs={};for(const a of [...el.attributes].slice(0,40))attrs[a.name]=a.value;let styles={};let computed={};try{const cs=getComputedStyle(el);for(const k of ['display','position','width','height','margin','padding','color','background','font','font-size','line-height','opacity','z-index','overflow','border','grid-template-columns','grid-template-rows','flex-direction','justify-content','align-items']){styles[k]=cs.getPropertyValue(k)||''}}catch{}try{const cs=getComputedStyle(el);for(let i=0;i<cs.length&&i<140;i++){const k=cs[i];if(/^(margin|padding|font|color|background|display|position|width|height|border|grid|flex|overflow|opacity|z-index)/i.test(k))computed[k]=cs.getPropertyValue(k)}}catch{}const outer=String(el.outerHTML||'').slice(0,16000);const children=[...el.children].slice(0,60).map((c,i)=>({index:i,tag:c.tagName.toLowerCase(),id:c.id||'',classes:String(c.className||'').slice(0,300),path:inspectPath(c)}));const parent=el.parentElement?{tag:el.parentElement.tagName.toLowerCase(),id:el.parentElement.id||'',path:inspectPath(el.parentElement)}:null;return {tag:el.tagName.toLowerCase(),id:el.id||'',classes:String(el.className||'').slice(0,500),attrs,path:inspectPath(el),outerHTML:outer,rect:{x:rect.x,y:rect.y,width:rect.width,height:rect.height},scrollWidth:el.scrollWidth||0,scrollHeight:el.scrollHeight||0,styles,computed,inlineStyle:el.getAttribute('style')||'',parent,children,tree:inspectPath(el)} }
   function inspectEmit(type,el){const data=inspectData(el);if(!data)return;topPost({type,sessionId:SESSION_ID,pageUrl:virtualUrl,...data})}
   window.addEventListener('message',function(ev){const d=ev.data||{};if(!d||d.type!=='veyra:inspect')return;inspectMode=!!d.enabled;if(!inspectMode&&inspectSelected){try{inspectSelected.style.removeProperty('outline')}catch{}inspectSelected=null}topPost({type:'veyra:inspect-state',enabled:inspectMode,sessionId:SESSION_ID,pageUrl:virtualUrl})});
+  // DevTools bridge: loaded on demand from the Veyra origin the first time the
+  // frontend's DevTools / extensions talk to this page.
+  let dtLoading=null;const dtQueue=[];
+  function dtReply(msg){try{window.parent.postMessage(msg,'*')}catch{}}
+  function dtLoad(){if(window.__veyraDevtools)return Promise.resolve(window.__veyraDevtools);if(dtLoading)return dtLoading;dtLoading=new Promise((resolve,reject)=>{const sc=document.createElement('script');sc.setAttribute('data-veyra-devtools','bridge');sc.src=(API_ORIGIN||location.origin)+'/api/devtools/bridge.js?v=1';sc.onload=()=>{try{resolve(window.installVeyraDevtools(dtReply,{unwrap:x=>{const r=unwrap(x);try{return r?new URL(r,virtualUrl).href:''}catch{return r}},pageUrl:()=>virtualUrl}))}catch(e){reject(e)}};sc.onerror=()=>{dtLoading=null;reject(new Error('Could not load the DevTools bridge.'))};(document.head||document.documentElement).appendChild(sc)});return dtLoading}
+  function dtSer(e){return {message:String(e&&e.message||e),stack:String(e&&e.stack||'')}}
+  window.addEventListener('message',function(ev){const d=ev.data||{};if(!d||d.type!=='veyra:dt')return;if(ev.source!==window.parent||window.parent===window)return;if(!rootProxiedFrame())return;
+    dtLoad().then(b=>b.call(String(d.method||''),d.params||{})).then(result=>{let safe=result;try{safe=JSON.parse(JSON.stringify(result===undefined?null:result))}catch{safe=null}dtReply({type:'veyra:dt-result',id:d.id,ok:true,result:safe,pageUrl:virtualUrl})},e=>dtReply({type:'veyra:dt-result',id:d.id,ok:false,error:dtSer(e),pageUrl:virtualUrl}))});
+  // Keyboard shortcuts pressed inside the page are forwarded to the Veyra UI
+  // (the parent frame never sees keydown events that happen in this iframe).
+  const SC_SHIFT=['i','j','c','v','delete','t','n','b','o','m','r','p','k','tab','pageup','pagedown'];
+  const SC_MOD=['t','w','n','l','r','f','p','j','h','d','k','e','u','g','s',',','pageup','pagedown','=','+','-','0','1','2','3','4','5','6','7','8','9','tab'];
+  const SC_ALT=['arrowleft','arrowright','home','d','t','w'];
+  document.addEventListener('keydown',function(ev){try{if(!rootProxiedFrame())return;const k=String(ev.key||'').toLowerCase();const mod=ev.ctrlKey||ev.metaKey;
+    let fwd=false;
+    if(k==='f12'||k==='f5'||k==='f6')fwd=true;
+    else if(mod&&ev.shiftKey&&SC_SHIFT.includes(k))fwd=true;
+    else if(mod&&!ev.shiftKey&&!ev.altKey&&SC_MOD.includes(k))fwd=true;
+    else if(ev.altKey&&!mod&&SC_ALT.includes(k))fwd=true;
+    if(!fwd)return;
+    ev.preventDefault();ev.stopPropagation();
+    topPost({type:'veyra:shortcut',key:ev.key,code:ev.code,ctrlKey:ev.ctrlKey,metaKey:ev.metaKey,shiftKey:ev.shiftKey,altKey:ev.altKey,sessionId:SESSION_ID});
+  }catch{}},true);
   window.addEventListener('message',function(ev){const d=ev.data||{};if(d.type==='veyra:find'){try{const q=String(d.query||'').slice(0,200);if(!q){window.getSelection()?.removeAllRanges();topPost({type:'veyra:find-result',matches:0,pageUrl:virtualUrl});return;}let text=String(document.body?.innerText||'').slice(0,2000000);const hay=text.toLocaleLowerCase(),needle=q.toLocaleLowerCase();const matches=needle?(hay.split(needle).length-1):0;window.find(q,false,String(d.direction||'forward')==='backward',true,false,false,false);topPost({type:'veyra:find-result',matches,pageUrl:virtualUrl});}catch{}}else if(d.type==='veyra:find-close'){try{window.getSelection()?.removeAllRanges();}catch{}}else if(d.type==='veyra:print'){try{window.print();}catch{}}});
   document.addEventListener('mousemove',function(ev){if(!inspectMode)return;const now=performance.now();if(now-inspectLast<45)return;inspectLast=now;let el=ev.target;if(!(el instanceof Element))return;inspectEmit('veyra:inspect-hover',el)},true);
   document.addEventListener('click',function(ev){if(inspectMode){ev.preventDefault();ev.stopPropagation();let el=ev.target;while(el&&el.nodeType===1&&el.tagName==='HTML')el=el.parentElement;inspectSelected=el;if(el)inspectEmit('veyra:inspect-select',el);return;}
@@ -2829,7 +2901,7 @@ function browserCapabilitySignals(html = "", headers = {}) {
   const scriptCount = (text.match(/<script\b/gi) || []).length;
   const moduleCount = (text.match(/type\s*=\s*["']module["']/gi) || []).length;
   const fetchSignals = (text.match(/fetch\s*\(|xmlhttprequest|websocket|eventsource|indexeddb|localstorage|sessionstorage|serviceworker|history\.pushstate|history\.replacestate/gi) || []).length;
-  const shellSignals = /<div[^>]+(?:id|class)=["'][^"']*(?:root|app|__next|__nuxt|svelte)[^"']*["'][^>]*>\s*<\/div>/i.test(text) || text.replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '').replace(/<[^>]+>/g, ' ').trim().length < 500;
+  const shellSignals = /<div[^>]+(?:id|class)=["'][^"']*(?:root|app|__next|__nuxt|svelte)[^"']*["'][^>]*>\s*<\/div>/i.test(text) || ((scriptCount + moduleCount) > 0 && text.replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '').replace(/<[^>]+>/g, ' ').trim().length < 500);
   const spa = /__next|__nuxt|webpack|vite|react|angular|vue|svelte|ng-version/i.test(text);
   const scriptHeavy = scriptCount >= CFG.proxyJsHeavyThreshold && (fetchSignals >= 1 || moduleCount > 0 || shellSignals);
   const spaHeavy = spa && (fetchSignals >= 2 || shellSignals || moduleCount > 0);
@@ -2902,15 +2974,87 @@ app.get('/api/vpn/ip', async (req, res) => {
 
 // ---------------------------------------------------------------------------
 // Sessions — explicit close (frontend: navigator.sendBeacon on tab close) and stats.
-app.get('/api/sessions', (req, res) => res.json({ ok: true, ...sessionManager.report(), vpnConnections: vpnManager.status().connections, browser: { sessions: browserEngine.sessions.size, running: !!browserEngine.browser } }));
+function sessionInfo(sid, rec) {
+  const expiresAt = sessionManager.expiresAt(rec);
+  return { sessionId: sid, active: true, createdAt: new Date(rec.createdAt).toISOString(), lastUsed: new Date(rec.lastUsed).toISOString(),
+    timeLimitMs: sessionManager.timeLimitMs || null, expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null, remainingMs: sessionManager.remainingMs(rec),
+    idleExpiresInMs: Math.max(0, CFG.sessionIdleTtlMs - (Date.now() - rec.lastUsed)), cookies: rec.cookies.size, requests: rec.requests,
+    serverTime: new Date().toISOString(), vpn: vpnManager.sessionInfo?.(sid) || null };
+}
+app.get('/api/sessions', requireAdmin, (req, res) => res.json({ ok: true, ...sessionManager.report(), vpnConnections: vpnManager.status().connections, browser: { sessions: browserEngine.sessions.size, running: !!browserEngine.browser } }));
+// Start a fresh browsing session. The frontend shows a countdown from expiresAt.
+app.post('/api/session', (req, res) => {
+  const user = authStore.userFromRequest(req);
+  const sid = crypto.randomUUID().replaceAll("-", "");
+  const rec = sessionManager.create(sid);
+  rec.userId = user?.id || null;
+  res.status(201).json({ ok: true, ...sessionInfo(sid, rec), user: user ? authStore.publicUser(user) : null });
+});
 app.get('/api/session/:sid', (req, res) => {
+  const sid = String(req.params.sid);
+  if (sessionManager.checkLimit(sid)) return res.json({ ok: true, sessionId: sid, active: false, expired: true, reason: "SESSION_EXPIRED" });
+  const rec = sessionManager.peek(sid);
+  if (!rec) return res.json({ ok: true, sessionId: sid, active: false });
+  res.json({ ok: true, ...sessionInfo(sid, rec) });
+});
+// Server-side cookie jar for DevTools > Application > Cookies.
+app.get('/api/session/:sid/cookies', (req, res) => {
+  const sid = String(req.params.sid);
+  if (sessionManager.checkLimit(sid)) return respondError(res, 410, "Session expired.", "SESSION_EXPIRED");
+  const rec = sessionManager.peek(sid);
+  if (!rec) return res.json({ ok: true, cookies: [] });
+  const host = String(req.query.host || "").toLowerCase();
+  const cookies = [...rec.cookies.values()].filter(c => !host || (c.hostOnly ? c.domain === host : cookieDomainMatches(host, c.domain)))
+    .map(c => ({ name: c.name, value: c.value, domain: (c.hostOnly ? "" : ".") + c.domain.replace(/^\./, ""), path: c.path, secure: c.secure, expires: c.expiresAt ? new Date(c.expiresAt).toISOString() : "Session", size: c.name.length + String(c.value).length }));
+  res.json({ ok: true, cookies });
+});
+app.delete('/api/session/:sid/cookies', (req, res) => {
   const rec = sessionManager.peek(String(req.params.sid));
-  if (!rec) return res.json({ ok: true, active: false });
-  res.json({ ok: true, active: true, createdAt: new Date(rec.createdAt).toISOString(), lastUsed: new Date(rec.lastUsed).toISOString(), expiresInMs: Math.max(0, CFG.sessionIdleTtlMs - (Date.now() - rec.lastUsed)), cookies: rec.cookies.size, requests: rec.requests, vpn: vpnManager.sessionInfo?.(String(req.params.sid)) || null });
+  if (!rec) return res.json({ ok: true, deleted: 0 });
+  const name = String(req.query.name || ""), domain = String(req.query.domain || "").replace(/^\./, "").toLowerCase();
+  let n = 0;
+  for (const [k, c] of [...rec.cookies]) if ((!name || c.name === name) && (!domain || c.domain.replace(/^\./, "") === domain)) { rec.cookies.delete(k); n += 1; }
+  res.json({ ok: true, deleted: n });
+});
+app.post('/api/session/:sid/prefs', (req, res) => {
+  const sid = String(req.params.sid);
+  if (sessionManager.checkLimit(sid)) return respondError(res, 410, "Session expired.", "SESSION_EXPIRED");
+  let rec; try { rec = sessionManager.touch(sid); } catch (e) { return respondError(res, e.status || 400, e.message, e.code || "SESSION_ERROR"); }
+  rec.prefs = { ...(rec.prefs || {}), ...(typeof req.body?.blockTrackers === "boolean" ? { blockTrackers: req.body.blockTrackers } : {}) };
+  res.json({ ok: true, prefs: rec.prefs, blocked: rec.blocked || 0 });
 });
 const closeSession = (req, res) => { const closed = sessionManager.close(String(req.params.sid)); res.json({ ok: true, closed }); };
 app.delete('/api/session/:sid', closeSession);
 app.post('/api/session/:sid/close', express.text({ type: () => true, limit: '4kb' }), closeSession);
+
+// ---------------------------------------------------------------------------
+// Accounts — sign up / sign in for the frontend homepage. Admin role gates
+// /dev, #console and the debug API.
+function authFail(res, e) { respondError(res, e.status || 400, e.message, e.code || "AUTH_ERROR"); }
+function clientIp(req) { return String(req.ip || req.socket?.remoteAddress || ""); }
+function requireUser(req, res, next) {
+  const user = authStore.userFromRequest(req);
+  if (!user) return respondError(res, 401, "Sign in to continue.", "AUTH_REQUIRED");
+  req.veyraUser = user; next();
+}
+function isAdminRequest(req) {
+  const user = authStore.userFromRequest(req);
+  if (user && authStore.roleFor(user.email) === "admin") return true;
+  return configEditAllowed(req);
+}
+function requireAdmin(req, res, next) {
+  if (!CFG.adminGate || isAdminRequest(req)) return next();
+  respondError(res, 403, "This area is for Veyra administrators only.", "ADMIN_REQUIRED");
+}
+app.post('/api/auth/signup', (req, res) => { try { res.status(201).json({ ok: true, ...authStore.signup(req.body || {}, clientIp(req)) }); } catch (e) { authFail(res, e); } });
+app.post('/api/auth/login', (req, res) => { try { res.json({ ok: true, ...authStore.login(req.body || {}, clientIp(req)) }); } catch (e) { authFail(res, e); } });
+app.get('/api/auth/me', requireUser, (req, res) => res.json({ ok: true, user: authStore.publicUser(req.veyraUser), sessionTimeLimitMs: CFG.sessionTimeLimitMs }));
+app.patch('/api/auth/me', requireUser, (req, res) => { try { res.json({ ok: true, ...authStore.update(req.veyraUser, req.body || {}) }); } catch (e) { authFail(res, e); } });
+app.delete('/api/auth/me', requireUser, (req, res) => { try { authStore.remove(req.veyraUser, req.body?.password); res.json({ ok: true }); } catch (e) { authFail(res, e); } });
+app.post('/api/auth/logout', (req, res) => { const user = authStore.userFromRequest(req); if (user && req.body?.everywhere) authStore.logoutEverywhere(user); res.json({ ok: true }); });
+app.get('/api/auth/data', requireUser, (req, res) => res.json({ ok: true, data: authStore.getData(req.veyraUser), updatedAt: req.veyraUser.dataUpdatedAt || null }));
+app.put('/api/auth/data', requireUser, (req, res) => { try { res.json({ ok: true, ...authStore.setData(req.veyraUser, req.body?.data) }); } catch (e) { authFail(res, e); } });
+app.get('/api/auth/config', (req, res) => res.json({ ok: true, signupEnabled: CFG.authAllowSignup, sessionTimeLimitMs: CFG.sessionTimeLimitMs, admin: isAdminRequest(req) }));
 
 // ---------------------------------------------------------------------------
 // Config — read-only everywhere; editable in development (or with VEYRA_ADMIN_TOKEN).
@@ -2961,6 +3105,7 @@ app.post('/api/browser/session', async (req, res) => {
     const jobId = String(req.body?.jobId || '').slice(0, 100);
     const url = normalizeUrl(String(req.body?.url || ''));
     const sid = normalizeSessionId(req.body?.proxySessionId || req.body?.sid);
+    if (sessionManager.checkLimit(sid)) return respondError(res, 410, 'This Veyra session reached its time limit and was deleted.', 'SESSION_EXPIRED');
     const proxySession = sessionRecord(sid);
     const wantedVpn = String(req.body?.vpnProfileId || '');
     if (wantedVpn && vpnManager.enabled && !vpnManager.profileForSession(sid)) { try { vpnManager.connect(sid, wantedVpn); proxySession.vpnProfileId = wantedVpn; } catch {} }
@@ -2982,10 +3127,44 @@ app.post('/api/browser/session/:id/history', async (req,res) => { try { const se
 app.post('/api/browser/session/:id/inspect', async (req,res) => { try { const data=await browserEngine.inspect(req.params.id, req.body?.x, req.body?.y); res.json({ok:true,data}); } catch(e) { respondError(res,400,e.message,'BROWSER_INSPECT_ERROR'); } });
 app.post('/api/browser/session/:id/stop', async (req,res) => { try { const session=await browserEngine.stopNavigation(req.params.id); res.json({ok:true,session}); } catch(e) { respondError(res,400,e.message,'BROWSER_STOP_ERROR'); } });
 app.delete('/api/browser/session/:id', async (req,res) => { try { await browserEngine.stop(req.params.id); res.json({ok:true}); } catch(e) { respondError(res,404,e.message,e.code||'BROWSER_SESSION_NOT_FOUND'); } });
+// DevTools for BROWSER_ENGINE tabs: same bridge API, evaluated inside Chromium.
+const DEVTOOLS_BRIDGE_FN = require("./devtools-bridge").source;
+app.post('/api/browser/session/:id/devtools', async (req, res) => {
+  try {
+    const s = browserEngine.get(req.params.id);
+    if (!s?.page) return respondError(res, 404, 'Browser session not found.', 'BROWSER_SESSION_NOT_FOUND');
+    const method = String(req.body?.method || '').slice(0, 60);
+    if (!/^[a-z]+\.[A-Za-z]+$/.test(method)) return respondError(res, 400, 'Invalid DevTools method.', 'DEVTOOLS_BAD_METHOD');
+    if (method === 'logs.get') return res.json({ ok: true, result: { console: s.console.slice(-300), network: s.network.slice(-400) } });
+    s.lastUsed = Date.now();
+    const result = await Promise.race([
+      s.page.evaluate(async ({ src, method, params }) => {
+        if (!window.__veyraDevtools) (0, eval)('(' + src + ')')(null, {});
+        const r = await window.__veyraDevtools.call(method, params);
+        return JSON.parse(JSON.stringify(r === undefined ? null : r));
+      }, { src: DEVTOOLS_BRIDGE_FN, method, params: req.body?.params || {} }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('DevTools call timed out.')), 8000))
+    ]);
+    res.json({ ok: true, result });
+  } catch (e) { respondError(res, 500, e.message, 'DEVTOOLS_ERROR'); }
+});
 app.get('/api/browser/session/:id/screenshot', async (req,res) => { try { const png=await browserEngine.screenshot(req.params.id); if(!png) return respondError(res,503,'Screenshot unavailable.','BROWSER_SCREENSHOT_ERROR'); res.setHeader('content-type','image/png'); res.setHeader('cache-control','no-store'); res.send(png); } catch(e) { respondError(res,404,e.message,e.code||'BROWSER_SCREENSHOT_ERROR'); } });
 
 // Health and debug.
 app.get("/health", (req, res) => res.json({ ok: true, service: "veyra", plan: CFG.plan, sleeping: sessionManager.sleeping, sessions: sessionManager.size, crawlers: { running: activeCrawlCount(), queued: crawlQueue.length, max: effectiveMaxActiveJobs() }, uptimeSec: Math.round(process.uptime()), activeJobs: [...jobs.values()].filter(j => !j.done).length, processRole: CFG.processRole, resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb, crawlerFetchLimit: effectiveCrawlerConcurrency(), logicalRobots: CFG.logicalRobots, vpn: vpnManager.status() }));
+// DevTools bridge script (loaded on demand by the injected page runtime).
+const DEVTOOLS_BRIDGE = (() => { const src = fs.readFileSync(path.join(__dirname, "devtools-bridge.js"), "utf8"); return src.slice(0, src.indexOf("if (typeof module")) + "\nwindow.installVeyraDevtools = installVeyraDevtools;\n"; })();
+const DEVTOOLS_BRIDGE_ETAG = `"${crypto.createHash("sha1").update(DEVTOOLS_BRIDGE).digest("hex").slice(0, 16)}"`;
+app.get("/api/devtools/bridge.js", (req, res) => {
+  res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+  res.setHeader("Cache-Control", "public, max-age=600");
+  res.setHeader("ETag", DEVTOOLS_BRIDGE_ETAG);
+  res.setHeader("Cross-Origin-Resource-Policy", "cross-origin");
+  if (req.get("if-none-match") === DEVTOOLS_BRIDGE_ETAG) return res.status(304).end();
+  res.send(DEVTOOLS_BRIDGE);
+});
+// Admin-only diagnostics (client-log stays open: every tab reports errors there).
+app.use("/api/debug", (req, res, next) => (req.path === "/client-log" ? next() : requireAdmin(req, res, next)));
 app.get("/api/debug/system", (req, res) => {
   const mem = process.memoryUsage();
   const idx = searchIndexStats();
@@ -3261,6 +3440,15 @@ async function proxyRequest(req, res, mode) {
   const referrer = sourceUrl || "";
   const sourceOrigin = sourceUrl ? new URL(sourceUrl).origin : "";
   const sid = normalizeSessionId(req.query.sid);
+  if (sessionManager.checkLimit(sid)) return sendSessionExpired(req, res, mode, sid);
+  { const rec = sessionManager.touch(sid); const exp = sessionManager.expiresAt(rec); if (exp) res.setHeader("X-Veyra-Session-Expires", new Date(exp).toISOString());
+    // Tracker/ad blocking extension: answered locally, never fetched upstream.
+    if (rec.prefs?.blockTrackers && isTrackerHost(new URL(canonical).hostname)) {
+      rec.blocked = (rec.blocked || 0) + 1;
+      res.setHeader("X-Veyra-Blocked", "tracker"); res.setHeader("Cache-Control", "no-store");
+      if (mode === "view") return res.status(200).type("html").send("<!doctype html><title></title>");
+      return res.status(204).end();
+    } }
   const headers = forwardProxyBrowserHeaders(req, canonical, sourceUrl, mode, {
     accept,
     ...(req.get("Content-Type") ? { "content-type": String(req.get("Content-Type")).slice(0, 500) } : {}),
@@ -3373,7 +3561,10 @@ app.post("/api/open", async (req, res) => {
     await assertPublicUrl(root);
     const oldId = activeByRoot.get(root); const old = oldId && jobs.get(oldId);
     if (old && !old.done && !old.stopRequested) return res.status(202).json({ jobId: old.id, url: root, viewUrl: makeViewUrl(root) });
+    const openSid = String(req.body?.sessionId || req.body?.sid || "");
+    if (openSid && sessionManager.checkLimit(openSid)) return respondError(res, 410, "This Veyra session reached its time limit and was deleted.", "SESSION_EXPIRED");
     const job = createJob(root);
+    if (/^[A-Za-z0-9_-]{16,80}$/.test(openSid)) job.sessionId = openSid;
     let state;
     try { state = scheduleCrawl(job); } catch (e) { return respondError(res, 503, e.message, e.code || "CRAWLER_CAPACITY_BUSY", { maxActiveJobs: effectiveMaxActiveJobs(), queued: crawlQueue.length }); }
     jobs.set(job.id, job); activeByRoot.set(root, job.id);
@@ -3384,7 +3575,7 @@ app.post("/api/open", async (req, res) => {
 
 app.get("/api/crawl/:id", (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); res.json(publicJob(j)); });
 app.post("/api/crawl/:id/stop", (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); if (!j.started && !j.done) { dequeueCrawl(j); j.stopRequested = true; j.stopReason = "user"; j.done = true; j.finishedAt = now(); j.status = "stopped"; j.statusText = "Removed from queue."; return res.json(publicJob(j)); } j.stopRequested = true; j.stopReason = "user"; j.status = "stopping"; j.statusText = "Stopping…"; j.controller.abort(); jobLog(j, "warn", "Stop requested."); res.json({ ok: true }); });
-app.get("/api/crawl/:id/robots", (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); if (!j.robotPool) return res.json({ summary: { logicalRobots: j.robotFleet || CFG.logicalRobots, activeRobots: 0, multitaskingRobots: 0, idleRobots: j.robotFleet || CFG.logicalRobots, queuedRobotTasks: 0, globalPageQueue: j.pageFrontier.size, globalResourceQueue: j.resourceFrontier.size, networkActive: fetchSemaphore.active, networkLimit: CFG.maxActiveFetches, helpRequests: 0, helpAccepted: 0, helpDeclined: 0, helpGiven: 0 }, robots: [], events: [] }); const limit = Math.min(100, Math.max(1, Number(req.query.limit || 48) || 48)); res.json(j.robotPool.report(limit)); });
+app.get("/api/crawl/:id/robots", requireAdmin, (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); if (!j.robotPool) return res.json({ summary: { logicalRobots: j.robotFleet || CFG.logicalRobots, activeRobots: 0, multitaskingRobots: 0, idleRobots: j.robotFleet || CFG.logicalRobots, queuedRobotTasks: 0, globalPageQueue: j.pageFrontier.size, globalResourceQueue: j.resourceFrontier.size, networkActive: fetchSemaphore.active, networkLimit: CFG.maxActiveFetches, helpRequests: 0, helpAccepted: 0, helpDeclined: 0, helpGiven: 0 }, robots: [], events: [] }); const limit = Math.min(100, Math.max(1, Number(req.query.limit || 48) || 48)); res.json(j.robotPool.report(limit)); });
 app.get("/api/crawl/:id/resources", (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); res.json({ resources: j.resources.map(r => ({ id: r.id, url: r.url, requestedUrl: r.requestedUrl, type: r.type, status: r.status, contentType: r.contentType, bytes: r.bytes, bytesLabel: r.bytesLabel, truncated: r.truncated, sourceId: r.sourceId })) }); });
 app.get("/api/crawl/:id/source/:resourceId", async (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); const id = Number(req.params.resourceId); const r = j.resources[id]; if (!r) return respondError(res, 404, "Resource not found.", "RESOURCE_NOT_FOUND"); res.json({ id: r.id, url: r.url, type: r.type, source: await sourceStore.read(j, r) }); });
 app.get("/api/crawl/:id/links", (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); const offset = Math.max(0, Number(req.query.offset || 0) || 0); const limit = Math.min(10000, Math.max(1, Number(req.query.limit || 1000) || 1000)); res.json({ total: j.links.length, offset, limit, links: j.links.slice(offset, offset + limit) }); });
@@ -3816,6 +4007,7 @@ load();
 </body></html>`;
 }
 app.get("/api/debug/status", (req, res) => res.json(buildStatusReport()));
+app.get("/status", (req, res, next) => { if (!CFG.adminGate || isAdminRequest(req)) return next(); res.status(403).type("html").send("<!doctype html><title>Veyra</title><body style=\"font:15px system-ui;background:#0e1014;color:#e8eaee;display:grid;place-items:center;min-height:100vh;margin:0\"><p>This page is for Veyra administrators. Open it from the Veyra app while signed in as an admin, or send the X-Veyra-Admin-Token header.</p></body>"); });
 app.get("/status", (req, res) => res.type("html").send(statusPage()));
 
 function consolePage() {
