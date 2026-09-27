@@ -17,7 +17,7 @@ const { isMainThread } = require("worker_threads");
 // parse-worker.js loads this file inside worker threads to reuse the pure
 // rewrite / discovery functions. In that mode nothing long-lived is started.
 const IS_THREAD_WORKER = !isMainThread && process.env.VEYRA_THREAD_WORKER === "1";
-const { fetch: undiciFetch } = require("undici");
+const { fetch: undiciFetch, Agent: UndiciAgent } = require("undici");
 const veyraConfigModule = require("./config");
 // Layer plan preset + veyra.config.json under the real environment BEFORE any
 // env var is read below.
@@ -172,8 +172,12 @@ const CFG = Object.freeze({
   proxyWarmPerHost: numberEnv("PROXY_WARM_PER_HOST", 3, 1, 16),
   sitemapConcurrency: Math.min(numberEnv("SITEMAP_CONCURRENCY", P.sitemapConcurrency, 1, 32), P.sitemapConcurrency),
   initialResourceBudget: numberEnv("INITIAL_RESOURCE_BUDGET", 64, 16, 256),
-  userAgent: process.env.VEYRA_USER_AGENT || "VeyraBrowseCrawler/8.13.0 (+https://github.com/HomekidChud/VeyraServer)",
+  userAgent: process.env.VEYRA_USER_AGENT || "VeyraBrowseCrawler/8.14.3 (+https://github.com/HomekidChud/VeyraServer)",
   frontendOrigins: csvEnv("FRONTEND_ORIGIN", ["*"]),
+  // Canonical Veyra frontend URL used for safe diagnostics hand-off when /status
+  // is opened directly without the Authorization/admin header. A direct browser
+  // navigation cannot attach the frontend's localStorage bearer token.
+  frontendUrl: process.env.VEYRA_FRONTEND_URL || "https://homekidchud.github.io/VeyraBrowser/",
   searchProvider: enumEnv("SEARCH_PROVIDER", "local", ["auto", "local", "brave", "bing", "custom", "none"]),
   searchEndpoint: process.env.SEARCH_ENDPOINT || "",
   searchApiKey: process.env.SEARCH_API_KEY || "",
@@ -251,6 +255,18 @@ const CFG = Object.freeze({
   maxCrossOriginResources: Math.min(numberEnv("MAX_CROSS_ORIGIN_RESOURCES", P.maxCrossOriginResources, 0, 10000), P.maxCrossOriginResources),
   skipLowValueThirdParty: boolEnv("SKIP_LOW_VALUE_THIRD_PARTY", true),
   playwrightBrowsersPath: process.env.PLAYWRIGHT_BROWSERS_PATH || "0"
+});
+
+// Dedicated direct HTTP dispatcher. Hosted environments can have mixed IPv4/IPv6
+// reachability; Undici's family selection avoids turning a reachable public
+// origin into a generic "fetch failed". This is deliberately separate from
+// VPN dispatchers so VPN traffic can never silently fall back to direct HTTP.
+const DIRECT_HTTP_AGENT = new UndiciAgent({
+  connect: { timeout: 12000, autoSelectFamily: true, autoSelectFamilyAttemptTimeout: 250 },
+  keepAliveTimeout: 10000,
+  keepAliveMaxTimeout: 30000,
+  connections: 24,
+  pipelining: 1
 });
 
 const allowedOrigins = CFG.frontendOrigins.includes("*") ? true : CFG.frontendOrigins;
@@ -939,6 +955,33 @@ function backoffMs(attempt, retryAfter = 0) {
   if (retryAfter) return retryAfter;
   return Math.min(10000, CFG.retryBaseMs * 2 ** attempt + Math.random() * CFG.retryBaseMs);
 }
+function networkErrorCode(err) {
+  return String(err?.code || err?.cause?.code || err?.cause?.cause?.code || '').trim().toUpperCase();
+}
+function networkErrorMessage(err) {
+  const code = networkErrorCode(err);
+  const raw = String(err?.message || err || 'Network request failed').trim();
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return `Upstream DNS lookup failed (${code}).`;
+  if (code === 'ECONNREFUSED') return 'The destination refused the upstream connection.';
+  if (code === 'ECONNRESET') return 'The destination reset the upstream connection.';
+  if (code === 'ETIMEDOUT' || code === 'UND_ERR_CONNECT_TIMEOUT' || code === 'UND_ERR_HEADERS_TIMEOUT') return 'The upstream connection timed out.';
+  if (code === 'ENETUNREACH' || code === 'EHOSTUNREACH') return 'The Veyra server could not reach the destination network.';
+  if (/CERT_|ERR_TLS|UNABLE_TO_VERIFY_LEAF_SIGNATURE|SELF_SIGNED/i.test(code)) return `The destination TLS certificate could not be verified (${code || 'TLS_ERROR'}).`;
+  if (/fetch failed/i.test(raw)) return code ? `The upstream connection failed (${code}).` : 'The upstream connection failed before Veyra received an HTTP response.';
+  return raw.slice(0, 500);
+}
+function isRetryableNetworkError(err) {
+  const code = networkErrorCode(err);
+  return /^(?:EAI_AGAIN|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|UND_ERR_CONNECT_TIMEOUT|UND_ERR_SOCKET|UND_ERR_HEADERS_TIMEOUT)$/i.test(code) || /fetch failed/i.test(String(err?.message || ''));
+}
+function decorateUpstreamError(err, url) {
+  const e = err instanceof Error ? err : new Error(String(err));
+  e.upstreamCode = networkErrorCode(err) || 'UPSTREAM_NETWORK_ERROR';
+  e.upstreamPhase = /timed out|timeout|headers_timeout/i.test(String(err?.message || '')) ? 'timeout' : 'connect';
+  e.upstreamMessage = networkErrorMessage(err);
+  e.upstreamHost = hostOf(url);
+  return e;
+}
 function oversizeStream(response, head, reader) {
   // Single-use handle to the remainder of an oversized upstream body so the
   // proxy can pipe it to the client without buffering it in memory.
@@ -1015,14 +1058,23 @@ async function fetchBuffer(url, opts = {}) {
         }
         if (cached?.etag) reqHeaders.set("if-none-match", cached.etag);
         if (cached?.lastModified) reqHeaders.set("if-modified-since", cached.lastModified);
-        const dispatcher = opts.dispatcher || (sessionId ? vpnManager.dispatcherForSession(sessionId) : vpnManager.dispatcherForCrawler());
+        const vpnEnabledForRequest = sessionId
+          ? !!vpnManager.enabledForUse?.()
+          : !!vpnManager.enabledForUse?.() && !!vpnManager.crawlerProfileId;
+        const suppliedDispatcher = opts.dispatcher || (sessionId ? vpnManager.dispatcherForSession(sessionId) : vpnManager.dispatcherForCrawler());
+        if (vpnEnabledForRequest && !suppliedDispatcher && vpnManager.killSwitch) {
+          const e = Object.assign(new Error('Veyra VPN is unavailable and the kill switch blocked a direct upstream connection.'), { code: 'VPN_KILL_SWITCH' });
+          throw e;
+        }
+        const directMode = !suppliedDispatcher && !vpnEnabledForRequest;
+        const dispatcher = suppliedDispatcher || (directMode ? (attempt % 2 === 0 ? DIRECT_HTTP_AGENT : undefined) : undefined);
         const response = await undiciFetch(current, {
           method,
           headers: reqHeaders,
           redirect: "manual",
           signal: controller.signal,
           body: opts.body && method !== "GET" && method !== "HEAD" ? opts.body : undefined,
-          dispatcher
+          ...(dispatcher ? { dispatcher } : {})
         });
         if (sessionId) storeSetCookies(sessionId, current, response);
         clearTimeout(timer);
@@ -1083,9 +1135,9 @@ async function fetchBuffer(url, opts = {}) {
         clearTimeout(timer);
         // The VPN kill switch is a deliberate block, not a flaky network: surface it.
         const vpnCause = e?.cause?.code && String(e.cause.code).startsWith("VPN_") ? e.cause : (String(e?.code || "").startsWith("VPN_") ? e : null);
-        if (vpnCause) throw Object.assign(new Error(vpnCause.message), { code: vpnCause.code, status: vpnCause.code === "VPN_KILL_SWITCH" ? 503 : 502 });
-        lastError = e;
-        const retryableError = attempt < (opts.retries ?? CFG.maxRetries);
+        if (vpnCause) throw Object.assign(new Error(vpnCause.message), { code: vpnCause.code, status: vpnCause.code === "VPN_KILL_SWITCH" ? 503 : 502, upstreamCode: vpnCause.code, upstreamPhase: 'vpn', upstreamMessage: vpnCause.message });
+        lastError = decorateUpstreamError(e, current);
+        const retryableError = isRetryableNetworkError(e) && attempt < (opts.retries ?? CFG.maxRetries);
         if (!retryableError) break;
         retriesUsed += 1;
         await sleep(backoffMs(attempt));
@@ -3545,7 +3597,7 @@ async function proxyRequest(req, res, mode) {
     const browserPriority = mode === "view" ? 1000 : (looksLikeApiResource(canonical, accept, method) ? 980 : (/css|javascript|font|svg/i.test(accept) ? 900 : /image/i.test(accept) ? 800 : 700));
     const requestLimit = looksLikeApiResource(canonical, accept, method) ? CFG.proxyApiBodyBytes : CFG.maxProxyBodyBytes;
     const retries = looksLikeApiResource(canonical, accept, method) ? CFG.proxyApiRetries : CFG.maxRetries;
-    const result = await browserScheduler.request(browserKey, () => fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, limit: requestLimit, retries, limitForContentType, noCache: method !== "GET", streamOversize: mode === "resource" }), { priority: browserPriority, host: hostOf(canonical), url: canonical });
+    const result = await browserScheduler.request(browserKey, () => fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, requestId: req.veyraRequestId, limit: requestLimit, retries, limitForContentType, noCache: method !== "GET", streamOversize: mode === "resource" }), { priority: browserPriority, host: hostOf(canonical), url: canonical });
   if (result.tooLarge && mode === "resource" && CFG.proxyStreamOversize && !(download && result.bytes > CFG.maxDownloadBytes)) {
     if (/javascript|ecmascript/i.test(result.contentType || "")) noteScriptDir(sid, result.finalUrl || canonical);
     return streamOversizeResponse(req, res, result, { canonical, method, headers, body, referrer, sid, download });
@@ -3625,7 +3677,11 @@ app.get("/api/form-get/:target/:sid", async (req, res) => {
     respondError(res, 502, `Veyra could not submit this form: ${e.message}`, "PROXY_FORM_GET_ERROR", { requestId: req.veyraRequestId });
   }
 });
-app.get("/api/view", async (req, res) => { try { await proxyRequest(req, res, "view"); } catch (e) { respondError(res, 502, `Veyra could not load this page: ${e.message}`, "PROXY_VIEW_ERROR", { requestId: req.veyraRequestId }); } });
+app.get("/api/view", async (req, res) => { try { await proxyRequest(req, res, "view"); } catch (e) {
+  const message = e.upstreamMessage || e.message;
+  serverLog("warn", "PROXY", `View failed for ${sanitizeLogUrl(req.query?.url || "")} — ${message}`, { requestId: req.veyraRequestId, code: e.code || "PROXY_VIEW_ERROR", upstreamCode: e.upstreamCode || networkErrorCode(e) || null, upstreamPhase: e.upstreamPhase || null, targetHost: e.upstreamHost || hostOf(req.query?.url || "") });
+  respondError(res, e.code === "VPN_KILL_SWITCH" ? 503 : 502, `Veyra could not load this page: ${message}`, "PROXY_VIEW_ERROR", { requestId: req.veyraRequestId, upstreamCode: e.upstreamCode || networkErrorCode(e) || null, upstreamPhase: e.upstreamPhase || null });
+} });
 app.post("/api/view", async (req, res) => { try { await proxyRequest(req, res, "view"); } catch (e) { respondError(res, 502, `Veyra could not submit this form: ${e.message}`, "PROXY_FORM_ERROR", { requestId: req.veyraRequestId }); } });
 app.get("/api/resource", async (req, res) => { try { await proxyRequest(req, res, "resource"); } catch (e) { respondError(res, 502, `Veyra resource error: ${e.message}`, "PROXY_RESOURCE_ERROR", { requestId: req.veyraRequestId }); } });
 app.get("/api/download", async (req, res) => { try { req.query.download = "1"; await proxyRequest(req, res, "resource"); } catch (e) { respondError(res, 502, `Veyra download error: ${e.message}`, "DOWNLOAD_ERROR", { requestId: req.veyraRequestId }); } });
@@ -4096,7 +4152,19 @@ load();
 </body></html>`;
 }
 app.get("/api/debug/status", (req, res) => res.json(buildStatusReport()));
-app.get("/status", (req, res, next) => { if (!CFG.adminGate || isAdminRequest(req)) return next(); res.status(403).type("html").send("<!doctype html><title>Veyra</title><body style=\"font:15px system-ui;background:#0e1014;color:#e8eaee;display:grid;place-items:center;min-height:100vh;margin:0\"><p>This page is for Veyra administrators. Open it from the Veyra app while signed in as an admin, or send the X-Veyra-Admin-Token header.</p></body>"); });
+app.get("/status", (req, res, next) => {
+  if (!CFG.adminGate || isAdminRequest(req)) return next();
+  // Direct navigation to the Render origin cannot carry the bearer token that
+  // Veyra stores in the frontend localStorage. Send the browser to the admin
+  // diagnostics view inside the Veyra app, whose API client attaches that token.
+  try {
+    const target = new URL(CFG.frontendUrl);
+    target.searchParams.set("veyra_route", "/dev");
+    return res.redirect(302, target.toString());
+  } catch {
+    return res.status(403).type("html").send("<!doctype html><title>Veyra</title><body style=\"font:15px system-ui;background:#0e1014;color:#e8eaee;display:grid;place-items:center;min-height:100vh;margin:0\"><p>This page is for Veyra administrators. Open it from the Veyra app while signed in as an admin, or send the X-Veyra-Admin-Token header.</p></body>");
+  }
+});
 app.get("/status", (req, res) => res.type("html").send(statusPage()));
 
 function consolePage() {
@@ -4218,7 +4286,7 @@ if (require.main === module && CFG.processRole !== "worker") {
     serverLog("info", "SYSTEM", `${signal} received — shutting down.`);
     for (const j of jobs.values()) if (!j.done) { j.stopRequested = true; j.stopReason = "shutdown"; }
     const force = setTimeout(() => process.exit(0), 8000); force.unref();
-    await Promise.allSettled([vpnManager.close?.(), workerPool?.close(), browserEngine.shedIdle(0).then(() => browserEngine.browser?.close())]);
+    await Promise.allSettled([vpnManager.close?.(), workerPool?.close(), browserEngine.shedIdle(0).then(() => browserEngine.browser?.close()), DIRECT_HTTP_AGENT.close()]);
     process.exit(0);
   };
   process.once("SIGTERM", () => shutdown("SIGTERM"));

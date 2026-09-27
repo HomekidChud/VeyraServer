@@ -7,6 +7,10 @@ services:
     startCommand: npm start
     healthCheckPath: /health
     envVars:
+      - key: VEYRA_FRONTEND_URL
+        value: https://homekidchud.github.io/VeyraBrowser/
+      - key: FRONTEND_ORIGIN
+        value: https://homekidchud.github.io
       - key: NODE_VERSION
         value: "20"
       - key: PLAYWRIGHT_BROWSERS_PATH
