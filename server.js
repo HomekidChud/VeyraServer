@@ -10,6 +10,10 @@ const path = require("path");
 const os = require("os");
 const { BrowserEngine } = require("./browser-engine");
 const { VpnManager } = require("./vpn");
+const { createShield } = require("./shield");
+const { createWebSearch } = require("./websearch");
+const { installBrandRoutes, isReservedOriginPath, brandNotFoundHtml } = require("./brand");
+const VEYRA_VERSION = require("./package.json").version;
 const { SessionManager } = require("./session-manager");
 const { AuthStore } = require("./auth");
 const { WorkerPool } = require("./worker-pool");
@@ -77,7 +81,17 @@ const PROFILE_CAPS = veyraConfigModule.LEGACY_CAPS;
 function detectResourceProfile() { return RESOURCE_PROFILE; }
 function capForProfile(profile, values) { return values[profile] ?? values.balanced; }
 const P = VEYRA_CONFIG.caps;
+// Lean mode: only for Render's Free instance (512 MB / 0.1 CPU). Big pages are
+// served by the streaming proxy + page-accelerator crawler instead of Chromium,
+// large binaries are streamed instead of buffered, and caches stay small.
+// Paid plans keep the full defaults. VEYRA_LEAN_MODE=0/1 overrides.
+const LEAN_MODE = boolEnv("VEYRA_LEAN_MODE", VEYRA_CONFIG.plan.key === "free");
+const MB = 1024 * 1024;
 const CFG = Object.freeze({
+  leanMode: LEAN_MODE,
+  // Lean mode never launches Chromium automatically; the user can still pick
+  // "Chromium" explicitly (or be handed over to it on a security challenge).
+  leanAutoBrowser: boolEnv("LEAN_AUTO_BROWSER", false),
   processRole: enumEnv("PROCESS_ROLE", "web", ["web", "worker", "all"]),
   // CRAWLER_ROBOTS is the logical crawler fleet. Actual simultaneous network
   // fetches are bounded independently by MAX_ACTIVE_FETCHES.
@@ -118,7 +132,7 @@ const CFG = Object.freeze({
   maxBrowserSessions: Math.min(numberEnv("MAX_BROWSER_SESSIONS", P.browserSessions, 1, 16), P.browserSessions),
   maxBrowserPages: Math.min(numberEnv("MAX_BROWSER_PAGES", P.browserPages, 1, 32), P.browserPages),
   maxBrowserContexts: Math.min(numberEnv("MAX_BROWSER_CONTEXTS", P.browserContexts, 1, 16), P.browserContexts),
-  browserIdleTimeoutMs: numberEnv("BROWSER_IDLE_TIMEOUT_MS", 300000, 10000, 86400000),
+  browserIdleTimeoutMs: numberEnv("BROWSER_IDLE_TIMEOUT_MS", LEAN_MODE ? 90000 : 300000, 10000, 86400000),
   browserSessionTtlMs: numberEnv("BROWSER_SESSION_TTL_MS", 1800000, 60000, 86400000),
   browserNavigationTimeoutMs: numberEnv("BROWSER_NAVIGATION_TIMEOUT_MS", 30000, 5000, 120000),
   browserPageTimeoutMs: numberEnv("BROWSER_PAGE_TIMEOUT_MS", 30000, 5000, 120000),
@@ -148,7 +162,7 @@ const CFG = Object.freeze({
   maxSitemapUrls: numberEnv("MAX_SITEMAP_URLS", 50000, 100, 500000),
   maxJobAgeMs: numberEnv("MAX_JOB_AGE_MS", 60 * 60 * 1000, 60 * 1000, 24 * 60 * 60 * 1000),
   proxyCacheMs: numberEnv("CACHE_TTL_MS", 10000, 0, 300000),
-  maxProxyCacheEntries: numberEnv("MAX_CACHE_ENTRIES", 200, 10, 5000),
+  maxProxyCacheEntries: numberEnv("MAX_CACHE_ENTRIES", LEAN_MODE ? 60 : 200, 10, 5000),
   searchCacheMs: numberEnv("SEARCH_CACHE_TTL_MS", 30000, 0, 600000),
   maxSearchCacheEntries: numberEnv("MAX_SEARCH_CACHE_ENTRIES", 100, 10, 5000),
   maxRequestLog: numberEnv("MAX_REQUEST_LOG", 500, 50, 5000),
@@ -158,9 +172,9 @@ const CFG = Object.freeze({
   maxSearchResults: numberEnv("MAX_SEARCH_RESULTS", 20, 1, 50),
   maxProxyBodyBytes: numberEnv("MAX_PROXY_BODY_BYTES", 4 * 1024 * 1024, 64 * 1024, 32 * 1024 * 1024),
   maxProxyTextBytes: numberEnv("MAX_PROXY_TEXT_BYTES", 8 * 1024 * 1024, 256 * 1024, 32 * 1024 * 1024),
-  maxProxyImageBytes: numberEnv("MAX_PROXY_IMAGE_BYTES", 16 * 1024 * 1024, 256 * 1024, 64 * 1024 * 1024),
-  maxProxyMediaBytes: numberEnv("MAX_PROXY_MEDIA_BYTES", 32 * 1024 * 1024, 512 * 1024, 128 * 1024 * 1024),
-  maxProxyOtherBytes: numberEnv("MAX_PROXY_OTHER_BYTES", 16 * 1024 * 1024, 256 * 1024, 64 * 1024 * 1024),
+  maxProxyImageBytes: numberEnv("MAX_PROXY_IMAGE_BYTES", LEAN_MODE ? 2 * MB : 16 * 1024 * 1024, 256 * 1024, 64 * 1024 * 1024),
+  maxProxyMediaBytes: numberEnv("MAX_PROXY_MEDIA_BYTES", LEAN_MODE ? 1 * MB : 32 * 1024 * 1024, 512 * 1024, 128 * 1024 * 1024),
+  maxProxyOtherBytes: numberEnv("MAX_PROXY_OTHER_BYTES", LEAN_MODE ? 2 * MB : 16 * 1024 * 1024, 256 * 1024, 64 * 1024 * 1024),
   maxFormBodyBytes: numberEnv("MAX_FORM_BODY_BYTES", 1 * 1024 * 1024, 16 * 1024, 8 * 1024 * 1024),
   maxDownloadBytes: numberEnv("MAX_DOWNLOAD_BYTES", 64 * 1024 * 1024, 256 * 1024, 256 * 1024 * 1024),
   maxCacheBodyBytes: Math.min(numberEnv("MAX_CACHE_BODY_BYTES", RESOURCE_PROFILE === "free" ? 1024 * 1024 : 4 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024), RESOURCE_PROFILE === "free" ? 1024 * 1024 : 4 * 1024 * 1024),
@@ -169,7 +183,7 @@ const CFG = Object.freeze({
   maxSessionCookies: numberEnv("MAX_SESSION_COOKIES", 50, 5, 500),
   proxyWarmRobots: Math.min(numberEnv("PROXY_WARM_ROBOTS", P.proxyWarmRobots, 1, 1000), P.proxyWarmRobots),
   proxyWarmConcurrency: Math.min(numberEnv("PROXY_WARM_CONCURRENCY", P.proxyWarmConcurrency, 1, 64), P.proxyWarmConcurrency),
-  proxyWarmLimit: numberEnv("PROXY_WARM_LIMIT", 128, 1, 256),
+  proxyWarmLimit: numberEnv("PROXY_WARM_LIMIT", LEAN_MODE ? 64 : 128, 1, 256),
   proxyWarmPerHost: numberEnv("PROXY_WARM_PER_HOST", 4, 1, 16),
   proxyCriticalPreloadLimit: numberEnv("PROXY_CRITICAL_PRELOAD_LIMIT", 24, 4, 40),
   proxyInlineWarmScanChars: numberEnv("PROXY_INLINE_WARM_SCAN_CHARS", 800000, 10000, 3000000),
@@ -182,7 +196,7 @@ const CFG = Object.freeze({
   mongoCacheBodyMaxBytes: numberEnv("MONGODB_CACHE_BODY_MAX_BYTES", 512 * 1024, 16 * 1024, 768 * 1024),
   mongoCacheTtlMs: numberEnv("MONGODB_CACHE_TTL_MS", 5 * 60 * 1000, 10 * 1000, 24 * 60 * 60 * 1000),
   mongoSharedCache: boolEnv("MONGODB_SHARED_CACHE", true),
-  userAgent: process.env.VEYRA_USER_AGENT || "VeyraBrowseCrawler/8.15.2 (+https://github.com/HomekidChud/VeyraServer)",
+  userAgent: process.env.VEYRA_USER_AGENT || `VeyraBrowseCrawler/${VEYRA_VERSION} (+https://github.com/HomekidChud/VeyraServer)`,
   frontendOrigins: csvEnv("FRONTEND_ORIGIN", ["*"]),
   // Canonical Veyra frontend URL used for safe diagnostics hand-off when /status
   // is opened directly without the Authorization/admin header. A direct browser
@@ -218,7 +232,7 @@ const CFG = Object.freeze({
   // quickly instead of turning the user's short browsing session into a full-site crawl.
   crawlerPageAccelerator: boolEnv("CRAWLER_PAGE_ACCELERATOR", true),
   crawlerPageWarmMs: numberEnv("CRAWLER_PAGE_WARM_MS", 8000, 2000, 60000),
-  crawlerPageMaxResources: numberEnv("CRAWLER_PAGE_MAX_RESOURCES", 128, 16, 2000),
+  crawlerPageMaxResources: numberEnv("CRAWLER_PAGE_MAX_RESOURCES", LEAN_MODE ? 96 : 128, 16, 2000),
   crawlerPageMinPerHostConcurrency: numberEnv("CRAWLER_PAGE_MIN_PER_HOST_CONCURRENCY", 4, 1, 32),
   vpnEnabled: boolEnv("VPN_ENABLED", false),
   vpnMode: enumEnv("VPN_MODE", "proxy", ["proxy", "auto", "wireguard"]),
@@ -279,6 +293,11 @@ const DIRECT_HTTP_AGENT = new UndiciAgent({
   pipelining: 1
 });
 
+const shield = createShield(process.env, { lean: CFG.leanMode, log: (level, source, message) => setImmediate(() => serverLog(level, source, message)) });
+app.set("trust proxy", true);
+app.disable("x-powered-by");
+app.use(shield.middleware);
+installBrandRoutes(app, { frontendUrl: () => CFG.frontendUrl, version: VEYRA_VERSION, isPreviewBot: ua => shield.isPreviewBot(ua), hasProxiedReferer: req => !!proxiedPageFromReferer(req, { allowCookie: false }) });
 const allowedOrigins = CFG.frontendOrigins.includes("*") ? true : CFG.frontendOrigins;
 app.use(cors({
   origin: allowedOrigins,
@@ -672,6 +691,11 @@ function jobLog(job, level, message, meta = {}) {
   if (job.logs.length > 250) job.logs.splice(0, job.logs.length - 250);
   serverLog(level, "CRAWLER", message, { jobId: job.id, ...meta });
 }
+function isIncognitoSid(sid) {
+  const id = String(sid || "");
+  if (!id) return false;
+  try { return !!sessionManager.peek(id)?.incognito; } catch { return false; }
+}
 function requestLogAdd(entry) {
   requestLog.push({ id: ++requestLogSeq, ...entry });
   if (requestLog.length > CFG.maxRequestLog) requestLog.splice(0, requestLog.length - CFG.maxRequestLog);
@@ -696,7 +720,8 @@ app.use((req, res, next) => {
       path: req.path,
       status: res.statusCode,
       ms: Math.round(ms * 10) / 10,
-      targetHost: target ? (() => { try { return new URL(target).hostname; } catch { return ""; } })() : ""
+      // Incognito sessions leave no browsing trail in the server's request log.
+      targetHost: target && !isIncognitoSid(req.query?.sid) ? (() => { try { return new URL(target).hostname; } catch { return ""; } })() : ""
     });
   });
   next();
@@ -1208,9 +1233,10 @@ async function fetchCached(url, opts = {}) {
       if (!noStore && !result.truncated && !result.tooLarge && bodyBytes <= CFG.maxCacheBodyBytes) cacheSet(proxyCache, key, { response: result, etag: result.etag, lastModified: result.lastModified }, CFG.maxProxyCacheEntries);
       const shareableType = /(?:text\/css|javascript|font\/|image\/|image\/svg\+xml)/i.test(String(result.contentType || ""));
       const noSessionCookies = !result.setCookieHeader && (!sid || !cookieHeader(sid, normalized));
-      const shared = CFG.mongoSharedCache && shareableType && noSessionCookies && !noStore && !result.truncated && !result.tooLarge && bodyBytes <= Math.min(CFG.maxCacheBodyBytes, CFG.mongoCacheBodyMaxBytes);
+      const incognito = isIncognitoSid(sid);
+      const shared = !incognito && CFG.mongoSharedCache && shareableType && noSessionCookies && !noStore && !result.truncated && !result.tooLarge && bodyBytes <= Math.min(CFG.maxCacheBodyBytes, CFG.mongoCacheBodyMaxBytes);
       if (shared) { const sharedResult = { ...result, sessionId: "" }; cacheSet(proxyCache, sharedKey, { response: sharedResult, etag: result.etag, lastModified: result.lastModified }, CFG.maxProxyCacheEntries); void mongoStore.putProxyCache(sharedKey, result, { url: result.finalUrl || normalized, sessionId: "" }); }
-      else if (!sid && !noStore && !result.truncated && !result.tooLarge && bodyBytes <= Math.min(CFG.maxCacheBodyBytes, CFG.mongoCacheBodyMaxBytes)) void mongoStore.putProxyCache(key, result, { url: result.finalUrl || normalized, sessionId: "" });
+      else if (!sid && !incognito && !noStore && !result.truncated && !result.tooLarge && bodyBytes <= Math.min(CFG.maxCacheBodyBytes, CFG.mongoCacheBodyMaxBytes)) void mongoStore.putProxyCache(key, result, { url: result.finalUrl || normalized, sessionId: "" });
     }
     return result;
   })();
@@ -1478,7 +1504,7 @@ function challengeFallbackHtml(url, info, sid = "") {
     ["Brave Search", `https://search.brave.com/search?q=${encodeURIComponent(query)}`],
     ["DuckDuckGo", `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`]
   ].map(([n, h]) => `<a class="secondary" href="${escapeHtml(makeViewUrl(h, sid))}">Search “${escapeHtml(query)}” on ${n}</a>`).join("") : "";
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#10151d;color:#eaf0f6;font:15px/1.5 system-ui,sans-serif}.card{max-width:650px;margin:24px;padding:32px;background:#171e28;border:1px solid #303a48;border-radius:18px;box-shadow:0 20px 60px #0008}.ey{font-size:11px;letter-spacing:.15em;text-transform:uppercase;color:#86a9d5}.card h1{font-size:26px;margin:10px 0}.card p{color:#aab5c4}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px}.actions a{display:inline-block;padding:10px 15px;border-radius:9px;text-decoration:none}.primary{background:#4b82c9;color:#fff}.secondary{border:1px solid #3a4657;color:#dce5ef}.secondary:hover{background:#1f2835}</style></head><body><main class="card"><div class="ey">Veyra Browser</div><h1>${escapeHtml(title)}</h1><p>${why}</p><div class="actions">${alt}<a class="primary" href="${safe}" target="_blank" rel="noopener noreferrer">Open directly in a new tab</a><a class="secondary" href="${escapeHtml(makeViewUrl(url, sid))}">Retry through Veyra</a></div></main></body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#10151d;color:#eaf0f6;font:15px/1.5 system-ui,sans-serif}.card{max-width:650px;margin:24px;padding:32px;background:#171e28;border:1px solid #303a48;border-radius:18px;box-shadow:0 20px 60px #0008}.ey{font-size:11px;letter-spacing:.15em;text-transform:uppercase;color:#86a9d5}.card h1{font-size:26px;margin:10px 0}.card p{color:#aab5c4}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px}.actions a{display:inline-block;padding:10px 15px;border-radius:9px;text-decoration:none}.primary{background:#4b82c9;color:#fff}.secondary{border:1px solid #3a4657;color:#dce5ef}.secondary:hover{background:#1f2835}</style></head><body><main class="card"><div class="ey">Veyra Browser</div><h1>${escapeHtml(title)}</h1><p>${why}</p><div class="actions"><a class="primary" href="#" id="veyraChromium">Verify in real Chromium</a>${alt}<a class="secondary" href="${safe}" target="_blank" rel="noopener noreferrer">Open directly in a new tab</a><a class="secondary" href="${escapeHtml(makeViewUrl(url, sid))}">Retry through Veyra</a></div><p style="font-size:13px;margin-top:18px">Chromium shows the site's own check so <b>you</b> can complete it. Veyra never solves or bypasses it for you.</p></main><script>(function(){var m={type:"veyra:challenge",url:${JSON.stringify(String(url)).replace(/</g, "\\u003c")},kind:${JSON.stringify(String(info?.type || "verification"))},auto:${CFG.leanMode ? "false" : "true"}};try{if(parent!==window)parent.postMessage(m,"*")}catch(e){}var b=document.getElementById("veyraChromium");if(b)b.onclick=function(e){e.preventDefault();m.auto=false;m.manual=true;try{parent.postMessage(m,"*")}catch(x){}}})();</script></body></html>`;
 }
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m])); }
 
@@ -1573,7 +1599,7 @@ function injectRuntime(html, original, sid = "") {
   const HP=(typeof History!=='undefined'&&History.prototype)||null;
   const nativeReplaceState=HP?HP.replaceState:history.replaceState;
   function rootProxiedFrame(){try{return window.parent===window||!window.parent.__VEYRA_PROXY__}catch{return true}}
-  function remember(next){virtualUrl=next;window.__VEYRA_PAGE_URL__=next;if(rootProxiedFrame())try{document.cookie='veyra_ctx='+encodeURIComponent(next)+'|'+encodeURIComponent(SESSION_ID)+';path=/;max-age=86400;'+(location.protocol==='https:'?'SameSite=None;Secure':'SameSite=Lax')}catch{}}
+  function remember(next){virtualUrl=next;window.__VEYRA_PAGE_URL__=next;if(rootProxiedFrame())try{document.cookie='veyra_ctx='+encodeURIComponent(next)+'|'+encodeURIComponent(SESSION_ID)+';path=/;max-age=3600;'+(location.protocol==='https:'?'SameSite=None;Secure;Partitioned':'SameSite=Lax')}catch{}}
   function proxyHistory(method,native){return function(state,title,url){
     let next=virtualUrl;try{if(url!=null)next=fixOwn(new URL(unwrap(String(url)),virtualUrl)).href}catch{}
     remember(next);
@@ -3068,10 +3094,14 @@ app.post('/api/browser/capability', async (req, res) => {
     await assertPublicUrl(raw);
     const result = await fetchCached(raw, { accept: 'text/html,application/xhtml+xml', limit: Math.min(CFG.maxProxyTextBytes, 1024 * 1024), timeout: CFG.requestTimeoutMs, retries: 0, referrer: '' });
     const signals = browserCapabilitySignals(result.body?.toString('utf8') || '', { 'content-type': result.contentType });
-    const mode = signals.heavy ? 'BROWSER_ENGINE' : 'FAST_PROXY';
-    res.json({ ok: true, url: result.finalUrl || raw, mode, signals, status: result.status, contentType: result.contentType });
+    const challenge = detectChallenge(result.body?.toString('utf8') || '', result.contentType, result.status, { server: result.serverHeader, 'cf-mitigated': result.cfMitigated, finalUrl: result.finalUrl });
+    // Lean (Render Free) mode: heavy/SPA pages are served by the fast proxy +
+    // page-accelerator crawler instead of a 250 MB+ Chromium process.
+    const lean = CFG.leanMode && !CFG.leanAutoBrowser;
+    const mode = challenge ? 'BROWSER_ENGINE' : signals.heavy ? (lean ? 'ACCELERATED_PROXY' : 'BROWSER_ENGINE') : 'FAST_PROXY';
+    res.json({ ok: true, url: result.finalUrl || raw, mode, lean: CFG.leanMode, challenge: challenge ? challenge.type : null, signals, status: result.status, contentType: result.contentType });
   } catch (e) {
-    res.json({ ok: true, url: raw, mode: 'BROWSER_ENGINE', reason: 'capability_probe_failed', error: e.message });
+    res.json({ ok: true, url: raw, mode: CFG.leanMode ? 'ACCELERATED_PROXY' : 'BROWSER_ENGINE', lean: CFG.leanMode, reason: 'capability_probe_failed', error: e.message });
   }
 });
 
@@ -3131,7 +3161,7 @@ function sessionInfo(sid, rec) {
   return { sessionId: sid, active: true, createdAt: new Date(rec.createdAt).toISOString(), lastUsed: new Date(rec.lastUsed).toISOString(),
     timeLimitMs: (rec.timeLimitMs ?? sessionManager.timeLimitMs) || null, expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null, remainingMs: sessionManager.remainingMs(rec),
     idleExpiresInMs: Math.max(0, CFG.sessionIdleTtlMs - (Date.now() - rec.lastUsed)), cookies: rec.cookies.size, requests: rec.requests,
-    serverTime: new Date().toISOString(), vpn: vpnManager.sessionInfo?.(sid) || null };
+    serverTime: new Date().toISOString(), incognito: !!rec.incognito, vpn: vpnManager.sessionInfo?.(sid) || null };
 }
 app.get('/api/sessions', requireAdmin, (req, res) => res.json({ ok: true, ...sessionManager.report(), vpnConnections: vpnManager.status().connections, browser: { sessions: browserEngine.sessions.size, running: !!browserEngine.browser } }));
 // Start a fresh browsing session. The frontend shows a countdown from expiresAt.
@@ -3143,6 +3173,8 @@ app.post('/api/session', (req, res) => {
   const rec = sessionManager.create(sid, { timeLimitMs: limit });
   rec.userId = user?.id || null;
   rec.role = isAdmin ? "admin" : "user";
+  // Incognito: no shared/persistent (Mongo) cache writes, no URL/host logging.
+  rec.incognito = req.body?.incognito === true;
   res.status(201).json({ ok: true, ...sessionInfo(sid, rec), user: user ? authStore.publicUser(user) : null });
 });
 app.get('/api/session/:sid', (req, res) => {
@@ -3231,7 +3263,8 @@ function configEditAllowed(req) {
 }
 function runtimeConfigSummary() {
   return {
-    plan: CFG.plan, resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb,
+    plan: CFG.plan, leanMode: CFG.leanMode, resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb,
+    shield: shield.status(),
     crawlers: { maxActiveJobs: CFG.maxActiveJobs, effectiveMaxActiveJobs: effectiveMaxActiveJobs(), running: activeCrawlCount(), queued: crawlQueue.length, queueMax: CFG.crawlQueueMax, abandonMs: CFG.crawlAbandonMs, robotsPerCrawl: CFG.logicalRobots, maxActiveFetches: CFG.maxActiveFetches, perHostConcurrency: CFG.perHostConcurrency, pageAccelerator: CFG.crawlerPageAccelerator, pageWarmMs: CFG.crawlerPageWarmMs, pageWarmMaxResources: CFG.crawlerPageMaxResources, proxyWarmLimit: CFG.proxyWarmLimit, proxyWarmConcurrency: CFG.proxyWarmConcurrency, proxyWarmPerHost: CFG.proxyWarmPerHost, proxyCriticalPreloadLimit: CFG.proxyCriticalPreloadLimit },
     workers: workerPool ? workerPool.report() : { size: 0, mode: 'inline', configured: CFG.parseWorkers },
     sessions: { maxSessions: CFG.maxProxySessions, idleTtlMs: CFG.sessionIdleTtlMs, maxAgeMs: CFG.sessionMaxAgeMs, maxCookieBytes: CFG.sessionMaxCookieBytes, serverIdleSleepMs: CFG.serverIdleSleepMs },
@@ -3363,8 +3396,9 @@ app.post('/api/browser/session/:id/devtools', async (req, res) => {
 app.get('/api/browser/session/:id/screenshot', async (req,res) => { try { const png=await browserEngine.screenshot(req.params.id); if(!png) return respondError(res,503,'Screenshot unavailable.','BROWSER_SCREENSHOT_ERROR'); res.setHeader('content-type','image/png'); res.setHeader('cache-control','no-store'); res.send(png); } catch(e) { respondError(res,404,e.message,e.code||'BROWSER_SCREENSHOT_ERROR'); } });
 
 // Health and debug.
-const healthPayload = () => ({ ok: true, service: "veyra", plan: CFG.plan, mongo: mongoStore.status(), sleeping: sessionManager.sleeping, sessions: sessionManager.size, crawlers: { running: activeCrawlCount(), queued: crawlQueue.length, max: effectiveMaxActiveJobs() }, uptimeSec: Math.round(process.uptime()), activeJobs: [...jobs.values()].filter(j => !j.done).length, processRole: CFG.processRole, resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb, crawlerFetchLimit: effectiveCrawlerConcurrency(), logicalRobots: CFG.logicalRobots, vpn: vpnManager.status() });
+const healthPayload = () => ({ ok: true, service: "veyra", version: VEYRA_VERSION, plan: CFG.plan, leanMode: CFG.leanMode, mongo: mongoStore.status(), sleeping: sessionManager.sleeping, sessions: sessionManager.size, crawlers: { running: activeCrawlCount(), queued: crawlQueue.length, max: effectiveMaxActiveJobs() }, uptimeSec: Math.round(process.uptime()), activeJobs: [...jobs.values()].filter(j => !j.done).length, processRole: CFG.processRole, resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb, crawlerFetchLimit: effectiveCrawlerConcurrency(), logicalRobots: CFG.logicalRobots, vpn: vpnManager.status() });
 app.get("/health", (req, res) => res.json(healthPayload()));
+app.get("/api/shield", (req, res) => res.json({ ok: true, ...shield.status() }));
 app.get("/api/health", (req, res) => res.json(healthPayload()));
 // DevTools bridge script (loaded on demand by the injected page runtime).
 const DEVTOOLS_BRIDGE = (() => { const src = fs.readFileSync(path.join(__dirname, "devtools-bridge.js"), "utf8"); return src.slice(0, src.indexOf("if (typeof module")) + "\nwindow.installVeyraDevtools = installVeyraDevtools;\n"; })();
@@ -3408,6 +3442,30 @@ app.post("/api/debug/client-log", (req, res) => {
     });
   }
   res.json({ ok: true, stored: events.length });
+});
+
+const WEB_SEARCH_UA = process.env.WEB_SEARCH_USER_AGENT || "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
+const webSearch = createWebSearch({
+  log: (level, source, message) => serverLog(level, source, message),
+  fetchText: async (url, { accept } = {}) => {
+    const r = await fetchBuffer(url, { headers: { "accept-language": "en-GB,en;q=0.8" }, accept: accept || "text/html", userAgent: WEB_SEARCH_UA, limit: 2 * 1024 * 1024, timeout: 9000, retries: 0 });
+    return { ok: r.status >= 200 && r.status < 300, status: r.status, text: r.body ? r.body.toString("utf8") : "", finalUrl: r.finalUrl };
+  }
+});
+// Web results for Veyra's own results page: Google (official API, if keys are
+// configured) -> DuckDuckGo -> Bing. Never proxies a search engine's UI.
+app.get("/api/search/web", async (req, res) => {
+  const started = performance.now();
+  const query = String(req.query.q || "").trim();
+  if (!query) return respondError(res, 400, "Search query is empty.", "SEARCH_EMPTY");
+  if (query.length > CFG.maxSearchQueryChars) return respondError(res, 400, "Search query is too long.", "SEARCH_QUERY_TOO_LONG");
+  const offset = Math.max(0, Math.min(90, Number(req.query.offset || 0) || 0));
+  const engine = String(req.query.engine || "").toLowerCase().replace(/[^a-z]/g, "").slice(0, 20);
+  const lang = String(req.query.lang || "").toLowerCase().replace(/[^a-z]/g, "").slice(0, 5);
+  try {
+    const r = await webSearch.search(query, { offset, engine, lang });
+    res.json({ ok: true, query, offset, responseTimeMs: Math.round((performance.now() - started) * 10) / 10, ...r });
+  } catch (e) { respondError(res, 502, e.message, "WEB_SEARCH_ERROR"); }
 });
 
 app.get("/api/search", async (req, res) => {
@@ -3792,7 +3850,11 @@ async function proxyRequest(req, res, mode) {
     const retries = looksLikeApiResource(canonical, accept, method) ? CFG.proxyApiRetries : CFG.maxRetries;
     const requestUserAgent = req.get("User-Agent") ? String(req.get("User-Agent")).slice(0, 2000) : "";
     const result = await browserScheduler.request(browserKey, () => fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, requestId: req.veyraRequestId, userAgent: requestUserAgent || undefined, limit: requestLimit, retries, limitForContentType, noCache: method !== "GET", streamOversize: mode === "resource" }), { priority: browserPriority, host: hostOf(canonical), url: canonical });
-  if (result.tooLarge && mode === "resource" && CFG.proxyStreamOversize && !(download && result.bytes > CFG.maxDownloadBytes)) {
+  // Oversize bodies are streamed straight through (constant memory) instead of
+  // buffered. Top-level non-HTML documents (a big image, PDF, video opened
+  // directly) stream as well; only HTML must be buffered for rewriting.
+  const streamable = mode === "resource" || !/html|xhtml/i.test(String(result.contentType || ""));
+  if (result.tooLarge && streamable && CFG.proxyStreamOversize && !(download && result.bytes > CFG.maxDownloadBytes)) {
     if (/javascript|ecmascript/i.test(result.contentType || "")) noteScriptDir(sid, result.finalUrl || canonical);
     return streamOversizeResponse(req, res, result, { canonical, method, headers, body, referrer, sid, download });
   }
@@ -4388,12 +4450,13 @@ function proxiedPageFromCookie(req) {
   const pageUrl = normalizeUrl(page || "");
   return pageUrl ? { pageUrl, sid: sid || "" } : null;
 }
-function proxiedPageFromReferer(req) {
+function proxiedPageFromReferer(req, { allowCookie = true } = {}) {
   const raw = String(req.get("Referer") || "");
-  if (!raw) return proxiedPageFromCookie(req);
+  const fromCookie = () => allowCookie ? proxiedPageFromCookie(req) : null;
+  if (!raw) return fromCookie();
   try {
     const r = new URL(raw);
-    if (!/^[/]api[/](view|resource|form-get)/.test(r.pathname)) return proxiedPageFromCookie(req);
+    if (!/^[/]api[/](view|resource|form-get)/.test(r.pathname)) return fromCookie();
     let page = r.searchParams.get("url") || r.searchParams.get("target") || r.searchParams.get("u") || "";
     if (!page && r.pathname.startsWith("/api/form-get/")) page = decodePathToken(r.pathname.split("/")[3] || "");
     const pageUrl = normalizeUrl(page);
@@ -4438,17 +4501,32 @@ app.use(async (req, res, next) => {
     if (VEYRA_API_ROUTES.has(first)) return next();
     escaped = req.originalUrl.replace(/^[/]api[/]/, "");
   }
-  const ctx = proxiedPageFromReferer(req);
+  // Header/favicon hijack guard. The veyra_ctx cookie remembers the last proxied
+  // page so escaped root-relative requests can be recovered, but it must never
+  // turn a *top-level* visit to Veyra's own origin (typing the Render URL,
+  // opening a shared link, the browser's automatic /favicon.ico fetch, link
+  // preview bots) into the last website someone viewed.
+  const dest = String(req.get("Sec-Fetch-Dest") || "").toLowerCase();
+  const topLevel = dest === "document" || (!dest && /text\/html/i.test(String(req.get("Accept") || "")) && !req.get("Referer"));
+  const reserved = isReservedOriginPath(req.path);
+  const ctx = proxiedPageFromReferer(req, { allowCookie: !topLevel && !reserved && !shield.isPreviewBot(req.get("User-Agent")) });
   if (!ctx) return next();
   let target = null;
   if (escaped !== req.originalUrl && /[.](m?js|css|wasm|json|map)([?#]|$)/i.test(req.path)) target = await resolveEscapedChunk(ctx.sid, escaped);
   if (!target) { try { target = normalizeUrl(new URL(escaped, ctx.pageUrl).href); } catch { target = null; } }
   if (!target) return next();
-  const dest = String(req.get("Sec-Fetch-Dest") || "").toLowerCase();
   const mode = dest === "document" || dest === "iframe" || dest === "frame" ? "view" : "resource";
   Object.defineProperty(req, "query", { value: { url: target, sid: ctx.sid, from: ctx.pageUrl }, writable: true, configurable: true });
   try { await proxyRequest(req, res, mode); }
   catch (e) { respondError(res, 502, `Veyra resource error: ${e.message}`, "PROXY_RELATIVE_FALLBACK_ERROR", { requestId: req.veyraRequestId }); }
+});
+
+// Anything that reaches here is not a Veyra route and not a recoverable
+// proxied path: answer with Veyra's own branded 404 (never a proxied site).
+app.use((req, res, next) => {
+  if (res.headersSent) return next();
+  if (req.path.startsWith("/api/")) return respondError(res, 404, "Unknown Veyra API route.", "NOT_FOUND");
+  res.status(404).type("html").send(brandNotFoundHtml(CFG.frontendUrl));
 });
 
 // Safe JSON/API error handling and process guards.

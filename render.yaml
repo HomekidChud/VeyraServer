@@ -24,6 +24,14 @@ services:
       # Optional durable MongoDB persistence/cache. Set MONGODB_URI in Render.
       - key: MONGODB_URI
         sync: false
+      # 8.16: Veyra Shield level (low | medium | high | under_attack).
+      - key: SHIELD_LEVEL
+        value: medium
+      # 8.16: optional Google results via the official Custom Search JSON API.
+      - key: GOOGLE_SEARCH_API_KEY
+        sync: false
+      - key: GOOGLE_SEARCH_CX
+        sync: false
       - key: MONGODB_DB
         value: veyra
       - key: MONGODB_MAX_POOL_SIZE

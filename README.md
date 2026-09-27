@@ -1,10 +1,10 @@
-## Veyra 8.15.4
+## Veyra 8.16.0
 
 ## Content-complete adaptive page loading
 
 Browsing crawls are bounded page accelerators. They do not expand same-origin navigation links during first-page acceleration. Critical assets receive bounded preload hints, inline script/style asset literals are warmed without executing page code, and crawler discovery is deferred until the page is usable.
 
-# Veyra Browser backend v8.15.4 — OmniCrawler / hybrid browser
+# Veyra Browser backend v8.16.0 — OmniCrawler / hybrid browser
 
 This release keeps the existing Express proxy, crawler, search index, browser scheduler, and browser-engine architecture and strengthens the scheduling/discovery path in place.
 
@@ -48,11 +48,7 @@ Security verification remains user-assisted. Veyra does not solve or bypass anti
 
 ## Tests
 
-```text
-npm test
-npm run test:urls
-npm run test:all
-```
+The release package ships without test files. Keep regression tests in your development checkout; they are not needed to run or deploy Veyra.
 
 
 ## v8.10.0 stability profile
@@ -163,18 +159,7 @@ VPN_PROFILES_JSON=[{"id":"uk1","server":"socks5://user-{session}:pw@gw.provider.
 
 Endpoints: `GET /api/vpn/status`, `GET /api/vpn/profiles`, `POST /api/vpn/connect {sessionId, profileId | "auto", region?, group?}`, `POST /api/vpn/disconnect`, `POST /api/vpn/rotate`, `GET /api/vpn/session?sid=`, `GET /api/vpn/ip?sid=` (the real exit IP), `POST /api/vpn/test {profileId}`, `POST /api/vpn/health`.
 
-### Tests
-
-`npm run test:vpn` covers these against local SOCKS5/HTTP proxies:
-
-- auth and remote DNS
-- sticky sessions and rotation
-- failover and the kill switch
-- split tunnelling
-- the Chromium gateway
-- a real WireGuard handshake between two wireproxy peers
-
-`npm run test:capacity` covers the config precedence rules, the CLI, the session LRU/idle/sleep behaviour, worker-vs-inline parity, and the crawl queue.
+Coverage for VPN failover, kill switch, split tunnelling and capacity/queue behaviour was verified before release; test files are not shipped in this package.
 
 ## v8.13.0 — accounts, session time limits, admin gating
 
