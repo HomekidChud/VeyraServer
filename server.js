@@ -1180,9 +1180,13 @@ async function fetchCached(url, opts = {}) {
   const normalized = normalizeUrl(url);
   const referrerKey = String(opts.referrer || "");
   const sid = String(opts.sessionId || "");
-  const baseKey = `${method} ${normalized} | ref=${referrerKey}`;
+  // User-Agent can materially change Google/YouTube login/API responses. Keep
+  // foreground browser traffic isolated from crawler responses in both the
+  // in-memory and Mongo shared-cache keys.
+  const userAgentKey = opts.userAgent ? crypto.createHash("sha1").update(String(opts.userAgent)).digest("hex").slice(0, 16) : "default";
+  const baseKey = `${method} ${normalized} | ref=${referrerKey} | ua=${userAgentKey}`;
   const key = `${baseKey} | sid=${sid}`;
-  const sharedKey = `${method} ${normalized} | sid=*`;
+  const sharedKey = `${method} ${normalized} | ua=${userAgentKey} | sid=*`;
   const canCoalesce = method === "GET" && !opts.noCache && !opts.streamOversize;
   if (canCoalesce) { const existing = fetchInflight.get(key); if (existing) return existing; }
   const work = (async () => {
@@ -3590,7 +3594,8 @@ function sameSiteFetchMetadata(targetUrl, sourceUrl, mode) {
     return {
       "sec-fetch-site": source ? (sameOriginRequest ? "same-origin" : "cross-site") : "none",
       "sec-fetch-mode": mode === "view" ? "navigate" : "cors",
-      "sec-fetch-dest": mode === "view" ? "document" : "empty"
+      "sec-fetch-dest": mode === "view" ? "document" : "empty",
+      ...(mode === "view" ? { "sec-fetch-user": "?1" } : {})
     };
   } catch {
     return {};
@@ -3762,10 +3767,16 @@ async function proxyRequest(req, res, mode) {
     } }
   const headers = forwardProxyBrowserHeaders(req, canonical, sourceUrl, mode, {
     accept,
+    // Foreground proxy traffic should look like the real browser request to the
+    // destination. The crawler User-Agent is intentionally reserved for crawler jobs.
+    ...(req.get("User-Agent") ? { "user-agent": String(req.get("User-Agent")).slice(0, 2000) } : {}),
+    ...(req.get("Accept-Language") ? { "accept-language": String(req.get("Accept-Language")).slice(0, 1000) } : {}),
+    ...(req.get("Upgrade-Insecure-Requests") ? { "upgrade-insecure-requests": String(req.get("Upgrade-Insecure-Requests")).slice(0, 20) } : {}),
     ...(req.get("Content-Type") ? { "content-type": String(req.get("Content-Type")).slice(0, 500) } : {}),
     ...(req.get("Range") ? { range: String(req.get("Range")).slice(0, 200) } : {}),
     ...(referrer ? { referer: referrer } : {}),
-    ...(sourceOrigin ? { origin: sourceOrigin } : {})
+    // Do not manufacture an Origin header for top-level GET/HEAD navigations.
+    ...(sourceOrigin && method !== "GET" && method !== "HEAD" ? { origin: sourceOrigin } : {})
   });
   const limitForContentType = (ct) => {
     const type = String(ct || "").toLowerCase();
@@ -3779,7 +3790,8 @@ async function proxyRequest(req, res, mode) {
     const browserPriority = mode === "view" ? 1000 : (looksLikeApiResource(canonical, accept, method) ? 980 : (/css|javascript|font|svg/i.test(accept) ? 900 : /image/i.test(accept) ? 800 : 700));
     const requestLimit = looksLikeApiResource(canonical, accept, method) ? CFG.proxyApiBodyBytes : CFG.maxProxyBodyBytes;
     const retries = looksLikeApiResource(canonical, accept, method) ? CFG.proxyApiRetries : CFG.maxRetries;
-    const result = await browserScheduler.request(browserKey, () => fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, requestId: req.veyraRequestId, limit: requestLimit, retries, limitForContentType, noCache: method !== "GET", streamOversize: mode === "resource" }), { priority: browserPriority, host: hostOf(canonical), url: canonical });
+    const requestUserAgent = req.get("User-Agent") ? String(req.get("User-Agent")).slice(0, 2000) : "";
+    const result = await browserScheduler.request(browserKey, () => fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, requestId: req.veyraRequestId, userAgent: requestUserAgent || undefined, limit: requestLimit, retries, limitForContentType, noCache: method !== "GET", streamOversize: mode === "resource" }), { priority: browserPriority, host: hostOf(canonical), url: canonical });
   if (result.tooLarge && mode === "resource" && CFG.proxyStreamOversize && !(download && result.bytes > CFG.maxDownloadBytes)) {
     if (/javascript|ecmascript/i.test(result.contentType || "")) noteScriptDir(sid, result.finalUrl || canonical);
     return streamOversizeResponse(req, res, result, { canonical, method, headers, body, referrer, sid, download });

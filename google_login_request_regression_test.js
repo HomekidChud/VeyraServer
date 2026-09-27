@@ -1,0 +1,12 @@
+const fs = require("fs");
+const assert = require("assert");
+const path = require("path");
+const s = fs.readFileSync(path.join(__dirname, "server.js"), "utf8");
+assert(s.includes('"sec-fetch-user": "?1"'), "top-level proxy navigation should send browser-like sec-fetch-user");
+assert(s.includes('sourceOrigin && method !== "GET" && method !== "HEAD"'), "Origin must not be forced onto top-level GET/HEAD navigations");
+assert(s.includes('const requestUserAgent'), "foreground proxy requests should retain the browser User-Agent");
+assert(s.includes('userAgent: requestUserAgent || undefined'), "foreground fetches must receive the browser User-Agent");
+assert(s.includes('Upgrade-Insecure-Requests'), "browser upgrade-insecure request hint should be forwarded when present");
+assert(s.includes('const userAgentKey'), "proxy cache keys must vary by foreground User-Agent");
+assert(s.includes('| ua=${userAgentKey}'), "crawler and foreground cache entries must not collide");
+console.log("Google login request regression checks passed");
