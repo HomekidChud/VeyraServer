@@ -2,10 +2,17 @@ services:
   - type: web
     name: VeyraServer
     runtime: node
-    buildCommand: npm install && npx playwright install chromium
+    plan: free
+    buildCommand: npm install && npx playwright install chromium && node install-wireproxy.js
     startCommand: npm start
     envVars:
       - key: NODE_VERSION
         value: "20"
       - key: PLAYWRIGHT_BROWSERS_PATH
         value: "0"
+      # Keep in sync with `plan:` above (npm run config -- plan <name> does both).
+      # "auto" also works: Veyra detects the instance's RAM/CPU from cgroups.
+      - key: VEYRA_ENV
+        value: production
+      # Secrets — set these in the Render dashboard, never in git:
+      # VEYRA_ADMIN_TOKEN, VPN_PROFILES_JSON, VPN_WIREGUARD_CONFIG_B64

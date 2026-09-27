@@ -18,4 +18,4 @@ ok('status includes new robot bundle configuration', s.includes('robotBundleSize
 ok('browser binary ensure script is wired', fs.existsSync(path.join(__dirname, 'ensure-browser.js')) && fs.existsSync(path.join(__dirname, 'render.yaml')));
 const pkg = JSON.parse(fs.readFileSync(path.join(__dirname,'package.json'),'utf8'));
 ok('prestart browser ensure is wired', pkg.scripts && pkg.scripts.prestart === 'node ensure-browser.js');
-console.log('Veyra v8.8.2 static regression checks passed');
+console.log('Veyra static regression checks passed');

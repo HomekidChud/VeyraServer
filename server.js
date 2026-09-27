@@ -10,7 +10,17 @@ const path = require("path");
 const os = require("os");
 const { BrowserEngine } = require("./browser-engine");
 const { VpnManager } = require("./vpn");
+const { SessionManager } = require("./session-manager");
+const { WorkerPool } = require("./worker-pool");
+const { isMainThread } = require("worker_threads");
+// parse-worker.js loads this file inside worker threads to reuse the pure
+// rewrite / discovery functions. In that mode nothing long-lived is started.
+const IS_THREAD_WORKER = !isMainThread && process.env.VEYRA_THREAD_WORKER === "1";
 const { fetch: undiciFetch } = require("undici");
+const veyraConfigModule = require("./config");
+// Layer plan preset + veyra.config.json under the real environment BEFORE any
+// env var is read below.
+const VEYRA_CONFIG = veyraConfigModule.applyToProcessEnv(veyraConfigModule.loadConfig());
 
 const app = express();
 const PORT = numberEnv("PORT", 10000, 1, 65535);
@@ -57,43 +67,14 @@ function detectCgroupMemoryLimitBytes() {
   return 0;
 }
 function detectedMemoryMb() { const b = detectCgroupMemoryLimitBytes(); return b ? Math.round(b / 1024 / 1024) : 0; }
-function detectResourceProfile() {
-  const explicit = String(process.env.RESOURCE_PROFILE || "auto").trim().toLowerCase();
-  if (["free","balanced","high"].includes(explicit)) return explicit;
-  const mb = detectedMemoryMb();
-  if (mb && mb <= 768) return "free";
-  if (mb && mb <= 2048) return "balanced";
-  return "high";
-}
-function capForProfile(profile, values) {
-  return values[profile] ?? values.balanced;
-}
-const RESOURCE_PROFILE = detectResourceProfile();
-const MEMORY_LIMIT_MB = detectedMemoryMb();
-const PROFILE_CAPS = {
-  free: {
-    maxActiveFetches: 10, browserMaxActiveFetches: 6, browserSessions: 1, browserPages: 2, browserContexts: 2,
-    maxPendingQueue: 600, maxPages: 2500, maxResources: 6000, maxLinks: 30000, maxCacheEntries: 50,
-    maxIndexDocs: 5000, maxCrossOriginResources: 250, sitemapConcurrency: 2, maxSitemapFiles: 20,
-    proxyWarmConcurrency: 4, proxyWarmRobots: 16, browserCrawlerConcurrency: 3,
-    maxTextBytesPerResource: 1024 * 1024, maxImageBytes: 6 * 1024 * 1024, maxMediaBytes: 8 * 1024 * 1024
-  },
-  balanced: {
-    maxActiveFetches: 32, browserMaxActiveFetches: 12, browserSessions: 2, browserPages: 4, browserContexts: 4,
-    maxPendingQueue: 1200, maxPages: 10000, maxResources: 20000, maxLinks: 100000, maxCacheEntries: 150,
-    maxIndexDocs: 20000, maxCrossOriginResources: 500, sitemapConcurrency: 4, maxSitemapFiles: 50,
-    proxyWarmConcurrency: 8, proxyWarmRobots: 32, browserCrawlerConcurrency: 8,
-    maxTextBytesPerResource: 2 * 1024 * 1024, maxImageBytes: 12 * 1024 * 1024, maxMediaBytes: 24 * 1024 * 1024
-  },
-  high: {
-    maxActiveFetches: 128, browserMaxActiveFetches: 24, browserSessions: 4, browserPages: 8, browserContexts: 4,
-    maxPendingQueue: 3000, maxPages: 25000, maxResources: 50000, maxLinks: 250000, maxCacheEntries: 500,
-    maxIndexDocs: 50000, maxCrossOriginResources: 1000, sitemapConcurrency: 8, maxSitemapFiles: 100,
-    proxyWarmConcurrency: 12, proxyWarmRobots: 64, browserCrawlerConcurrency: 16,
-    maxTextBytesPerResource: 2 * 1024 * 1024, maxImageBytes: 16 * 1024 * 1024, maxMediaBytes: 32 * 1024 * 1024
-  }
-};
-const P = PROFILE_CAPS[RESOURCE_PROFILE];
+// Resource profile + caps now come from config.js (Render plan presets,
+// veyra.config.json, env). RESOURCE_PROFILE keeps its legacy meaning.
+const RESOURCE_PROFILE = VEYRA_CONFIG.resourceProfile;
+const MEMORY_LIMIT_MB = numberEnv("MEMORY_LIMIT_MB", detectedMemoryMb() || VEYRA_CONFIG.plan.ramMb || 0, 0, 262144);
+const PROFILE_CAPS = veyraConfigModule.LEGACY_CAPS;
+function detectResourceProfile() { return RESOURCE_PROFILE; }
+function capForProfile(profile, values) { return values[profile] ?? values.balanced; }
+const P = VEYRA_CONFIG.caps;
 const CFG = Object.freeze({
   processRole: enumEnv("PROCESS_ROLE", "web", ["web", "worker", "all"]),
   // CRAWLER_ROBOTS is the logical crawler fleet. Actual simultaneous network
@@ -182,7 +163,7 @@ const CFG = Object.freeze({
   maxDownloadBytes: numberEnv("MAX_DOWNLOAD_BYTES", 64 * 1024 * 1024, 256 * 1024, 256 * 1024 * 1024),
   maxCacheBodyBytes: Math.min(numberEnv("MAX_CACHE_BODY_BYTES", RESOURCE_PROFILE === "free" ? 1024 * 1024 : 4 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024), RESOURCE_PROFILE === "free" ? 1024 * 1024 : 4 * 1024 * 1024),
   proxySessionTtlMs: numberEnv("PROXY_SESSION_TTL_MS", 30 * 60 * 1000, 60 * 1000, 24 * 60 * 60 * 1000),
-  maxProxySessions: numberEnv("MAX_PROXY_SESSIONS", 500, 10, 5000),
+  maxProxySessions: numberEnv("MAX_PROXY_SESSIONS", P.maxProxySessions || 500, 10, 5000),
   maxSessionCookies: numberEnv("MAX_SESSION_COOKIES", 50, 5, 500),
   proxyWarmRobots: Math.min(numberEnv("PROXY_WARM_ROBOTS", P.proxyWarmRobots, 1, 1000), P.proxyWarmRobots),
   proxyWarmConcurrency: Math.min(numberEnv("PROXY_WARM_CONCURRENCY", P.proxyWarmConcurrency, 1, 64), P.proxyWarmConcurrency),
@@ -190,7 +171,7 @@ const CFG = Object.freeze({
   proxyWarmPerHost: numberEnv("PROXY_WARM_PER_HOST", 3, 1, 16),
   sitemapConcurrency: Math.min(numberEnv("SITEMAP_CONCURRENCY", P.sitemapConcurrency, 1, 32), P.sitemapConcurrency),
   initialResourceBudget: numberEnv("INITIAL_RESOURCE_BUDGET", 64, 16, 256),
-  userAgent: process.env.VEYRA_USER_AGENT || "VeyraBrowseCrawler/8.11.1 (+https://github.com/HomekidChud/VeyraServer)",
+  userAgent: process.env.VEYRA_USER_AGENT || "VeyraBrowseCrawler/8.12.0 (+https://github.com/HomekidChud/VeyraServer)",
   frontendOrigins: csvEnv("FRONTEND_ORIGIN", ["*"]),
   searchProvider: enumEnv("SEARCH_PROVIDER", "local", ["auto", "local", "brave", "bing", "custom", "none"]),
   searchEndpoint: process.env.SEARCH_ENDPOINT || "",
@@ -219,7 +200,28 @@ const CFG = Object.freeze({
   browserCrawlerConcurrency: P.browserCrawlerConcurrency,
   browserKeepWarm: boolEnv("BROWSER_KEEP_WARM", RESOURCE_PROFILE !== "free"),
   vpnEnabled: boolEnv("VPN_ENABLED", false),
-  vpnMode: enumEnv("VPN_MODE", "proxy", ["proxy"]),
+  vpnMode: enumEnv("VPN_MODE", "proxy", ["proxy", "auto", "wireguard"]),
+  vpnKillSwitch: boolEnv("VPN_KILL_SWITCH", true),
+  vpnFailover: boolEnv("VPN_FAILOVER", true),
+  vpnAlwaysOn: boolEnv("VPN_ALWAYS_ON", false),
+  // Crawler scheduling: several crawls run side by side, extra ones queue.
+  maxActiveJobs: numberEnv("MAX_ACTIVE_JOBS", P.maxActiveJobs, 1, 20),
+  crawlQueueMax: numberEnv("CRAWL_QUEUE_MAX", 20, 0, 500),
+  crawlAbandonMs: numberEnv("CRAWL_ABANDON_MS", 10 * 60 * 1000, 0, 24 * 60 * 60 * 1000),
+  // Worker threads for HTML/JS/CSS parsing + rewriting.
+  parseWorkers: numberEnv("CRAWLER_PARSE_WORKERS", P.parseWorkers, 0, 16),
+  parseWorkerMinBytes: numberEnv("PARSE_WORKER_MIN_BYTES", 48 * 1024, 0, 64 * 1024 * 1024),
+  parseWorkerTimeoutMs: numberEnv("PARSE_WORKER_TIMEOUT_MS", 20000, 1000, 120000),
+  parseWorkerHeapMb: numberEnv("PARSE_WORKER_HEAP_MB", MEMORY_LIMIT_MB && MEMORY_LIMIT_MB <= 2048 ? 160 : 384, 64, 4096),
+  // Session manager.
+  sessionIdleTtlMs: numberEnv("SESSION_IDLE_TTL_MS", numberEnv("PROXY_SESSION_TTL_MS", P.sessionIdleMs, 60 * 1000, 24 * 60 * 60 * 1000), 60 * 1000, 24 * 60 * 60 * 1000),
+  sessionMaxAgeMs: numberEnv("SESSION_MAX_AGE_MS", 24 * 60 * 60 * 1000, 10 * 60 * 1000, 7 * 24 * 60 * 60 * 1000),
+  sessionMaxCookieBytes: numberEnv("SESSION_MAX_COOKIE_BYTES", 128 * 1024, 4 * 1024, 4 * 1024 * 1024),
+  serverIdleSleepMs: numberEnv("SERVER_IDLE_SLEEP_MS", 10 * 60 * 1000, 0, 24 * 60 * 60 * 1000),
+  browserWarmIdleMs: numberEnv("BROWSER_WARM_IDLE_MS", 15 * 60 * 1000, 0, 24 * 60 * 60 * 1000),
+  devConfigApi: boolEnv("VEYRA_DEV_CONFIG_API", VEYRA_CONFIG.envName === "development"),
+  adminToken: process.env.VEYRA_ADMIN_TOKEN || "",
+  plan: VEYRA_CONFIG.plan.key,
   vpnDefaultProfile: process.env.VPN_DEFAULT_PROFILE || "",
   vpnProxyServer: process.env.VPN_PROXY_SERVER || "",
   vpnProxyUsername: process.env.VPN_PROXY_USERNAME || "",
@@ -244,12 +246,25 @@ app.use(cors({
 app.use(["/api/resource", "/api/view"], express.raw({ type: () => true, limit: CFG.maxProxyBodyBytes, inflate: true }));
 app.use(express.json({ limit: "256kb" }));
 app.use(express.urlencoded({ extended: false, limit: CFG.maxFormBodyBytes }));
+// Activity tracking: wakes the server from idle mode and tells the crawler
+// scheduler that someone is still watching a crawl.
+app.use((req, res, next) => {
+  if (req.path.startsWith("/api/")) sessionManager.activity();
+  const m = req.path.match(/^\/api\/crawl\/([^/]+)/);
+  if (m) { const j = jobs.get(m[1]); if (j) j.lastPolledAt = Date.now(); }
+  next();
+});
 
 const jobs = new Map();
 const activeByRoot = new Map();
 const proxyCache = new Map();
 const searchCache = new Map();
-const proxySessions = new Map();
+const sessionManager = new SessionManager({
+  maxSessions: CFG.maxProxySessions, idleTtlMs: CFG.sessionIdleTtlMs, hardTtlMs: CFG.sessionMaxAgeMs,
+  maxCookieBytes: CFG.sessionMaxCookieBytes, serverIdleMs: CFG.serverIdleSleepMs,
+  log: (level, source, message) => serverLog(level, source, message)
+});
+const proxySessions = sessionManager.sessions;
 
 class Semaphore {
   constructor(limit) { this.limit = Math.max(1, limit); this.active = 0; this.waiters = []; }
@@ -286,8 +301,10 @@ class Semaphore {
 const fetchSemaphore = new Semaphore(CFG.maxActiveFetches);
 const proxyWarmSemaphore = new Semaphore(CFG.proxyWarmConcurrency);
 const runtimeGuard = { pressure: false, critical: false, lastNotice: 0 };
-function effectiveCrawlerConcurrency() {
+function effectiveCrawlerConcurrency(job = null) {
   let limit = CFG.maxActiveFetches;
+  // Several crawlers share the global fetch budget fairly.
+  if (job) { const running = activeCrawlCount(); if (running > 1) limit = Math.max(2, Math.ceil(limit / running)); }
   if (browserEngine && browserEngine.status().sessions > 0) limit = Math.min(limit, CFG.browserCrawlerConcurrency);
   if (runtimeGuard.pressure) limit = Math.min(limit, Math.max(1, Math.floor(limit / 2)));
   if (runtimeGuard.critical) limit = 1;
@@ -300,7 +317,9 @@ function clearHotCachesForPressure() {
   while (dnsPublicCache && dnsPublicCache.size > 500) dnsPublicCache.delete(dnsPublicCache.keys().next().value);
 }
 
-const vpnManager = new VpnManager((level, source, message) => serverLog(level, source, message));
+const vpnManager = IS_THREAD_WORKER
+  ? { dispatcherForSession() { return undefined; }, dispatcherForCrawler() { return undefined; }, status() { return {}; } }
+  : new VpnManager((level, source, message) => serverLog(level, source, message));
 
 const browserEngine = new BrowserEngine(
   CFG,
@@ -326,10 +345,33 @@ const browserEngine = new BrowserEngine(
   },
   vpnManager
 );
-const browserEngineTimer = setInterval(() => browserEngine.expireIdle().catch(() => {}), 30000);
-browserEngineTimer.unref?.();
+// Worker threads for parsing/rewriting (0 on 512 MB plans = inline).
+const workerPool = (!IS_THREAD_WORKER && CFG.parseWorkers > 0 && (require.main === module || process.env.VEYRA_POOL_IN_TESTS === "1"))
+  ? new WorkerPool({ size: CFG.parseWorkers, taskTimeoutMs: CFG.parseWorkerTimeoutMs, heapMb: CFG.parseWorkerHeapMb, log: (level, source, message) => serverLog(level, source, message) })
+  : null;
+
+// Session lifecycle hooks: an expired/closed session releases everything it held.
+sessionManager.on("expire", (sid) => {
+  try { vpnManager.disconnect?.(sid); } catch {}
+  try { scriptDirsBySession.delete(sid); } catch {}
+  return browserEngine.stopForProxySession?.(sid);
+});
+sessionManager.on("sleep", async () => {
+  await browserEngine.shedIdle(0).catch(() => {});
+  if (browserEngine.browser && !browserEngine.sessions.size) {
+    await browserEngine.browser.close().catch(() => {});
+    browserEngine.browser = null; browserEngine.playwright = null;
+  }
+  proxyCache.clear(); searchCache.clear(); dnsPublicCache.clear();
+  for (const j of jobs.values()) if (j.seed && !j.done) j.backgroundPaused = true;
+});
+sessionManager.on("wake", () => { for (const j of jobs.values()) if (j.seed && !j.done && !runtimeGuard.critical) j.backgroundPaused = false; });
+if (!IS_THREAD_WORKER) sessionManager.start();
+
+const browserEngineTimer = IS_THREAD_WORKER ? null : setInterval(() => browserEngine.expireIdle().catch(() => {}), 30000);
+browserEngineTimer?.unref?.();
 const runtimeMemoryLimitBytes = MEMORY_LIMIT_MB ? MEMORY_LIMIT_MB * 1024 * 1024 : 0;
-const memoryGuardTimer = setInterval(() => {
+const memoryGuardTimer = IS_THREAD_WORKER ? null : setInterval(() => {
   try {
     const rss = process.memoryUsage().rss;
     if (!runtimeMemoryLimitBytes) return;
@@ -337,11 +379,12 @@ const memoryGuardTimer = setInterval(() => {
     const prev = runtimeGuard.pressure;
     runtimeGuard.pressure = ratio >= 0.78;
     runtimeGuard.critical = ratio >= 0.90;
-    if (runtimeGuard.pressure) clearHotCachesForPressure();
+    if (runtimeGuard.pressure) { clearHotCachesForPressure(); sessionManager.shed(runtimeGuard.critical ? "critical" : "pressure"); }
     if (runtimeGuard.critical) {
+      browserEngine.shedIdle(20000).catch(() => {});
       for (const job of jobs.values()) if (!job.done) job.backgroundPaused = true;
     } else if (ratio < 0.70) {
-      for (const job of jobs.values()) if (!job.done) job.backgroundPaused = false;
+      for (const job of jobs.values()) if (!job.done) job.backgroundPaused = !!(job.seed && sessionManager.sleeping);
     }
     if ((runtimeGuard.pressure !== prev || runtimeGuard.critical) && Date.now() - runtimeGuard.lastNotice > 10000) {
       runtimeGuard.lastNotice = Date.now();
@@ -349,7 +392,7 @@ const memoryGuardTimer = setInterval(() => {
     }
   } catch {}
 }, 2000);
-memoryGuardTimer.unref?.();
+memoryGuardTimer?.unref?.();
 
 // Foreground browser scheduler. This is intentionally independent from the
 // crawler scheduler so page navigation cannot be starved by background work.
@@ -770,19 +813,8 @@ function normalizeSessionId(value) {
   return /^[A-Za-z0-9_-]{16,80}$/.test(sid) ? sid : crypto.randomUUID().replaceAll("-", "");
 }
 function sessionRecord(sid) {
-  const nowMs = Date.now();
-  let session = proxySessions.get(sid);
-  if (!session || nowMs - session.lastUsed > CFG.proxySessionTtlMs) {
-    session = { createdAt: nowMs, lastUsed: nowMs, cookies: new Map(), vpnProfileId: null };
-    proxySessions.set(sid, session);
-    while (proxySessions.size > CFG.maxProxySessions) {
-      const oldest = [...proxySessions.entries()].sort((a,b) => a[1].lastUsed - b[1].lastUsed)[0]?.[0];
-      if (!oldest) break;
-      proxySessions.delete(oldest);
-    }
-  }
-  session.lastUsed = nowMs;
-  return session;
+  // O(1) LRU touch; expiry releases VPN / browser / cache state via hooks.
+  return sessionManager.touch(sid);
 }
 function cookieDomainMatches(host, domain) {
   const h = String(host || "").toLowerCase();
@@ -825,6 +857,7 @@ function storeSetCookies(sessionId, url, response) {
     if (!oldest) break;
     session.cookies.delete(oldest);
   }
+  sessionManager.trimCookies(session);
 }
 function cookieHeader(sessionId, url) {
   if (!sessionId) return "";
@@ -929,7 +962,7 @@ async function fetchBuffer(url, opts = {}) {
         }
         if (cached?.etag) reqHeaders.set("if-none-match", cached.etag);
         if (cached?.lastModified) reqHeaders.set("if-modified-since", cached.lastModified);
-        const dispatcher = opts.dispatcher || (sessionId ? vpnManager.dispatcherForSession(sessionId) : (process.env.VPN_CRAWLER_PROFILE ? vpnManager.dispatcherForSession(`__crawler__${process.env.VPN_CRAWLER_PROFILE}`) : undefined));
+        const dispatcher = opts.dispatcher || (sessionId ? vpnManager.dispatcherForSession(sessionId) : vpnManager.dispatcherForCrawler());
         const response = await undiciFetch(current, {
           method,
           headers: reqHeaders,
@@ -995,6 +1028,9 @@ async function fetchBuffer(url, opts = {}) {
         };
       } catch (e) {
         clearTimeout(timer);
+        // The VPN kill switch is a deliberate block, not a flaky network: surface it.
+        const vpnCause = e?.cause?.code && String(e.cause.code).startsWith("VPN_") ? e.cause : (String(e?.code || "").startsWith("VPN_") ? e : null);
+        if (vpnCause) throw Object.assign(new Error(vpnCause.message), { code: vpnCause.code, status: vpnCause.code === "VPN_KILL_SWITCH" ? 503 : 502 });
         lastError = e;
         const retryableError = attempt < (opts.retries ?? CFG.maxRetries);
         if (!retryableError) break;
@@ -1078,7 +1114,7 @@ class PriorityFrontier {
   #down(heap, i) { for (;;) { const l = i * 2 + 1, r = l + 1; let best = i; if (l < heap.length && this.#greater(heap[l], heap[best])) best = l; if (r < heap.length && this.#greater(heap[r], heap[best])) best = r; if (best === i) break; [heap[i], heap[best]] = [heap[best], heap[i]]; i = best; } }
   #pushNode(bucket, node) { bucket.heap.push(node); this.#up(bucket.heap, bucket.heap.length - 1); }
   #popNode(bucket) { const top = bucket.heap[0], last = bucket.heap.pop(); if (bucket.heap.length) { bucket.heap[0] = last; this.#down(bucket.heap, 0); } return top; }
-  #pushHostRef(bucket) { const ref = { host: bucket.host, node: bucket.heap[0], seq: ++this.seq }; this.hostHeap.push(ref); this.#up(this.hostHeap, this.hostHeap.length - 1); }
+  #pushHostRef(bucket) { const top = bucket.heap[0]; const ref = { host: bucket.host, node: top, priority: top.priority, notBefore: top.notBefore, seq: ++this.seq }; this.hostHeap.push(ref); this.#up(this.hostHeap, this.hostHeap.length - 1); }
   #popHostRef() { const top = this.hostHeap[0], last = this.hostHeap.pop(); if (this.hostHeap.length) { this.hostHeap[0] = last; this.#down(this.hostHeap, 0); } return top; }
   #insert(item, priority, key, notBefore = 0) {
     const host = hostOf(item.url) || '(unknown)';
@@ -1599,9 +1635,9 @@ function addIndexedDocument(doc) {
     removeIndexedDocument(oldest); searchIndex.delete(oldest.url);
   }
 }
-function indexDocument(url, text) {
+function indexDocument(url, text, precomputedMeta = null) {
   try {
-    const meta = extractPageMeta(text, url);
+    const meta = precomputedMeta || extractPageMeta(text, url);
     const candidateCanonical = normalizeUrl(meta.canonical || url) || url;
     const canonical = sameOrigin(candidateCanonical, url) ? candidateCanonical : url;
     const existing = searchIndex.get(canonical);
@@ -1751,6 +1787,14 @@ function lowValueThirdPartyHost(url) {
 }
 
 function addLink(job, rawUrl, hint, source, reason = "discovered") {
+  if (job.collector) {
+    // Worker-thread discovery: just record candidates; the main thread applies them.
+    if (job.links.length >= CFG.maxLinks || rawUrl == null) return false;
+    const k = `${rawUrl}\u0000${hint}\u0000${source}`;
+    if (job.seen.has(k)) return false;
+    job.seen.add(k); job.links.push([String(rawUrl), hint, source || null, reason]);
+    return true;
+  }
   const u = sanitizeDiscoveredUrl(rawUrl, source || job.root); if (!u) return false;
   const type = typeFor(u, hint);
   const internal = crawlOriginAllowed(job, u);
@@ -2062,6 +2106,7 @@ function publicJob(job) {
   return {
     id: job.id, url: job.url, createdAt: job.createdAt, finishedAt: job.finishedAt, done: job.done,
     status: job.status, statusText: job.statusText, stopRequested: job.stopRequested,
+    scheduler: { started: !!job.started, queuePosition: job.queuePosition || 0, seed: !!job.seed, activeCrawlers: activeCrawlCount(), maxCrawlers: effectiveMaxActiveJobs(), queued: crawlQueue.length },
     maxUrls: CFG.maxResources, maxScanBytes: CFG.maxScanBytes, elapsedMs: Date.now() - Date.parse(job.createdAt),
     counts: { ...job.counts, processed: job.processed, queued, active: job.activeWorkers },
     workers: { html: { active: job.activeHtmlWorkers, max: CFG.maxActiveFetches, queued: job.pageFrontier.size }, asset: { active: job.activeAssetWorkers, max: CFG.maxActiveFetches, queued: job.resourceFrontier.size }, logicalRobots: job.robotFleet || CFG.logicalRobots, networkSlots: effectiveCrawlerConcurrency(), configuredNetworkSlots: CFG.maxActiveFetches, availableNetworkSlots: fetchSemaphore.available, queuedNetworkWaiters: fetchSemaphore.queued },
@@ -2116,6 +2161,37 @@ async function fetchResourceProbe(item, opts) {
   if (head.status >= 200 && head.status < 400 && (head.contentType || head.contentLength)) return head;
   const rangeOpts = { ...opts, method: "GET", range: "bytes=0-65535", limit: 64 * 1024, limitForContentType: () => 64 * 1024, retries: Math.min(1, opts.retries ?? 0) };
   return fetchCached(item.url, rangeOpts);
+}
+// Link discovery (+ search-index extraction for HTML). Runs in a worker thread
+// for large documents so the main loop keeps serving pages; inline otherwise.
+function discoverInto(job, kind, text, base, contentType = "") {
+  if (kind === "html") discoverHtml(job, text, base);
+  else if (kind === "css") discoverCss(job, text, base);
+  else if (kind === "js") discoverJs(job, text, base);
+  else if (kind === "data") { discoverDataText(job, text, base); if (/json|xml|graphql|javascript|api|ld\+json/i.test(contentType)) discoverJs(job, text, base); }
+}
+function collectDiscovery(text, kind, base, contentType) {
+  const collector = { collector: true, links: [], seen: new Set(), root: base };
+  discoverInto(collector, kind, text, base, contentType);
+  return { links: collector.links, meta: kind === "html" ? extractPageMeta(text, base) : null };
+}
+async function discoverContent(job, kind, text, base, contentType = "") {
+  if (workerPool?.enabled && text.length >= CFG.parseWorkerMinBytes) {
+    try {
+      const out = await workerPool.run("discover", [kind, base, contentType], text);
+      if (kind === "html") indexDocument(base, text, out.meta);
+      for (const [raw, hint, src, reason] of out.links) { if (job.stopRequested) break; addLink(job, raw, hint, src, reason); }
+      return;
+    } catch (e) { if (workerPool) workerPool.stats.inlineFallbacks += 1; }
+  }
+  if (kind === "html") indexDocument(base, text);
+  discoverInto(job, kind, text, base, contentType);
+}
+async function rewriteOffThread(op, text, args, inline) {
+  if (workerPool?.enabled && text.length >= CFG.parseWorkerMinBytes) {
+    try { return await workerPool.run(op, args, text); } catch (e) { if (workerPool) workerPool.stats.inlineFallbacks += 1; }
+  }
+  return inline(text, ...args);
 }
 async function processItem(job, item) {
   if (job.stopRequested) return;
@@ -2184,19 +2260,18 @@ async function processItem(job, item) {
     const link = job.links.find(x => x.url === item.url || x.url === resource.url); if (link) { link.captured = true; link.redirectChain = resource.redirectChain; link.url = resource.url; }
     job.hostFailures.set(host, 0); job.hostCooldowns.delete(host); noteHostSuccess(job, host);
     if (type === "html") {
-      job.counts.htmlPages += 1; indexDocument(resource.url, text); discoverHtml(job, text, resource.url);
+      job.counts.htmlPages += 1; await discoverContent(job, "html", text, resource.url, r.contentType);
       job.counts.bytesStored += Math.min(r.bytes, CFG.maxTextBytesPerResource);
     } else if (type === "css") {
-      job.counts.css += 1; discoverCss(job, text, resource.url);
+      job.counts.css += 1; await discoverContent(job, "css", text, resource.url, r.contentType);
       job.counts.bytesStored += Math.min(r.bytes, CFG.maxTextBytesPerResource);
     } else if (type === "js") {
-      job.counts.js += 1; discoverJs(job, text, resource.url);
+      job.counts.js += 1; await discoverContent(job, "js", text, resource.url, r.contentType);
       job.counts.bytesStored += Math.min(r.bytes, CFG.maxTextBytesPerResource);
     } else if (type === "data") {
       job.counts.data += 1;
       job.counts.bytesStored += Math.min(r.bytes, CFG.maxTextBytesPerResource);
-      discoverDataText(job, text, resource.url);
-      if (/json|xml|graphql|javascript|api|ld\+json/i.test(r.contentType)) discoverJs(job, text, resource.url);
+      await discoverContent(job, "data", text, resource.url, r.contentType);
     } else if (type === "image" || type === "media" || type === "font" || type === "asset") {
       job.counts.assets += 1;
       job.counts.bytesStored += Math.min(r.bytes, CFG.maxCacheBodyBytes);
@@ -2357,7 +2432,7 @@ class CooperativeRobotPool {
   }
   assignGlobalTasks() {
     let assigned = 0;
-    const runtimeLimit = effectiveCrawlerConcurrency();
+    const runtimeLimit = effectiveCrawlerConcurrency(this.job);
     const target = Math.min(CFG.robotDispatchBatch, Math.max(runtimeLimit * 4, 32));
     while (assigned < target) {
       const robot = this.nextReceiver();
@@ -2523,7 +2598,7 @@ class CooperativeRobotPool {
     for (let load = 0; load < this.loadBuckets.length && this.activePromises.size < CFG.maxActiveFetches; load++) {
       const robots = [...(this.loadBuckets[load] || [])];
       for (const robot of robots) {
-        while (robot.activeTasks < this.activeCapacity && robot.queue.length && this.activePromises.size < effectiveCrawlerConcurrency()) {
+        while (robot.activeTasks < this.activeCapacity && robot.queue.length && this.activePromises.size < effectiveCrawlerConcurrency(this.job)) {
           const item = robot.queue.shift();
           this.totalQueued = Math.max(0, this.totalQueued - 1);
           this.updateLoadBucket(robot); this.markShareable(robot);
@@ -2531,7 +2606,7 @@ class CooperativeRobotPool {
           else { robot.queue.unshift(item); this.totalQueued += 1; this.updateLoadBucket(robot); this.markShareable(robot); break; }
         }
         this.updateStatus(robot);
-        if (this.activePromises.size >= effectiveCrawlerConcurrency()) break;
+        if (this.activePromises.size >= effectiveCrawlerConcurrency(this.job)) break;
       }
     }
     return started;
@@ -2575,7 +2650,7 @@ class CooperativeRobotPool {
       this.assignGlobalTasks();
       this.rebalanceLocals();
       this.startAvailable();
-      if (runtimeGuard.critical || job.backgroundPaused) {
+      if (runtimeGuard.critical || this.job.backgroundPaused) {
         if (!this.activePromises.size) { await sleep(250); continue; }
         await Promise.race(this.activePromises);
         continue;
@@ -2611,6 +2686,8 @@ async function runCrawl(job) {
     if (job.status === "challenge") job.statusText = "Security verification required; crawl stopped.";
     else if (job.stopRequested && job.stopReason === "scan-byte-limit") { job.status = "done"; job.statusText = `Scan budget reached (${bytesLabel(CFG.maxScanBytes)}).`; }
     else if (job.stopRequested && job.stopReason === "resource-limit") { job.status = "done"; job.statusText = `Resource safety limit reached (${CFG.maxResources.toLocaleString()}).`; }
+    else if (job.stopRequested && job.stopReason === "abandoned") { job.status = "stopped"; job.statusText = "Stopped automatically — nobody has checked this crawl for a while (CRAWL_ABANDON_MS)."; }
+    else if (job.stopRequested && job.stopReason === "shutdown") { job.status = "stopped"; job.statusText = "Stopped — server is shutting down."; }
     else if (job.stopRequested) { job.status = "stopped"; job.statusText = "Stopped by user."; }
     else { job.status = "done"; job.statusText = `Complete — ${job.processed.toLocaleString()} resources scanned.`; }
     jobLog(job, job.status === "done" ? "info" : "warn", job.statusText, { robots: job.robotPool.report(12).summary });
@@ -2669,9 +2746,63 @@ async function searchService(query, offset, limit) {
   return value;
 }
 const indexSeedState = new Map();
-function effectiveMaxActiveJobs() { return Math.min(numberEnv("MAX_ACTIVE_JOBS", RESOURCE_PROFILE === "free" ? 1 : 3, 1, 20), RESOURCE_PROFILE === "free" ? 1 : 20); }
+function effectiveMaxActiveJobs() {
+  let n = CFG.maxActiveJobs;
+  // Memory governor: under pressure only one crawler keeps running.
+  if (runtimeGuard.pressure) n = Math.min(n, Math.max(1, Math.floor(n / 2)));
+  if (runtimeGuard.critical) n = 1;
+  return n;
+}
+// Multi-crawler scheduler: up to MAX_ACTIVE_JOBS crawls run concurrently and
+// share the fetch budget; extra crawls wait in a FIFO (user crawls ahead of
+// background index-seed crawls).
+const crawlQueue = [];
+function activeCrawlCount() { let n = 0; for (const j of jobs.values()) if (j.started && !j.done) n += 1; return n; }
+function refreshQueuePositions() { crawlQueue.forEach((j, i) => { j.queuePosition = i + 1; j.statusText = `Queued — ${i + 1} ahead in line (${activeCrawlCount()}/${effectiveMaxActiveJobs()} crawlers busy).`; }); }
+function startCrawl(job) {
+  job.started = true; job.startedAt = now(); job.queuePosition = 0;
+  runCrawl(job)
+    .catch(e => { job.done = true; job.finishedAt = now(); job.status = "error"; job.statusText = e.message; jobLog(job, "error", e.stack || e.message); })
+    .finally(() => { if (!job.done) { job.done = true; job.finishedAt = now(); } pumpCrawlQueue(); });
+}
+function pumpCrawlQueue() {
+  while (crawlQueue.length && activeCrawlCount() < effectiveMaxActiveJobs()) {
+    const job = crawlQueue.shift();
+    if (job.done || job.stopRequested) continue;
+    jobLog(job, "info", "Crawler slot free — starting.");
+    startCrawl(job);
+  }
+  refreshQueuePositions();
+}
+function scheduleCrawl(job, { seed = false } = {}) {
+  job.seed = seed; job.lastPolledAt = Date.now();
+  if (activeCrawlCount() < effectiveMaxActiveJobs() && !crawlQueue.some(j => !j.seed || seed)) { startCrawl(job); return "running"; }
+  if (crawlQueue.length >= CFG.crawlQueueMax) throw Object.assign(new Error(`All ${effectiveMaxActiveJobs()} crawlers are busy and the queue is full (${CFG.crawlQueueMax}); try again shortly.`), { code: "CRAWLER_CAPACITY_BUSY" });
+  job.status = "queued"; job.queuedAt = now();
+  if (seed) crawlQueue.push(job);
+  else { const firstSeed = crawlQueue.findIndex(j => j.seed); if (firstSeed < 0) crawlQueue.push(job); else crawlQueue.splice(firstSeed, 0, job); }
+  refreshQueuePositions();
+  return "queued";
+}
+function dequeueCrawl(job) {
+  const i = crawlQueue.indexOf(job);
+  if (i >= 0) crawlQueue.splice(i, 1);
+  refreshQueuePositions();
+  return i >= 0;
+}
+function sweepAbandonedCrawls() {
+  if (!CFG.crawlAbandonMs) return;
+  const cutoff = Date.now() - CFG.crawlAbandonMs;
+  for (const job of jobs.values()) {
+    if (job.done || job.seed || job.stopRequested || (job.lastPolledAt || 0) > cutoff) continue;
+    job.stopRequested = true; job.stopReason = "abandoned";
+    try { job.controller.abort(); } catch {}
+    if (!job.started) { dequeueCrawl(job); job.done = true; job.finishedAt = now(); job.status = "stopped"; job.statusText = "Removed from queue — nobody was waiting for it."; }
+    jobLog(job, "warn", `No client has polled this crawl for ${Math.round(CFG.crawlAbandonMs / 60000)} min; stopping it to free Render resources.`);
+  }
+}
 async function pumpIndexSeeds() {
-  if (!CFG.indexSeedCrawl || !CFG.indexSeeds.length) return;
+  if (!CFG.indexSeedCrawl || !CFG.indexSeeds.length || sessionManager.sleeping) return;
   const maxActive = effectiveMaxActiveJobs();
   const activeCount = [...jobs.values()].filter(j => !j.done && !j.stopRequested).length;
   if (activeCount >= maxActive) return;
@@ -2685,7 +2816,7 @@ async function pumpIndexSeeds() {
       await assertPublicUrl(root);
       const job = createJob(root); jobs.set(job.id, job); activeByRoot.set(root, job.id); indexSeedState.set(raw, Date.now());
       jobLog(job, "info", "Index seed crawl queued.", { source: "INDEX", seed: raw });
-      runCrawl(job).catch(e => { job.done = true; job.finishedAt = now(); job.status = "error"; job.statusText = e.message; jobLog(job, "error", e.stack || e.message); });
+      scheduleCrawl(job, { seed: true });
     } catch (e) { indexSeedState.set(raw, Date.now()); serverLog("warn", "SEARCH", `Index seed rejected: ${raw} — ${e.message}`); }
   }
 }
@@ -2720,22 +2851,28 @@ app.post('/api/browser/capability', async (req, res) => {
   }
 });
 
+const vpnErrStatus = code => ({ VPN_DISABLED: 503, VPN_NOT_CONFIGURED: 404, VPN_ALL_DOWN: 503, VPN_KILL_SWITCH: 503, VPN_TEST_FAILED: 502, VPN_NOT_CONNECTED: 409 })[code] || 400;
 app.get('/api/vpn/status', (req, res) => {
   res.json({ ok: true, ...vpnManager.status() });
 });
+app.get('/api/vpn/profiles', (req, res) => res.json({ ok: true, profiles: vpnManager.list(), defaultProfile: vpnManager.defaultProfileId || null }));
 app.post('/api/vpn/test', async (req, res) => {
   try {
     const result = await vpnManager.test(String(req.body?.profileId || ''));
     res.json({ ok:true, ...result });
-  } catch (e) { respondError(res, e.code === 'VPN_TEST_FAILED' ? 502 : (e.code === 'VPN_DISABLED' ? 503 : 400), e.message, e.code || 'VPN_TEST_ERROR'); }
+  } catch (e) { respondError(res, vpnErrStatus(e.code), e.message, e.code || 'VPN_TEST_ERROR', { profile: e.profile }); }
+});
+app.post('/api/vpn/health', async (req, res) => {
+  if (!vpnManager.enabled) return respondError(res, 503, 'Veyra VPN is disabled on this server.', 'VPN_DISABLED');
+  res.json({ ok: true, results: await vpnManager.checkAll(), profiles: vpnManager.list() });
 });
 app.post('/api/vpn/connect', (req, res) => {
   try {
     const sid = normalizeSessionId(req.body?.sessionId || req.body?.sid);
-    const result = vpnManager.connect(sid, String(req.body?.profileId || ''));
+    const result = vpnManager.connect(sid, String(req.body?.profileId || ''), { region: String(req.body?.region || ''), group: String(req.body?.group || '') });
     const ps = sessionRecord(sid); ps.vpnProfileId = result.profile?.id || null;
-    res.json({ ok:true, ...result, note:'Veyra VPN routes this Veyra browser/proxy session through the configured HTTP/HTTPS/SOCKS5 gateway. It is not a device-wide operating-system VPN.' });
-  } catch (e) { respondError(res, e.code === 'VPN_DISABLED' ? 503 : 400, e.message, e.code || 'VPN_CONNECT_ERROR'); }
+    res.json({ ok:true, ...result, note:'Every request from this Veyra session (proxy, crawler and Chromium) now leaves through the VPN exit. If the tunnel drops, the kill switch blocks traffic instead of falling back to the server IP.' });
+  } catch (e) { respondError(res, vpnErrStatus(e.code), e.message, e.code || 'VPN_CONNECT_ERROR'); }
 });
 app.post('/api/vpn/disconnect', (req, res) => {
   try {
@@ -2744,6 +2881,76 @@ app.post('/api/vpn/disconnect', (req, res) => {
     const ps = sessionRecord(sid); ps.vpnProfileId = null;
     res.json({ ok:true, connected:false });
   } catch (e) { respondError(res, 400, e.message, e.code || 'VPN_DISCONNECT_ERROR'); }
+});
+app.post('/api/vpn/rotate', (req, res) => {
+  try {
+    const sid = normalizeSessionId(req.body?.sessionId || req.body?.sid);
+    const result = vpnManager.rotate(sid);
+    sessionRecord(sid).vpnProfileId = result.profile?.id || null;
+    res.json({ ok: true, ...result });
+  } catch (e) { respondError(res, vpnErrStatus(e.code), e.message, e.code || 'VPN_ROTATE_ERROR'); }
+});
+app.get('/api/vpn/session', (req, res) => {
+  const sid = String(req.query.sid || req.query.sessionId || '');
+  res.json({ ok: true, ...vpnManager.sessionInfo(sid) });
+});
+app.get('/api/vpn/ip', async (req, res) => {
+  const sid = String(req.query.sid || req.query.sessionId || '');
+  try { res.json({ ok: true, ...(await vpnManager.exitIpForSession(sid)) }); }
+  catch (e) { respondError(res, vpnErrStatus(e.code) === 400 ? 502 : vpnErrStatus(e.code), e.message, e.code || 'VPN_IP_ERROR'); }
+});
+
+// ---------------------------------------------------------------------------
+// Sessions — explicit close (frontend: navigator.sendBeacon on tab close) and stats.
+app.get('/api/sessions', (req, res) => res.json({ ok: true, ...sessionManager.report(), vpnConnections: vpnManager.status().connections, browser: { sessions: browserEngine.sessions.size, running: !!browserEngine.browser } }));
+app.get('/api/session/:sid', (req, res) => {
+  const rec = sessionManager.peek(String(req.params.sid));
+  if (!rec) return res.json({ ok: true, active: false });
+  res.json({ ok: true, active: true, createdAt: new Date(rec.createdAt).toISOString(), lastUsed: new Date(rec.lastUsed).toISOString(), expiresInMs: Math.max(0, CFG.sessionIdleTtlMs - (Date.now() - rec.lastUsed)), cookies: rec.cookies.size, requests: rec.requests, vpn: vpnManager.sessionInfo?.(String(req.params.sid)) || null });
+});
+const closeSession = (req, res) => { const closed = sessionManager.close(String(req.params.sid)); res.json({ ok: true, closed }); };
+app.delete('/api/session/:sid', closeSession);
+app.post('/api/session/:sid/close', express.text({ type: () => true, limit: '4kb' }), closeSession);
+
+// ---------------------------------------------------------------------------
+// Config — read-only everywhere; editable in development (or with VEYRA_ADMIN_TOKEN).
+function configEditAllowed(req) {
+  if (CFG.adminToken) {
+    const got = String(req.get('x-veyra-admin-token') || '').trim();
+    return got.length === CFG.adminToken.length && crypto.timingSafeEqual(Buffer.from(got), Buffer.from(CFG.adminToken));
+  }
+  const ip = String(req.socket?.remoteAddress || '');
+  return CFG.devConfigApi && /^(::1|127\.|::ffff:127\.)/.test(ip);
+}
+function runtimeConfigSummary() {
+  return {
+    plan: CFG.plan, resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb,
+    crawlers: { maxActiveJobs: CFG.maxActiveJobs, effectiveMaxActiveJobs: effectiveMaxActiveJobs(), running: activeCrawlCount(), queued: crawlQueue.length, queueMax: CFG.crawlQueueMax, abandonMs: CFG.crawlAbandonMs, robotsPerCrawl: CFG.logicalRobots, maxActiveFetches: CFG.maxActiveFetches, perHostConcurrency: CFG.perHostConcurrency },
+    workers: workerPool ? workerPool.report() : { size: 0, mode: 'inline', configured: CFG.parseWorkers },
+    sessions: { maxSessions: CFG.maxProxySessions, idleTtlMs: CFG.sessionIdleTtlMs, maxAgeMs: CFG.sessionMaxAgeMs, maxCookieBytes: CFG.sessionMaxCookieBytes, serverIdleSleepMs: CFG.serverIdleSleepMs },
+    browser: { maxSessions: CFG.maxBrowserSessions, maxPages: CFG.maxBrowserPages, keepWarm: CFG.browserKeepWarm, warmIdleMs: CFG.browserWarmIdleMs },
+    vpn: { enabled: CFG.vpnEnabled, killSwitch: CFG.vpnKillSwitch, failover: CFG.vpnFailover, alwaysOn: CFG.vpnAlwaysOn }
+  };
+}
+app.get('/api/config', (req, res) => res.json({ ok: true, config: veyraConfigModule.publicSummary(VEYRA_CONFIG), runtime: runtimeConfigSummary(), editable: configEditAllowed(req) }));
+app.get('/api/config/plans', (req, res) => res.json({ ok: true, current: CFG.plan, plans: Object.entries(veyraConfigModule.RENDER_PLANS).map(([key, p]) => ({ key, label: p.label, ramMb: p.ramMb, cpu: p.cpu, renderYaml: p.renderYaml, caps: veyraConfigModule.capsFor(p.ramMb, p.cpu) })) }));
+app.post('/api/config/validate', (req, res) => { const v = veyraConfigModule.validateConfig(req.body || {}); res.json({ ok: !v.errors.length, ...v }); });
+app.put('/api/config', (req, res) => {
+  if (!configEditAllowed(req)) return respondError(res, 403, 'Config editing is only available in development from localhost, or with the X-Veyra-Admin-Token header when VEYRA_ADMIN_TOKEN is set. In production, change veyra.config.json in the repo (npm run config -- plan <name>) and redeploy.', 'CONFIG_READ_ONLY');
+  try {
+    const current = veyraConfigModule.loadRawFile();
+    const body = req.body || {};
+    const next = { ...current };
+    if (body.plan !== undefined) next.plan = body.plan;
+    if (body.env && typeof body.env === 'object') next.env = { ...(current.env || {}), ...body.env };
+    if (body.caps && typeof body.caps === 'object') next.caps = { ...(current.caps || {}), ...body.caps };
+    for (const k of Object.keys(next.env || {})) if (next.env[k] === null) delete next.env[k];
+    for (const k of Object.keys(next.caps || {})) if (next.caps[k] === null) delete next.caps[k];
+    const validation = veyraConfigModule.saveRawFile(next);
+    const yaml = body.plan && body.plan !== 'auto' && body.updateRenderYaml !== false ? veyraConfigModule.setPlanInRenderYaml(veyraConfigModule.resolvePlanName(body.plan) || body.plan) : false;
+    const preview = veyraConfigModule.publicSummary(veyraConfigModule.loadConfig());
+    res.json({ ok: true, saved: true, renderYamlUpdated: yaml, validation, preview, note: 'Saved. `npm run dev` restarts automatically; otherwise restart the server. On Render, commit + push to redeploy.' });
+  } catch (e) { respondError(res, 400, e.message, e.code || 'CONFIG_SAVE_FAILED', { validation: e.validation }); }
 });
 
 app.get('/api/browser/status', (req, res) => res.json({ ok: true, ...browserEngine.status(), config: { backend: CFG.browserBackend, enabled: CFG.browserEnabled, headless: CFG.browserHeadless, maxSessions: CFG.maxBrowserSessions, maxPages: CFG.maxBrowserPages, maxContexts: CFG.maxBrowserContexts } }));
@@ -2755,8 +2962,13 @@ app.post('/api/browser/session', async (req, res) => {
     const url = normalizeUrl(String(req.body?.url || ''));
     const sid = normalizeSessionId(req.body?.proxySessionId || req.body?.sid);
     const proxySession = sessionRecord(sid);
-    const vpnProfile = vpnManager.get(String(proxySession.vpnProfileId || req.body?.vpnProfileId || ''));
-    const session = await browserEngine.create(tabId, url, jobId, vpnProfile);
+    const wantedVpn = String(req.body?.vpnProfileId || '');
+    if (wantedVpn && vpnManager.enabled && !vpnManager.profileForSession(sid)) { try { vpnManager.connect(sid, wantedVpn); proxySession.vpnProfileId = wantedVpn; } catch {} }
+    const proxy = await vpnManager.playwrightProxy(sid);
+    const vpnProfileId = vpnManager.profileForSession(sid)?.id || null;
+    const vpnProfile = proxy ? { id: vpnProfileId, profileId: vpnProfileId, proxy, contextHints: vpnManager.browserContextHints(sid) } : null;
+    const session = await browserEngine.create(tabId, url, jobId, vpnProfile, { proxySessionId: sid });
+    sessionManager.linkBrowser(sid, session.id);
     res.json({ ok: true, session });
   } catch (e) {
     if (e.code === 'BROWSER_CAPACITY') return respondError(res, 409, e.message, e.code);
@@ -2773,7 +2985,7 @@ app.delete('/api/browser/session/:id', async (req,res) => { try { await browserE
 app.get('/api/browser/session/:id/screenshot', async (req,res) => { try { const png=await browserEngine.screenshot(req.params.id); if(!png) return respondError(res,503,'Screenshot unavailable.','BROWSER_SCREENSHOT_ERROR'); res.setHeader('content-type','image/png'); res.setHeader('cache-control','no-store'); res.send(png); } catch(e) { respondError(res,404,e.message,e.code||'BROWSER_SCREENSHOT_ERROR'); } });
 
 // Health and debug.
-app.get("/health", (req, res) => res.json({ ok: true, service: "veyra", uptimeSec: Math.round(process.uptime()), activeJobs: [...jobs.values()].filter(j => !j.done).length, processRole: CFG.processRole, resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb, crawlerFetchLimit: effectiveCrawlerConcurrency(), logicalRobots: CFG.logicalRobots, vpn: vpnManager.status() }));
+app.get("/health", (req, res) => res.json({ ok: true, service: "veyra", plan: CFG.plan, sleeping: sessionManager.sleeping, sessions: sessionManager.size, crawlers: { running: activeCrawlCount(), queued: crawlQueue.length, max: effectiveMaxActiveJobs() }, uptimeSec: Math.round(process.uptime()), activeJobs: [...jobs.values()].filter(j => !j.done).length, processRole: CFG.processRole, resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb, crawlerFetchLimit: effectiveCrawlerConcurrency(), logicalRobots: CFG.logicalRobots, vpn: vpnManager.status() }));
 app.get("/api/debug/system", (req, res) => {
   const mem = process.memoryUsage();
   const idx = searchIndexStats();
@@ -3093,9 +3305,9 @@ async function proxyRequest(req, res, mode) {
   if (mode === "resource" && /javascript|ecmascript/i.test(result.contentType || "")) noteScriptDir(sid, result.finalUrl || canonical);
   let payload = result.body;
   try {
-    if (!download && mode === "view" && (/html|xhtml|^$/.test(result.contentType.toLowerCase()))) payload = Buffer.from(rewriteHtml(payload.toString("utf8"), result.finalUrl || canonical, sid), "utf8");
-    else if (!download && mode === "resource" && result.contentType.toLowerCase().includes("text/css")) payload = Buffer.from(rewriteCssText(payload.toString("utf8"), result.finalUrl || canonical, sid), "utf8");
-    else if (!download && mode === "resource" && /javascript|ecmascript/.test(result.contentType.toLowerCase())) payload = Buffer.from(rewriteJsText(payload.toString("utf8"), result.finalUrl || canonical, sid), "utf8");
+    if (!download && mode === "view" && (/html|xhtml|^$/.test(result.contentType.toLowerCase()))) payload = Buffer.from(await rewriteOffThread("rewriteHtml", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteHtml), "utf8");
+    else if (!download && mode === "resource" && result.contentType.toLowerCase().includes("text/css")) payload = Buffer.from(await rewriteOffThread("rewriteCss", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteCssText), "utf8");
+    else if (!download && mode === "resource" && /javascript|ecmascript/.test(result.contentType.toLowerCase())) payload = Buffer.from(await rewriteOffThread("rewriteJs", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteJsText), "utf8");
     else if (!download && mode === "resource" && /mpegurl|dash\+xml/i.test(result.contentType.toLowerCase())) payload = Buffer.from(rewriteMediaManifest(payload.toString("utf8"), result.finalUrl || canonical, sid), "utf8");
   } catch (rewriteErr) {
     // A parser edge case in the HTML/CSS/JS rewriter should degrade the page,
@@ -3161,17 +3373,17 @@ app.post("/api/open", async (req, res) => {
     await assertPublicUrl(root);
     const oldId = activeByRoot.get(root); const old = oldId && jobs.get(oldId);
     if (old && !old.done && !old.stopRequested) return res.status(202).json({ jobId: old.id, url: root, viewUrl: makeViewUrl(root) });
-    const activeCount = [...jobs.values()].filter(j => !j.done && !j.stopRequested).length;
-    if (activeCount >= effectiveMaxActiveJobs()) return respondError(res, 503, "Crawler capacity is busy; try again shortly.", "CRAWLER_CAPACITY_BUSY");
-    const job = createJob(root); jobs.set(job.id, job); activeByRoot.set(root, job.id);
-    jobLog(job, "info", "Background crawl queued.");
-    runCrawl(job).catch(e => { job.done = true; job.finishedAt = now(); job.status = "error"; job.statusText = e.message; jobLog(job, "error", e.stack || e.message); });
-    res.status(202).json({ jobId: job.id, url: root, viewUrl: makeViewUrl(root), state: "queued" });
+    const job = createJob(root);
+    let state;
+    try { state = scheduleCrawl(job); } catch (e) { return respondError(res, 503, e.message, e.code || "CRAWLER_CAPACITY_BUSY", { maxActiveJobs: effectiveMaxActiveJobs(), queued: crawlQueue.length }); }
+    jobs.set(job.id, job); activeByRoot.set(root, job.id);
+    jobLog(job, "info", state === "running" ? "Background crawl started." : `Background crawl queued (position ${job.queuePosition}).`);
+    res.status(202).json({ jobId: job.id, url: root, viewUrl: makeViewUrl(root), state: "queued", scheduler: state, queuePosition: job.queuePosition || 0 });
   } catch (e) { respondError(res, 400, e.message, "OPEN_FAILED"); }
 });
 
 app.get("/api/crawl/:id", (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); res.json(publicJob(j)); });
-app.post("/api/crawl/:id/stop", (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); j.stopRequested = true; j.stopReason = "user"; j.status = "stopping"; j.statusText = "Stopping…"; j.controller.abort(); jobLog(j, "warn", "Stop requested."); res.json({ ok: true }); });
+app.post("/api/crawl/:id/stop", (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); if (!j.started && !j.done) { dequeueCrawl(j); j.stopRequested = true; j.stopReason = "user"; j.done = true; j.finishedAt = now(); j.status = "stopped"; j.statusText = "Removed from queue."; return res.json(publicJob(j)); } j.stopRequested = true; j.stopReason = "user"; j.status = "stopping"; j.statusText = "Stopping…"; j.controller.abort(); jobLog(j, "warn", "Stop requested."); res.json({ ok: true }); });
 app.get("/api/crawl/:id/robots", (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); if (!j.robotPool) return res.json({ summary: { logicalRobots: j.robotFleet || CFG.logicalRobots, activeRobots: 0, multitaskingRobots: 0, idleRobots: j.robotFleet || CFG.logicalRobots, queuedRobotTasks: 0, globalPageQueue: j.pageFrontier.size, globalResourceQueue: j.resourceFrontier.size, networkActive: fetchSemaphore.active, networkLimit: CFG.maxActiveFetches, helpRequests: 0, helpAccepted: 0, helpDeclined: 0, helpGiven: 0 }, robots: [], events: [] }); const limit = Math.min(100, Math.max(1, Number(req.query.limit || 48) || 48)); res.json(j.robotPool.report(limit)); });
 app.get("/api/crawl/:id/resources", (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); res.json({ resources: j.resources.map(r => ({ id: r.id, url: r.url, requestedUrl: r.requestedUrl, type: r.type, status: r.status, contentType: r.contentType, bytes: r.bytes, bytesLabel: r.bytesLabel, truncated: r.truncated, sourceId: r.sourceId })) }); });
 app.get("/api/crawl/:id/source/:resourceId", async (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); const id = Number(req.params.resourceId); const r = j.resources[id]; if (!r) return respondError(res, 404, "Resource not found.", "RESOURCE_NOT_FOUND"); res.json({ id: r.id, url: r.url, type: r.type, source: await sourceStore.read(j, r) }); });
@@ -3393,6 +3605,45 @@ const STATUS_VAR_DEFS = [
   { group: "Browser engine", key: "browserPageTimeoutMs", label: "Browser page timeout (ms)", kind: "number", names: ["BROWSER_PAGE_TIMEOUT_MS"], fallback: 30000, min: 5000, max: 120000 },
   { group: "Browser engine", key: "browserKeepWarm", label: "Keep Chromium warm", kind: "bool", names: ["BROWSER_KEEP_WARM"], fallback: false },
   { group: "Browser engine", key: "playwrightBrowsersPath", label: "Playwright browsers path", kind: "string", names: ["PLAYWRIGHT_BROWSERS_PATH"], fallback: "0" },
+  { group: "Plan / config", key: "veyraPlan", label: "Render plan (VEYRA_PLAN)", kind: "string", names: ["VEYRA_PLAN"], fallback: "auto", note: "free, starter, standard, pro, pro_plus, pro_max, pro_ultra or a new slug like 2c-8g. Overrides veyra.config.json." },
+  { group: "Plan / config", key: "renderPlan", label: "Render plan (alias)", kind: "string", names: ["RENDER_PLAN"], fallback: "" },
+  { group: "Plan / config", key: "veyraEnv", label: "Config environment", kind: "string", names: ["VEYRA_ENV"], fallback: "" },
+  { group: "Plan / config", key: "veyraConfigPath", label: "Config file path", kind: "string", names: ["VEYRA_CONFIG_PATH"], fallback: "veyra.config.json" },
+  { group: "Plan / config", key: "veyraCpuLimit", label: "CPU override", kind: "string", names: ["VEYRA_CPU_LIMIT"], fallback: "" },
+  { group: "Plan / config", key: "devConfigApi", label: "Dev config API", kind: "bool", names: ["VEYRA_DEV_CONFIG_API"], fallback: false },
+  { group: "Plan / config", key: "adminToken", label: "Admin token", kind: "string", names: ["VEYRA_ADMIN_TOKEN"], fallback: "", secret: true },
+  { group: "Crawlers / workers", key: "parseWorkers", label: "Parse worker threads", kind: "number", names: ["CRAWLER_PARSE_WORKERS"], fallback: P.parseWorkers, min: 0, max: 16 },
+  { group: "Crawlers / workers", key: "parseWorkerMinBytes", label: "Min bytes to use a worker", kind: "number", names: ["PARSE_WORKER_MIN_BYTES"], fallback: 48 * 1024, min: 0, max: 64 * 1024 * 1024 },
+  { group: "Crawlers / workers", key: "parseWorkerTimeoutMs", label: "Worker task timeout (ms)", kind: "number", names: ["PARSE_WORKER_TIMEOUT_MS"], fallback: 20000, min: 1000, max: 120000 },
+  { group: "Crawlers / workers", key: "parseWorkerHeapMb", label: "Worker heap (MB)", kind: "number", names: ["PARSE_WORKER_HEAP_MB"], fallback: 384, min: 64, max: 4096 },
+  { group: "Crawlers / workers", key: "crawlQueueMax", label: "Crawl queue length", kind: "number", names: ["CRAWL_QUEUE_MAX"], fallback: 20, min: 0, max: 500 },
+  { group: "Crawlers / workers", key: "crawlAbandonMs", label: "Stop unwatched crawls after (ms)", kind: "number", names: ["CRAWL_ABANDON_MS"], fallback: 10 * 60 * 1000, min: 0, max: 24 * 60 * 60 * 1000 },
+  { group: "Sessions", key: "sessionIdleTtlMs", label: "Session idle TTL (ms)", kind: "number", names: ["SESSION_IDLE_TTL_MS"], fallback: P.sessionIdleMs, min: 60000, max: 86400000 },
+  { group: "Sessions", key: "sessionMaxAgeMs", label: "Session max age (ms)", kind: "number", names: ["SESSION_MAX_AGE_MS"], fallback: 86400000, min: 600000, max: 604800000 },
+  { group: "Sessions", key: "sessionMaxCookieBytes", label: "Cookie bytes per session", kind: "number", names: ["SESSION_MAX_COOKIE_BYTES"], fallback: 131072, min: 4096, max: 4194304 },
+  { group: "Sessions", key: "serverIdleSleepMs", label: "Idle mode after (ms, 0=off)", kind: "number", names: ["SERVER_IDLE_SLEEP_MS"], fallback: 600000, min: 0, max: 86400000 },
+  { group: "Browser engine", key: "browserWarmIdleMs", label: "Close warm Chromium after idle (ms)", kind: "number", names: ["BROWSER_WARM_IDLE_MS"], fallback: 900000, min: 0, max: 86400000 },
+  { group: "VPN", key: "vpnKillSwitch", label: "Kill switch", kind: "bool", names: ["VPN_KILL_SWITCH"], fallback: true },
+  { group: "VPN", key: "vpnFailover", label: "Automatic failover", kind: "bool", names: ["VPN_FAILOVER"], fallback: true },
+  { group: "VPN", key: "vpnAlwaysOn", label: "Always-on (every session)", kind: "bool", names: ["VPN_ALWAYS_ON"], fallback: false },
+  { group: "VPN", key: "vpnSplitBypass", label: "Split tunnel: bypass hosts", kind: "string", names: ["VPN_SPLIT_BYPASS"], fallback: "" },
+  { group: "VPN", key: "vpnSplitOnly", label: "Split tunnel: only these hosts", kind: "string", names: ["VPN_SPLIT_ONLY"], fallback: "" },
+  { group: "VPN", key: "vpnHealthUrl", label: "Health / exit-IP URL", kind: "string", names: ["VPN_HEALTH_URL"], fallback: "https://api.ipify.org?format=json" },
+  { group: "VPN", key: "vpnHealthIntervalMs", label: "Health check interval (ms)", kind: "number", names: ["VPN_HEALTH_INTERVAL_MS"], fallback: 120000, min: 0, max: 86400000 },
+  { group: "VPN", key: "vpnFailureThreshold", label: "Failures before marking down", kind: "number", names: ["VPN_FAILURE_THRESHOLD"], fallback: 2, min: 1, max: 20 },
+  { group: "VPN", key: "vpnConnectTimeoutMs", label: "Tunnel connect timeout (ms)", kind: "number", names: ["VPN_CONNECT_TIMEOUT_MS"], fallback: 10000, min: 1000, max: 60000 },
+  { group: "VPN", key: "vpnSessionIdleMs", label: "VPN session idle (ms)", kind: "number", names: ["VPN_SESSION_IDLE_MS"], fallback: 1800000, min: 60000, max: 86400000 },
+  { group: "VPN", key: "vpnWgIdleMs", label: "Stop idle WireGuard after (ms)", kind: "number", names: ["VPN_WG_IDLE_MS"], fallback: 600000, min: 30000, max: 86400000 },
+  { group: "VPN", key: "vpnWgConfig", label: "WireGuard config", kind: "string", names: ["VPN_WIREGUARD_CONFIG"], fallback: "", secret: true },
+  { group: "VPN", key: "vpnWgConfigB64", label: "WireGuard config (base64)", kind: "string", names: ["VPN_WIREGUARD_CONFIG_B64"], fallback: "", secret: true },
+  { group: "VPN", key: "vpnWgConfigFile", label: "WireGuard config file", kind: "string", names: ["VPN_WIREGUARD_CONFIG_FILE"], fallback: "" },
+  { group: "VPN", key: "vpnWgId", label: "WireGuard profile id", kind: "string", names: ["VPN_WIREGUARD_ID"], fallback: "wireguard" },
+  { group: "VPN", key: "vpnWgName", label: "WireGuard profile name", kind: "string", names: ["VPN_WIREGUARD_NAME"], fallback: "WireGuard" },
+  { group: "VPN", key: "vpnWgRegion", label: "WireGuard region", kind: "string", names: ["VPN_WIREGUARD_REGION"], fallback: "" },
+  { group: "VPN", key: "vpnWireproxyBin", label: "wireproxy binary", kind: "string", names: ["VPN_WIREPROXY_BIN"], fallback: "bin/wireproxy" },
+  { group: "VPN", key: "vpnProfilesFile", label: "VPN profiles file", kind: "string", names: ["VPN_PROFILES_FILE"], fallback: "" },
+  { group: "VPN", key: "vpnTimezone", label: "Browser timezone on VPN", kind: "string", names: ["VPN_TIMEZONE"], fallback: "" },
+  { group: "VPN", key: "vpnLocale", label: "Browser locale on VPN", kind: "string", names: ["VPN_LOCALE"], fallback: "" },
   { group: "Misc", key: "browserRenderFallback", label: "Browser render fallback", kind: "bool", names: ["BROWSER_RENDER_FALLBACK"], fallback: false },
   { group: "Misc", key: "sortQueryParams", label: "Normalize/sort query params", kind: "bool", names: ["NORMALIZE_SORT_QUERY_PARAMS"], fallback: false }
 ];
@@ -3401,7 +3652,9 @@ const STATUS_VAR_DEFS = [
 // not read anywhere. Setting these has no effect — flagged explicitly so they
 // don't get mistaken for working configuration.
 const STATUS_KNOWN_UNUSED = [];
-const STATUS_WATCHED_PREFIXES = ["CRAWLER_", "ROBOT_", "MAX_", "PROXY_", "SEARCH_", "INDEX_", "VEYRA_", "ROBOTS_", "SITEMAP_", "CACHE_", "BROWSER_", "NORMALIZE_", "FRONTEND_", "PUBLIC_", "PORT", "PROCESS_ROLE", "SERVER_LOG_LEVEL", "REQUEST_TIMEOUT_MS", "BODY_TIMEOUT_MS", "DNS_TIMEOUT_MS", "HOST_BACKOFF_MS", "RETRY_BASE_MS", "BING_", "BRAVE_"];
+// Set by the build/runtime, not by the user.
+const STATUS_IGNORED_VARS = new Set(["VEYRA_THREAD_WORKER", "VEYRA_POOL_IN_TESTS"]);
+const STATUS_WATCHED_PREFIXES = ["VPN_", "SESSION_", "CRAWL_", "PARSE_WORKER_", "SERVER_IDLE_", "RENDER_PLAN", "CRAWLER_", "ROBOT_", "MAX_", "PROXY_", "SEARCH_", "INDEX_", "VEYRA_", "ROBOTS_", "SITEMAP_", "CACHE_", "BROWSER_", "NORMALIZE_", "FRONTEND_", "PUBLIC_", "PORT", "PROCESS_ROLE", "SERVER_LOG_LEVEL", "REQUEST_TIMEOUT_MS", "BODY_TIMEOUT_MS", "DNS_TIMEOUT_MS", "HOST_BACKOFF_MS", "RETRY_BASE_MS", "BING_", "BRAVE_"];
 
 function buildStatusReport() {
   const vars = STATUS_VAR_DEFS.map(def => {
@@ -3414,9 +3667,14 @@ function buildStatusReport() {
     return { group: def.group, key: def.key, label: def.label, note: def.note || "", secret: !!def.secret, ...d };
   });
 
+  for (const v of vars) {
+    const src = VEYRA_CONFIG.applied?.[v.name];
+    if (src && v.present) { v.source = src; v.detail = `${v.detail || ""} Value comes from ${src} (a real env var would override it).`.trim(); }
+    else if (v.present) v.source = "env";
+  }
   const knownNames = new Set(STATUS_VAR_DEFS.flatMap(d => d.names).concat(STATUS_KNOWN_UNUSED));
   const unrecognized = Object.keys(process.env)
-    .filter(name => STATUS_WATCHED_PREFIXES.some(p => name.startsWith(p)) && !knownNames.has(name))
+    .filter(name => STATUS_WATCHED_PREFIXES.some(p => name.startsWith(p)) && !knownNames.has(name) && !STATUS_IGNORED_VARS.has(name))
     .sort()
     .map(name => ({ name, raw: name.includes("KEY") || name.includes("SECRET") || name.includes("AUTH") ? "(hidden)" : process.env[name] }));
 
@@ -3452,6 +3710,12 @@ function buildStatusReport() {
   for (const name of setUnused) addIssue("warn", `${name} is set but this server build never reads it — it has no effect. Remove it or check you're deploying the version of the code that's supposed to use it.`);
   for (const u of unrecognized) addIssue("warn", `${u.name} looks like a Veyra config variable but isn't recognized by this server build (raw value: ${u.raw}). Check for a typo, e.g. did you mean one of: ${STATUS_VAR_DEFS.flatMap(d => d.names).filter(n => n.slice(0, 4) === u.name.slice(0, 4)).join(", ") || "(no close match found)"}.`);
 
+  for (const e of VEYRA_CONFIG.errors) addIssue("error", `Config: ${e}`);
+  for (const w of VEYRA_CONFIG.warnings) addIssue("warn", `Config: ${w}`);
+  if (CFG.vpnEnabled && !vpnManager.profiles?.size) addIssue("error", "VPN_ENABLED is on but no valid VPN profile was loaded — check VPN_PROFILES_JSON / VPN_PROXY_SERVER / VPN_WIREGUARD_CONFIG.");
+  if (CFG.vpnEnabled && [...(vpnManager.profiles?.values() || [])].some(p => p.type === "wireguard") && !vpnManager.wireproxyBin) addIssue("error", "A WireGuard VPN profile is configured but the wireproxy binary is missing — add `node install-wireproxy.js` to the Render build command.");
+  if (CFG.vpnEnabled && !CFG.vpnKillSwitch) addIssue("warn", "VPN_KILL_SWITCH is off — if a tunnel fails, traffic falls back to the Render server IP.");
+  if (CFG.adminToken && CFG.adminToken.length < 16) addIssue("warn", "VEYRA_ADMIN_TOKEN is shorter than 16 characters.");
   if (rewriteFailures.length) addIssue("warn", `${rewriteFailures.length} page(s) failed HTML/CSS/JS rewriting since boot and were served unrewritten as a fallback (links on those pages may point outside Veyra). Most recent: ${rewriteFailures[rewriteFailures.length - 1].url} — ${rewriteFailures[rewriteFailures.length - 1].message}`);
 
 
@@ -3476,6 +3740,10 @@ function buildStatusReport() {
       info: issues.filter(i => i.severity === "info").length
     },
     browser: browserEngine.status(),
+    config: veyraConfigModule.publicSummary(VEYRA_CONFIG),
+    capacity: runtimeConfigSummary(),
+    sessions: sessionManager.report(),
+    vpn: vpnManager.status(),
     issues,
     groups: STATUS_VAR_DEFS.reduce((acc, def) => { (acc[def.group] ||= []).push(byKey[def.key]); return acc; }, {}),
     unrecognizedVars: unrecognized,
@@ -3605,7 +3873,7 @@ async function resolveEscapedChunk(sid, relative) {
   }
   return null;
 }
-const VEYRA_API_ROUTES = new Set(["view", "resource", "download", "form-get", "open", "crawl", "search", "suggest", "browser", "debug", "session", "vpn", "status", "health"]);
+const VEYRA_API_ROUTES = new Set(["view", "resource", "download", "form-get", "open", "crawl", "search", "suggest", "browser", "debug", "session", "sessions", "config", "vpn", "status", "health"]);
 app.use(async (req, res, next) => {
   if (!CFG.proxyRelativeFallback || res.headersSent) return next();
   // Relative specifiers on a proxied page resolve against Veyra's /api/ path
@@ -3641,7 +3909,8 @@ app.use((err, req, res, next) => {
 process.on("uncaughtException", err => { serverLog("error", "SYSTEM", `Uncaught exception: ${err.stack || err}`); });
 process.on("unhandledRejection", reason => { serverLog("error", "SYSTEM", `Unhandled rejection: ${reason?.stack || reason}`); });
 
-setInterval(async () => {
+if (!IS_THREAD_WORKER) setInterval(async () => {
+  sweepAbandonedCrawls();
   const cutoff = Date.now() - CFG.maxJobAgeMs;
   for (const [id, job] of jobs) {
     if (job.done && Date.parse(job.finishedAt || job.createdAt) < cutoff) {
@@ -3655,13 +3924,36 @@ setInterval(async () => {
 if (require.main === module && CFG.processRole !== "worker") {
   app.listen(PORT, "0.0.0.0", () => {
     serverLog("info", "SYSTEM", `Veyra server listening on ${PORT}`);
+    serverLog("info", "CONFIG", `Plan ${VEYRA_CONFIG.plan.label} (${CFG.plan}, ${VEYRA_CONFIG.plan.ramMb}MB / ${VEYRA_CONFIG.plan.cpu} CPU, via ${VEYRA_CONFIG.planSource}) — ${CFG.maxActiveJobs} crawlers × ${CFG.maxActiveFetches} fetches, ${CFG.parseWorkers} parse workers, ${CFG.maxProxySessions} sessions, ${CFG.maxBrowserSessions} browser sessions.`);
+    for (const e of VEYRA_CONFIG.errors) serverLog("error", "CONFIG", e);
+    for (const w of VEYRA_CONFIG.warnings) serverLog("warn", "CONFIG", w);
     pumpIndexSeeds().catch(e => serverLog("warn", "SEARCH", `Seed startup failed: ${e.message}`));
     if (CFG.indexRefreshMs > 0) setInterval(() => pumpIndexSeeds().catch(e => serverLog("warn", "SEARCH", `Seed scheduler failed: ${e.message}`)), 30000).unref();
   });
+  // Render sends SIGTERM on deploy/restart: stop tunnels, threads and Chromium cleanly.
+  let shuttingDown = false;
+  const shutdown = async signal => {
+    if (shuttingDown) return; shuttingDown = true;
+    serverLog("info", "SYSTEM", `${signal} received — shutting down.`);
+    for (const j of jobs.values()) if (!j.done) { j.stopRequested = true; j.stopReason = "shutdown"; }
+    const force = setTimeout(() => process.exit(0), 8000); force.unref();
+    await Promise.allSettled([vpnManager.close?.(), workerPool?.close(), browserEngine.shedIdle(0).then(() => browserEngine.browser?.close())]);
+    process.exit(0);
+  };
+  process.once("SIGTERM", () => shutdown("SIGTERM"));
+  process.once("SIGINT", () => shutdown("SIGINT"));
 } else if (require.main === module) {
   pumpIndexSeeds().catch(e => serverLog("warn", "SEARCH", `Seed startup failed: ${e.message}`));
   if (CFG.indexRefreshMs > 0) setInterval(() => pumpIndexSeeds().catch(e => serverLog("warn", "SEARCH", `Seed scheduler failed: ${e.message}`)), 30000).unref();
   serverLog("info", "SYSTEM", "PROCESS_ROLE=worker selected; no HTTP listener started.");
 }
 
-module.exports = { app, CFG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions };
+// Pure functions used by parse-worker.js threads. (text, ...args) signature.
+const __workerOps = {
+  rewriteHtml: (text, base, sid) => rewriteHtml(text, base, sid),
+  rewriteCss: (text, base, sid) => rewriteCssText(text, base, sid),
+  rewriteJs: (text, base, sid) => rewriteJsText(text, base, sid),
+  discover: (text, kind, base, contentType) => collectDiscovery(text, kind, base, contentType)
+};
+
+module.exports = { app, CFG, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions };

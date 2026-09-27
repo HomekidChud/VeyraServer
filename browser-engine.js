@@ -53,6 +53,9 @@ class BrowserEngine {
           headless: this.cfg.browserHeadless !== false,
           args: [
             '--disable-dev-shm-usage',
+            // Stop WebRTC from revealing the server's real IP around the VPN.
+            '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
+            '--webrtc-ip-handling-policy=disable_non_proxied_udp',
             '--disable-background-networking',
             '--disable-component-update',
             '--disable-default-apps',
@@ -99,7 +102,11 @@ class BrowserEngine {
     return null;
   }
 
-  async create(tabId, target, jobId = '', vpnProfile = null) {
+  // vpn: { profileId, proxy, contextHints } from VpnManager (proxy points at the
+  // local VPN gateway so Chromium gets failover + kill switch too).
+  // proxySessionId links this browser session to a Veyra proxy session so the
+  // session manager can close it when that session expires.
+  async create(tabId, target, jobId = '', vpnProfile = null, extra = {}) {
     const url = safeUrl(target);
     if (!url) throw Object.assign(new Error('Invalid HTTP(S) browser URL.'), { code: 'INVALID_URL' });
     await this.assertPublicUrl(url);
@@ -107,7 +114,7 @@ class BrowserEngine {
     const existing = this.getByTabId(tabId);
     if (existing) {
       const existingVpn = existing.vpnProfileId || null;
-      const requestedVpn = vpnProfile?.id || null;
+      const requestedVpn = vpnProfile?.id || vpnProfile?.profileId || null;
       if (existingVpn === requestedVpn) {
         existing.jobId = String(jobId || existing.jobId || '');
         await this.navigateSession(existing, url);
@@ -133,7 +140,12 @@ class BrowserEngine {
         viewport: { width: 1365, height: 820 },
         serviceWorkers: 'allow'
       };
-      if (vpnProfile?.server) {
+      if (vpnProfile?.proxy) {
+        contextOptions.proxy = { ...vpnProfile.proxy };
+        const hints = vpnProfile.contextHints || {};
+        if (hints.timezoneId) contextOptions.timezoneId = hints.timezoneId;
+        if (hints.locale) contextOptions.locale = hints.locale;
+      } else if (vpnProfile?.server) {
         contextOptions.proxy = { server: vpnProfile.server };
         if (vpnProfile.username) contextOptions.proxy.username = vpnProfile.username;
         if (vpnProfile.password) contextOptions.proxy.password = vpnProfile.password;
@@ -170,7 +182,8 @@ class BrowserEngine {
         status: 'LOADING',
         error: '',
         verification: null,
-        vpnProfileId: vpnProfile?.id || null,
+        vpnProfileId: vpnProfile?.id || vpnProfile?.profileId || null,
+        proxySessionId: String(extra.proxySessionId || ''),
         navigationActive: false,
         console: [],
         network: [],
@@ -375,6 +388,7 @@ class BrowserEngine {
     clearTimeout(s.browserPoll);
     await s.context.close().catch(() => {});
     this.sessions.delete(String(sid));
+    if (!this.sessions.size) this.lastSessionClosedAt = Date.now();
     if (!this.sessions.size && this.browser && !this.cfg.browserKeepWarm) {
       await this.browser.close().catch(() => {});
       this.browser = null;
@@ -391,8 +405,30 @@ class BrowserEngine {
     return this.public(s);
   }
 
+  // Close every session tied to a Veyra proxy session (used by the session manager).
+  async stopForProxySession(proxySid) {
+    let n = 0;
+    for (const [sid, s] of this.sessions) if (proxySid && s.proxySessionId === proxySid) { await this.stop(sid).catch(() => {}); n += 1; }
+    return n;
+  }
+
+  // Close sessions that are not navigating and have been idle for minIdleMs.
+  async shedIdle(minIdleMs = 30000) {
+    let n = 0;
+    const cutoff = Date.now() - minIdleMs;
+    for (const [sid, s] of this.sessions) if (!s.navigationActive && s.lastUsed < cutoff) { await this.stop(sid).catch(() => {}); n += 1; }
+    return n;
+  }
+
   async expireIdle() {
     const nowMs = Date.now();
+    // Even with BROWSER_KEEP_WARM, don't hold ~150MB of Chromium forever when
+    // nobody is using it.
+    if (!this.sessions.size && this.browser && this.cfg.browserKeepWarm && this.cfg.browserWarmIdleMs > 0 && this.lastSessionClosedAt && nowMs - this.lastSessionClosedAt > this.cfg.browserWarmIdleMs) {
+      await this.browser.close().catch(() => {});
+      this.browser = null; this.playwright = null;
+      this.log('info', 'BROWSER', 'Chromium stopped after staying idle (BROWSER_WARM_IDLE_MS).');
+    }
     const idleCutoff = nowMs - this.cfg.browserIdleTimeoutMs;
     const ttlCutoff = nowMs - this.cfg.browserSessionTtlMs;
     for (const [sid, s] of this.sessions) {
@@ -432,7 +468,7 @@ class BrowserEngine {
       available: !!this.browser,
       ...this.capacity(),
       sessionList: [...this.sessions.values()].map(s => ({
-        id: s.id, tabId: s.tabId, url: safeUrl(s.page?.url()) || s.canonicalUrl,
+        id: s.id, tabId: s.tabId, proxySessionId: s.proxySessionId ? `${s.proxySessionId.slice(0, 6)}…` : null, url: safeUrl(s.page?.url()) || s.canonicalUrl,
         status: s.status, navigationActive: !!s.navigationActive, lastUsed: s.lastUsed
       }))
     };

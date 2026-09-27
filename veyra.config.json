@@ -1,0 +1,17 @@
+{
+  "$comment": "Veyra config. Set plan to your Render instance type (or 'auto'). Real env vars always win over this file. Keep secrets in Render env vars, not here. Run `npm run config -- help`.",
+  "plan": "auto",
+  "env": {},
+  "caps": {},
+  "environments": {
+    "development": {
+      "env": {
+        "SERVER_LOG_LEVEL": "debug",
+        "INDEX_SEED_CRAWL": "false"
+      }
+    },
+    "production": {
+      "env": {}
+    }
+  }
+}
