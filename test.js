@@ -2,7 +2,8 @@ const assert = require("assert/strict");
 const {
   CFG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, crawlLimitForContentType,
   rewriteHtml, rewriteCssText, rewriteJsText, injectRuntime, detectChallenge, PriorityFrontier, CooperativeRobotPool, crawlPriority,
-  tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument
+  tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument,
+  BrowserTaskScheduler
 } = require("./server");
 
 (async () => {

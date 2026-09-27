@@ -1308,7 +1308,7 @@ function injectRuntime(html, original, sid = "") {
           return '';
         }
       }catch{}
-      try{const decoded=decodeURIComponent(raw);if(decoded!==raw&&/^https?:\/\//i.test(decoded)){raw=decoded;continue;}}catch{}
+      try{const decoded=decodeURIComponent(raw);if(decoded!==raw&&/^https?:[/][/]/i.test(decoded)){raw=decoded;continue;}}catch{}
       break;
     }
     return raw;
@@ -2882,6 +2882,7 @@ function forwardProxyBrowserHeaders(req, targetUrl, sourceUrl, mode, baseHeaders
     }
     Object.assign(out, sameSiteFetchMetadata(targetUrl, sourceUrl, mode));
   }
+  for (const k of Object.keys(out)) if (out[k] === undefined || out[k] === null || out[k] === "undefined") delete out[k];
   return out;
 }
 
@@ -2927,7 +2928,7 @@ async function proxyRequest(req, res, mode) {
   const sid = normalizeSessionId(req.query.sid);
   const headers = forwardProxyBrowserHeaders(req, canonical, sourceUrl, mode, {
     accept,
-    "content-type": req.get("Content-Type") || undefined,
+    ...(req.get("Content-Type") ? { "content-type": String(req.get("Content-Type")).slice(0, 500) } : {}),
     ...(req.get("Range") ? { range: String(req.get("Range")).slice(0, 200) } : {}),
     ...(referrer ? { referer: referrer } : {}),
     ...(sourceOrigin ? { origin: sourceOrigin } : {})

@@ -8,7 +8,7 @@
     "start": "node server.js",
     "test": "node test.js",
     "test:urls": "node url_regression_test.js",
-    "test:all": "node test.js && node url_regression_test.js && node regression_test.js && node google_form_regression_test.js && node static_regression_test.js && node browser_vpn_regression_test.js",
+    "test:all": "node test.js && node url_regression_test.js && node regression_test.js && node google_form_regression_test.js && node static_regression_test.js && node browser_vpn_regression_test.js && node proxy_header_regression_test.js",
     "prestart": "node ensure-browser.js",
     "build": "npx playwright install chromium"
   },
