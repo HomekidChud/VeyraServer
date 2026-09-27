@@ -62,3 +62,21 @@ GET forms are rewritten to `/api/form-get/:target/:sid` so form fields cannot ov
 ## Veyra VPN tunnel
 
 The server supports optional per-session outbound HTTP/HTTPS/SOCKS5 proxy gateways. Set `VPN_ENABLED=true` and configure either a single `VPN_PROXY_SERVER` profile or `VPN_PROFILES_JSON`. The browser context uses the configured gateway; proxy-mode fetches use the matching session dispatcher. This is a Veyra session tunnel, not an operating-system-wide VPN. Credentials remain server-side.
+
+
+## v8.11.2 proxy compatibility fixes (YouTube / SPA sites)
+
+- GET requests no longer send `content-type: undefined` (Google/YouTube answered 400).
+- Injected runtime no longer has a SyntaxError (template-literal escape loss in the unwrap regex).
+- Oversize resources (e.g. YouTube's ~10 MB app bundle) are streamed instead of returning 413. `PROXY_STREAM_OVERSIZE=true` (default).
+- Proxy routes relay the raw request body (JSON, protobuf, gzip, text) instead of re-serialising or dropping it.
+- `fetch(Request)` bodies are buffered (Chrome can only stream uploads over HTTP/2), the real URL of a Request is read via the native getter (YouTube replays cached responses with `data:` Requests and a spoofed `url`), and `URL` objects are handled.
+- Custom `x-*` API headers (`x-goog-api-key`, `x-user-agent`, ...) are relayed; proxy/infrastructure headers are not.
+- Relative and location-derived URLs (`/youtubei/...`, `/api/view/<rest>`, `?page=2`) map onto the real site.
+- `History.prototype` is patched and a watchdog restores the proxied URL if a page escapes it.
+- Relative-path fallback: root-relative requests that bypass the runtime (DOM-inserted `<script>`, audio, CSS) are resolved from the Referer, or from the `veyra_ctx` cookie. Webpack chunks requested as `/api/<chunk>.js` are resolved against recently proxied script directories. `PROXY_RELATIVE_FALLBACK=true` (default).
+- The JS rewriter no longer rewrites partial dynamic-import prefixes such as `import("./" + chunk)`.
+
+### Known limits
+- YouTube video playback from a datacenter IP (Render, AWS) is blocked by Google's "Sign in to confirm you're not a bot" check. Route the session through a residential `VPN_PROXY_SERVER` profile if you need playback.
+- Apps whose router reads `location.pathname` directly (e.g. Twitch) still see `/api/view`; fully fixing this needs a virtualised `location` (JS rewriting).

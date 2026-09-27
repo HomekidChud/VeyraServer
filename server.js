@@ -209,6 +209,8 @@ const CFG = Object.freeze({
   sortQueryParams: boolEnv("NORMALIZE_SORT_QUERY_PARAMS", false),
   proxyForwardCompatHeaders: boolEnv("PROXY_FORWARD_COMPAT_HEADERS", true),
   proxyForwardClientHints: boolEnv("PROXY_FORWARD_CLIENT_HINTS", true),
+  proxyStreamOversize: boolEnv("PROXY_STREAM_OVERSIZE", true),
+  proxyRelativeFallback: boolEnv("PROXY_RELATIVE_FALLBACK", true),
   proxyApiBodyBytes: numberEnv("PROXY_API_BODY_BYTES", 4 * 1024 * 1024, 64 * 1024, 32 * 1024 * 1024),
   proxyJsHeavyThreshold: numberEnv("PROXY_JS_HEAVY_THRESHOLD", 4, 1, 20),
   proxyApiRetries: numberEnv("PROXY_API_RETRIES", 1, 0, 3),
@@ -237,6 +239,9 @@ app.use(cors({
   allowedHeaders: ["Content-Type", "Accept", "X-Veyra-Request-ID", "X-Requested-With", "X-CSRF-Token", "X-XSRF-Token", "DNT", "Cache-Control", "Pragma", "Range"],
   exposedHeaders: ["X-Veyra-Request-ID", "X-Veyra-Canonical-URL", "X-Veyra-Challenge", "X-Veyra-Content-Type", "X-Veyra-Session-ID"]
 }));
+// Proxy routes receive the page's request body byte-for-byte (JSON, protobuf,
+// text, gzip-compressed payloads, etc.) so it can be relayed upstream unchanged.
+app.use(["/api/resource", "/api/view"], express.raw({ type: () => true, limit: CFG.maxProxyBodyBytes, inflate: true }));
 app.use(express.json({ limit: "256kb" }));
 app.use(express.urlencoded({ extended: false, limit: CFG.maxFormBodyBytes }));
 
@@ -848,9 +853,23 @@ function backoffMs(attempt, retryAfter = 0) {
   if (retryAfter) return retryAfter;
   return Math.min(10000, CFG.retryBaseMs * 2 ** attempt + Math.random() * CFG.retryBaseMs);
 }
-async function readBodyLimited(response, limit) {
+function oversizeStream(response, head, reader) {
+  // Single-use handle to the remainder of an oversized upstream body so the
+  // proxy can pipe it to the client without buffering it in memory.
+  let taken = false;
+  return {
+    take() {
+      if (taken) return null; taken = true;
+      const r = reader || response.body?.getReader();
+      return { head, reader: r };
+    },
+    cancel() { if (taken) return; taken = true; try { (reader ? reader.cancel() : response.body?.cancel())?.catch?.(() => {}); } catch {} }
+  };
+}
+async function readBodyLimited(response, limit, keepStream = false) {
   const len = Number(response.headers.get("content-length"));
   if (Number.isFinite(len) && len > limit) {
+    if (keepStream && response.body) return { body: Buffer.alloc(0), bytes: len, truncated: true, tooLarge: true, stream: oversizeStream(response, [], null) };
     try { await response.body?.cancel(); } catch {}
     return { body: Buffer.alloc(0), bytes: len, truncated: true, tooLarge: true };
   }
@@ -869,7 +888,15 @@ async function readBodyLimited(response, limit) {
     const keep = Math.max(0, Math.min(chunk.length, limit - total));
     if (keep) chunks.push(chunk.subarray(0, keep));
     total += chunk.length;
-    if (total > limit) { truncated = true; try { await reader.cancel(); } catch {} break; }
+    if (total > limit) {
+      if (keepStream) {
+        // Hand back everything read so far (including the chunk that crossed the
+        // limit) plus the live reader, so nothing is lost when streaming.
+        const head = keep ? [...chunks.slice(0, -1), chunk] : [...chunks, chunk];
+        return { body: Buffer.alloc(0), bytes: total, truncated: true, tooLarge: true, stream: oversizeStream(response, head, reader) };
+      }
+      truncated = true; try { await reader.cancel(); } catch {} break;
+    }
   }
   return { body: Buffer.concat(chunks), bytes: total, truncated, tooLarge: truncated };
 }
@@ -937,7 +964,7 @@ async function fetchBuffer(url, opts = {}) {
         }
         const contentType = response.headers.get("content-type") || "";
         const bodyLimit = typeof opts.limitForContentType === "function" ? opts.limitForContentType(contentType, response.headers) : limit;
-        const body = await readBodyLimited(response, bodyLimit);
+        const body = await readBodyLimited(response, bodyLimit, !!opts.streamOversize);
         return {
           ok: response.ok,
           status: response.status,
@@ -960,6 +987,7 @@ async function fetchBuffer(url, opts = {}) {
           bytes: body.bytes,
           truncated: body.truncated,
           tooLarge: body.tooLarge,
+          stream: body.stream || null,
           body: body.body,
           redirectChain,
           retries: retriesUsed,
@@ -1269,7 +1297,11 @@ function rewriteCssText(text, base, sid = "") {
 }
 function rewriteJsText(text, base, sid = "") {
   const patterns = [
-    /(\bimport\s*\(\s*|\bimport\s+(?:[^'"`]*?\s+from\s+)?|\bexport\s+[^'"`]*?\s+from\s+)(["'`])([^"'`]+)\2/g
+    // Only rewrite complete literal specifiers. A dynamic import whose argument
+    // is an expression (import("./" + chunk)) must be left alone, otherwise the
+    // prefix becomes a proxied URL and the chunk name is appended to its query.
+    /(\bimport\s*\(\s*)(["'`])([^"'`$]+)\2(?=\s*[,)])/g,
+    /(\bimport\s+(?:[^'"`;()]*?\s+from\s+)?|\bexport\s+[^'"`;()]*?\s+from\s+)(["'])([^"']+)\2(?=\s*(?:;|$|\n|\r|assert\b|with\b))/gm
   ];
   let out = String(text || "");
   for (const re of patterns) {
@@ -1313,20 +1345,47 @@ function injectRuntime(html, original, sid = "") {
     }
     return raw;
   }
-  function resolve(v){try{return new URL(unwrap(typeof v==='string'?v:v&&v.url||''),virtualUrl).href}catch{return String(v||'')}}
+  function ownOrigin(o){return o===location.origin||(!!API_ORIGIN&&o===API_ORIGIN)}
+  const VEYRA_ROUTES=/^[/]api[/](view|resource|download|form-get|open|crawl|search|suggest|browser|debug|session|vpn|status|health)([/?#]|$)/;
+  function fixOwn(u){try{if(!ownOrigin(u.origin))return u;
+    if(!/^[/]api[/]/.test(u.pathname))return new URL(u.pathname+u.search+u.hash,virtualUrl);
+    // location.pathname is "/api/view" on a proxied page, so app code that builds
+    // URLs from it yields "/api/view/<rest>"; map that onto the real page path.
+    const vp=new URL(virtualUrl);
+    if(/^[/]api[/]view[/]/.test(u.pathname))return new URL(vp.pathname.replace(/[/]$/,'')+u.pathname.slice(9)+u.search+u.hash,vp);
+    // Other non-Veyra /api/... paths are page-relative specifiers resolved against /api/view.
+    if(!VEYRA_ROUTES.test(u.pathname))return new URL(u.pathname.slice(5)+u.search+u.hash,virtualUrl);
+  }catch{}return u}
+  // Read a Request's real URL via the native getter: some apps (YouTube) hand fetch()
+  // a data: Request with a spoofed own 'url' getter to replay a cached response.
+  const reqUrlGet=(()=>{try{return Object.getOwnPropertyDescriptor(Request.prototype,'url').get}catch{return null}})();
+  function realUrl(v){if(v==null)return '';if(typeof v==='string')return v;try{if(reqUrlGet&&typeof Request!=='undefined'&&v instanceof Request)return reqUrlGet.call(v)}catch{}if(typeof v.url==='string')return v.url;if(typeof v.href==='string')return v.href;return String(v)}
+  function toVirtual(raw){if(/^[?#]/.test(raw))return new URL(raw,virtualUrl);const u=new URL(raw,location.href);return ownOrigin(u.origin)?fixOwn(u):u}
+  function resolve(v){try{const raw=unwrap(realUrl(v));return (raw===''?new URL(virtualUrl):toVirtual(raw)).href}catch{return String(v||'')}}
   function shouldProxy(v){try{const u=new URL(unwrap(v));return /^https?:$/.test(u.protocol)}catch{return false}}
   function proxy(kind,u){const prefix=API_ORIGIN || location.origin;const base=prefix+(kind==='view'?'/api/view?url=':'/api/resource?url=')+encodeURIComponent(u);const from=encodeURIComponent(new URL(virtualUrl).href);return kind==='view'?base+'&sid='+encodeURIComponent(SESSION_ID):base+'&from='+from+'&sid='+encodeURIComponent(SESSION_ID)}
   function topPost(msg){try{window.top.postMessage(msg,'*')}catch{}}
   function emit(source,url,extra){if(!url)return;topPost({type:'veyra:navigate',url,source,sessionId:SESSION_ID,...extra})}
   function net(method,url,status,ms,ok){topPost({type:'veyra:browser-network',sessionId:SESSION_ID,pageUrl:virtualUrl,method:String(method||'GET').toUpperCase(),url:String(url||''),status:status||0,duration:Math.round(ms||0),ok:!!ok})}
-  function canonicalizeMaybeProxy(href){try{const raw=unwrap(href);if(!raw)return null;const u=new URL(raw,virtualUrl);if(!/^https?:$/.test(u.protocol))return null;return u.href}catch{return null}}
-  function proxyHistory(method){const native=history[method].bind(history);return function(state,title,url){
-    let next=virtualUrl;try{if(url!=null)next=new URL(unwrap(String(url)),virtualUrl).href}catch{}
-    virtualUrl=next;window.__VEYRA_PAGE_URL__=next;
-    try{native(state,title,proxy('view',next))}catch{}
+  function canonicalizeMaybeProxy(href){try{const raw=unwrap(href);if(!raw)return null;const u=toVirtual(raw);if(!/^https?:$/.test(u.protocol))return null;return u.href}catch{return null}}
+  const HP=(typeof History!=='undefined'&&History.prototype)||null;
+  const nativeReplaceState=HP?HP.replaceState:history.replaceState;
+  function rootProxiedFrame(){try{return window.parent===window||!window.parent.__VEYRA_PROXY__}catch{return true}}
+  function remember(next){virtualUrl=next;window.__VEYRA_PAGE_URL__=next;if(rootProxiedFrame())try{document.cookie='veyra_ctx='+encodeURIComponent(next)+'|'+encodeURIComponent(SESSION_ID)+';path=/;max-age=86400;'+(location.protocol==='https:'?'SameSite=None;Secure':'SameSite=Lax')}catch{}}
+  function proxyHistory(method,native){return function(state,title,url){
+    let next=virtualUrl;try{if(url!=null)next=fixOwn(new URL(unwrap(String(url)),virtualUrl)).href}catch{}
+    remember(next);
+    try{native.call(this||history,state,title,proxy('view',next))}catch{}
     emit('history.'+method,next);return undefined;
   }}
-  try{history.pushState=proxyHistory('pushState');history.replaceState=proxyHistory('replaceState')}catch{}
+  // Patch the prototype (not just the instance): apps such as YouTube call
+  // History.prototype.pushState directly, which would otherwise move the frame
+  // to a bare Veyra-origin URL and break relative paths and reloads.
+  try{if(HP){const np=HP.pushState,nr=HP.replaceState;HP.pushState=proxyHistory('pushState',np);HP.replaceState=proxyHistory('replaceState',nr)}else{const np=history.pushState,nr=history.replaceState;history.pushState=proxyHistory('pushState',np);history.replaceState=proxyHistory('replaceState',nr)}}catch{}
+  // Watchdog: if anything still escapes (pristine History from another realm),
+  // map the escaped path back onto the real site and restore the proxied URL.
+  function heal(){try{if(!/^[/]api[/]/.test(location.pathname)){const next=new URL(location.pathname+location.search+location.hash,virtualUrl).href;remember(next);nativeReplaceState.call(history,history.state,'',proxy('view',next));emit('history.heal',next)}}catch{}}
+  try{setInterval(heal,300);addEventListener('popstate',()=>{try{const u=canonicalizeMaybeProxy(location.href);if(u&&u!==virtualUrl){remember(u);emit('history.popstate',u)}}catch{}})}catch{}
   try{
     const LP=Location&&Location.prototype;
     if(LP&&LP.assign){const nativeAssign=LP.assign;LP.assign=function(next){const u=canonicalizeMaybeProxy(next);if(u){emit('location.assign',u);return;}return nativeAssign.call(this,next)}}
@@ -1334,8 +1393,8 @@ function injectRuntime(html, original, sid = "") {
   }catch{}
   try{navigator.serviceWorker&&navigator.serviceWorker.register&&(navigator.serviceWorker.register=()=>Promise.reject(new Error('Service workers are disabled inside the Veyra proxy.')))}catch{}
   const nativeFetch=window.fetch;if(nativeFetch)window.fetch=function(input,init){
-    const started=performance.now(); const method=String(init&&init.method||input&&input.method||'GET').toUpperCase(); const original=String(input&&input.url||input||''); let target='';
-    try{target=resolve(input);if(shouldProxy(target)){const proxied=(typeof Request!=='undefined'&&input instanceof Request)?new Request(proxy('resource',target),input):proxy('resource',target);return nativeFetch(proxied,init).then(r=>{net(method,target,r.status,performance.now()-started,r.ok);return r},e=>{net(method,target,0,performance.now()-started,false);throw e});}}catch{}
+    const started=performance.now(); const method=String(init&&init.method||input&&input.method||'GET').toUpperCase(); const original=realUrl(input); let target='';
+    try{target=resolve(input);if(shouldProxy(target)){const ok=r=>{net(method,target,r.status,performance.now()-started,r.ok);return r},bad=e=>{net(method,target,0,performance.now()-started,false);throw e};const dest=proxy('resource',target);if(typeof Request!=='undefined'&&input instanceof Request){const src=input;const hasBody=!/^(GET|HEAD)$/i.test(src.method)&&!(init&&'body' in init);return (hasBody?src.clone().arrayBuffer():Promise.resolve(undefined)).then(buf=>{const opts={method:src.method,headers:src.headers,credentials:src.credentials,cache:src.cache,redirect:src.redirect,integrity:src.integrity,signal:src.signal};if(buf&&buf.byteLength)opts.body=buf;if(src.keepalive&&!(buf&&buf.byteLength>60000))opts.keepalive=true;return nativeFetch(dest,Object.assign(opts,init||{}))}).then(ok,bad)}if(init&&init.body&&typeof ReadableStream!=='undefined'&&init.body instanceof ReadableStream){return new Response(init.body).arrayBuffer().then(buf=>{const o=Object.assign({},init,{body:buf});delete o.duplex;return nativeFetch(dest,o)}).then(ok,bad)}return nativeFetch(dest,init).then(ok,bad);}}catch{}
     return nativeFetch(input,init).then(r=>{net(method,target||original,r.status,performance.now()-started,r.ok);return r},e=>{net(method,target||original,0,performance.now()-started,false);throw e});
   };
   try{const nativeXhrOpen=XMLHttpRequest.prototype.open,nativeXhrSend=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(method,url,...rest){this.__veyraMethod=method;this.__veyraTarget=resolve(url);this.__veyraStarted=0;return nativeXhrOpen.call(this,method,shouldProxy(this.__veyraTarget)?proxy('resource',this.__veyraTarget):url,...rest)};XMLHttpRequest.prototype.send=function(body){this.__veyraStarted=performance.now();this.addEventListener('loadend',()=>net(this.__veyraMethod||'GET',this.__veyraTarget||'',this.status,performance.now()-this.__veyraStarted,this.status>=200&&this.status<400),{once:true});return nativeXhrSend.call(this,body)}}catch{}
@@ -1448,6 +1507,10 @@ function rewriteHtml(html, base, sid = "") {
   $(`[data-srcset]`).each((_, el) => $(el).attr("data-srcset", rewriteSrcset($(el).attr("data-srcset"), effectiveBase, sid)));
   $("track[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), effectiveBase); if (u) $(el).attr("src", makeResourceUrl(u, effectiveBase, sid)); });
   $("[srcset]").each((_, el) => $(el).attr("srcset", rewriteSrcset($(el).attr("srcset"), effectiveBase, sid)));
+  // Page-level referrer policies (e.g. "no-referrer") would stop Veyra from
+  // recovering the real origin for relative requests the page makes by DOM
+  // insertion; Veyra's own document header already keeps referrers same-origin.
+  $("meta[name]").filter((_, el) => String($(el).attr("name") || "").toLowerCase() === "referrer").remove();
   $("meta[http-equiv='refresh'],meta[http-equiv='Refresh']").each((_, el) => {
     const raw = $(el).attr("content") || ""; const m = raw.match(/^(\s*\d+\s*;\s*url\s*=\s*)(.+)$/i); if (!m) return;
     const u = resolveNavigation(m[2].trim().replace(/^['"]|['"]$/g, ""), effectiveBase); if (u) $(el).attr("content", `${m[1]}${makeViewUrl(u, sid)}`);
@@ -2870,6 +2933,15 @@ function forwardProxyBrowserHeaders(req, targetUrl, sourceUrl, mode, baseHeaders
       const value = req.get(name);
       if (value) out[name] = String(value).slice(0, 20000);
     }
+    // Web apps send many custom x-* API headers (x-goog-api-key, x-user-agent,
+    // x-goog-authuser, x-goog-ext-*, x-client-data, x-api-key, ...). Relay them,
+    // but never infrastructure/proxy headers added by Render, CDNs or Veyra.
+    const blocked = /^x-(forwarded-|real-ip$|client-ip$|cluster-client-ip$|veyra-|render-|request-id$|request-start$|amzn-|envoy-|b3-|cloud-trace|original-|http-method-override$)/i;
+    for (const [rawName, value] of Object.entries(req.headers || {})) {
+      const name = rawName.toLowerCase();
+      if (!name.startsWith("x-") || blocked.test(name) || out[name] || value == null) continue;
+      out[name] = String(Array.isArray(value) ? value.join(", ") : value).slice(0, 20000);
+    }
   }
   if (CFG.proxyForwardClientHints) {
     for (const name of [
@@ -2908,6 +2980,56 @@ function looksLikeApiResource(url, accept = "", method = "GET") {
   }
 }
 
+// Large resources (e.g. YouTube's ~10 MB app bundle, big JSON payloads, media
+// without Range) are piped straight to the client instead of being buffered.
+// They are served without rewriting: the injected runtime already routes the
+// page's fetch/XHR/beacon traffic through Veyra, and the JS rewriter only
+// touches ES module import specifiers, which large classic bundles don't use.
+async function streamOversizeResponse(req, res, result, ctx) {
+  let handle = result.stream ? result.stream.take() : null;
+  if (!handle) {
+    // The scheduler de-duplicated this request and another client already took
+    // the single-use stream. Open a fresh streaming fetch for this client.
+    const again = await fetchBuffer(ctx.canonical, { method: ctx.method, headers: ctx.headers, body: ctx.body, referrer: ctx.referrer, sessionId: ctx.sid, retries: 0, limit: 0, limitForContentType: () => 0, streamOversize: true });
+    handle = again.stream ? again.stream.take() : null;
+    if (!handle) return respondError(res, 502, "Veyra could not stream this resource.", "PROXY_STREAM_ERROR");
+    result = again;
+  }
+  const type = result.contentType || "application/octet-stream";
+  res.setHeader("content-type", type);
+  res.setHeader("cache-control", ctx.download ? "no-store" : "public, max-age=60");
+  res.setHeader("x-content-type-options", "nosniff");
+  res.setHeader("referrer-policy", "no-referrer");
+  if (ctx.download) res.setHeader("content-disposition", `attachment; filename="${safeDownloadFilename(result.finalUrl || ctx.canonical, type)}"`);
+  if (result.contentRange) res.setHeader("content-range", result.contentRange);
+  if (result.acceptRanges) res.setHeader("accept-ranges", result.acceptRanges);
+  if (result.etag) res.setHeader("ETag", result.etag);
+  if (result.lastModified) res.setHeader("Last-Modified", result.lastModified);
+  res.setHeader("X-Veyra-Canonical-URL", result.finalUrl || ctx.canonical);
+  res.setHeader("X-Veyra-Session-ID", ctx.sid);
+  res.setHeader("X-Veyra-Content-Type", type);
+  res.setHeader("X-Veyra-Proxy-Mode", "resource-stream");
+  res.status(result.status >= 300 && result.status < 400 ? 200 : result.status);
+  let closed = false;
+  res.on("close", () => { if (!res.writableFinished) { closed = true; try { handle.reader?.cancel().catch(() => {}); } catch {} } });
+  const write = (buf) => new Promise((resolve) => { if (closed) return resolve(); if (res.write(buf)) resolve(); else res.once("drain", resolve); });
+  try {
+    for (const chunk of handle.head) await write(chunk);
+    if (handle.reader) {
+      while (!closed) {
+        const { done, value } = await withTimeout(handle.reader.read(), CFG.bodyTimeoutMs, "Response body timed out.");
+        if (done) break;
+        await write(Buffer.from(value));
+      }
+    }
+  } catch {
+    try { handle.reader?.cancel().catch(() => {}); } catch {}
+    if (!res.writableEnded) res.destroy();
+    return;
+  }
+  if (!res.writableEnded) res.end();
+}
+
 async function proxyRequest(req, res, mode) {
   const canonical = firstValidUrl([req.query.url, req.query.target, req.query.u], req.get('Origin') || undefined) || proxyRefererCanonical(req);
   const download = String(req.query.download || "") === "1";
@@ -2917,6 +3039,7 @@ async function proxyRequest(req, res, mode) {
   const method = req.method.toUpperCase();
   if (!safeMethod(method)) return respondError(res, 405, "Unsupported proxy method.", "PROXY_METHOD_NOT_ALLOWED");
   const body = method === "GET" || method === "HEAD" ? undefined : (() => {
+    if (Buffer.isBuffer(req.body)) return req.body.length ? req.body : undefined;
     if (req.is("application/x-www-form-urlencoded")) return new URLSearchParams(req.body || {}).toString();
     if (req.is("application/json")) return JSON.stringify(req.body || {});
     return typeof req.body === "string" ? req.body : undefined;
@@ -2941,18 +3064,23 @@ async function proxyRequest(req, res, mode) {
     return CFG.maxProxyOtherBytes;
   };
   try {
-    const browserKey = `${method} ${canonical}|ref=${referrer}|sid=${sid}|range=${headers.range || ""}|body=${body || ""}`;
+    const browserKey = `${method} ${canonical}|ref=${referrer}|sid=${sid}|range=${headers.range || ""}|body=${body ? require("crypto").createHash("sha1").update(body).digest("hex") : ""}`;
     const browserPriority = mode === "view" ? 1000 : (looksLikeApiResource(canonical, accept, method) ? 980 : (/css|javascript|font|svg/i.test(accept) ? 900 : /image/i.test(accept) ? 800 : 700));
     const requestLimit = looksLikeApiResource(canonical, accept, method) ? CFG.proxyApiBodyBytes : CFG.maxProxyBodyBytes;
     const retries = looksLikeApiResource(canonical, accept, method) ? CFG.proxyApiRetries : CFG.maxRetries;
-    const result = await browserScheduler.request(browserKey, () => fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, limit: requestLimit, retries, limitForContentType, noCache: method !== "GET" }), { priority: browserPriority, host: hostOf(canonical), url: canonical });
+    const result = await browserScheduler.request(browserKey, () => fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, limit: requestLimit, retries, limitForContentType, noCache: method !== "GET", streamOversize: mode === "resource" }), { priority: browserPriority, host: hostOf(canonical), url: canonical });
+  if (result.tooLarge && mode === "resource" && CFG.proxyStreamOversize && !(download && result.bytes > CFG.maxDownloadBytes)) {
+    if (/javascript|ecmascript/i.test(result.contentType || "")) noteScriptDir(sid, result.finalUrl || canonical);
+    return streamOversizeResponse(req, res, result, { canonical, method, headers, body, referrer, sid, download });
+  }
+  if (result.stream) result.stream.cancel();
   if (result.tooLarge || (download && result.bytes > CFG.maxDownloadBytes)) return respondError(res, 413, "The upstream response exceeds Veyra's safety limit.", "RESPONSE_TOO_LARGE");
   const upstreamHeaders = {
     "content-type": result.contentType || (mode === "view" ? "text/html; charset=utf-8" : "application/octet-stream"),
     "cache-control": download ? "no-store" : mode === "view" ? "no-store" : "public, max-age=15",
     ...(download ? { "content-disposition": `attachment; filename="${safeDownloadFilename(result.finalUrl || canonical, result.contentType)}"` } : {}),
     "x-content-type-options": "nosniff",
-    "referrer-policy": "no-referrer",
+    "referrer-policy": mode === "view" ? "same-origin" : "no-referrer",
     ...(result.contentRange ? { "content-range": result.contentRange } : {}),
     ...(result.acceptRanges ? { "accept-ranges": result.acceptRanges } : {})
   };
@@ -2962,6 +3090,7 @@ async function proxyRequest(req, res, mode) {
     res.setHeader("X-Veyra-Canonical-URL", canonical);
     return res.status(200).type("html").send(challengeFallbackHtml(canonical, challenge));
   }
+  if (mode === "resource" && /javascript|ecmascript/i.test(result.contentType || "")) noteScriptDir(sid, result.finalUrl || canonical);
   let payload = result.body;
   try {
     if (!download && mode === "view" && (/html|xhtml|^$/.test(result.contentType.toLowerCase()))) payload = Buffer.from(rewriteHtml(payload.toString("utf8"), result.finalUrl || canonical, sid), "utf8");
@@ -3157,6 +3286,8 @@ const STATUS_VAR_DEFS = [
   { group: "Crawler discovery", key: "skipLowValueThirdParty", label: "Skip low-value third party", kind: "bool", names: ["SKIP_LOW_VALUE_THIRD_PARTY"], fallback: true },
   { group: "Proxy", key: "proxyForwardCompatHeaders", label: "Forward compatibility headers", kind: "bool", names: ["PROXY_FORWARD_COMPAT_HEADERS"], fallback: true },
   { group: "Proxy", key: "proxyForwardClientHints", label: "Forward client hints", kind: "bool", names: ["PROXY_FORWARD_CLIENT_HINTS"], fallback: true },
+  { group: "Proxy", key: "proxyRelativeFallback", label: "Recover relative paths via Referer", kind: "bool", names: ["PROXY_RELATIVE_FALLBACK"], fallback: true },
+  { group: "Proxy", key: "proxyStreamOversize", label: "Stream oversize resources", kind: "bool", names: ["PROXY_STREAM_OVERSIZE"], fallback: true },
   { group: "Proxy", key: "proxyApiBodyBytes", label: "API body limit", kind: "number", names: ["PROXY_API_BODY_BYTES"], fallback: 4194304, min: 65536, max: 33554432 },
   { group: "Proxy", key: "proxyApiRetries", label: "API retries", kind: "number", names: ["PROXY_API_RETRIES"], fallback: 1, min: 0, max: 3 },
   { group: "Proxy", key: "proxyJsHeavyThreshold", label: "JS-heavy threshold", kind: "number", names: ["PROXY_JS_HEAVY_THRESHOLD"], fallback: 4, min: 1, max: 20 },
@@ -3423,6 +3554,81 @@ function consolePage() {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Veyra Console</title><style>body{margin:0;background:#0e1116;color:#e7edf5;font:13px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace}header{padding:16px 20px;border-bottom:1px solid #2a313b;position:sticky;top:0;background:#11151b}h1{font:700 18px system-ui;margin:0 0 8px}.bar{display:flex;gap:8px;flex-wrap:wrap}select,button{background:#1a2029;color:#dce5ef;border:1px solid #343d49;border-radius:7px;padding:7px 9px}main{padding:16px 20px}.log{display:grid;grid-template-columns:155px 72px 72px 1fr;gap:10px;padding:7px 8px;border-bottom:1px solid #181e26;white-space:pre-wrap;word-break:break-word}.SERVER{background:#121821}.BROWSER{background:#11171b}.err{color:#ff9f9f}.warn{color:#e9c36f}.info{color:#a9c8f0}.debug{color:#8f9aaa}@media(max-width:800px){.log{grid-template-columns:1fr}.log span{display:block}}</style></head><body><header><h1>Veyra — /console</h1><div class="bar"><select id="source"><option>all</option><option>browser</option><option>server</option></select><select id="level"><option>all</option><option>error</option><option>warn</option><option>info</option><option>debug</option></select><button id="refresh">Refresh</button><button id="auto">Auto: on</button></div></header><main id="log">Loading…</main><script>let on=true;async function load(){try{const s=document.getElementById('source').value,l=document.getElementById('level').value;const r=await fetch('/api/debug/logs?source='+encodeURIComponent(s)+'&level='+encodeURIComponent(l)+'&limit=500');const b=await r.json();document.getElementById('log').innerHTML=(b.logs||[]).map(x=>'<div class="log '+(x.source||'')+'"><span>'+esc(x.time||'')+'</span><span>'+esc(x.source||'')+'</span><span class="'+esc(x.level||'')+'">'+esc(x.level||'')+'</span><span>'+esc(x.message||'')+' '+esc(x.requestId||'')+'</span></div>').join('')||'<p>No logs.</p>'}catch(e){document.getElementById('log').textContent=e.message}}function esc(s){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]) )}document.getElementById('refresh').onclick=load;document.getElementById('source').onchange=load;document.getElementById('level').onchange=load;document.getElementById('auto').onclick=()=>{on=!on;document.getElementById('auto').textContent='Auto: '+(on?'on':'off')};load();setInterval(()=>on&&load(),2000);</script></body></html>`;
 }
 app.get("/console", (req, res) => res.type("html").send(consolePage()));
+
+// Relative-path recovery. Pages sometimes request root-relative URLs that never
+// pass through the runtime hooks (e.g. <script src="/s/player/base.js"> inserted
+// by JS, CSS/audio loaded by players). Those land on Veyra's own origin; the
+// Referer (kept by the same-origin referrer policy) tells us which proxied page
+// asked, so the path is resolved against that page's real URL and proxied.
+function proxiedPageFromCookie(req) {
+  const m = String(req.get("Cookie") || "").match(/(?:^|;\s*)veyra_ctx=([^;]+)/);
+  if (!m) return null;
+  const [page, sid] = m[1].split("|").map(x => { try { return decodeURIComponent(x); } catch { return ""; } });
+  const pageUrl = normalizeUrl(page || "");
+  return pageUrl ? { pageUrl, sid: sid || "" } : null;
+}
+function proxiedPageFromReferer(req) {
+  const raw = String(req.get("Referer") || "");
+  if (!raw) return proxiedPageFromCookie(req);
+  try {
+    const r = new URL(raw);
+    if (!/^[/]api[/](view|resource|form-get)/.test(r.pathname)) return proxiedPageFromCookie(req);
+    let page = r.searchParams.get("url") || r.searchParams.get("target") || r.searchParams.get("u") || "";
+    if (!page && r.pathname.startsWith("/api/form-get/")) page = decodePathToken(r.pathname.split("/")[3] || "");
+    const pageUrl = normalizeUrl(page);
+    if (!pageUrl) return null;
+    return { pageUrl, sid: r.searchParams.get("sid") || (r.pathname.startsWith("/api/form-get/") ? decodePathToken(r.pathname.split("/")[4] || "") : "") };
+  } catch { return null; }
+}
+// Bundlers (webpack/rspack/vite legacy) derive their chunk base from
+// document.currentScript.src. For a proxied script that is /api/resource?url=...,
+// so chunks are requested as /api/<chunk>.js. Remember the real directories of
+// recently proxied scripts per session so those chunks can be resolved.
+const scriptDirsBySession = new Map();
+function noteScriptDir(sid, url) {
+  if (!sid) return;
+  let dir; try { const u = new URL(url); dir = u.origin + u.pathname.replace(/[^/]*$/, ""); } catch { return; }
+  const list = (scriptDirsBySession.get(sid) || []).filter(d => d !== dir);
+  list.unshift(dir); if (list.length > 8) list.length = 8;
+  scriptDirsBySession.delete(sid); scriptDirsBySession.set(sid, list);
+  while (scriptDirsBySession.size > 2000) scriptDirsBySession.delete(scriptDirsBySession.keys().next().value);
+}
+async function resolveEscapedChunk(sid, relative) {
+  const dirs = scriptDirsBySession.get(sid) || [];
+  for (const dir of dirs.slice(0, 6)) {
+    let candidate; try { candidate = normalizeUrl(new URL(relative, dir).href); } catch { continue; }
+    if (!candidate) continue;
+    try {
+      const probe = await fetchCached(candidate, { method: "HEAD", sessionId: sid, retries: 0, limit: 0, timeout: Math.min(CFG.requestTimeoutMs, 6000), noCache: true });
+      if (probe.status < 400) return candidate;
+    } catch {}
+  }
+  return null;
+}
+const VEYRA_API_ROUTES = new Set(["view", "resource", "download", "form-get", "open", "crawl", "search", "suggest", "browser", "debug", "session", "vpn", "status", "health"]);
+app.use(async (req, res, next) => {
+  if (!CFG.proxyRelativeFallback || res.headersSent) return next();
+  // Relative specifiers on a proxied page resolve against Veyra's /api/ path
+  // (e.g. "app.js" next to /api/view becomes /api/app.js). Anything under /api/
+  // that is not a real Veyra route is treated as such an escaped relative path.
+  let escaped = req.originalUrl;
+  if (req.path.startsWith("/api/")) {
+    const first = req.path.slice(5).split("/")[0];
+    if (VEYRA_API_ROUTES.has(first)) return next();
+    escaped = req.originalUrl.replace(/^[/]api[/]/, "");
+  }
+  const ctx = proxiedPageFromReferer(req);
+  if (!ctx) return next();
+  let target = null;
+  if (escaped !== req.originalUrl && /[.](m?js|css|wasm|json|map)([?#]|$)/i.test(req.path)) target = await resolveEscapedChunk(ctx.sid, escaped);
+  if (!target) { try { target = normalizeUrl(new URL(escaped, ctx.pageUrl).href); } catch { target = null; } }
+  if (!target) return next();
+  const dest = String(req.get("Sec-Fetch-Dest") || "").toLowerCase();
+  const mode = dest === "document" || dest === "iframe" || dest === "frame" ? "view" : "resource";
+  Object.defineProperty(req, "query", { value: { url: target, sid: ctx.sid, from: ctx.pageUrl }, writable: true, configurable: true });
+  try { await proxyRequest(req, res, mode); }
+  catch (e) { respondError(res, 502, `Veyra resource error: ${e.message}`, "PROXY_RELATIVE_FALLBACK_ERROR", { requestId: req.veyraRequestId }); }
+});
 
 // Safe JSON/API error handling and process guards.
 app.use((err, req, res, next) => {

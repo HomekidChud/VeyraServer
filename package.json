@@ -1,6 +1,6 @@
 {
   "name": "veyra-browse-crawler",
-  "version": "8.11.1",
+  "version": "8.11.2",
   "private": true,
   "description": "Veyra Browser API, high-throughput crawler, page proxy, search service, and diagnostics.",
   "main": "server.js",
