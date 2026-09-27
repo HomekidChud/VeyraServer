@@ -9,6 +9,8 @@ const fsp = fs.promises;
 const path = require("path");
 const os = require("os");
 const { BrowserEngine } = require("./browser-engine");
+const { VpnManager } = require("./vpn");
+const { fetch: undiciFetch } = require("undici");
 
 const app = express();
 const PORT = numberEnv("PORT", 10000, 1, 65535);
@@ -137,6 +139,8 @@ const CFG = Object.freeze({
   browserSessionTtlMs: numberEnv("BROWSER_SESSION_TTL_MS", 1800000, 60000, 86400000),
   browserNavigationTimeoutMs: numberEnv("BROWSER_NAVIGATION_TIMEOUT_MS", 30000, 5000, 120000),
   browserPageTimeoutMs: numberEnv("BROWSER_PAGE_TIMEOUT_MS", 30000, 5000, 120000),
+  browserEvictIdleOnCapacity: boolEnv("BROWSER_EVICT_IDLE_ON_CAPACITY", true),
+  browserEvictMinIdleMs: numberEnv("BROWSER_EVICT_MIN_IDLE_MS", 60000, 10000, 86400000),
   browserBackend: enumEnv("BROWSER_BACKEND", "local", ["local", "remote"]),
   browserBackendUrl: process.env.BROWSER_BACKEND_URL || "",
   dnsCacheTtlMs: numberEnv("DNS_CACHE_TTL_MS", 5000, 0, 60000),
@@ -186,7 +190,7 @@ const CFG = Object.freeze({
   proxyWarmPerHost: numberEnv("PROXY_WARM_PER_HOST", 3, 1, 16),
   sitemapConcurrency: Math.min(numberEnv("SITEMAP_CONCURRENCY", P.sitemapConcurrency, 1, 32), P.sitemapConcurrency),
   initialResourceBudget: numberEnv("INITIAL_RESOURCE_BUDGET", 64, 16, 256),
-  userAgent: process.env.VEYRA_USER_AGENT || "VeyraBrowseCrawler/8.10.1 (+https://github.com/HomekidChud/VeyraServer)",
+  userAgent: process.env.VEYRA_USER_AGENT || "VeyraBrowseCrawler/8.11.1 (+https://github.com/HomekidChud/VeyraServer)",
   frontendOrigins: csvEnv("FRONTEND_ORIGIN", ["*"]),
   searchProvider: enumEnv("SEARCH_PROVIDER", "local", ["auto", "local", "brave", "bing", "custom", "none"]),
   searchEndpoint: process.env.SEARCH_ENDPOINT || "",
@@ -212,6 +216,13 @@ const CFG = Object.freeze({
   memoryLimitMb: MEMORY_LIMIT_MB,
   browserCrawlerConcurrency: P.browserCrawlerConcurrency,
   browserKeepWarm: boolEnv("BROWSER_KEEP_WARM", RESOURCE_PROFILE !== "free"),
+  vpnEnabled: boolEnv("VPN_ENABLED", false),
+  vpnMode: enumEnv("VPN_MODE", "proxy", ["proxy"]),
+  vpnDefaultProfile: process.env.VPN_DEFAULT_PROFILE || "",
+  vpnProxyServer: process.env.VPN_PROXY_SERVER || "",
+  vpnProxyUsername: process.env.VPN_PROXY_USERNAME || "",
+  vpnProxyBypass: process.env.VPN_PROXY_BYPASS || "",
+  vpnCrawlerProfile: process.env.VPN_CRAWLER_PROFILE || "",
   filterTemplateUrls: boolEnv("FILTER_TEMPLATE_URLS", true),
   maxDiscoveredUrlLength: numberEnv("MAX_DISCOVERED_URL_LENGTH", 4096, 256, 20000),
   maxCrossOriginResources: Math.min(numberEnv("MAX_CROSS_ORIGIN_RESOURCES", P.maxCrossOriginResources, 0, 10000), P.maxCrossOriginResources),
@@ -284,6 +295,8 @@ function clearHotCachesForPressure() {
   while (dnsPublicCache && dnsPublicCache.size > 500) dnsPublicCache.delete(dnsPublicCache.keys().next().value);
 }
 
+const vpnManager = new VpnManager((level, source, message) => serverLog(level, source, message));
+
 const browserEngine = new BrowserEngine(
   CFG,
   assertPublicUrl,
@@ -305,7 +318,8 @@ const browserEngine = new BrowserEngine(
       const hint = row.resourceType === 'document' ? 'html' : row.resourceType === 'stylesheet' ? 'css' : row.resourceType === 'script' ? 'js' : row.resourceType === 'image' ? 'image' : row.resourceType === 'font' ? 'font' : row.resourceType === 'media' ? 'media' : typeFor(u);
       addLink(job, u, hint, session.canonicalUrl || job.root, row.resourceType === 'document' ? 'browser-navigation' : 'browser-network');
     } catch {}
-  }
+  },
+  vpnManager
 );
 const browserEngineTimer = setInterval(() => browserEngine.expireIdle().catch(() => {}), 30000);
 browserEngineTimer.unref?.();
@@ -754,7 +768,7 @@ function sessionRecord(sid) {
   const nowMs = Date.now();
   let session = proxySessions.get(sid);
   if (!session || nowMs - session.lastUsed > CFG.proxySessionTtlMs) {
-    session = { createdAt: nowMs, lastUsed: nowMs, cookies: new Map() };
+    session = { createdAt: nowMs, lastUsed: nowMs, cookies: new Map(), vpnProfileId: null };
     proxySessions.set(sid, session);
     while (proxySessions.size > CFG.maxProxySessions) {
       const oldest = [...proxySessions.entries()].sort((a,b) => a[1].lastUsed - b[1].lastUsed)[0]?.[0];
@@ -888,12 +902,14 @@ async function fetchBuffer(url, opts = {}) {
         }
         if (cached?.etag) reqHeaders.set("if-none-match", cached.etag);
         if (cached?.lastModified) reqHeaders.set("if-modified-since", cached.lastModified);
-        const response = await fetch(current, {
+        const dispatcher = opts.dispatcher || (sessionId ? vpnManager.dispatcherForSession(sessionId) : (process.env.VPN_CRAWLER_PROFILE ? vpnManager.dispatcherForSession(`__crawler__${process.env.VPN_CRAWLER_PROFILE}`) : undefined));
+        const response = await undiciFetch(current, {
           method,
           headers: reqHeaders,
           redirect: "manual",
           signal: controller.signal,
-          body: opts.body && method !== "GET" && method !== "HEAD" ? opts.body : undefined
+          body: opts.body && method !== "GET" && method !== "HEAD" ? opts.body : undefined,
+          dispatcher
         });
         if (sessionId) storeSetCookies(sessionId, current, response);
         clearTimeout(timer);
@@ -2641,6 +2657,32 @@ app.post('/api/browser/capability', async (req, res) => {
   }
 });
 
+app.get('/api/vpn/status', (req, res) => {
+  res.json({ ok: true, ...vpnManager.status() });
+});
+app.post('/api/vpn/test', async (req, res) => {
+  try {
+    const result = await vpnManager.test(String(req.body?.profileId || ''));
+    res.json({ ok:true, ...result });
+  } catch (e) { respondError(res, e.code === 'VPN_TEST_FAILED' ? 502 : (e.code === 'VPN_DISABLED' ? 503 : 400), e.message, e.code || 'VPN_TEST_ERROR'); }
+});
+app.post('/api/vpn/connect', (req, res) => {
+  try {
+    const sid = normalizeSessionId(req.body?.sessionId || req.body?.sid);
+    const result = vpnManager.connect(sid, String(req.body?.profileId || ''));
+    const ps = sessionRecord(sid); ps.vpnProfileId = result.profile?.id || null;
+    res.json({ ok:true, ...result, note:'Veyra VPN routes this Veyra browser/proxy session through the configured HTTP/HTTPS/SOCKS5 gateway. It is not a device-wide operating-system VPN.' });
+  } catch (e) { respondError(res, e.code === 'VPN_DISABLED' ? 503 : 400, e.message, e.code || 'VPN_CONNECT_ERROR'); }
+});
+app.post('/api/vpn/disconnect', (req, res) => {
+  try {
+    const sid = normalizeSessionId(req.body?.sessionId || req.body?.sid);
+    vpnManager.disconnect(sid);
+    const ps = sessionRecord(sid); ps.vpnProfileId = null;
+    res.json({ ok:true, connected:false });
+  } catch (e) { respondError(res, 400, e.message, e.code || 'VPN_DISCONNECT_ERROR'); }
+});
+
 app.get('/api/browser/status', (req, res) => res.json({ ok: true, ...browserEngine.status(), config: { backend: CFG.browserBackend, enabled: CFG.browserEnabled, headless: CFG.browserHeadless, maxSessions: CFG.maxBrowserSessions, maxPages: CFG.maxBrowserPages, maxContexts: CFG.maxBrowserContexts } }));
 app.post('/api/browser/session', async (req, res) => {
   if (!CFG.browserEnabled) return respondError(res, 503, 'Browser engine is disabled.', 'BROWSER_ENGINE_UNAVAILABLE');
@@ -2648,9 +2690,15 @@ app.post('/api/browser/session', async (req, res) => {
     const tabId = String(req.body?.tabId || '').slice(0, 100);
     const jobId = String(req.body?.jobId || '').slice(0, 100);
     const url = normalizeUrl(String(req.body?.url || ''));
-    const session = await browserEngine.create(tabId, url, jobId);
+    const sid = normalizeSessionId(req.body?.proxySessionId || req.body?.sid);
+    const proxySession = sessionRecord(sid);
+    const vpnProfile = vpnManager.get(String(proxySession.vpnProfileId || req.body?.vpnProfileId || ''));
+    const session = await browserEngine.create(tabId, url, jobId, vpnProfile);
     res.json({ ok: true, session });
-  } catch (e) { respondError(res, e.code === 'BROWSER_CAPACITY' ? 503 : 502, e.message, e.code || 'BROWSER_ENGINE_ERROR'); }
+  } catch (e) {
+    if (e.code === 'BROWSER_CAPACITY') return respondError(res, 409, e.message, e.code);
+    respondError(res, e.code === 'INVALID_URL' ? 400 : 502, e.message, e.code || 'BROWSER_ENGINE_ERROR');
+  }
 });
 app.get('/api/browser/session/:id', (req, res) => { try { res.json({ ok:true, session: browserEngine.public(browserEngine.get(req.params.id)) }); } catch(e) { respondError(res,404,e.message,e.code||'BROWSER_SESSION_NOT_FOUND'); } });
 app.post('/api/browser/session/:id/navigate', async (req,res) => { try { const s=browserEngine.get(req.params.id); const target = firstValidUrl([req.body?.url, req.body?.target, req.body?.u], s?.page?.url?.() || undefined); if (!target) return respondError(res,400,'Missing or invalid public HTTP(S) URL.','INVALID_URL'); const session=await browserEngine.navigateSession(s, target); res.json({ok:true,session}); } catch(e) { respondError(res,e.code==='INVALID_URL'?400:502,e.message,e.code||'BROWSER_NAVIGATION_ERROR'); } });
@@ -2662,11 +2710,11 @@ app.delete('/api/browser/session/:id', async (req,res) => { try { await browserE
 app.get('/api/browser/session/:id/screenshot', async (req,res) => { try { const png=await browserEngine.screenshot(req.params.id); if(!png) return respondError(res,503,'Screenshot unavailable.','BROWSER_SCREENSHOT_ERROR'); res.setHeader('content-type','image/png'); res.setHeader('cache-control','no-store'); res.send(png); } catch(e) { respondError(res,404,e.message,e.code||'BROWSER_SCREENSHOT_ERROR'); } });
 
 // Health and debug.
-app.get("/health", (req, res) => res.json({ ok: true, service: "veyra", uptimeSec: Math.round(process.uptime()), activeJobs: [...jobs.values()].filter(j => !j.done).length, processRole: CFG.processRole, resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb, crawlerFetchLimit: effectiveCrawlerConcurrency(), logicalRobots: CFG.logicalRobots }));
+app.get("/health", (req, res) => res.json({ ok: true, service: "veyra", uptimeSec: Math.round(process.uptime()), activeJobs: [...jobs.values()].filter(j => !j.done).length, processRole: CFG.processRole, resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb, crawlerFetchLimit: effectiveCrawlerConcurrency(), logicalRobots: CFG.logicalRobots, vpn: vpnManager.status() }));
 app.get("/api/debug/system", (req, res) => {
   const mem = process.memoryUsage();
   const idx = searchIndexStats();
-  res.json({ time: now(), uptimeSec: Math.round(process.uptime()), startedAt: new Date(serverStartedAt).toISOString(), nodeVersion: process.version, platform: process.platform, processRole: CFG.processRole, resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb, memory: { rss: mem.rss, heapUsed: mem.heapUsed, heapTotal: mem.heapTotal, external: mem.external }, jobs: { total: jobs.size, active: [...jobs.values()].filter(j => !j.done).length, done: [...jobs.values()].filter(j => j.done).length }, proxyCacheEntries: proxyCache.size, searchCacheEntries: searchCache.size, network: { crawlerActive: fetchSemaphore.active, crawlerQueued: fetchSemaphore.queued, crawlerLimit: effectiveCrawlerConcurrency(), configuredCrawlerLimit: CFG.maxActiveFetches, requestedCrawlerLimit: CFG.requestedMaxActiveFetches, logicalRobots: CFG.logicalRobots, warmActive: proxyWarmSemaphore.active, warmQueued: proxyWarmSemaphore.queued, warmLimit: CFG.proxyWarmConcurrency, warmLogicalRobots: CFG.proxyWarmRobots, browserActive: browserScheduler.active, browserQueued: browserScheduler.queue.length, browserLimit: CFG.browserMaxActiveFetches, browserPerHost: CFG.browserPerHostConcurrency }, browser: { ...browserScheduler.status(), sessions: browserEngine.status().sessions, pages: browserEngine.status().pages, contexts: browserEngine.status().contexts, maxSessions: browserEngine.status().maxSessions, maxPages: browserEngine.status().maxPages, maxContexts: browserEngine.status().maxContexts, sessionList: browserEngine.status().sessionList, proxySessions: proxySessions.size, cacheEntries: proxyCache.size }, hostPolicies: [...jobs.values()].reduce((n,j)=>n+(j.hostPolicy?.size||0),0), searchIndexEntries: idx.documents, searchIndexTerms: idx.terms, searchIndexDomains: idx.domains, requestsLogged: requestLog.length, logs: serverLogs.length });
+  res.json({ time: now(), uptimeSec: Math.round(process.uptime()), startedAt: new Date(serverStartedAt).toISOString(), nodeVersion: process.version, platform: process.platform, processRole: CFG.processRole, resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb, memory: { rss: mem.rss, heapUsed: mem.heapUsed, heapTotal: mem.heapTotal, external: mem.external }, jobs: { total: jobs.size, active: [...jobs.values()].filter(j => !j.done).length, done: [...jobs.values()].filter(j => j.done).length }, proxyCacheEntries: proxyCache.size, searchCacheEntries: searchCache.size, network: { crawlerActive: fetchSemaphore.active, crawlerQueued: fetchSemaphore.queued, crawlerLimit: effectiveCrawlerConcurrency(), configuredCrawlerLimit: CFG.maxActiveFetches, requestedCrawlerLimit: CFG.requestedMaxActiveFetches, logicalRobots: CFG.logicalRobots, warmActive: proxyWarmSemaphore.active, warmQueued: proxyWarmSemaphore.queued, warmLimit: CFG.proxyWarmConcurrency, warmLogicalRobots: CFG.proxyWarmRobots, browserActive: browserScheduler.active, browserQueued: browserScheduler.queue.length, browserLimit: CFG.browserMaxActiveFetches, browserPerHost: CFG.browserPerHostConcurrency }, vpn: vpnManager.status(), browser: { ...browserScheduler.status(), sessions: browserEngine.status().sessions, pages: browserEngine.status().pages, contexts: browserEngine.status().contexts, maxSessions: browserEngine.status().maxSessions, maxPages: browserEngine.status().maxPages, maxContexts: browserEngine.status().maxContexts, sessionList: browserEngine.status().sessionList, proxySessions: proxySessions.size, cacheEntries: proxyCache.size }, hostPolicies: [...jobs.values()].reduce((n,j)=>n+(j.hostPolicy?.size||0),0), searchIndexEntries: idx.documents, searchIndexTerms: idx.terms, searchIndexDomains: idx.domains, requestsLogged: requestLog.length, logs: serverLogs.length });
 });
 app.get("/api/debug/config", (req, res) => res.json({ ...CFG, searchApiKey: undefined }));
 app.get("/api/debug/jobs", (req, res) => res.json({ jobs: [...jobs.values()].sort((a,b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)).map(publicJob) }));
@@ -3111,6 +3159,19 @@ const STATUS_VAR_DEFS = [
   { group: "Proxy", key: "proxyApiBodyBytes", label: "API body limit", kind: "number", names: ["PROXY_API_BODY_BYTES"], fallback: 4194304, min: 65536, max: 33554432 },
   { group: "Proxy", key: "proxyApiRetries", label: "API retries", kind: "number", names: ["PROXY_API_RETRIES"], fallback: 1, min: 0, max: 3 },
   { group: "Proxy", key: "proxyJsHeavyThreshold", label: "JS-heavy threshold", kind: "number", names: ["PROXY_JS_HEAVY_THRESHOLD"], fallback: 4, min: 1, max: 20 },
+  { group: "VPN", key: "vpnEnabled", label: "Veyra VPN enabled", kind: "bool", names: ["VPN_ENABLED"], fallback: false },
+  { group: "VPN", key: "vpnMode", label: "VPN mode", kind: "enum", names: ["VPN_MODE"], fallback: "proxy", allowed: ["proxy"] },
+  { group: "VPN", key: "vpnDefaultProfile", label: "Default VPN profile", kind: "string", names: ["VPN_DEFAULT_PROFILE"], fallback: "" },
+  { group: "VPN", key: "vpnProxyServer", label: "VPN proxy server", kind: "string", names: ["VPN_PROXY_SERVER"], fallback: "", secret: true },
+  { group: "VPN", key: "vpnProfileId", label: "Default profile id", kind: "string", names: ["VPN_PROFILE_ID"], fallback: "default" },
+  { group: "VPN", key: "vpnProfileName", label: "Default profile name", kind: "string", names: ["VPN_PROFILE_NAME"], fallback: "Veyra VPN" },
+  { group: "VPN", key: "vpnProviderName", label: "VPN provider name", kind: "string", names: ["VPN_PROVIDER_NAME"], fallback: "Configured gateway" },
+  { group: "VPN", key: "vpnRegion", label: "VPN region", kind: "string", names: ["VPN_REGION"], fallback: "" },
+  { group: "VPN", key: "vpnProxyUsername", label: "VPN proxy username", kind: "string", names: ["VPN_PROXY_USERNAME"], fallback: "", secret: true },
+  { group: "VPN", key: "vpnProxyPassword", label: "VPN proxy password", kind: "string", names: ["VPN_PROXY_PASSWORD"], fallback: "", secret: true },
+  { group: "VPN", key: "vpnProxyBypass", label: "VPN proxy bypass", kind: "string", names: ["VPN_PROXY_BYPASS"], fallback: "" },
+  { group: "VPN", key: "vpnProfilesJson", label: "VPN profiles JSON", kind: "string", names: ["VPN_PROFILES_JSON"], fallback: "", secret: true },
+  { group: "VPN", key: "vpnCrawlerProfile", label: "VPN crawler profile", kind: "string", names: ["VPN_CRAWLER_PROFILE"], fallback: "" },
   { group: "Browser engine", key: "browserMaxActiveFetches", label: "Browser fetch slots", kind: "number", names: ["BROWSER_MAX_ACTIVE_FETCHES"], fallback: 24, min: 1, max: 64 },
   { group: "Browser engine", key: "browserPerHostConcurrency", label: "Browser per-host concurrency", kind: "number", names: ["BROWSER_PER_HOST_CONCURRENCY"], fallback: 8, min: 1, max: 32 },
   { group: "Browser engine", key: "browserEnabled", label: "Browser engine enabled", kind: "bool", names: ["BROWSER_ENABLED"], fallback: true },
@@ -3124,6 +3185,8 @@ const STATUS_VAR_DEFS = [
   { group: "Browser engine", key: "browserSessionTtlMs", label: "Browser session TTL (ms)", kind: "number", names: ["BROWSER_SESSION_TTL_MS"], fallback: 1800000, min: 60000, max: 86400000 },
   { group: "Browser engine", key: "browserNavigationTimeoutMs", label: "Browser navigation timeout (ms)", kind: "number", names: ["BROWSER_NAVIGATION_TIMEOUT_MS"], fallback: 30000, min: 5000, max: 120000 },
   { group: "Browser engine", key: "browserPageTimeoutMs", label: "Browser page timeout (ms)", kind: "number", names: ["BROWSER_PAGE_TIMEOUT_MS"], fallback: 30000, min: 5000, max: 120000 },
+  { group: "Browser engine", key: "browserEvictIdleOnCapacity", label: "Evict idle browser session on capacity", kind: "bool", names: ["BROWSER_EVICT_IDLE_ON_CAPACITY"], fallback: true },
+  { group: "Browser engine", key: "browserEvictMinIdleMs", label: "Minimum idle before eviction (ms)", kind: "number", names: ["BROWSER_EVICT_MIN_IDLE_MS"], fallback: 60000, min: 10000, max: 86400000 },
   { group: "Browser engine", key: "browserKeepWarm", label: "Keep Chromium warm", kind: "bool", names: ["BROWSER_KEEP_WARM"], fallback: false },
   { group: "Browser engine", key: "playwrightBrowsersPath", label: "Playwright browsers path", kind: "string", names: ["PLAYWRIGHT_BROWSERS_PATH"], fallback: "0" },
   { group: "Security / DNS", key: "dnsCacheTtlMs", label: "DNS public-result cache TTL (ms)", kind: "number", names: ["DNS_CACHE_TTL_MS"], fallback: 5000, min: 0, max: 60000 },

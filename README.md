@@ -57,3 +57,8 @@ On constrained Render instances, RESOURCE_PROFILE=free keeps the 1000 logical ro
 ## GET forms
 
 GET forms are rewritten to `/api/form-get/:target/:sid` so form fields cannot overwrite Veyra proxy control parameters or force a frame-protected destination to load directly inside the iframe.
+
+
+## Veyra VPN tunnel
+
+The server supports optional per-session outbound HTTP/HTTPS/SOCKS5 proxy gateways. Set `VPN_ENABLED=true` and configure either a single `VPN_PROXY_SERVER` profile or `VPN_PROFILES_JSON`. The browser context uses the configured gateway; proxy-mode fetches use the matching session dispatcher. This is a Veyra session tunnel, not an operating-system-wide VPN. Credentials remain server-side.
