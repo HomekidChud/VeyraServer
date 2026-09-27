@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#0d0f13">
+  <meta name="description" content="Veyra is a private, server-side web browser. Open any site through a fresh 2-minute session with its own cookies, VPN exit and real developer tools.">
+  <title>Veyra — browse through a clean session</title>
+  <script>/* Resolve assets from the app root even on deep links like /settings/about. */(function(){var m=location.pathname.match(/^(.*?)\/(?:browse|search|calculator|downloads|history|extensions|settings|vpn|dev|console|resources|links)(?:\/.*)?$/);var b=m?m[1]+'/':location.pathname.replace(/[^\/]*$/,'');window.VEYRA_BASE=b;var l=document.createElement('link');l.rel='stylesheet';l.href=b+'style.css';document.head.appendChild(l);})();</script>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230d0f13'/%3E%3Cpath d='M8 9l8 15 8-15' fill='none' stroke='%238fb0f0' stroke-width='3.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='24' cy='9' r='2.2' fill='%238fb0f0'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://api.fontshare.com">
+  <link rel="stylesheet" href="https://api.fontshare.com/v2/css?f[]=satoshi@400,500,700&f[]=cabinet-grotesk@500,700,800&display=swap">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&display=swap">
+  <script>
+    // Apply theme before first paint (no flash).
+    (function(){try{var s=JSON.parse(localStorage.getItem("veyra-settings")||"{}");var t=s.theme||"dark";if(t==="system")t=matchMedia("(prefers-color-scheme: light)").matches?"light":"dark";document.documentElement.dataset.theme=t;if(s.accent)document.documentElement.style.setProperty("--accent",s.accent);if(s.fontScale)document.documentElement.style.setProperty("--ui-scale",s.fontScale);}catch(e){}})();
+  </script>
+</head>
+<body>
+  <svg class="svg-sprite" aria-hidden="true" width="0" height="0">
+    <symbol id="logo" viewBox="0 0 32 32"><path d="M7 8.5l9 16 9-16" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><circle cx="25" cy="8.5" r="2.4" fill="var(--accent)"/></symbol>
+    <symbol id="i-back" viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></symbol>
+    <symbol id="i-forward" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></symbol>
+    <symbol id="i-reload" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0 .9 4.5"/><path d="M20 4v7h-7"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+    <symbol id="i-home" viewBox="0 0 24 24"><path d="M4 11l8-7 8 7"/><path d="M6 9.5V20h12V9.5"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="10.5" width="14" height="9.5" rx="2"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5M12 8h.01"/></symbol>
+    <symbol id="i-star" viewBox="0 0 24 24"><path d="M12 3.8l2.5 5.1 5.6.8-4 3.9 1 5.6-5.1-2.7-5 2.7 1-5.6-4.1-3.9 5.6-.8z"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11"/><path d="M7.5 11l4.5 4.5 4.5-4.5"/><path d="M5 20h14"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 24 24"><circle cx="12" cy="5.5" r="1.1"/><circle cx="12" cy="12" r="1.1"/><circle cx="12" cy="18.5" r="1.1"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M7 7l10 10M17 7L7 17"/></symbol>
+    <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.2 2.5 3.2 5.3 3.2 8.5s-1 6-3.2 8.5c-2.2-2.5-3.2-5.3-3.2-8.5s1-6 3.2-8.5z"/></symbol>
+    <symbol id="i-code" viewBox="0 0 24 24"><path d="M8.5 8l-4 4 4 4M15.5 8l4 4-4 4M13.5 5l-3 14"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="M15 15l5 5"/></symbol>
+    <symbol id="i-calc" viewBox="0 0 24 24"><rect x="5.5" y="3.5" width="13" height="17" rx="2.5"/><path d="M8.5 7.5h7M8.5 11.5h1M12 11.5h0M15 11.5h.5M8.5 15h1M15 15h.5M8.5 18h7"/></symbol>
+    <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 5h5v5"/><path d="M19 5l-8 8"/><path d="M18 14v4a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h4"/></symbol>
+    <symbol id="i-puzzle" viewBox="0 0 24 24"><path d="M9 4.5a2 2 0 0 1 4 0V6h3.5a1.5 1.5 0 0 1 1.5 1.5V11h-1.5a2 2 0 0 0 0 4H18v3.5a1.5 1.5 0 0 1-1.5 1.5H13v-1.5a2 2 0 0 0-4 0V20H5.5A1.5 1.5 0 0 1 4 18.5V15h1.5a2 2 0 0 0 0-4H4V7.5A1.5 1.5 0 0 1 5.5 6H9z"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 3.5l7 2.8v5.2c0 4.4-3 7.9-7 9-4-1.1-7-4.6-7-9V6.3z"/><path d="M9 12l2 2 4-4"/></symbol>
+    <symbol id="i-inspect" viewBox="0 0 24 24"><path d="M4 4h10v4M4 4v10h4"/><path d="M11 11l8.5 3.2-3.6 1.6-1.6 3.6z"/></symbol>
+    <symbol id="i-timer" viewBox="0 0 24 24"><circle cx="12" cy="13.5" r="7"/><path d="M12 10v3.5l2.2 1.5M9.5 3.5h5"/></symbol>
+    <symbol id="i-history" viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.4-5.7"/><path d="M4 4.5V9h4.5M12 8v4.2l2.8 1.8"/></symbol>
+    <symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 13.5a7.7 7.7 0 0 0 0-3l2-1.6-2-3.4-2.4 1a7.6 7.6 0 0 0-2.6-1.5L14 2.5h-4l-.4 2.5A7.6 7.6 0 0 0 7 6.5l-2.4-1-2 3.4 2 1.6a7.7 7.7 0 0 0 0 3l-2 1.6 2 3.4 2.4-1a7.6 7.6 0 0 0 2.6 1.5l.4 2.5h4l.4-2.5a7.6 7.6 0 0 0 2.6-1.5l2.4 1 2-3.4z"/></symbol>
+    <symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="8.5" r="3.8"/><path d="M4.5 20c1.3-3.6 4.1-5.3 7.5-5.3s6.2 1.7 7.5 5.3"/></symbol>
+    <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 3.5h8l4 4v13H6z"/><path d="M14 3.5v4h4"/></symbol>
+    <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="M7.5 9.5l3 2.5-3 2.5M12.5 15h4"/></symbol>
+    <symbol id="i-gauge" viewBox="0 0 24 24"><path d="M4.5 17a8 8 0 1 1 15 0"/><path d="M12 13l3.5-4"/></symbol>
+    <symbol id="i-printer" viewBox="0 0 24 24"><path d="M7 9V4h10v5"/><rect x="4" y="9" width="16" height="7" rx="2"/><path d="M7 14h10v6H7z"/></symbol>
+    <symbol id="i-find" viewBox="0 0 24 24"><path d="M5 4h9l5 5v5"/><circle cx="11" cy="15" r="3.5"/><path d="M13.5 17.5L16 20"/></symbol>
+    <symbol id="i-tab" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="2"/><path d="M3.5 9h7V5"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 24 24"><path d="M19 14.5A7.5 7.5 0 0 1 9.5 5a7.5 7.5 0 1 0 9.5 9.5z"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 3v2M12 19v2M3 12h2M19 12h2M5.6 5.6l1.4 1.4M17 17l1.4 1.4M5.6 18.4L7 17M17 7l1.4-1.4"/></symbol>
+    <symbol id="i-book" viewBox="0 0 24 24"><path d="M4.5 5.5c2.8-1 5.3-.8 7.5.8 2.2-1.6 4.7-1.8 7.5-.8v13c-2.8-1-5.3-.8-7.5.8-2.2-1.6-4.7-1.8-7.5-.8z"/><path d="M12 6.3v13"/></symbol>
+    <symbol id="i-note" viewBox="0 0 24 24"><path d="M5 4.5h14v11l-4.5 4.5H5z"/><path d="M14.5 20v-4.5H19M8.5 9h7M8.5 12.5h4"/></symbol>
+    <symbol id="i-zoom" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6"/><path d="M15 15l5 5M8 10.5h5M10.5 8v5"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M5 7h14M10 7V4.5h4V7M7 7l1 13h8l1-13"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8.5" y="8.5" width="11" height="11" rx="2"/><path d="M15.5 8.5V5.5a1 1 0 0 0-1-1h-9a1 1 0 0 0-1 1v9a1 1 0 0 0 1 1h3"/></symbol>
+    <symbol id="i-dock-bottom" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="M3.5 13.5h17"/></symbol>
+    <symbol id="i-dock-right" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2"/><path d="M13.5 4.5v15"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5.5v13l10-6.5z"/></symbol>
+    <symbol id="i-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5.5"/></symbol>
+    <symbol id="i-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><path d="M6.5 6.5l11 11"/></symbol>
+    <symbol id="i-filter" viewBox="0 0 24 24"><path d="M4 5h16l-6 7.5V19l-4-2v-4.5z"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+    <symbol id="i-vpn" viewBox="0 0 24 24"><path d="M12 3.5l7 2.8v5.2c0 4.4-3 7.9-7 9-4-1.1-7-4.6-7-9V6.3z"/><circle cx="12" cy="11" r="2.2"/><path d="M12 13.2V16"/></symbol>
+    <symbol id="i-keyboard" viewBox="0 0 24 24"><rect x="2.5" y="6" width="19" height="12" rx="2"/><path d="M6 10h.01M9 10h.01M12 10h.01M15 10h.01M18 10h.01M7 14h10"/></symbol>
+    <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 3L5 13.5h6L10 21l8-10.5h-6z"/></symbol>
+    <symbol id="i-layers" viewBox="0 0 24 24"><path d="M12 4l8.5 4.5L12 13 3.5 8.5z"/><path d="M3.5 12.5L12 17l8.5-4.5M3.5 16.5L12 21l8.5-4.5"/></symbol>
+    <symbol id="i-app" viewBox="0 0 24 24"><rect x="4" y="4" width="6.5" height="6.5" rx="1.5"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.5"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.5"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.5"/></symbol>
+  </svg>
+
+  <!-- ================================================================ LANDING -->
+  <div id="landing" class="landing hidden">
+    <header class="land-nav">
+      <a class="brand" href="./" data-route="/"><svg class="brand-mark"><use href="#logo"/></svg><span>Veyra</span></a>
+      <nav class="land-links" aria-label="Main">
+        <a href="#features">Features</a><a href="#explore">Explore</a><a href="#how">How it works</a><a href="#faq">FAQ</a>
+      </nav>
+      <div class="land-actions" id="landActions">
+        <button class="btn ghost" data-auth="login">Sign in</button>
+        <button class="btn primary" data-auth="signup">Create account</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="kicker"><span class="pulse"></span>Server-side browsing · fresh session every time</p>
+          <h1>Browse the web through a clean room.</h1>
+          <p class="lede">Veyra loads pages on its own servers and streams them to you. Each session gets its own cookie jar and optional VPN exit, and it deletes itself after two minutes.</p>
+          <form class="hero-omni" id="heroForm" autocomplete="off">
+            <svg><use href="#i-search"/></svg>
+            <input id="heroInput" placeholder="Try wikipedia.org, or search anything" aria-label="Open a site or search">
+            <button class="btn primary" type="submit">Open in Veyra</button>
+          </form>
+          <p class="hero-note">No account needed to try it. <a href="#" data-auth="signup">Create one</a> to sync your settings, shortcuts and extensions.</p>
+        </div>
+        <div class="hero-visual" aria-hidden="true">
+          <div class="mock">
+            <div class="mock-tabs"><i></i><i></i><i></i><span class="mock-tab on">en.wikipedia.org</span><span class="mock-tab">Veyra Search</span></div>
+            <div class="mock-bar"><span class="mock-lock"></span><span class="mock-url">en.wikipedia.org/wiki/Cardiff</span><span class="mock-timer">1:42</span></div>
+            <div class="mock-body">
+              <div class="mock-page">
+                <b></b><p></p><p></p><p class="short"></p><div class="mock-img"></div><p></p><p class="short"></p>
+              </div>
+              <div class="mock-dev">
+                <div class="mock-dev-tabs"><span class="on">Elements</span><span>Console</span><span>Network</span></div>
+                <code><em>&lt;main</em> <u>id</u>=<s>"content"</s><em>&gt;</em></code>
+                <code class="in"><em>&lt;h1</em> <u>class</u>=<s>"title"</s><em>&gt;</em>Cardiff<em>&lt;/h1&gt;</em></code>
+                <code class="in sel"><em>&lt;p&gt;</em>…<em>&lt;/p&gt;</em> <i>== $0</i></code>
+                <code class="in"><em>&lt;figure&gt;</em>…<em>&lt;/figure&gt;</em></code>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="strip" aria-label="Highlights">
+        <div><b>2:00</b><span>session lifetime, then everything is deleted</span></div>
+        <div><b>0</b><span>cookies left in your own browser</span></div>
+        <div><b>6</b><span>DevTools panels: Elements to Performance</span></div>
+        <div><b>WireGuard</b><span>VPN exits, with a kill switch</span></div>
+      </section>
+
+      <section class="features" id="features">
+        <div class="section-head"><p class="kicker">Features</p><h2>A browser that runs somewhere else.</h2></div>
+        <div class="feature-grid">
+          <article class="feature big"><svg><use href="#i-timer"/></svg><h3>Two-minute sessions</h3><p>Every session starts clean and has a visible countdown. When it hits zero, Veyra deletes the session's cookies, tabs, Chromium context and VPN tunnel on the server.</p></article>
+          <article class="feature"><svg><use href="#i-code"/></svg><h3>Real DevTools</h3><p>Elements with live CSS editing, a console REPL, network waterfall, storage, sources and performance, all working against the proxied page.</p></article>
+          <article class="feature"><svg><use href="#i-vpn"/></svg><h3>Veyra VPN</h3><p>Send a session through WireGuard, SOCKS5 or HTTP exits. Region pools, failover and a kill switch are handled on the server.</p></article>
+          <article class="feature"><svg><use href="#i-puzzle"/></svg><h3>Extensions that act on pages</h3><p>Dark mode, tracker blocking, reader view, focus mode, zoom, page stats and notes. You can also load your own CSS extension manifests.</p></article>
+          <article class="feature"><svg><use href="#i-bolt"/></svg><h3>Two engines</h3><p>A fast rewriting proxy for most sites. Heavy apps get a real Chromium tab streamed to you.</p></article>
+          <article class="feature wide"><svg><use href="#i-keyboard"/></svg><h3>Keyboard first</h3><p>Browser shortcuts work even when the focus is inside a page, and you can rebind every one of them in Settings.</p></article>
+        </div>
+      </section>
+
+      <section class="explore" id="explore">
+        <div class="section-head"><p class="kicker">Explore</p><h2>Start somewhere.</h2><p class="sub">Each card opens in a fresh session. Nothing is saved on your device.</p></div>
+        <div class="explore-grid" id="exploreGrid"></div>
+      </section>
+
+      <section class="how" id="how">
+        <div class="section-head"><p class="kicker">How it works</p><h2>Three hops, no residue.</h2></div>
+        <ol class="steps">
+          <li><b>You open a site.</b><span>Veyra creates a session with a two-minute lifetime and a private cookie jar.</span></li>
+          <li><b>Our server fetches it.</b><span>The page is loaded server-side, optionally through a VPN exit, then rewritten so every link, script and request stays inside Veyra.</span></li>
+          <li><b>The session ends.</b><span>At 0:00 the server deletes it: cookies, Chromium context, VPN tunnel and crawl jobs. Your browser keeps nothing from the site.</span></li>
+        </ol>
+      </section>
+
+      <section class="faq" id="faq">
+        <div class="section-head"><p class="kicker">FAQ</p><h2>Questions, answered.</h2></div>
+        <div class="faq-list" id="faqList"></div>
+      </section>
+
+      <section class="cta">
+        <h2>Open your first session.</h2>
+        <p>Free to try. Sign up if you want your settings to follow you.</p>
+        <div class="cta-actions"><button class="btn primary lg" data-go="/browse">Start browsing</button><button class="btn ghost lg" data-auth="signup">Create account</button></div>
+      </section>
+    </main>
+    <footer class="land-foot">
+      <div class="brand small"><svg class="brand-mark"><use href="#logo"/></svg><span>Veyra</span></div>
+      <nav><a href="#features">Features</a><a href="#faq">FAQ</a><a href="#" data-go="/settings/about">About</a><a href="#" data-go="/browse">Open browser</a></nav>
+      <small>Veyra runs pages on a remote server. Respect each site's terms of use.</small>
+    </footer>
+  </div>
+
+  <!-- ================================================================ AUTH MODAL -->
+  <dialog id="authDialog" class="modal auth-modal">
+    <form method="dialog" class="modal-card" id="authForm" novalidate>
+      <button class="icon-btn modal-x" value="cancel" formnovalidate aria-label="Close"><svg><use href="#i-x"/></svg></button>
+      <svg class="auth-mark"><use href="#logo"/></svg>
+      <h2 id="authTitle">Welcome back</h2>
+      <p class="muted" id="authSub">Sign in to sync your Veyra settings.</p>
+      <div class="seg" role="tablist"><button type="button" data-mode="login" class="on">Sign in</button><button type="button" data-mode="signup">Create account</button></div>
+      <label class="field" id="authNameRow"><span>Name</span><input name="name" autocomplete="nickname" maxlength="60" placeholder="What should we call you?"></label>
+      <label class="field"><span>Email</span><input name="email" type="email" autocomplete="email" required placeholder="you@example.com"></label>
+      <label class="field"><span>Password</span><input name="password" type="password" autocomplete="current-password" required minlength="8" placeholder="At least 8 characters, a letter and a number"></label>
+      <p class="form-error" id="authError" role="alert"></p>
+      <button class="btn primary block" id="authSubmit" value="default">Sign in</button>
+      <button type="button" class="btn ghost block" data-go="/browse" id="authGuest">Continue as guest</button>
+    </form>
+  </dialog>
+
+  <!-- ================================================================ BROWSER -->
+  <div id="app" class="browser hidden">
+    <header class="chrome">
+      <div class="tabs-row">
+        <a class="chrome-brand" href="./" data-route="/" title="Veyra home"><svg><use href="#logo"/></svg></a>
+        <div class="tabs-list" id="tabsList" role="tablist"></div>
+        <button class="icon-btn new-tab" id="newTabBtn" title="New tab"><svg><use href="#i-plus"/></svg></button>
+        <div class="tabs-spacer"></div>
+      </div>
+      <div class="toolbar">
+        <button class="icon-btn" id="backBtn" title="Back"><svg><use href="#i-back"/></svg></button>
+        <button class="icon-btn" id="forwardBtn" title="Forward"><svg><use href="#i-forward"/></svg></button>
+        <button class="icon-btn" id="reloadBtn" title="Reload"><svg><use href="#i-reload"/></svg></button>
+        <button class="icon-btn" id="homeBtn" title="New tab page"><svg><use href="#i-home"/></svg></button>
+        <div class="omnibox" id="omnibox">
+          <button class="site-chip" id="siteChip" title="Site information"><svg><use href="#i-search"/></svg><span id="siteChipText"></span></button>
+          <input id="address" autocomplete="off" spellcheck="false" placeholder="Search or enter a web address" aria-label="Address and search bar">
+          <span class="zoom-chip hidden" id="zoomChip" title="Reset zoom">100%</span>
+          <button class="icon-btn star" id="starBtn" title="Bookmark this tab"><svg><use href="#i-star"/></svg></button>
+          <div class="omni-pop hidden" id="omniPop" role="listbox"></div>
+        </div>
+        <button class="session-pill idle" id="sessionPill" title="Session time left"><svg><use href="#i-timer"/></svg><span id="sessionTime">2:00</span></button>
+        <button class="icon-btn" id="vpnBtn" title="Veyra VPN"><svg><use href="#i-vpn"/></svg></button>
+        <button class="icon-btn" id="extBtn" title="Extensions"><svg><use href="#i-puzzle"/></svg></button>
+        <button class="icon-btn" id="downloadBtn" title="Downloads"><svg><use href="#i-download"/></svg></button>
+        <button class="avatar" id="profileBtn" title="Profile"><span id="avatarText"><svg><use href="#i-user"/></svg></span></button>
+        <button class="icon-btn" id="menuBtn" title="Customise and control Veyra" aria-haspopup="menu"><svg><use href="#i-menu"/></svg></button>
+      </div>
+      <nav class="bookmarks-bar hidden" id="bookmarksBar" aria-label="Bookmarks"></nav>
+      <div class="load-line"><i id="loadProgress"></i></div>
+    </header>
+
+    <div class="workspace" id="workspace">
+      <main class="viewport" id="viewport">
+        <!-- New tab -->
+        <section class="view" id="view-newtab">
+          <div class="ntp">
+            <div class="ntp-top"><span id="ntpClock" class="ntp-clock"></span><span id="ntpGreeting" class="ntp-greet"></span></div>
+            <div class="ntp-brand"><svg><use href="#logo"/></svg><span>Veyra</span></div>
+            <form class="ntp-search" id="ntpForm" autocomplete="off">
+              <svg><use href="#i-search"/></svg>
+              <input id="ntpInput" placeholder="Search or type a URL" aria-label="Search or type a URL">
+              <span class="ntp-engine" id="ntpEngine">Veyra Search</span>
+            </form>
+            <div class="ntp-tiles" id="ntpTiles"></div>
+            <div class="ntp-lower">
+              <section class="ntp-card" id="ntpRecentCard"><header><h3>Recently visited</h3><button class="link-btn" data-go="/history">All history</button></header><div id="ntpRecent" class="ntp-recent"></div></section>
+              <section class="ntp-card ntp-session"><header><h3>This session</h3></header><div id="ntpSession"></div></section>
+            </div>
+          </div>
+        </section>
+
+        <!-- Browser page -->
+        <section class="view" id="view-page">
+          <div class="page-split" id="pageSplit">
+            <div class="frame-wrap" id="frameWrap">
+              <div class="frame-loader hidden" id="frameLoader"><div class="spinner"></div><span id="frameLoaderText">Loading…</span></div>
+              <div class="find-bar hidden" id="findBar">
+                <input id="findInput" placeholder="Find in page" aria-label="Find in page">
+                <span id="findCount">0/0</span>
+                <button class="icon-btn sm" id="findPrev" title="Previous (Shift+Enter)"><svg style="transform:rotate(-90deg)"><use href="#i-chevron"/></svg></button>
+                <button class="icon-btn sm" id="findNext" title="Next (Enter)"><svg style="transform:rotate(90deg)"><use href="#i-chevron"/></svg></button>
+                <button class="icon-btn sm" id="findClose" title="Close (Esc)"><svg><use href="#i-x"/></svg></button>
+              </div>
+              <div class="reader hidden" id="readerView"></div>
+            </div>
+            <div class="side-panel hidden" id="sidePanel"></div>
+          </div>
+        </section>
+
+        <!-- Search -->
+        <section class="view" id="view-search">
+          <div class="page-shell narrow">
+            <form class="search-hero" id="searchForm" autocomplete="off">
+              <svg><use href="#i-search"/></svg><input id="searchInput" list="searchSuggestions" placeholder="Search the Veyra index" aria-label="Search the Veyra index"><button class="btn primary">Search</button>
+              <datalist id="searchSuggestions"></datalist>
+            </form>
+            <div class="search-meta"><b id="searchStat">Veyra Search</b><span id="searchMeta">Search words, phrases or domains. Operators like site: and intitle: work too.</span></div>
+            <div id="searchResults" class="search-results"></div>
+            <button class="btn ghost hidden" id="searchMore">More results</button>
+            <p class="muted small" id="searchCoverage"></p>
+          </div>
+        </section>
+
+        <!-- Calculator -->
+        <section class="view" id="view-calculator">
+          <div class="page-shell calc-shell">
+            <header class="page-head"><h1>Calculator</h1><p class="muted">Runs locally. Nothing is sent to a server.</p></header>
+            <div class="calc">
+              <input id="calcInput" class="calc-input" placeholder="(12 + 30) * 2" aria-label="Expression">
+              <output id="calcResult" class="calc-result">0</output>
+              <p id="calcStatus" class="muted small">Supports + − × ÷ %, parentheses and negative numbers.</p>
+              <div class="calc-keys" id="calcKeys"></div>
+            </div>
+          </div>
+        </section>
+
+        <!-- Downloads -->
+        <section class="view" id="view-downloads">
+          <div class="page-shell">
+            <header class="page-head row"><div><h1>Downloads</h1><p class="muted">Files are fetched through your Veyra session and saved by your own browser.</p></div><div class="head-actions"><input class="input" id="downloadsFilter" placeholder="Search downloads"><button class="btn ghost" id="clearDownloadsBtn">Clear all</button></div></header>
+            <div id="downloadsList" class="list"></div>
+          </div>
+        </section>
+
+        <!-- History -->
+        <section class="view" id="view-history">
+          <div class="page-shell">
+            <header class="page-head row"><div><h1>History</h1><p class="muted">Stored on this device only.</p></div><div class="head-actions"><input class="input" id="historyFilter" placeholder="Search history"><button class="btn ghost" id="clearHistoryBtn">Clear browsing data</button></div></header>
+            <div id="historyList" class="list"></div>
+          </div>
+        </section>
+
+        <!-- Extensions -->
+        <section class="view" id="view-extensions">
+          <div class="page-shell">
+            <header class="page-head row"><div><h1>Extensions</h1><p class="muted">Extensions run inside proxied pages through the Veyra page bridge.</p></div>
+              <div class="head-actions"><label class="switch-row"><span>Developer mode</span><input type="checkbox" class="switch" id="extDevMode"></label></div></header>
+            <div class="ext-dev hidden" id="extDevBar">
+              <button class="btn ghost" id="loadExtensionBtn">Load manifest…</button><button class="btn ghost" id="exportExtensionsBtn">Export</button>
+              <span class="muted small">Manifests are JSON with <code>id</code>, <code>name</code>, <code>css</code> and optional <code>matches</code> host patterns. Scripts aren't allowed.</span>
+              <input type="file" id="extensionFile" accept="application/json,.json" hidden>
+            </div>
+            <div class="ext-grid" id="extensionsGrid"></div>
+          </div>
+        </section>
+
+        <!-- Settings -->
+        <section class="view" id="view-settings">
+          <div class="settings">
+            <aside class="settings-nav">
+              <h1>Settings</h1>
+              <label class="settings-search"><svg><use href="#i-search"/></svg><input id="settingsSearch" placeholder="Search settings" aria-label="Search settings"></label>
+              <nav id="settingsNav"></nav>
+            </aside>
+            <div class="settings-body" id="settingsBody"></div>
+          </div>
+        </section>
+
+        <!-- VPN -->
+        <section class="view" id="view-vpn">
+          <div class="page-shell narrow" id="vpnPanel"></div>
+        </section>
+
+        <!-- Resources (view source) -->
+        <section class="view" id="view-resources">
+          <div class="split-tool">
+            <aside class="split-list">
+              <header><h2>Page resources</h2><input class="input" id="resFilter" placeholder="Filter"></header>
+              <div id="resourceList" class="res-list"></div>
+            </aside>
+            <div class="split-main">
+              <header class="code-head"><div><b id="sourceTitle">Select a resource</b><span id="sourceMeta" class="muted small"></span></div><div class="head-actions"><button class="btn ghost sm" id="sourcePretty">{ } Format</button><button class="btn ghost sm" id="sourceCopy">Copy</button></div></header>
+              <pre class="code-view" id="sourceCode"></pre>
+            </div>
+          </div>
+        </section>
+
+        <!-- Links -->
+        <section class="view" id="view-links">
+          <div class="page-shell wide">
+            <header class="page-head row"><div><h1>All links</h1><p class="muted" id="linkSummary">Links found on this page and by the background crawl.</p></div><div class="head-actions"><input class="input" id="linkFilter" placeholder="Filter links"><select class="input" id="linkScope"><option value="all">All</option><option value="internal">Same site</option><option value="external">External</option></select><button class="btn ghost" id="linkCopy">Copy all</button></div></header>
+            <div class="table-wrap"><table class="table"><thead><tr><th>Link</th><th>Text / type</th><th>Found on</th><th></th></tr></thead><tbody id="linkBody"></tbody></table></div>
+          </div>
+        </section>
+
+        <!-- Admin: Veyra console -->
+        <section class="view" id="view-console">
+          <div class="page-shell wide">
+            <header class="page-head row"><div><h1>Veyra console</h1><p class="muted">App, crawler and page logs. Admin only.</p></div><div class="head-actions"><select class="input" id="consoleFilter"><option value="all">All levels</option><option value="error">Errors</option><option value="warn">Warnings</option><option value="info">Info</option><option value="debug">Debug</option></select><input class="input" id="consoleSearch" placeholder="Filter"><button class="btn ghost" id="copyConsole">Copy</button><button class="btn ghost" id="clearConsole">Clear</button></div></header>
+            <div class="log-view" id="consoleLog"></div>
+          </div>
+        </section>
+
+        <!-- Admin: /dev -->
+        <section class="view" id="view-dev">
+          <div class="page-shell wide" id="devPanel"></div>
+        </section>
+      </main>
+
+      <!-- DevTools drawer (docked bottom or right) -->
+      <div class="devtools hidden" id="devtools" aria-label="Developer tools"></div>
+    </div>
+
+    <footer class="statusbar" id="statusbar"><span id="statusLeft">Ready</span><span id="statusRight"></span></footer>
+  </div>
+
+  <!-- Menus / popovers -->
+  <div class="menu hidden" id="mainMenu" role="menu"></div>
+  <div class="popover hidden" id="popover"></div>
+  <div class="ctx-menu hidden" id="ctxMenu" role="menu"></div>
+
+  <!-- Session ended -->
+  <div class="overlay hidden" id="sessionOverlay" role="alertdialog" aria-labelledby="sessionOverTitle">
+    <div class="overlay-card">
+      <div class="timer-ring done"><svg viewBox="0 0 48 48"><circle cx="24" cy="24" r="20"/></svg><span>0:00</span></div>
+      <h2 id="sessionOverTitle">Session ended and deleted</h2>
+      <p class="muted" id="sessionOverText">Your two minutes are up. Veyra deleted the session on the server: cookies, tabs, Chromium context and VPN tunnel.</p>
+      <div class="overlay-actions"><button class="btn primary" id="sessionRestart">Start a new session</button><button class="btn ghost" id="sessionHome">Back to new tab</button></div>
+    </div>
+  </div>
+
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+
+  <dialog id="promptDialog" class="modal">
+    <form method="dialog" class="modal-card sm" id="promptForm">
+      <h2 id="promptTitle">Edit</h2>
+      <div id="promptFields"></div>
+      <div class="modal-actions"><button class="btn ghost" value="cancel" formnovalidate>Cancel</button><button class="btn primary" value="ok" id="promptOk">Save</button></div>
+    </form>
+  </dialog>
+
+  <div class="fatal hidden" id="fatalOverlay"><div class="overlay-card"><h2>Veyra hit an error</h2><pre id="fatalMessage"></pre><button class="btn primary" onclick="location.reload()">Reload</button></div></div>
+
+  <script>(function(){var s=document.createElement("script");s.type="module";s.src=(window.VEYRA_BASE||"./")+"app.js";document.body.appendChild(s);})();</script>
+  <noscript><p style="padding:24px">Veyra needs JavaScript.</p></noscript>
+</body>
+</html>
