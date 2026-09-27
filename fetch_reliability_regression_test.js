@@ -8,7 +8,7 @@ const checks = [
   ['direct network alternates dispatcher on retries', /attempt % 2 === 0 \? DIRECT_HTTP_AGENT : undefined/.test(s)],
   ['upstream fetch failures preserve cause codes', /function networkErrorCode\(err\)/.test(s) && /e\.upstreamCode = networkErrorCode\(err\)/.test(s)],
   ['transient connection errors are retried', /function isRetryableNetworkError\(err\)/.test(s) && /isRetryableNetworkError\(e\)/.test(s)],
-  ['view errors return useful upstream diagnostics', /upstreamCode: e\.upstreamCode/.test(s) && /upstreamPhase: e\.upstreamPhase/.test(s)],
+  ['view errors return useful upstream diagnostics', /const upstreamCode = e\.upstreamCode/.test(s) && /legacyCode: "PROXY_VIEW_ERROR"/.test(s) && /upstreamPhase: e\.upstreamPhase/.test(s)],
   ['VPN kill switch cannot fall back to direct fetch', /vpnEnabledForRequest && !suppliedDispatcher && vpnManager\.killSwitch/.test(s)],
   ['direct dispatcher is closed during shutdown', /DIRECT_HTTP_AGENT\.close\(\)/.test(s)],
 ];

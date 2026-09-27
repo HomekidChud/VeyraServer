@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const s = fs.readFileSync(path.join(__dirname, 'server.js'), 'utf8');
 const vpnJs = fs.readFileSync(path.join(__dirname, 'vpn.js'), 'utf8');
+const frontendJs = fs.readFileSync(path.join(__dirname, '../frontend/app.js'), 'utf8');
 function ok(name, cond) { if (!cond) throw new Error(`FAIL ${name}`); console.log('PASS', name); }
 ok('logical robot bundle config exists', s.includes('ROBOT_BUNDLE_SIZE'));
 ok('adaptive host policy exists', s.includes('hostConcurrencyLimit(job, host)') && s.includes('noteHostSuccess(job, host)') && s.includes('noteHostError(job, host)'));
@@ -20,6 +21,9 @@ ok('proxy-only mode can skip crawler', s.includes('state: "disabled"') && s.incl
 ok('browse crawler opens use bounded page accelerator', s.includes('const job = createJob(root, { pageAccelerator: CFG.crawlerPageAccelerator });'));
 ok('critical asset preload pipeline exists', s.includes('criticalPreloadHtml') && s.includes('preloadCandidates') && s.includes('PROXY_CRITICAL_PRELOAD_LIMIT'));
 ok('inline asset warm scan exists', s.includes('extractInlineWarmUrls') && s.includes('PROXY_INLINE_WARM_SCAN_CHARS'));
+ok('request coalescing prevents duplicate foreground fetches', s.includes("fetchInflight") && s.includes("canCoalesce"));
+ok('Mongo persistence and L2 cache are wired', fs.existsSync(path.join(__dirname, "mongo-store.js")) && s.includes("mongoStore"));
+ok('auto heavy pages can race proxy and Chromium', frontendJs.includes('key: "combined", proxy: true, crawler: true, browser: true, race: true') && frontendJs.includes('background: true'));
 ok('proxy referrer recovery is validated', s.includes('function proxyRefererCanonical') && s.includes('proxyRefererCanonical(req)'));
 
 ok('retryable crawl failures requeue', s.includes('targetFrontier.requeue'));

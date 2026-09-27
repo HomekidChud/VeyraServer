@@ -12,7 +12,7 @@ assert(browser.includes('getByTabId(tabId)'));
 assert(browser.includes("code: 'BROWSER_CAPACITY'"));
 assert(browser.includes('finally {\n      this.creatingSessions'));
 assert(browser.includes('!s.navigationActive &&'));
-if (app) assert(app.includes('if (e.code === \'BROWSER_CAPACITY\') addLog'));
+if (app) assert(app.includes('if (e.code === "BROWSER_CAPACITY") addLog') || app.includes("e.code === 'BROWSER_CAPACITY'"));
 if (app) assert(!app.match(/if \(e\.code === 'BROWSER_CAPACITY'\)[\s\S]{0,300}navigateUrl\(/));
 if (app) assert(app.includes("/api/vpn/test"));
 assert(server.includes("app.post('/api/vpn/test'"));

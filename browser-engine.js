@@ -22,6 +22,16 @@ function sanitizeHeaderMap(headers = {}) {
   for (const [k, v] of Object.entries(headers || {})) if (!blocked.test(k)) out[k] = String(v).slice(0, 1000);
   return out;
 }
+function sanitizeRequestWarmHeaders(headers = {}) {
+  const out = {};
+  const allow = /^(accept|accept-language|cache-control|pragma|dnt|origin|referer|priority|content-type|x-goog-|x-youtube-|x-yt-|x-requested-with|sec-fetch-)/i;
+  const blocked = /^(cookie|set-cookie|authorization|proxy-authorization|x-api-key|x-auth-token|x-csrf-token|.*token.*|.*secret.*)$/i;
+  for (const [k, v] of Object.entries(headers || {})) {
+    if (!allow.test(k) || blocked.test(k)) continue;
+    out[k] = String(v).slice(0, 2000);
+  }
+  return out;
+}
 
 class BrowserEngine {
   constructor(cfg, assertPublicUrl, logger = () => {}, discover = () => {}, vpnManager = null) {
@@ -117,7 +127,7 @@ class BrowserEngine {
       const requestedVpn = vpnProfile?.id || vpnProfile?.profileId || null;
       if (existingVpn === requestedVpn) {
         existing.jobId = String(jobId || existing.jobId || '');
-        await this.navigateSession(existing, url);
+        await this.navigateSession(existing, url, { fast: !!extra.fastStart });
         return this.public(existing);
       }
       await this.stop(existing.id).catch(() => {});
@@ -198,7 +208,7 @@ class BrowserEngine {
       this.sessions.set(sid, session);
       this.attachPage(session, page);
       try {
-        await this.navigateSession(session, url);
+        await this.navigateSession(session, url, { fast: !!extra.fastStart });
         return this.public(session);
       } catch (e) {
         session.navigationActive = false;
@@ -229,9 +239,13 @@ class BrowserEngine {
         try { this.discover(session, { url: new URL(response.url()).href, type: req.resourceType(), status: response.status(), method: req.method() }); } catch {}
       }
     });
-    page.on('request', req => this.pushNetwork(session, {
-      type: 'request', method: req.method(), url: sanitizeUrl(req.url()), resourceType: req.resourceType()
-    }));
+    page.on('request', req => {
+      const row = { type: 'request', method: req.method(), url: sanitizeUrl(req.url()), resourceType: req.resourceType(), requestHeaders: {} };
+      this.pushNetwork(session, row);
+      // allHeaders() is async in Playwright; keep only compatibility headers and
+      // never persist cookies/authorization/tokens into the diagnostics buffer.
+      void req.allHeaders?.().then(h => { row.requestHeaders = sanitizeRequestWarmHeaders(h); }).catch(() => {});
+    });
     page.on('framenavigated', frame => {
       if (frame === page.mainFrame()) {
         session.canonicalUrl = safeUrl(frame.url()) || session.canonicalUrl;
@@ -273,7 +287,7 @@ class BrowserEngine {
     if (session.network.length > 600) session.network.splice(0, session.network.length - 600);
   }
 
-  async navigateSession(session, target) {
+  async navigateSession(session, target, options = {}) {
     const url = safeUrl(target);
     if (!url) throw Object.assign(new Error('Invalid browser URL.'), { code: 'INVALID_URL' });
     await this.assertPublicUrl(url);
@@ -287,7 +301,8 @@ class BrowserEngine {
         waitUntil: 'domcontentloaded',
         timeout: this.cfg.browserNavigationTimeoutMs
       });
-      await session.page.waitForLoadState('load', { timeout: Math.min(10000, this.cfg.browserPageTimeoutMs) }).catch(() => {});
+      if (!options.fast) await session.page.waitForLoadState('load', { timeout: Math.min(10000, this.cfg.browserPageTimeoutMs) }).catch(() => {});
+      else await Promise.race([session.page.waitForLoadState('load').catch(() => {}), new Promise(r => setTimeout(r, 1800))]);
       session.canonicalUrl = safeUrl(session.page.url()) || url;
       session.title = await session.page.title().catch(() => '');
       const challenge = await this.detectVerification(session.page);
@@ -304,6 +319,17 @@ class BrowserEngine {
       session.navigationActive = false;
       session.lastUsed = Date.now();
     }
+  }
+
+  async renderedContent(sid, timeoutMs = 1800) {
+    const s = this.get(sid);
+    if (!s?.page) throw Object.assign(new Error('Browser session is unavailable.'), { code: 'BROWSER_SESSION_NOT_FOUND' });
+    s.lastUsed = Date.now();
+    const html = await Promise.race([
+      s.page.content(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Rendered content snapshot timed out.')), Math.max(500, Number(timeoutMs) || 1800)))
+    ]);
+    return { html: String(html || ''), url: safeUrl(s.page.url()) || s.canonicalUrl, title: await s.page.title().catch(() => s.title || '') };
   }
 
   async detectVerification(page) {

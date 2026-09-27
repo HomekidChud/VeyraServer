@@ -30,6 +30,11 @@ class AuthStore {
     this.maxUsers = opts.maxUsers || 5000;
     this.maxDataBytes = opts.maxDataBytes || 64 * 1024;
     this.log = opts.log || (() => {});
+    this.persistence = opts.persistence || null;
+    this.ready = Promise.resolve();
+    if (this.persistence?.enabled) {
+      this.ready = this.persistence.loadUsers().then(rows => { for (const u of rows || []) { if (!u?.id || !u?.email) continue; this.users.set(u.id, u); this.byEmail.set(u.email, u.id); } this.log("info", "AUTH", `Loaded ${this.users.size} account(s) including MongoDB persistence.`); }).catch(e => this.log("warn", "AUTH", `MongoDB account hydration skipped: ${e.message}`));
+    }
     this.users = new Map();      // id -> user
     this.byEmail = new Map();    // email -> id
     this.attempts = new Map();   // key -> [timestamps]
@@ -126,6 +131,7 @@ class AuthStore {
     const user = { id: crypto.randomUUID(), email, name: name || email.split("@")[0], password: this.hash(password), tokenVersion: 0, createdAt: now, lastLoginAt: now, data: {} };
     this.users.set(user.id, user); this.byEmail.set(email, user.id);
     this.save();
+    void this.persistence?.upsertUser(user);
     this.log("info", "AUTH", `New account ${email}.`);
     return { user: this.publicUser(user), token: this.sign(user) };
   }
@@ -138,9 +144,10 @@ class AuthStore {
     if (!user || !ok) throw authError(401, "That email and password don't match.", "AUTH_INVALID");
     user.lastLoginAt = new Date().toISOString();
     this.save();
+    void this.persistence?.upsertUser(user);
     return { user: this.publicUser(user), token: this.sign(user) };
   }
-  logoutEverywhere(user) { user.tokenVersion = (user.tokenVersion || 0) + 1; this.save(); }
+  logoutEverywhere(user) { user.tokenVersion = (user.tokenVersion || 0) + 1; this.save(); void this.persistence?.upsertUser(user); }
   update(user, { name, password, currentPassword }) {
     if (name != null) user.name = String(name).trim().replace(/\s+/g, " ").slice(0, 60) || user.name;
     if (password != null) {
@@ -150,6 +157,7 @@ class AuthStore {
       user.tokenVersion = (user.tokenVersion || 0) + 1;
     }
     this.save();
+    void this.persistence?.upsertUser(user);
     return { user: this.publicUser(user), token: this.sign(user) };
   }
   getData(user) { return user.data || {}; }
@@ -159,15 +167,17 @@ class AuthStore {
     user.data = JSON.parse(json);
     user.dataUpdatedAt = new Date().toISOString();
     this.save();
+    void this.persistence?.upsertUser(user);
     return { updatedAt: user.dataUpdatedAt };
   }
   remove(user, password) {
     if (!this.verify(password, user.password)) throw authError(401, "Password is incorrect.", "AUTH_INVALID");
     this.users.delete(user.id); this.byEmail.delete(user.email);
     this.save();
+    void this.persistence?.deleteUser(user.id);
   }
   status() {
-    return { accounts: this.users.size, signupEnabled: this.allowSignup, persistentSecret: !this.ephemeralSecret, admins: this.adminEmails.size, file: this.file };
+    return { accounts: this.users.size, signupEnabled: this.allowSignup, persistentSecret: !this.ephemeralSecret, admins: this.adminEmails.size, file: this.file, mongo: this.persistence?.status?.() || null };
   }
 }
 

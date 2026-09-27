@@ -13,6 +13,7 @@ const { VpnManager } = require("./vpn");
 const { SessionManager } = require("./session-manager");
 const { AuthStore } = require("./auth");
 const { WorkerPool } = require("./worker-pool");
+const { MongoStore } = require("./mongo-store");
 const { isMainThread } = require("worker_threads");
 // parse-worker.js loads this file inside worker threads to reuse the pure
 // rewrite / discovery functions. In that mode nothing long-lived is started.
@@ -168,13 +169,20 @@ const CFG = Object.freeze({
   maxSessionCookies: numberEnv("MAX_SESSION_COOKIES", 50, 5, 500),
   proxyWarmRobots: Math.min(numberEnv("PROXY_WARM_ROBOTS", P.proxyWarmRobots, 1, 1000), P.proxyWarmRobots),
   proxyWarmConcurrency: Math.min(numberEnv("PROXY_WARM_CONCURRENCY", P.proxyWarmConcurrency, 1, 64), P.proxyWarmConcurrency),
-  proxyWarmLimit: numberEnv("PROXY_WARM_LIMIT", 96, 1, 256),
+  proxyWarmLimit: numberEnv("PROXY_WARM_LIMIT", 128, 1, 256),
   proxyWarmPerHost: numberEnv("PROXY_WARM_PER_HOST", 4, 1, 16),
-  proxyCriticalPreloadLimit: numberEnv("PROXY_CRITICAL_PRELOAD_LIMIT", 18, 4, 40),
+  proxyCriticalPreloadLimit: numberEnv("PROXY_CRITICAL_PRELOAD_LIMIT", 24, 4, 40),
   proxyInlineWarmScanChars: numberEnv("PROXY_INLINE_WARM_SCAN_CHARS", 800000, 10000, 3000000),
+  proxyWarmMaxBinaryBytes: numberEnv("PROXY_WARM_MAX_BINARY_BYTES", 768 * 1024, 64 * 1024, 4 * 1024 * 1024),
   sitemapConcurrency: Math.min(numberEnv("SITEMAP_CONCURRENCY", P.sitemapConcurrency, 1, 32), P.sitemapConcurrency),
   initialResourceBudget: numberEnv("INITIAL_RESOURCE_BUDGET", 64, 16, 256),
-  userAgent: process.env.VEYRA_USER_AGENT || "VeyraBrowseCrawler/8.14.6 (+https://github.com/HomekidChud/VeyraServer)",
+  mongoUri: process.env.MONGODB_URI || "",
+  mongoDb: process.env.MONGODB_DB || "veyra",
+  mongoPoolSize: numberEnv("MONGODB_MAX_POOL_SIZE", 2, 1, 4),
+  mongoCacheBodyMaxBytes: numberEnv("MONGODB_CACHE_BODY_MAX_BYTES", 512 * 1024, 16 * 1024, 768 * 1024),
+  mongoCacheTtlMs: numberEnv("MONGODB_CACHE_TTL_MS", 5 * 60 * 1000, 10 * 1000, 24 * 60 * 60 * 1000),
+  mongoSharedCache: boolEnv("MONGODB_SHARED_CACHE", true),
+  userAgent: process.env.VEYRA_USER_AGENT || "VeyraBrowseCrawler/8.15.2 (+https://github.com/HomekidChud/VeyraServer)",
   frontendOrigins: csvEnv("FRONTEND_ORIGIN", ["*"]),
   // Canonical Veyra frontend URL used for safe diagnostics hand-off when /status
   // is opened directly without the Authorization/admin header. A direct browser
@@ -275,7 +283,10 @@ const allowedOrigins = CFG.frontendOrigins.includes("*") ? true : CFG.frontendOr
 app.use(cors({
   origin: allowedOrigins,
   methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Accept", "X-Veyra-Request-ID", "X-Requested-With", "Authorization", "X-Veyra-Admin-Token", "X-CSRF-Token", "X-XSRF-Token", "DNT", "Cache-Control", "Pragma", "Range"],
+  // Intentionally omit `allowedHeaders`: the cors package then reflects the
+  // browser's Access-Control-Request-Headers during preflight. This is required
+  // for dynamic site/API headers (including YouTube/Google x-* headers), while
+  // upstream forwarding remains governed by forwardProxyBrowserHeaders().
   exposedHeaders: ["X-Veyra-Request-ID", "X-Veyra-Canonical-URL", "X-Veyra-Challenge", "X-Veyra-Content-Type", "X-Veyra-Session-ID", "X-Veyra-Session-Expires"]
 }));
 // Proxy routes receive the page's request body byte-for-byte (JSON, protobuf,
@@ -295,6 +306,7 @@ app.use((req, res, next) => {
 const jobs = new Map();
 const activeByRoot = new Map();
 const proxyCache = new Map();
+const fetchInflight = new Map();
 const searchCache = new Map();
 const sessionManager = new SessionManager({
   maxSessions: CFG.maxProxySessions, idleTtlMs: CFG.sessionIdleTtlMs, hardTtlMs: CFG.sessionMaxAgeMs, timeLimitMs: CFG.sessionTimeLimitMs,
@@ -302,9 +314,10 @@ const sessionManager = new SessionManager({
   log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
 });
 const proxySessions = sessionManager.sessions;
+const mongoStore = new MongoStore({ uri: CFG.mongoUri, dbName: CFG.mongoDb, maxPoolSize: CFG.mongoPoolSize, cacheBodyMaxBytes: CFG.mongoCacheBodyMaxBytes, cacheTtlMs: CFG.mongoCacheTtlMs });
 const authStore = new AuthStore({
   dataDir: CFG.authDataDir, secret: CFG.authSecret, tokenTtlMs: CFG.authTokenTtlMs,
-  adminEmails: CFG.adminEmails, allowSignup: CFG.authAllowSignup,
+  adminEmails: CFG.adminEmails, allowSignup: CFG.authAllowSignup, persistence: mongoStore,
   // Deferred: AuthStore loads users synchronously before the log buffer below is initialised.
   log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
 });
@@ -979,9 +992,10 @@ function isRetryableNetworkError(err) {
 function decorateUpstreamError(err, url) {
   const e = err instanceof Error ? err : new Error(String(err));
   e.upstreamCode = networkErrorCode(err) || 'UPSTREAM_NETWORK_ERROR';
-  e.upstreamPhase = /timed out|timeout|headers_timeout/i.test(String(err?.message || '')) ? 'timeout' : 'connect';
+  e.upstreamPhase = /timed out|timeout|headers_timeout|Response body timed out/i.test(String(err?.message || '')) ? 'timeout' : 'connect';
   e.upstreamMessage = networkErrorMessage(err);
   e.upstreamHost = hostOf(url);
+  e.code = /^VPN_/.test(String(e.code || '')) ? e.code : 'UPSTREAM_NETWORK_ERROR';
   return e;
 }
 function oversizeStream(response, head, reader) {
@@ -1119,6 +1133,7 @@ async function fetchBuffer(url, opts = {}) {
           acceptRanges: response.headers.get("accept-ranges") || "",
           linkHeader: response.headers.get("link") || "",
           contentDisposition: response.headers.get("content-disposition") || "",
+          setCookieHeader: response.headers.get("set-cookie") || "",
           contentLength: response.headers.get("content-length") || "",
           serverHeader: response.headers.get("server") || "",
           cfMitigated: response.headers.get("cf-mitigated") || "",
@@ -1162,22 +1177,42 @@ function cacheSet(map, key, value, maxEntries) {
 }
 async function fetchCached(url, opts = {}) {
   const method = String(opts.method || "GET").toUpperCase();
+  const normalized = normalizeUrl(url);
   const referrerKey = String(opts.referrer || "");
-  const key = `${method} ${normalizeUrl(url)} | ref=${referrerKey} | sid=${String(opts.sessionId || "")}`;
-  const cachedEntry = opts.noCache || method !== "GET" ? null : proxyCache.get(key) || null;
-  if (cachedEntry && Date.now() - cachedEntry.time <= CFG.proxyCacheMs && !opts.revalidate) {
-    return { ...cachedEntry.response, cacheHit: true };
-  }
-  const result = await fetchBuffer(url, { ...opts, cached: cachedEntry && method === "GET" ? cachedEntry : null });
-  if (!opts.noCache && method === "GET") {
-    const noStore = /no-store/i.test(result.cacheControl || "");
-    if (!noStore && !result.truncated && !result.tooLarge && Buffer.byteLength(result.body || Buffer.alloc(0)) <= CFG.maxCacheBodyBytes) {
-      cacheSet(proxyCache, key, { response: result, etag: result.etag, lastModified: result.lastModified }, CFG.maxProxyCacheEntries);
+  const sid = String(opts.sessionId || "");
+  const baseKey = `${method} ${normalized} | ref=${referrerKey}`;
+  const key = `${baseKey} | sid=${sid}`;
+  const sharedKey = `${method} ${normalized} | sid=*`;
+  const canCoalesce = method === "GET" && !opts.noCache && !opts.streamOversize;
+  if (canCoalesce) { const existing = fetchInflight.get(key); if (existing) return existing; }
+  const work = (async () => {
+    let cachedEntry = opts.noCache || method !== "GET" ? null : proxyCache.get(key) || null;
+    if (!cachedEntry && method === "GET" && CFG.mongoSharedCache) cachedEntry = proxyCache.get(sharedKey) || null;
+    if (!cachedEntry && method === "GET" && mongoStore.enabled) {
+      const persisted = await mongoStore.getProxyCache(key);
+      if (persisted) { cacheSet(proxyCache, key, persisted, CFG.maxProxyCacheEntries); cachedEntry = persisted; }
     }
-  }
-  return result;
+    if (!cachedEntry && method === "GET" && CFG.mongoSharedCache && mongoStore.enabled) {
+      const persisted = await mongoStore.getProxyCache(sharedKey);
+      if (persisted) { cacheSet(proxyCache, sharedKey, persisted, CFG.maxProxyCacheEntries); cachedEntry = persisted; }
+    }
+    if (cachedEntry && Date.now() - cachedEntry.time <= CFG.proxyCacheMs && !opts.revalidate) return { ...cachedEntry.response, cacheHit: true };
+    const result = await fetchBuffer(url, { ...opts, cached: cachedEntry && method === "GET" ? cachedEntry : null });
+    if (!opts.noCache && method === "GET") {
+      const noStore = /no-store/i.test(result.cacheControl || "");
+      const bodyBytes = Buffer.byteLength(result.body || Buffer.alloc(0));
+      if (!noStore && !result.truncated && !result.tooLarge && bodyBytes <= CFG.maxCacheBodyBytes) cacheSet(proxyCache, key, { response: result, etag: result.etag, lastModified: result.lastModified }, CFG.maxProxyCacheEntries);
+      const shareableType = /(?:text\/css|javascript|font\/|image\/|image\/svg\+xml)/i.test(String(result.contentType || ""));
+      const noSessionCookies = !result.setCookieHeader && (!sid || !cookieHeader(sid, normalized));
+      const shared = CFG.mongoSharedCache && shareableType && noSessionCookies && !noStore && !result.truncated && !result.tooLarge && bodyBytes <= Math.min(CFG.maxCacheBodyBytes, CFG.mongoCacheBodyMaxBytes);
+      if (shared) { const sharedResult = { ...result, sessionId: "" }; cacheSet(proxyCache, sharedKey, { response: sharedResult, etag: result.etag, lastModified: result.lastModified }, CFG.maxProxyCacheEntries); void mongoStore.putProxyCache(sharedKey, result, { url: result.finalUrl || normalized, sessionId: "" }); }
+      else if (!sid && !noStore && !result.truncated && !result.tooLarge && bodyBytes <= Math.min(CFG.maxCacheBodyBytes, CFG.mongoCacheBodyMaxBytes)) void mongoStore.putProxyCache(key, result, { url: result.finalUrl || normalized, sessionId: "" });
+    }
+    return result;
+  })();
+  if (canCoalesce) fetchInflight.set(key, work);
+  try { return await work; } finally { if (canCoalesce && fetchInflight.get(key) === work) fetchInflight.delete(key); }
 }
-
 function statusRetryClass(status) {
   if (status === 429) return "throttled";
   if (status >= 500) return "server-error";
@@ -1758,6 +1793,7 @@ function removeIndexedDocument(doc) {
     const count = (termCounts.get(term) || 0) - 1;
     if (count > 0) termCounts.set(term, count); else termCounts.delete(term);
   }
+  void mongoStore.deleteSearchDocument(doc.url);
 }
 function extractPageMeta(text, url) {
   const $ = cheerio.load(String(text || ""), { decodeEntities: false });
@@ -1821,6 +1857,7 @@ function indexDocument(url, text, precomputedMeta = null) {
       termFreq: meta.termFreq
     };
     addIndexedDocument(doc);
+    void mongoStore.upsertSearchDocument(doc);
     invalidateSearchCaches();
     return doc;
   } catch (e) {
@@ -2254,7 +2291,7 @@ function createJob(root, options = {}) {
   const id = crypto.randomUUID();
   const pageAccelerator = !!options.pageAccelerator;
   return {
-    id, root, url: root, createdAt: now(), pageAccelerator, warmDeadlineAt: pageAccelerator ? Date.now() + CFG.crawlerPageWarmMs : 0, finishedAt: null, done: false, stopRequested: false, status: "queued", statusText: "Queued",
+    id, root, url: root, createdAt: now(), pageAccelerator, warmDeadlineAt: pageAccelerator ? Date.now() + CFG.crawlerPageWarmMs : 0, fastPhaseComplete: false, finishedAt: null, done: false, stopRequested: false, status: "queued", statusText: "Queued",
     pageFrontier: new PriorityFrontier(CFG.maxPendingQueue), resourceFrontier: new PriorityFrontier(CFG.maxPendingQueue), criticalResourceFrontier: new PriorityFrontier(Math.min(CFG.maxPendingQueue, CFG.criticalResourceBudget * 4)), visited: new Set(), discovered: new Set(), retryCounts: new Map(),
     resources: [], links: [], logs: [], logSeq: 0, sourceDir: path.join(ROOT, id), sourceFiles: 0, textBytesStored: 0,
     activeWorkers: 0, activeHtmlWorkers: 0, activeAssetWorkers: 0, processed: 0, pagesDiscovered: 0, resourcesScheduled: 0, crossOriginResources: 0, sitemapLoading: false, browserDiscoveredCount: 0, browserDiscoveredHosts: new Set(),
@@ -2817,10 +2854,10 @@ class CooperativeRobotPool {
     this.running = true;
     while (!this.job.stopRequested) {
       if (this.job.pageAccelerator && this.job.warmDeadlineAt && Date.now() >= this.job.warmDeadlineAt) {
-        this.job.stopRequested = true;
-        this.job.stopReason = "page-warm-deadline";
-        this.event("page-warm-deadline", { warmMs: CFG.crawlerPageWarmMs });
-        break;
+        this.job.fastPhaseComplete = true;
+        this.job.warmDeadlineAt = 0;
+        this.job.statusText = "Critical page resources warmed; finishing required assets in the background…";
+        this.event("page-critical-phase-complete", { warmMs: CFG.crawlerPageWarmMs });
       }
       if (!this.job.robotsReady) { await sleep(5); continue; }
       if (this.job.counts.bytesScanned >= CFG.maxScanBytes) { this.job.stopRequested = true; this.job.stopReason = "scan-byte-limit"; break; }
@@ -2866,14 +2903,16 @@ async function runCrawl(job) {
     if (job.status === "challenge") job.statusText = "Security verification required; crawl stopped.";
     else if (job.stopRequested && job.stopReason === "scan-byte-limit") { job.status = "done"; job.statusText = `Scan budget reached (${bytesLabel(CFG.maxScanBytes)}).`; }
     else if (job.stopRequested && job.stopReason === "resource-limit") { job.status = "done"; job.statusText = `Resource safety limit reached (${CFG.maxResources.toLocaleString()}).`; }
-    else if (job.stopRequested && job.stopReason === "page-warm-deadline") { job.status = "done"; job.statusText = `Fast page warm-up finished after ${Math.round(CFG.crawlerPageWarmMs / 1000)}s.`; }
+    else if (job.pageAccelerator && job.fastPhaseComplete) { job.status = "done"; job.statusText = `Required page assets finished — ${job.processed.toLocaleString()} resources scanned.`; }
     else if (job.stopRequested && job.stopReason === "abandoned") { job.status = "stopped"; job.statusText = "Stopped automatically — nobody has checked this crawl for a while (CRAWL_ABANDON_MS)."; }
     else if (job.stopRequested && job.stopReason === "shutdown") { job.status = "stopped"; job.statusText = "Stopped — server is shutting down."; }
     else if (job.stopRequested) { job.status = "stopped"; job.statusText = "Stopped by user."; }
     else { job.status = "done"; job.statusText = `Complete — ${job.processed.toLocaleString()} resources scanned.`; }
     jobLog(job, job.status === "done" ? "info" : "warn", job.statusText, { robots: job.robotPool.report(12).summary });
+    void mongoStore.saveCrawlSummary(job);
   } catch (e) {
     job.done = true; job.finishedAt = now(); job.status = "error"; job.statusText = e.message || "Crawler error"; jobLog(job, "error", e.stack || e.message);
+    void mongoStore.saveCrawlSummary(job);
   }
 }
 
@@ -3193,6 +3232,7 @@ function runtimeConfigSummary() {
     workers: workerPool ? workerPool.report() : { size: 0, mode: 'inline', configured: CFG.parseWorkers },
     sessions: { maxSessions: CFG.maxProxySessions, idleTtlMs: CFG.sessionIdleTtlMs, maxAgeMs: CFG.sessionMaxAgeMs, maxCookieBytes: CFG.sessionMaxCookieBytes, serverIdleSleepMs: CFG.serverIdleSleepMs },
     browser: { maxSessions: CFG.maxBrowserSessions, maxPages: CFG.maxBrowserPages, keepWarm: CFG.browserKeepWarm, warmIdleMs: CFG.browserWarmIdleMs },
+    mongo: mongoStore.status(),
     vpn: { enabled: CFG.vpnEnabled, killSwitch: CFG.vpnKillSwitch, failover: CFG.vpnFailover, alwaysOn: CFG.vpnAlwaysOn }
   };
 }
@@ -3218,6 +3258,53 @@ app.put('/api/config', (req, res) => {
 });
 
 app.get('/api/browser/status', (req, res) => res.json({ ok: true, ...browserEngine.status(), config: { backend: CFG.browserBackend, enabled: CFG.browserEnabled, headless: CFG.browserHeadless, maxSessions: CFG.maxBrowserSessions, maxPages: CFG.maxBrowserPages, maxContexts: CFG.maxBrowserContexts } }));
+async function warmRenderedBrowserPage(browserSessionId, sid) {
+  try {
+    const rendered = await browserEngine.renderedContent(browserSessionId, 1800);
+    if (rendered.html && rendered.url) void warmPageResources(rendered.html, rendered.url, sid);
+    const session = browserEngine.sessions.get(browserSessionId);
+    if (!session) return;
+    const observed = new Map();
+    for (const row of session.network.slice(-160)) {
+      if (String(row.method || 'GET').toUpperCase() !== 'GET' || Number(row.status || 0) >= 400) continue;
+      const type = String(row.resourceType || '').toLowerCase();
+      if (!/script|stylesheet|fetch|xhr|image|font|media|manifest|texttrack/.test(type)) continue;
+      const u = normalizeUrl(row.url || '');
+      if (!u || observed.has(u)) continue;
+      let priority = /document/.test(type) ? 140 : /stylesheet|script/.test(type) ? 125 : /fetch|xhr/.test(type) ? 118 : /font/.test(type) ? 105 : /image|media/.test(type) ? 90 : 70;
+      observed.set(u, { url: u, priority, sid, requestHeaders: row.requestHeaders || {} });
+      if (observed.size >= Math.min(96, CFG.proxyWarmLimit)) break;
+    }
+    if (observed.size) {
+      const rows = [...observed.values()].sort((a,b) => b.priority - a.priority);
+      const hostActive = new Map(); let cursor = 0;
+      const worker = async () => {
+        while (cursor < rows.length) {
+          const item = rows[cursor++];
+          const host = hostOf(item.url);
+          while ((hostActive.get(host) || 0) >= CFG.proxyWarmPerHost) await sleep(2);
+          hostActive.set(host, (hostActive.get(host)||0)+1);
+          try {
+            const warmType = warmTypeForUrl(item.url, item.type === 'stylesheet' ? 'css' : item.type === 'script' ? 'js' : item.type);
+            const common = { sessionId: sid, referrer: rendered.url, headers: item.requestHeaders || {}, accept: '*/*', timeout: Math.min(CFG.requestTimeoutMs, 10000), retries: 0, limitForContentType: crawlLimitForContentType };
+            if (warmType === 'media') { await fetchCached(item.url, { ...common, method: 'HEAD', limit: 16 * 1024 }); }
+            else if (warmType === 'image' || warmType === 'font') {
+              const head = await fetchCached(item.url, { ...common, method: 'HEAD', limit: 16 * 1024 });
+              const length = Number(String(head.contentLength || '').split(',')[0]) || 0;
+              if (!length || length <= CFG.proxyWarmMaxBinaryBytes) await fetchCached(item.url, { ...common, limit: CFG.maxTextBytesPerResource });
+            } else {
+              await fetchCached(item.url, { ...common, limit: CFG.maxTextBytesPerResource });
+            }
+          } catch {} finally {
+            hostActive.set(host,Math.max(0,(hostActive.get(host)||1)-1));
+          }
+        }
+      };
+      await Promise.allSettled(Array.from({length: Math.min(CFG.proxyWarmConcurrency, rows.length)}, worker));
+    }
+  } catch (e) { serverLog('debug', 'BROWSER', `Rendered page warm-up skipped: ${e.message}`); }
+}
+
 app.post('/api/browser/session', async (req, res) => {
   if (!CFG.browserEnabled) return respondError(res, 503, 'Browser engine is disabled.', 'BROWSER_ENGINE_UNAVAILABLE');
   try {
@@ -3232,16 +3319,17 @@ app.post('/api/browser/session', async (req, res) => {
     const proxy = await vpnManager.playwrightProxy(sid);
     const vpnProfileId = vpnManager.profileForSession(sid)?.id || null;
     const vpnProfile = proxy ? { id: vpnProfileId, profileId: vpnProfileId, proxy, contextHints: vpnManager.browserContextHints(sid) } : null;
-    const session = await browserEngine.create(tabId, url, jobId, vpnProfile, { proxySessionId: sid });
+    const session = await browserEngine.create(tabId, url, jobId, vpnProfile, { proxySessionId: sid, fastStart: !!req.body?.fastStart });
     sessionManager.linkBrowser(sid, session.id);
     res.json({ ok: true, session });
+    void warmRenderedBrowserPage(session.id, sid);
   } catch (e) {
     if (e.code === 'BROWSER_CAPACITY') return respondError(res, 409, e.message, e.code);
     respondError(res, e.code === 'INVALID_URL' ? 400 : 502, e.message, e.code || 'BROWSER_ENGINE_ERROR');
   }
 });
 app.get('/api/browser/session/:id', (req, res) => { try { res.json({ ok:true, session: browserEngine.public(browserEngine.get(req.params.id)) }); } catch(e) { respondError(res,404,e.message,e.code||'BROWSER_SESSION_NOT_FOUND'); } });
-app.post('/api/browser/session/:id/navigate', async (req,res) => { try { const s=browserEngine.get(req.params.id); const target = firstValidUrl([req.body?.url, req.body?.target, req.body?.u], s?.page?.url?.() || undefined); if (!target) return respondError(res,400,'Missing or invalid public HTTP(S) URL.','INVALID_URL'); const session=await browserEngine.navigateSession(s, target); res.json({ok:true,session}); } catch(e) { respondError(res,e.code==='INVALID_URL'?400:502,e.message,e.code||'BROWSER_NAVIGATION_ERROR'); } });
+app.post('/api/browser/session/:id/navigate', async (req,res) => { try { const s=browserEngine.get(req.params.id); const target = firstValidUrl([req.body?.url, req.body?.target, req.body?.u], s?.page?.url?.() || undefined); if (!target) return respondError(res,400,'Missing or invalid public HTTP(S) URL.','INVALID_URL'); const session=await browserEngine.navigateSession(s, target, { fast: !!req.body?.fastStart }); res.json({ok:true,session}); void warmRenderedBrowserPage(session.id, s.proxySessionId || ''); } catch(e) { respondError(res,e.code==='INVALID_URL'?400:502,e.message,e.code||'BROWSER_NAVIGATION_ERROR'); } });
 app.post('/api/browser/session/:id/input', async (req,res) => { try { const session=await browserEngine.input(req.params.id, req.body || {}); res.json({ok:true,session}); } catch(e) { respondError(res,400,e.message,'BROWSER_INPUT_ERROR'); } });
 app.post('/api/browser/session/:id/history', async (req,res) => { try { const session=await browserEngine.history(req.params.id, String(req.body?.direction||'reload')); res.json({ok:true,session}); } catch(e) { respondError(res,400,e.message,'BROWSER_HISTORY_ERROR'); } });
 app.post('/api/browser/session/:id/inspect', async (req,res) => { try { const data=await browserEngine.inspect(req.params.id, req.body?.x, req.body?.y); res.json({ok:true,data}); } catch(e) { respondError(res,400,e.message,'BROWSER_INSPECT_ERROR'); } });
@@ -3271,7 +3359,7 @@ app.post('/api/browser/session/:id/devtools', async (req, res) => {
 app.get('/api/browser/session/:id/screenshot', async (req,res) => { try { const png=await browserEngine.screenshot(req.params.id); if(!png) return respondError(res,503,'Screenshot unavailable.','BROWSER_SCREENSHOT_ERROR'); res.setHeader('content-type','image/png'); res.setHeader('cache-control','no-store'); res.send(png); } catch(e) { respondError(res,404,e.message,e.code||'BROWSER_SCREENSHOT_ERROR'); } });
 
 // Health and debug.
-const healthPayload = () => ({ ok: true, service: "veyra", plan: CFG.plan, sleeping: sessionManager.sleeping, sessions: sessionManager.size, crawlers: { running: activeCrawlCount(), queued: crawlQueue.length, max: effectiveMaxActiveJobs() }, uptimeSec: Math.round(process.uptime()), activeJobs: [...jobs.values()].filter(j => !j.done).length, processRole: CFG.processRole, resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb, crawlerFetchLimit: effectiveCrawlerConcurrency(), logicalRobots: CFG.logicalRobots, vpn: vpnManager.status() });
+const healthPayload = () => ({ ok: true, service: "veyra", plan: CFG.plan, mongo: mongoStore.status(), sleeping: sessionManager.sleeping, sessions: sessionManager.size, crawlers: { running: activeCrawlCount(), queued: crawlQueue.length, max: effectiveMaxActiveJobs() }, uptimeSec: Math.round(process.uptime()), activeJobs: [...jobs.values()].filter(j => !j.done).length, processRole: CFG.processRole, resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb, crawlerFetchLimit: effectiveCrawlerConcurrency(), logicalRobots: CFG.logicalRobots, vpn: vpnManager.status() });
 app.get("/health", (req, res) => res.json(healthPayload()));
 app.get("/api/health", (req, res) => res.json(healthPayload()));
 // DevTools bridge script (loaded on demand by the injected page runtime).
@@ -3290,7 +3378,7 @@ app.use("/api/debug", (req, res, next) => (req.path === "/client-log" ? next() :
 app.get("/api/debug/system", (req, res) => {
   const mem = process.memoryUsage();
   const idx = searchIndexStats();
-  res.json({ time: now(), uptimeSec: Math.round(process.uptime()), startedAt: new Date(serverStartedAt).toISOString(), nodeVersion: process.version, platform: process.platform, processRole: CFG.processRole, resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb, memory: { rss: mem.rss, heapUsed: mem.heapUsed, heapTotal: mem.heapTotal, external: mem.external }, jobs: { total: jobs.size, active: [...jobs.values()].filter(j => !j.done).length, done: [...jobs.values()].filter(j => j.done).length }, proxyCacheEntries: proxyCache.size, searchCacheEntries: searchCache.size, network: { crawlerActive: fetchSemaphore.active, crawlerQueued: fetchSemaphore.queued, crawlerLimit: effectiveCrawlerConcurrency(), configuredCrawlerLimit: CFG.maxActiveFetches, requestedCrawlerLimit: CFG.requestedMaxActiveFetches, logicalRobots: CFG.logicalRobots, warmActive: proxyWarmSemaphore.active, warmQueued: proxyWarmSemaphore.queued, warmLimit: CFG.proxyWarmConcurrency, warmLogicalRobots: CFG.proxyWarmRobots, browserActive: browserScheduler.active, browserQueued: browserScheduler.queue.length, browserLimit: CFG.browserMaxActiveFetches, browserPerHost: CFG.browserPerHostConcurrency }, vpn: vpnManager.status(), browser: { ...browserScheduler.status(), sessions: browserEngine.status().sessions, pages: browserEngine.status().pages, contexts: browserEngine.status().contexts, maxSessions: browserEngine.status().maxSessions, maxPages: browserEngine.status().maxPages, maxContexts: browserEngine.status().maxContexts, sessionList: browserEngine.status().sessionList, proxySessions: proxySessions.size, cacheEntries: proxyCache.size }, hostPolicies: [...jobs.values()].reduce((n,j)=>n+(j.hostPolicy?.size||0),0), searchIndexEntries: idx.documents, searchIndexTerms: idx.terms, searchIndexDomains: idx.domains, requestsLogged: requestLog.length, logs: serverLogs.length });
+  res.json({ time: now(), uptimeSec: Math.round(process.uptime()), startedAt: new Date(serverStartedAt).toISOString(), nodeVersion: process.version, platform: process.platform, processRole: CFG.processRole, resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb, memory: { rss: mem.rss, heapUsed: mem.heapUsed, heapTotal: mem.heapTotal, external: mem.external }, jobs: { total: jobs.size, active: [...jobs.values()].filter(j => !j.done).length, done: [...jobs.values()].filter(j => j.done).length }, proxyCacheEntries: proxyCache.size, fetchInflight: fetchInflight.size, mongo: mongoStore.status(), searchCacheEntries: searchCache.size, network: { crawlerActive: fetchSemaphore.active, crawlerQueued: fetchSemaphore.queued, crawlerLimit: effectiveCrawlerConcurrency(), configuredCrawlerLimit: CFG.maxActiveFetches, requestedCrawlerLimit: CFG.requestedMaxActiveFetches, logicalRobots: CFG.logicalRobots, warmActive: proxyWarmSemaphore.active, warmQueued: proxyWarmSemaphore.queued, warmLimit: CFG.proxyWarmConcurrency, warmLogicalRobots: CFG.proxyWarmRobots, browserActive: browserScheduler.active, browserQueued: browserScheduler.queue.length, browserLimit: CFG.browserMaxActiveFetches, browserPerHost: CFG.browserPerHostConcurrency }, vpn: vpnManager.status(), browser: { ...browserScheduler.status(), sessions: browserEngine.status().sessions, pages: browserEngine.status().pages, contexts: browserEngine.status().contexts, maxSessions: browserEngine.status().maxSessions, maxPages: browserEngine.status().maxPages, maxContexts: browserEngine.status().maxContexts, sessionList: browserEngine.status().sessionList, proxySessions: proxySessions.size, cacheEntries: proxyCache.size }, hostPolicies: [...jobs.values()].reduce((n,j)=>n+(j.hostPolicy?.size||0),0), searchIndexEntries: idx.documents, searchIndexTerms: idx.terms, searchIndexDomains: idx.domains, requestsLogged: requestLog.length, logs: serverLogs.length });
 });
 app.get("/api/debug/config", (req, res) => res.json({ ...CFG, searchApiKey: undefined }));
 app.get("/api/debug/jobs", (req, res) => res.json({ jobs: [...jobs.values()].sort((a,b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)).map(publicJob) }));
@@ -3334,14 +3422,28 @@ app.get("/api/search", async (req, res) => {
   }
 });
 
+function warmTypeForUrl(url, hintedType = "") {
+  const hint = String(hintedType || "").toLowerCase();
+  if (hint) return hint;
+  const pathOnly = String(url || "").split("?")[0].split("#")[0].toLowerCase();
+  if (/\.(?:m?js|cjs)(?:$|\.)/.test(pathOnly)) return "js";
+  if (/\.css(?:$|\.)/.test(pathOnly)) return "css";
+  if (/\.(?:woff2?|ttf|otf|eot)(?:$|\.)/.test(pathOnly)) return "font";
+  if (/\.(?:png|jpe?g|webp|avif|gif|bmp|ico|svg|apng)(?:$|\.)/.test(pathOnly)) return "image";
+  if (/\.(?:mp4|webm|m3u8|mpd|m4a|mp3|aac|wav|ogg|ogv)(?:$|\.)/.test(pathOnly)) return "media";
+  if (/\.(?:json|xml|txt|map)(?:$|\.)/.test(pathOnly)) return "data";
+  return "asset";
+}
+
 function extractInlineWarmUrls($, base, add) {
+  // Scan literals only; never execute the page.
   let scanned = 0;
   const scanText = (text, priority = 40) => {
     const src = String(text || "").slice(0, CFG.proxyInlineWarmScanChars);
     scanned += src.length;
-    const re = /(?:https?:\/\/[^\s"'`<>\)]+|(?:\/|\.\.?\/)[A-Za-z0-9_~:%@+\-./?=#&;]+\.(?:js|mjs|css|json|wasm|woff2?|ttf|otf|png|jpe?g|webp|avif|svg|ico|mp4|webm)(?:\?[^\s"'`<>\)]*)?)/gi;
+    const re = /(?:https?:\/\/[^\s"'`<>\)]+|(?:\/|\.\.?\/)[A-Za-z0-9_~:%@+\-./?=#&;]+(?:\.(?:js|mjs|css|json|wasm|woff2?|ttf|otf|png|jpe?g|webp|avif|svg|ico)(?:\?[^\s"'`<>\)]*)?))/gi;
     let m;
-    while ((m = re.exec(src)) && scanned <= CFG.proxyInlineWarmScanChars * 2) add(m[0], priority);
+    while ((m = re.exec(src)) && scanned <= CFG.proxyInlineWarmScanChars * 2) add(m[0], priority, warmTypeForUrl(m[0]));
   };
   $("style").each((_, el) => scanText($(el).html() || "", 82));
   $("script:not([src])").each((_, el) => scanText($(el).html() || "", 76));
@@ -3369,41 +3471,51 @@ function criticalPreloadHtml(candidates, base, sid) {
 function extractWarmUrls(html, base, sid) {
   const $ = cheerio.load(String(html || ""), { decodeEntities: false });
   const out = new Map();
-  const add = (raw, priority = 20) => { const u = resolveResource(raw, base); if (!u) return; const current = out.get(u); if (!current || priority > current.priority) out.set(u, { url: u, priority }); };
+  const add = (raw, priority = 20, type = "asset") => {
+    const u = resolveResource(raw, base);
+    if (!u) return;
+    const safeType = warmTypeForUrl(u, type);
+    const current = out.get(u);
+    if (!current || priority > current.priority) out.set(u, { url: u, priority, type: safeType });
+  };
   $("link[href]").each((_, el) => {
     const rel = String($(el).attr("rel") || "").toLowerCase();
     const as = String($(el).attr("as") || "").toLowerCase();
-    if (rel.includes("stylesheet")) add($(el).attr("href"), 120);
-    else if (rel.includes("modulepreload")) add($(el).attr("href"), 115);
-    else if (rel.includes("preload")) add($(el).attr("href"), as === "font" ? 118 : as === "script" ? 112 : as === "image" ? 108 : 100);
-    else if (rel.includes("icon") || rel.includes("manifest")) add($(el).attr("href"), 65);
+    if (rel.includes("stylesheet")) add($(el).attr("href"), 120, "css");
+    else if (rel.includes("modulepreload")) add($(el).attr("href"), 115, "js");
+    else if (rel.includes("preload")) add($(el).attr("href"), as === "font" ? 118 : as === "script" ? 112 : as === "image" ? 108 : 100, warmTypeForUrl($(el).attr("href"), as));
+    else if (rel.includes("icon")) add($(el).attr("href"), 65, "image");
+    else if (rel.includes("manifest")) add($(el).attr("href"), 62, "data");
   });
-  $("script[src]").each((_, el) => add($(el).attr("src"), String($(el).attr("type") || "").toLowerCase() === "module" ? 108 : 92));
-  $("img[src]").each((_, el) => add($(el).attr("src"), 86));
-  $("video[poster]").each((_, el) => add($(el).attr("poster"), 72));
-  $("source[src]").each((_, el) => add($(el).attr("src"), 55));
-  $("track[src]").each((_, el) => add($(el).attr("src"), 35));
+  $("script[src]").each((_, el) => add($(el).attr("src"), String($(el).attr("type") || "").toLowerCase() === "module" ? 108 : 92, "js"));
+  $("link[as='style'][href], link[type='text/css'][href]").each((_, el) => add($(el).attr("href"), 116, "css"));
+  $("img[src]").each((_, el) => add($(el).attr("src"), 86, "image"));
+  $("video[poster]").each((_, el) => add($(el).attr("poster"), 72, "image"));
+  $("video[src],audio[src],source[src]").each((_, el) => {
+    const tag = String(el.tagName || el.name || "").toLowerCase();
+    add($(el).attr("src"), tag === "source" ? 55 : 52, "media");
+  });
+  $("track[src]").each((_, el) => add($(el).attr("src"), 35, "data"));
   $("[srcset]").each((_, el) => {
     const raw = String($(el).attr("srcset") || "");
     const first = raw.split(/,\s*/)[0]?.trim().split(/\s+/)[0];
-    if (first) add(first, 82);
+    if (first) add(first, 82, "image");
   });
   $("[imagesrcset]").each((_, el) => {
     const first = String($(el).attr("imagesrcset") || "").split(/,\s*/)[0]?.trim().split(/\s+/)[0];
-    if (first) add(first, 88);
+    if (first) add(first, 88, "image");
   });
   $("[data-src],[data-original],[data-lazy-src]").each((_, el) => {
     const raw = $(el).attr("data-src") || $(el).attr("data-original") || $(el).attr("data-lazy-src");
-    add(raw, 58);
+    add(raw, 58, warmTypeForUrl(raw));
   });
-  // Inline application code frequently declares chunks, fonts, images and API
-  // assets needed for first render. Scan literals only; never execute the page.
-  extractInlineWarmUrls($, base, (raw, priority) => add(raw, priority));
+  extractInlineWarmUrls($, base, (raw, priority, type) => add(raw, priority, type));
   return [...out.values()]
     .sort((a, b) => b.priority - a.priority)
     .slice(0, Math.min(CFG.proxyWarmLimit, 256))
     .map(item => ({ ...item, sid }));
 }
+
 async function warmPageResources(html, base, sid) {
   if (CFG.proxyWarmLimit <= 0) return;
   const candidates = extractWarmUrls(html, base, sid);
@@ -3414,22 +3526,35 @@ async function warmPageResources(html, base, sid) {
   const next = () => queue[cursor++];
   const worker = async () => {
     while (true) {
-      const item = next(); if (!item) return;
+      const item = next();
+      if (!item) return;
       const host = hostOf(item.url);
       while ((hostActive.get(host) || 0) >= CFG.proxyWarmPerHost) await sleep(2);
       hostActive.set(host, (hostActive.get(host) || 0) + 1);
       let release = null;
       try {
         release = await proxyWarmSemaphore.acquire();
-        await fetchCached(item.url, {
+        const common = {
           sessionId: item.sid,
           referrer: base,
-          accept: item.type === "css" ? "text/css,*/*;q=0.05" : item.type === "js" ? "application/javascript,text/javascript,*/*;q=0.05" : "image/avif,image/webp,image/apng,image/svg+xml,image/*,font/*,*/*;q=0.05",
+          accept: item.type === "css" ? "text/css,*/*;q=0.05" : item.type === "js" ? "application/javascript,text/javascript,*/*;q=0.05" : item.type === "font" ? "font/*,*/*;q=0.05" : item.type === "image" ? "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.05" : "*/*;q=0.05",
           limitForContentType: crawlLimitForContentType,
-          limit: CFG.maxTextBytesPerResource,
           timeout: item.priority >= 100 ? Math.min(CFG.requestTimeoutMs, 10000) : Math.min(CFG.requestTimeoutMs, 12000),
           retries: item.priority >= 100 ? 0 : 1
-        });
+        };
+        // Never download video/audio during the page warm phase. A video poster or
+        // manifest is useful; multi-megabyte media should be fetched only when the
+        // page/player actually asks for it.
+        if (item.type === "media") {
+          await fetchCached(item.url, { ...common, method: "HEAD", limit: 16 * 1024 });
+          continue;
+        }
+        if (item.type === "image" || item.type === "font") {
+          const head = await fetchCached(item.url, { ...common, method: "HEAD", limit: 16 * 1024 });
+          const length = Number(String(head.contentLength || "").split(",")[0]) || 0;
+          if (length && length > CFG.proxyWarmMaxBinaryBytes) continue;
+        }
+        await fetchCached(item.url, { ...common, limit: CFG.maxTextBytesPerResource });
       } catch {} finally {
         if (release) release();
         hostActive.set(host, Math.max(0, (hostActive.get(host) || 1) - 1));
@@ -3661,9 +3786,10 @@ async function proxyRequest(req, res, mode) {
   }
   if (result.stream) result.stream.cancel();
   if (result.tooLarge || (download && result.bytes > CFG.maxDownloadBytes)) return respondError(res, 413, "The upstream response exceeds Veyra's safety limit.", "RESPONSE_TOO_LARGE");
+  const staticResource = mode === "resource" && !download && !result.setCookieHeader && !cookieHeader(sid, canonical) && /^(?:text\/css|application\/(?:javascript|x-javascript)|text\/javascript|image\/|font\/)/i.test(result.contentType || "");
   const upstreamHeaders = {
     "content-type": result.contentType || (mode === "view" ? "text/html; charset=utf-8" : "application/octet-stream"),
-    "cache-control": download ? "no-store" : mode === "view" ? "no-store" : "public, max-age=15",
+    "cache-control": download ? "no-store" : mode === "view" ? "no-store" : staticResource ? "public, max-age=60, stale-while-revalidate=300" : "public, max-age=15",
     ...(download ? { "content-disposition": `attachment; filename="${safeDownloadFilename(result.finalUrl || canonical, result.contentType)}"` } : {}),
     "x-content-type-options": "nosniff",
     "referrer-policy": mode === "view" ? "same-origin" : "no-referrer",
@@ -3736,8 +3862,10 @@ app.get("/api/form-get/:target/:sid", async (req, res) => {
 });
 app.get("/api/view", async (req, res) => { try { await proxyRequest(req, res, "view"); } catch (e) {
   const message = e.upstreamMessage || e.message;
-  serverLog("warn", "PROXY", `View failed for ${sanitizeLogUrl(req.query?.url || "")} — ${message}`, { requestId: req.veyraRequestId, code: e.code || "PROXY_VIEW_ERROR", upstreamCode: e.upstreamCode || networkErrorCode(e) || null, upstreamPhase: e.upstreamPhase || null, targetHost: e.upstreamHost || hostOf(req.query?.url || "") });
-  respondError(res, e.code === "VPN_KILL_SWITCH" ? 503 : 502, `Veyra could not load this page: ${message}`, "PROXY_VIEW_ERROR", { requestId: req.veyraRequestId, upstreamCode: e.upstreamCode || networkErrorCode(e) || null, upstreamPhase: e.upstreamPhase || null });
+  const upstreamCode = e.upstreamCode || networkErrorCode(e) || null;
+  const publicCode = e.code === "VPN_KILL_SWITCH" ? "VPN_KILL_SWITCH" : /^UPSTREAM_[A-Z0-9_]+$/.test(String(e.code || "")) ? e.code : "PROXY_VIEW_ERROR";
+  serverLog("warn", "PROXY", `View failed for ${sanitizeLogUrl(req.query?.url || "")} — ${message}`, { requestId: req.veyraRequestId, code: publicCode, upstreamCode, upstreamPhase: e.upstreamPhase || null, targetHost: e.upstreamHost || hostOf(req.query?.url || "") });
+  respondError(res, e.code === "VPN_KILL_SWITCH" ? 503 : 502, `Veyra could not load this page: ${message}`, publicCode, { requestId: req.veyraRequestId, legacyCode: "PROXY_VIEW_ERROR", upstreamCode, upstreamPhase: e.upstreamPhase || null });
 } });
 app.post("/api/view", async (req, res) => { try { await proxyRequest(req, res, "view"); } catch (e) { respondError(res, 502, `Veyra could not submit this form: ${e.message}`, "PROXY_FORM_ERROR", { requestId: req.veyraRequestId }); } });
 app.get("/api/resource", async (req, res) => { try { await proxyRequest(req, res, "resource"); } catch (e) { respondError(res, 502, `Veyra resource error: ${e.message}`, "PROXY_RESOURCE_ERROR", { requestId: req.veyraRequestId }); } });
@@ -4334,23 +4462,44 @@ if (!IS_THREAD_WORKER) setInterval(async () => {
   }
 }, 60000).unref();
 
+async function hydrateSearchFromMongo() {
+  if (!mongoStore.enabled) return 0;
+  try { const rows = await mongoStore.loadSearchDocuments(CFG.maxIndexDocs); let loaded = 0; for (const row of rows) { if (!row?.url) continue; const doc = { ...row, termFreq: new Map(Object.entries(row.termFreq || {})) }; delete doc._id; addIndexedDocument(doc); loaded += 1; } mongoStore.stats.hydrated += loaded; if (loaded) serverLog("info", "MONGO", `Hydrated ${loaded} search document(s) from MongoDB.`); return loaded; } catch (e) { serverLog("warn", "MONGO", `Search index hydration skipped: ${e.message}`); return 0; }
+}
+
 if (require.main === module && CFG.processRole !== "worker") {
-  app.listen(PORT, "0.0.0.0", () => {
-    serverLog("info", "SYSTEM", `Veyra server listening on ${PORT}`);
-    serverLog("info", "CONFIG", `Plan ${VEYRA_CONFIG.plan.label} (${CFG.plan}, ${VEYRA_CONFIG.plan.ramMb}MB / ${VEYRA_CONFIG.plan.cpu} CPU, via ${VEYRA_CONFIG.planSource}) — ${CFG.maxActiveJobs} crawlers × ${CFG.maxActiveFetches} fetches, ${CFG.parseWorkers} parse workers, ${CFG.maxProxySessions} sessions, ${CFG.maxBrowserSessions} browser sessions.`);
-    for (const e of VEYRA_CONFIG.errors) serverLog("error", "CONFIG", e);
-    for (const w of VEYRA_CONFIG.warnings) serverLog("warn", "CONFIG", w);
-    pumpIndexSeeds().catch(e => serverLog("warn", "SEARCH", `Seed startup failed: ${e.message}`));
-    if (CFG.indexRefreshMs > 0) setInterval(() => pumpIndexSeeds().catch(e => serverLog("warn", "SEARCH", `Seed scheduler failed: ${e.message}`)), 30000).unref();
+  let shuttingDown = false;
+  const startServer = async () => {
+    await authStore.ready;
+    await mongoStore.connect();
+    await hydrateSearchFromMongo();
+    app.listen(PORT, "0.0.0.0", () => {
+      serverLog("info", "SYSTEM", `Veyra server listening on ${PORT}`);
+      serverLog("info", "CONFIG", `Plan ${VEYRA_CONFIG.plan.label} (${CFG.plan}, ${VEYRA_CONFIG.plan.ramMb}MB / ${VEYRA_CONFIG.plan.cpu} CPU, via ${VEYRA_CONFIG.planSource}) — ${CFG.maxActiveJobs} crawlers × ${CFG.maxActiveFetches} fetches, ${CFG.parseWorkers} parse workers, ${CFG.maxProxySessions} sessions, ${CFG.maxBrowserSessions} browser sessions.`);
+      serverLog("info", "MONGO", mongoStore.status().configured ? `MongoDB configured (${CFG.mongoDb}); persistence/cache is fail-open.` : "MongoDB not configured; using local/ephemeral persistence where applicable.");
+      for (const e of VEYRA_CONFIG.errors) serverLog("error", "CONFIG", e);
+      for (const w of VEYRA_CONFIG.warnings) serverLog("warn", "CONFIG", w);
+      pumpIndexSeeds().catch(e => serverLog("warn", "SEARCH", `Seed startup failed: ${e.message}`));
+      if (CFG.indexRefreshMs > 0) setInterval(() => pumpIndexSeeds().catch(e => serverLog("warn", "SEARCH", `Seed scheduler failed: ${e.message}`)), 30000).unref();
+    });
+  };
+  startServer().catch(err => {
+    serverLog("error", "SYSTEM", `Startup failed: ${err.stack || err}`);
+    process.exitCode = 1;
   });
   // Render sends SIGTERM on deploy/restart: stop tunnels, threads and Chromium cleanly.
-  let shuttingDown = false;
   const shutdown = async signal => {
     if (shuttingDown) return; shuttingDown = true;
     serverLog("info", "SYSTEM", `${signal} received — shutting down.`);
-    for (const j of jobs.values()) if (!j.done) { j.stopRequested = true; j.stopReason = "shutdown"; }
+    for (const j of jobs.values()) if (!j.done) { j.stopRequested = true; j.stopReason = "shutdown"; j.controller?.abort?.(); }
     const force = setTimeout(() => process.exit(0), 8000); force.unref();
-    await Promise.allSettled([vpnManager.close?.(), workerPool?.close(), browserEngine.shedIdle(0).then(() => browserEngine.browser?.close()), DIRECT_HTTP_AGENT.close()]);
+    await Promise.allSettled([
+      vpnManager.close?.(),
+      workerPool?.close(),
+      browserEngine.shedIdle(0).then(() => browserEngine.browser?.close()),
+      DIRECT_HTTP_AGENT.close(),
+      mongoStore.close()
+    ]);
     process.exit(0);
   };
   process.once("SIGTERM", () => shutdown("SIGTERM"));
@@ -4369,4 +4518,4 @@ const __workerOps = {
   discover: (text, kind, base, contentType) => collectDiscovery(text, kind, base, contentType)
 };
 
-module.exports = { app, mergeStrayProxyParams, detectChallenge, CFG, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions };
+module.exports = { app, mongoStore, mergeStrayProxyParams, detectChallenge, CFG, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions };

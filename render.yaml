@@ -21,3 +21,15 @@ services:
         value: production
       # Secrets — set these in the Render dashboard, never in git:
       # VEYRA_ADMIN_TOKEN, VPN_PROFILES_JSON, VPN_WIREGUARD_CONFIG_B64
+      # Optional durable MongoDB persistence/cache. Set MONGODB_URI in Render.
+      - key: MONGODB_URI
+        sync: false
+      - key: MONGODB_DB
+        value: veyra
+      - key: MONGODB_MAX_POOL_SIZE
+        value: "2"
+      - key: MONGODB_SHARED_CACHE
+        value: "true"
+      # Safe warm-up cap: media is never downloaded by the warm phase.
+      - key: PROXY_WARM_MAX_BINARY_BYTES
+        value: "786432"
