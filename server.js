@@ -186,7 +186,7 @@ const CFG = Object.freeze({
   proxyWarmPerHost: numberEnv("PROXY_WARM_PER_HOST", 3, 1, 16),
   sitemapConcurrency: Math.min(numberEnv("SITEMAP_CONCURRENCY", P.sitemapConcurrency, 1, 32), P.sitemapConcurrency),
   initialResourceBudget: numberEnv("INITIAL_RESOURCE_BUDGET", 64, 16, 256),
-  userAgent: process.env.VEYRA_USER_AGENT || "VeyraBrowseCrawler/8.8.2 (+https://github.com/HomekidChud/VeyraServer)",
+  userAgent: process.env.VEYRA_USER_AGENT || "VeyraBrowseCrawler/8.10.1 (+https://github.com/HomekidChud/VeyraServer)",
   frontendOrigins: csvEnv("FRONTEND_ORIGIN", ["*"]),
   searchProvider: enumEnv("SEARCH_PROVIDER", "local", ["auto", "local", "brave", "bing", "custom", "none"]),
   searchEndpoint: process.env.SEARCH_ENDPOINT || "",
@@ -1221,6 +1221,19 @@ async function loadSitemaps(job) {
   if (files) jobLog(job, "info", `Sitemap pass: ${files} file(s), ${urls} URL(s) discovered.`);
 }
 
+
+function encodePathToken(value) {
+  return Buffer.from(String(value || ""), "utf8").toString("base64url");
+}
+function decodePathToken(value) {
+  try { return Buffer.from(String(value || ""), "base64url").toString("utf8"); } catch { return ""; }
+}
+function makeGetFormProxyAction(url, sid) {
+  const token = encodePathToken(url);
+  const safeSid = encodePathToken(normalizeSessionId(sid || ""));
+  return `/api/form-get/${token}/${safeSid}`;
+}
+
 function challengeFallbackHtml(url, info) {
   const safe = escapeHtml(url);
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Veyra verification fallback</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#10151d;color:#eaf0f6;font:15px/1.5 system-ui,sans-serif}.card{max-width:650px;margin:24px;padding:32px;background:#171e28;border:1px solid #303a48;border-radius:18px;box-shadow:0 20px 60px #0008}.ey{font-size:11px;letter-spacing:.15em;text-transform:uppercase;color:#86a9d5}.card h1{font-size:26px;margin:10px 0}.card p{color:#aab5c4}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px}.actions a{display:inline-block;padding:10px 15px;border-radius:9px;text-decoration:none}.primary{background:#4b82c9;color:#fff}.secondary{border:1px solid #3a4657;color:#dce5ef}</style></head><body><main class="card"><div class="ey">Veyra Browser</div><h1>This site requires its own security verification</h1><p>Veyra's server proxy detected a security or bot-verification page (${escapeHtml(info?.type || "verification")}). It was not indexed as site content and Veyra will not attempt to bypass the site's security controls.</p><div class="actions"><a class="primary" href="${safe}" target="_blank" rel="noopener noreferrer">Open site directly</a><a class="secondary" href="${makeViewUrl(url)}">Retry through Veyra</a></div></main></body></html>`;
@@ -1372,16 +1385,21 @@ function rewriteHtml(html, base, sid = "") {
     // submission; preserve the canonical target explicitly for that runtime.
     $(el).attr("data-veyra-action", u);
     if (method === "POST") $(el).attr("action", makeViewUrl(u, sid));
-    else $(el).attr("action", u);
+    else $(el).attr("action", makeGetFormProxyAction(u, sid));
   });
   $("[formaction]").each((_, el) => {
     const raw = $(el).attr("formaction");
     const u = resolveNavigation(raw, effectiveBase);
     if (!u) return;
     $(el).attr("data-veyra-formaction", u);
-    // Do not rewrite formaction itself; the runtime submit/click intercept chooses
-    // the canonical target and Veyra's parent handles the navigation/form request.
-    $(el).attr("formaction", u);
+    const parentForm = $(el).closest("form");
+    const submitMethod = String(parentForm.attr("method") || "get").toUpperCase();
+    // Native GET form submission must remain inside Veyra. Putting a canonical
+    // URL in the action allows the browser to navigate the iframe directly to
+    // Google/other frame-protected pages, producing "refused to connect".
+    // Encode the canonical action into a Veyra route so the server can rebuild
+    // the final GET URL while preserving every user form field exactly.
+    $(el).attr("formaction", submitMethod === "POST" ? makeViewUrl(u, sid) : makeGetFormProxyAction(u, sid));
   });
   $("iframe[src]").each((_, el) => { const u = resolveNavigation($(el).attr("src"), effectiveBase); if (u) $(el).attr("src", makeViewUrl(u, sid)); });
   $("object[data]").each((_, el) => { const u = resolveResource($(el).attr("data"), effectiveBase); if (u) $(el).attr("data", makeResourceUrl(u, effectiveBase, sid)); });
@@ -2928,6 +2946,30 @@ async function proxyRequest(req, res, mode) {
   }
 }
 
+app.get("/api/form-get/:target/:sid", async (req, res) => {
+  try {
+    const target = normalizeUrl(decodePathToken(req.params.target || ""));
+    if (!target) return respondError(res, 400, "Invalid Veyra GET form target.", "INVALID_FORM_TARGET");
+    await assertPublicUrl(target);
+    const u = new URL(target);
+    // Every remaining query parameter is genuine form data. This route deliberately
+    // keeps control metadata out of the query string so fields named "url", "sid",
+    // "from", etc. cannot corrupt the navigation target.
+    for (const [key, value] of Object.entries(req.query || {})) {
+      const values = Array.isArray(value) ? value : [value];
+      for (const item of values) {
+        if (typeof item === "string") u.searchParams.append(String(key), item);
+      }
+    }
+    req.query.url = u.href;
+    req.query.sid = normalizeSessionId(decodePathToken(req.params.sid || ""));
+    const referer = proxyRefererCanonical(req);
+    if (referer) req.query.from = referer;
+    await proxyRequest(req, res, "view");
+  } catch (e) {
+    respondError(res, 502, `Veyra could not submit this form: ${e.message}`, "PROXY_FORM_GET_ERROR", { requestId: req.veyraRequestId });
+  }
+});
 app.get("/api/view", async (req, res) => { try { await proxyRequest(req, res, "view"); } catch (e) { respondError(res, 502, `Veyra could not load this page: ${e.message}`, "PROXY_VIEW_ERROR", { requestId: req.veyraRequestId }); } });
 app.post("/api/view", async (req, res) => { try { await proxyRequest(req, res, "view"); } catch (e) { respondError(res, 502, `Veyra could not submit this form: ${e.message}`, "PROXY_FORM_ERROR", { requestId: req.veyraRequestId }); } });
 app.get("/api/resource", async (req, res) => { try { await proxyRequest(req, res, "resource"); } catch (e) { respondError(res, 502, `Veyra resource error: ${e.message}`, "PROXY_RESOURCE_ERROR", { requestId: req.veyraRequestId }); } });
