@@ -96,8 +96,9 @@ const CFG = Object.freeze({
   leanAutoBrowser: boolEnv("LEAN_AUTO_BROWSER", false),
   processRole: enumEnv("PROCESS_ROLE", "web", ["web", "worker", "all"]),
   // CRAWLER_ROBOTS is the logical crawler fleet. Actual simultaneous network
-  // fetches are bounded independently by MAX_ACTIVE_FETCHES.
-  logicalRobots: numberEnv("CRAWLER_ROBOTS", 1000, 1, 1000),
+  // fetches are bounded independently by MAX_ACTIVE_FETCHES. The fleet is virtual
+  // scheduling state; it does not mean one TCP connection per robot.
+  logicalRobots: numberEnv("CRAWLER_ROBOTS", 10000, 1, 10000),
   requestedMaxActiveFetches: numberEnv("MAX_ACTIVE_FETCHES", numberEnv("MAX_GLOBAL_CONCURRENCY", P.maxActiveFetches, 1, 256), 1, 256),
   maxActiveFetches: Math.min(numberEnv("MAX_ACTIVE_FETCHES", numberEnv("MAX_GLOBAL_CONCURRENCY", P.maxActiveFetches, 1, 256), 1, 256), P.maxActiveFetches),
   globalConcurrency: Math.min(numberEnv("MAX_ACTIVE_FETCHES", numberEnv("MAX_GLOBAL_CONCURRENCY", P.maxActiveFetches, 1, 256), 1, 256), P.maxActiveFetches),
@@ -108,7 +109,7 @@ const CFG = Object.freeze({
   robotHelpThreshold: numberEnv("ROBOT_HELP_THRESHOLD", 2, 1, 16),
   robotHelpCooldownMs: numberEnv("ROBOT_HELP_COOLDOWN_MS", 250, 0, 10000),
   robotHelpScanLimit: numberEnv("ROBOT_HELP_SCAN_LIMIT", 24, 1, 128),
-  robotWorksetSize: numberEnv("ROBOT_WORKSET_SIZE", 1000, 8, 1000),
+  robotWorksetSize: numberEnv("ROBOT_WORKSET_SIZE", 10000, 8, 10000),
   robotQueueCapacity: numberEnv("ROBOT_QUEUE_CAPACITY", 8, 2, 32),
   robotStealBatch: numberEnv("ROBOT_STEAL_BATCH", 2, 1, 8),
   robotStealOnIdle: boolEnv("ROBOT_STEAL_ON_IDLE", true),
@@ -2697,7 +2698,7 @@ class CooperativeRobotPool {
     return this.job.resourceFrontier.takeNext(this.job.hostActive, host => hostConcurrencyLimit(this.job, host), this.job.hostCooldowns) || null;
   }
   chooseReceiver() {
-    // Load buckets make 1,000 logical robots cheap: selecting a receiver is O(1-ish)
+    // Load buckets make large logical fleets cheap: selecting a receiver is O(1-ish)
     // instead of scanning the entire fleet for every assignment.
     const maxLoad = this.loadLimit();
     for (let load = 0; load <= maxLoad && load < this.taskCapacity; load++) {
@@ -2997,7 +2998,7 @@ async function runCrawl(job) {
     job.status = "crawling";
     job.statusText = job.pageAccelerator
       ? `Fast page warm-up with ${effectiveCrawlerConcurrency(job)} network workers…`
-      : `Crawling with ${CFG.logicalRobots.toLocaleString()} cooperative robots…`;
+      : `Exhaustive same-origin crawl with ${CFG.logicalRobots.toLocaleString()} cooperative robots…`;
     await job.robotPool.run();
     job.done = true; job.finishedAt = now();
     if (job.status === "challenge") job.statusText = "Security verification required; crawl stopped.";
@@ -3457,7 +3458,7 @@ function runtimeConfigSummary() {
   return {
     plan: CFG.plan, leanMode: CFG.leanMode, resourceProfile: CFG.resourceProfile, memoryLimitMb: CFG.memoryLimitMb,
     shield: shield.status(),
-    crawlers: { maxActiveJobs: CFG.maxActiveJobs, effectiveMaxActiveJobs: effectiveMaxActiveJobs(), running: activeCrawlCount(), queued: crawlQueue.length, queueMax: CFG.crawlQueueMax, abandonMs: CFG.crawlAbandonMs, robotsPerCrawl: CFG.logicalRobots, maxActiveFetches: CFG.maxActiveFetches, perHostConcurrency: CFG.perHostConcurrency, pageAccelerator: CFG.crawlerPageAccelerator, pageWarmMs: CFG.crawlerPageWarmMs, pageWarmMaxResources: CFG.crawlerPageMaxResources, proxyWarmLimit: CFG.proxyWarmLimit, proxyWarmConcurrency: CFG.proxyWarmConcurrency, proxyWarmPerHost: CFG.proxyWarmPerHost, proxyCriticalPreloadLimit: CFG.proxyCriticalPreloadLimit },
+    crawlers: { maxActiveJobs: CFG.maxActiveJobs, effectiveMaxActiveJobs: effectiveMaxActiveJobs(), running: activeCrawlCount(), queued: crawlQueue.length, queueMax: CFG.crawlQueueMax, abandonMs: CFG.crawlAbandonMs, robotsPerCrawl: CFG.logicalRobots, maxActiveFetches: CFG.maxActiveFetches, perHostConcurrency: CFG.perHostConcurrency, pageAccelerator: CFG.crawlerPageAccelerator, exhaustiveModeAvailable: true, pageWarmMs: CFG.crawlerPageWarmMs, pageWarmMaxResources: CFG.crawlerPageMaxResources, proxyWarmLimit: CFG.proxyWarmLimit, proxyWarmConcurrency: CFG.proxyWarmConcurrency, proxyWarmPerHost: CFG.proxyWarmPerHost, proxyCriticalPreloadLimit: CFG.proxyCriticalPreloadLimit },
     workers: workerPool ? workerPool.report() : { size: 0, mode: 'inline', configured: CFG.parseWorkers },
     sessions: { maxSessions: CFG.maxProxySessions, idleTtlMs: CFG.sessionIdleTtlMs, maxAgeMs: CFG.sessionMaxAgeMs, maxCookieBytes: CFG.sessionMaxCookieBytes, serverIdleSleepMs: CFG.serverIdleSleepMs },
     browser: { maxSessions: CFG.maxBrowserSessions, maxPages: CFG.maxBrowserPages, keepWarm: CFG.browserKeepWarm, warmIdleMs: CFG.browserWarmIdleMs },
@@ -4166,13 +4167,13 @@ app.get("/api/download", async (req, res) => { try { req.query.download = "1"; a
 app.post("/api/resource", async (req, res) => { try { await proxyRequest(req, res, "resource"); } catch (e) { respondError(res, 502, `Veyra resource request failed: ${e.message}`, "PROXY_RESOURCE_POST_ERROR", { requestId: req.veyraRequestId }); } });
 for (const method of ["put","patch","delete","head","options"]) app[method]("/api/resource", async (req,res)=>{ try { await proxyRequest(req,res,"resource"); } catch(e) { respondError(res,502,`Veyra resource ${method.toUpperCase()} request failed: ${e.message}`,"PROXY_RESOURCE_METHOD_ERROR",{requestId:req.veyraRequestId}); } });
 
-const OPEN_ENGINE_MODES = new Set(["auto", "proxy", "crawler", "browser", "combined"]);
+const OPEN_ENGINE_MODES = new Set(["auto", "proxy", "crawler", "exhaustive", "browser", "combined"]);
 function normalizeOpenEngineMode(value) {
   const raw = String(value || "auto").trim().toLowerCase();
   return OPEN_ENGINE_MODES.has(raw) ? raw : "auto";
 }
 function shouldStartCrawlerForEngineMode(mode) {
-  return mode === "auto" || mode === "crawler" || mode === "combined";
+  return mode === "auto" || mode === "crawler" || mode === "exhaustive" || mode === "combined";
 }
 
 app.post("/api/open", async (req, res) => {
@@ -4182,13 +4183,15 @@ app.post("/api/open", async (req, res) => {
     const engineMode = normalizeOpenEngineMode(req.body?.engineMode);
     const crawlerEnabled = shouldStartCrawlerForEngineMode(engineMode);
     const oldId = activeByRoot.get(root); const old = oldId && jobs.get(oldId);
-    if (crawlerEnabled && old && !old.done && !old.stopRequested && (!CFG.crawlerPageAccelerator || old.pageAccelerator)) return res.status(202).json({ jobId: old.id, url: root, viewUrl: makeViewUrl(root), engineMode, crawlerEnabled: true });
+    const wantsPageAccelerator = engineMode !== "exhaustive";
+    if (crawlerEnabled && old && !old.done && !old.stopRequested && !!old.pageAccelerator === wantsPageAccelerator) return res.status(202).json({ jobId: old.id, url: root, viewUrl: makeViewUrl(root), engineMode, crawlerEnabled: true });
     const openSid = String(req.body?.sessionId || req.body?.sid || "");
     if (openSid && sessionManager.checkLimit(openSid)) return respondError(res, 410, "This Veyra session reached its time limit and was deleted.", "SESSION_EXPIRED");
     if (!crawlerEnabled) return res.status(200).json({ ok: true, jobId: null, url: root, viewUrl: makeViewUrl(root), state: "disabled", engineMode, crawlerEnabled: false });
-    // Browsing opens are bounded page accelerators, never site-wide crawls.
-    // Keep discovery useful without letting one page consume the whole session.
-    const job = createJob(root, { pageAccelerator: CFG.crawlerPageAccelerator });
+    // Normal browsing remains a bounded page accelerator. Explicit Exhaustive mode
+    // requests a full same-origin crawl while the current page still renders normally.
+    const fullSiteCrawl = engineMode === "exhaustive";
+    const job = createJob(root, { pageAccelerator: !fullSiteCrawl && CFG.crawlerPageAccelerator });
     if (/^[A-Za-z0-9_-]{16,80}$/.test(openSid)) job.sessionId = openSid;
     let state;
     try { state = scheduleCrawl(job); } catch (e) { return respondError(res, 503, e.message, e.code || "CRAWLER_CAPACITY_BUSY", { maxActiveJobs: effectiveMaxActiveJobs(), queued: crawlQueue.length }); }
@@ -4278,8 +4281,8 @@ const STATUS_VAR_DEFS = [
   { group: "Frontend / CORS", key: "frontendOrigin", label: "Allowed frontend origin(s)", kind: "csv", names: ["FRONTEND_ORIGIN"], fallback: ["*"] },
   { group: "Frontend / CORS", key: "publicApiOrigin", label: "Public API origin (for rewritten pages)", kind: "string", names: ["PUBLIC_API_ORIGIN"], fallback: "" },
   { group: "Frontend / CORS", key: "userAgent", label: "Crawler user agent", kind: "string", names: ["VEYRA_USER_AGENT"], fallback: "VeyraBrowseCrawler/8.0 (+https://github.com/)" },
-  { group: "Crawler concurrency", key: "logicalRobots", label: "Logical crawler robots", kind: "number", names: ["CRAWLER_ROBOTS"], fallback: 1000, min: 1, max: 1000 },
-  { group: "Robot mesh", key: "robotWorksetSize", label: "Robot workset size", kind: "number", names: ["ROBOT_WORKSET_SIZE"], fallback: 1000, min: 8, max: 1000 },
+  { group: "Crawler concurrency", key: "logicalRobots", label: "Logical crawler robots", kind: "number", names: ["CRAWLER_ROBOTS"], fallback: 10000, min: 1, max: 10000 },
+  { group: "Robot mesh", key: "robotWorksetSize", label: "Robot workset size", kind: "number", names: ["ROBOT_WORKSET_SIZE"], fallback: 10000, min: 8, max: 10000 },
   { group: "Robot mesh", key: "robotQueueCapacity", label: "Robot local queue capacity", kind: "number", names: ["ROBOT_QUEUE_CAPACITY"], fallback: 8, min: 2, max: 32 },
   { group: "Robot mesh", key: "robotStealBatch", label: "Help steal batch", kind: "number", names: ["ROBOT_STEAL_BATCH"], fallback: 4, min: 1, max: 8 },
   { group: "Robot mesh", key: "robotStealOnIdle", label: "Idle robots request help", kind: "bool", names: ["ROBOT_STEAL_ON_IDLE"], fallback: true },
@@ -4832,4 +4835,4 @@ const __workerOps = {
   discover: (text, kind, base, contentType) => collectDiscovery(text, kind, base, contentType)
 };
 
-module.exports = { app, mongoStore, mergeStrayProxyParams, detectChallenge, CFG, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions };
+module.exports = { app, mongoStore, mergeStrayProxyParams, detectChallenge, CFG, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions, normalizeOpenEngineMode, shouldStartCrawlerForEngineMode };
