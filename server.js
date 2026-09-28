@@ -24,6 +24,8 @@ const { isMainThread } = require("worker_threads");
 const { NeuralRobotPool } = require("./neural-robots");
 const { ChallengeSolver } = require("./challenge-solver");
 const { CastServer, InternetConnectionManager } = require("./cast-server");
+const { AIAnswerEngine } = require("./ai-answer");
+const { RenewingManager } = require("./renewing-system");
 // parse-worker.js loads this file inside worker threads to reuse the pure
 // rewrite / discovery functions. In that mode nothing long-lived is started.
 const IS_THREAD_WORKER = !isMainThread && process.env.VEYRA_THREAD_WORKER === "1";
@@ -3625,6 +3627,48 @@ app.get('/api/search/web', async (req, res) => {
 });
 
 app.get('/api/browser/status', (req, res) => res.json({ ok: true, ...browserEngine.status(), config: { backend: CFG.browserBackend, enabled: CFG.browserEnabled, headless: CFG.browserHeadless, maxSessions: CFG.maxBrowserSessions, maxPages: CFG.maxBrowserPages, maxContexts: CFG.maxBrowserContexts } }));
+
+// AI Search Answer — reads search results and generates a summary
+const aiAnswerEngine = new AIAnswerEngine();
+app.post('/api/search/answer', async (req, res) => {
+  try {
+    const { query, results } = req.body;
+    if (!query) return res.json({ hasAnswer: false, reason: 'No query provided' });
+    const answer = await aiAnswerEngine.answer(query, results || []);
+    res.json(answer);
+  } catch (e) { res.json({ hasAnswer: false, reason: e.message }); }
+});
+app.get('/api/answer/status', (req, res) => res.json(aiAnswerEngine.report()));
+
+// ---------------------------------------------------------------------------
+// Renewing System — session renewal via ads
+const renewingManager = new RenewingManager({ log: (level, source, msg) => serverLog(level, source, msg) });
+app.get('/api/renew/ads', (req, res) => res.json({ ok: true, ads: renewingManager.getActiveAds() }));
+app.get('/api/renew/status/:sessionId', (req, res) => res.json(renewingManager.getSessionStatus(req.params.sessionId)));
+app.post('/api/renew/watch/:adId', (req, res) => {
+  try {
+    const result = renewingManager.watchAd(req.params.adId, req.body.sessionId);
+    res.json({ ok: true, ...result });
+  } catch (e) { res.status(400).json({ error: e.message, ok: false }); }
+});
+app.post('/api/renew/complete/:watchId', (req, res) => {
+  try {
+    const result = renewingManager.completeWatch(req.params.watchId);
+    res.json({ ok: true, ...result });
+  } catch (e) { res.status(400).json({ error: e.message, ok: false }); }
+});
+// Admin-only ad management
+app.post('/api/renew/ads', requireAdmin, (req, res) => {
+  try { const ad = renewingManager.addAd(req.body); res.json({ ok: true, ad }); }
+  catch (e) { res.status(400).json({ error: e.message, ok: false }); }
+});
+app.delete('/api/renew/ads/:id', requireAdmin, (req, res) => {
+  const ok = renewingManager.removeAd(req.params.id); res.json({ ok });
+});
+app.post('/api/renew/ads/:id/toggle', requireAdmin, (req, res) => {
+  const ad = renewingManager.toggleAd(req.params.id); res.json({ ok: !!ad, ad });
+});
+app.get('/api/renew/report', requireAdmin, (req, res) => res.json(renewingManager.report()));
 async function warmRenderedBrowserPage(browserSessionId, sid) {
   const controller = new AbortController();
   const hardTimer = setTimeout(() => controller.abort(), Math.max(500, CFG.proxyWarmHardMs));
