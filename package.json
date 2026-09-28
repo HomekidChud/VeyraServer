@@ -1,6 +1,6 @@
 {
   "name": "veyra-browse-crawler",
-  "version": "8.17.0",
+  "version": "8.17.1",
   "private": true,
   "description": "Veyra Browser API, adaptive proxy/browser engine, page resource acceleration, search service, and diagnostics.",
   "main": "server.js",
@@ -14,7 +14,8 @@
     "test:youtube-compat": "node tests/youtube-compat-static.mjs",
     "test:youtube-media-errors": "node tests/youtube-and-media-errors.mjs",
     "test:v817": "node tests/v817-regressions.mjs",
-    "test": "npm run test:static && npm run test:youtube-compat && npm run test:youtube-media-errors && npm run test:v817"
+    "test": "npm run test:static && npm run test:youtube-compat && npm run test:youtube-media-errors && npm run test:v817 && npm run test:v8171",
+    "test:v8171": "node tests/v8171-compat.mjs"
   },
   "engines": {
     "node": ">=20"

@@ -1524,7 +1524,7 @@ function challengeFallbackHtml(url, info, sid = "") {
     ["Brave Search", `https://search.brave.com/search?q=${encodeURIComponent(query)}`],
     ["DuckDuckGo", `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`]
   ].map(([n, h]) => `<a class="secondary" href="${escapeHtml(makeViewUrl(h, sid))}">Search “${escapeHtml(query)}” on ${n}</a>`).join("") : "";
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#10151d;color:#eaf0f6;font:15px/1.5 system-ui,sans-serif}.card{max-width:650px;margin:24px;padding:32px;background:#171e28;border:1px solid #303a48;border-radius:18px;box-shadow:0 20px 60px #0008}.ey{font-size:11px;letter-spacing:.15em;text-transform:uppercase;color:#86a9d5}.card h1{font-size:26px;margin:10px 0}.card p{color:#aab5c4}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px}.actions a{display:inline-block;padding:10px 15px;border-radius:9px;text-decoration:none}.primary{background:#4b82c9;color:#fff}.secondary{border:1px solid #3a4657;color:#dce5ef}.secondary:hover{background:#1f2835}</style></head><body><main class="card"><div class="ey">Veyra Browser</div><h1>${escapeHtml(title)}</h1><p>${why}</p><div class="actions"><a class="primary" href="#" id="veyraChromium">Verify in real Chromium</a>${alt}<a class="secondary" href="${safe}" target="_blank" rel="noopener noreferrer">Open directly in a new tab</a><a class="secondary" href="${escapeHtml(makeViewUrl(url, sid))}">Retry through Veyra</a></div><p style="font-size:13px;margin-top:18px">Chromium shows the site's own check so <b>you</b> can complete it. Veyra never solves or bypasses it for you.</p></main><script>(function(){var m={type:"veyra:challenge",url:${JSON.stringify(String(url)).replace(/</g, "\\u003c")},kind:${JSON.stringify(String(info?.type || "verification"))},auto:${CFG.leanMode ? "false" : "true"}};try{if(parent!==window)parent.postMessage(m,"*")}catch(e){}var b=document.getElementById("veyraChromium");if(b)b.onclick=function(e){e.preventDefault();m.auto=false;m.manual=true;try{parent.postMessage(m,"*")}catch(x){}}})();</script></body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#10151d;color:#eaf0f6;font:15px/1.5 system-ui,sans-serif}.card{max-width:650px;margin:24px;padding:32px;background:#171e28;border:1px solid #303a48;border-radius:18px;box-shadow:0 20px 60px #0008}.ey{font-size:11px;letter-spacing:.15em;text-transform:uppercase;color:#86a9d5}.card h1{font-size:26px;margin:10px 0}.card p{color:#aab5c4}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px}.actions a{display:inline-block;padding:10px 15px;border-radius:9px;text-decoration:none}.primary{background:#4b82c9;color:#fff}.secondary{border:1px solid #3a4657;color:#dce5ef}.secondary:hover{background:#1f2835}</style></head><body><main class="card"><div class="ey">Veyra Browser</div><h1>${escapeHtml(title)}</h1><p>${why}</p><div class="actions"><a class="primary" href="#" id="veyraChromium">Verify in real Chromium</a>${alt}<a class="secondary" href="${safe}" target="_blank" rel="noopener noreferrer">Open directly in a new tab</a><a class="secondary" href="${escapeHtml(makeViewUrl(url, sid))}">Retry through Veyra</a></div><p style="font-size:13px;margin-top:18px">Chromium shows the site's own check so <b>you</b> can complete it. Veyra never solves or bypasses it for you.</p></main><script>(function(){var m={type:"veyra:challenge",url:${JSON.stringify(String(url)).replace(/</g, "\\u003c")},kind:${JSON.stringify(String(info?.type || "verification"))},auto:${process.env.CHALLENGE_AUTO_HANDOFF == null ? "true" : /^(1|true|yes|on)$/i.test(String(process.env.CHALLENGE_AUTO_HANDOFF)) ? "true" : "false"}};try{if(parent!==window)parent.postMessage(m,"*")}catch(e){}var b=document.getElementById("veyraChromium");if(b)b.onclick=function(e){e.preventDefault();m.auto=false;m.manual=true;try{parent.postMessage(m,"*")}catch(x){}}})();</script></body></html>`;
 }
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m])); }
 
@@ -1639,7 +1639,11 @@ function injectRuntime(html, original, sid = "") {
     if(LP&&LP.assign){const nativeAssign=LP.assign;LP.assign=function(next){const u=canonicalizeMaybeProxy(next);if(u){emit('location.assign',u);return;}return nativeAssign.call(this,next)}}
     if(LP&&LP.replace){const nativeReplace=LP.replace;LP.replace=function(next){const u=canonicalizeMaybeProxy(next);if(u){emit('location.replace',u);return;}return nativeReplace.call(this,next)}}
   }catch{}
-  try{navigator.serviceWorker&&navigator.serviceWorker.register&&(navigator.serviceWorker.register=()=>Promise.reject(new Error('Service workers are disabled inside the Veyra proxy.')))}catch{}
+  try{navigator.serviceWorker&&navigator.serviceWorker.register&&(navigator.serviceWorker.register=function(){topPost({type:'veyra:browser-required',reason:'service-worker',sessionId:SESSION_ID,pageUrl:virtualUrl});return Promise.reject(new DOMException('This page requires browser service-worker support.','NotSupportedError'))})}catch{}
+  try{if(typeof WebSocket==='function'){const NativeWebSocket=WebSocket;window.WebSocket=function(url,protocols){try{const target=resolve(url);if(/^wss?:/i.test(String(target))){topPost({type:'veyra:browser-required',reason:'websocket',sessionId:SESSION_ID,pageUrl:virtualUrl,url:target})}}catch{};throw new Error('This page requires browser WebSocket support; switching to Chromium.');};window.WebSocket.prototype=NativeWebSocket.prototype}}catch{}
+  // Empty SPA shell detector (Roblox, browser.lol, etc.): if the main root stays
+  // empty after scripts have had a chance to run, ask the parent to switch to Chromium.
+  try{(function(){var fired=false;function check(){if(fired)return;try{var root=document.querySelector('#root,#app,#__next,[data-reactroot],#react-root');var body=document.body;var text=(body&&body.innerText||'').replace(/\\s+/g,' ').trim();var kids=body?body.children.length:0;var emptyRoot=root&&!(root.textContent||'').trim()&&root.children.length===0;var sparse=!text||text.length<40&&kids<4;if(emptyRoot||sparse){fired=true;topPost({type:'veyra:browser-required',reason:'empty-spa-shell',sessionId:SESSION_ID,pageUrl:virtualUrl})}}catch{}}setTimeout(check,2500);setTimeout(check,6000)})()}catch{}
   const nativeFetch=window.fetch;if(nativeFetch)window.fetch=function(input,init){
     const started=performance.now(); const method=String(init&&init.method||input&&input.method||'GET').toUpperCase(); const original=realUrl(input); let target=''; let reqX={initiator:'fetch'};try{reqX.requestHeaders=hdrObj(init&&init.headers||(typeof Request!=='undefined'&&input instanceof Request?input.headers:null));if(init&&typeof init.body==='string')reqX.requestBody=init.body.slice(0,20000)}catch{}
     try{target=resolve(input);if(shouldProxy(target)){const ok=r=>{net(method,target,r.status,performance.now()-started,r.ok,r,reqX);return r},bad=e=>{net(method,target,0,performance.now()-started,false,null,{...reqX,error:String(e&&e.message||e)});throw e};const dest=proxy('resource',target);if(typeof Request!=='undefined'&&input instanceof Request){const src=input;const hasBody=!/^(GET|HEAD)$/i.test(src.method)&&!(init&&'body' in init);return (hasBody?src.clone().arrayBuffer():Promise.resolve(undefined)).then(buf=>{const opts={method:src.method,headers:src.headers,credentials:src.credentials,cache:src.cache,redirect:src.redirect,integrity:src.integrity,signal:src.signal};if(buf&&buf.byteLength)opts.body=buf;if(src.keepalive&&!(buf&&buf.byteLength>60000))opts.keepalive=true;return nativeFetch(dest,Object.assign(opts,init||{}))}).then(ok,bad)}if(init&&init.body&&typeof ReadableStream!=='undefined'&&init.body instanceof ReadableStream){return new Response(init.body).arrayBuffer().then(buf=>{const o=Object.assign({},init,{body:buf});delete o.duplex;return nativeFetch(dest,o)}).then(ok,bad)}return nativeFetch(dest,init).then(ok,bad);}}catch{}
@@ -1714,8 +1718,23 @@ function injectRuntime(html, original, sid = "") {
   const withoutMetaCsp = String(html).replace(/<meta[^>]+http-equiv=["']?content-security-policy["']?[^>]*>/gi, "");
   return withoutMetaCsp.replace(/<head([^>]*)>/i, (m, attrs) => `<head${attrs}>${code}`);
 }
+function protectInlineScriptBlocks(html) {
+  const originals = [];
+  const tokenized = String(html || "").replace(/<script\b(?![^>]*\bsrc\s*=)[^>]*>([\s\S]*?)<\/script>/gi, (full, body) => {
+    const token = `__VEYRA_INLINE_SCRIPT_${originals.length}_${crypto.randomBytes(6).toString("hex")}__`;
+    originals.push({ token, body: String(body) });
+    return full.slice(0, full.indexOf(">") + 1) + token + "</script>";
+  });
+  return { html: tokenized, originals };
+}
+function restoreInlineScriptBlocks(html, originals) {
+  let out = String(html || "");
+  for (const item of originals || []) out = out.split(item.token).join(item.body);
+  return out;
+}
 function rewriteHtml(html, base, sid = "") {
-  const $ = cheerio.load(String(html || ""), { decodeEntities: false });
+  const protectedScripts = protectInlineScriptBlocks(html);
+  const $ = cheerio.load(protectedScripts.html, { decodeEntities: false });
   const declaredBase = $("base[href]").first().attr("href");
   const effectiveBase = resolveNavigation(declaredBase, base) || base;
   $("base").remove();
@@ -1799,7 +1818,7 @@ function rewriteHtml(html, base, sid = "") {
     if (preloadMarkup) $("head").first().prepend(preloadMarkup);
   }
 
-  return injectRuntime($.html(), base, sid);
+  return injectRuntime(restoreInlineScriptBlocks($.html(), protectedScripts.originals), base, sid);
 }
 
 const SEARCH_STOP_WORDS = new Set([
@@ -3118,11 +3137,33 @@ function browserCapabilitySignals(html = "", headers = {}) {
   const moduleCount = (text.match(/type\s*=\s*["']module["']/gi) || []).length;
   const fetchSignals = (text.match(/fetch\s*\(|xmlhttprequest|websocket|eventsource|indexeddb|localstorage|sessionstorage|serviceworker|history\.pushstate|history\.replacestate/gi) || []).length;
   const shellSignals = /<div[^>]+(?:id|class)=["'][^"']*(?:root|app|__next|__nuxt|svelte)[^"']*["'][^>]*>\s*<\/div>/i.test(text) || ((scriptCount + moduleCount) > 0 && text.replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '').replace(/<[^>]+>/g, ' ').trim().length < 500);
-  const spa = /__next|__nuxt|webpack|vite|react|angular|vue|svelte|ng-version/i.test(text);
+  const spa = /__next|__nuxt|webpack|vite|react|angular|vue|svelte|ng-version|roblox|rbxcdn|rbx\.com/i.test(text);
+  // Game platforms and remote-browser UIs almost always need real Chromium:
+  // empty React roots, heavy client bundles, and anti-bot checks break Fast proxy.
+  const gameOrRemoteBrowser = /roblox\.com|rbxcdn\.com|browser\.lol|now\.gg|play\.google\.com\/store|geforce\.com\/games/i.test(lower);
   const scriptHeavy = scriptCount >= CFG.proxyJsHeavyThreshold && (fetchSignals >= 1 || moduleCount > 0 || shellSignals);
   const spaHeavy = spa && (fetchSignals >= 2 || shellSignals || moduleCount > 0);
-  const heavy = shellSignals || fetchSignals >= 4 || scriptHeavy || spaHeavy;
-  return { scriptCount, moduleCount, fetchSignals, spa, shellSignals, heavy, contentType: headers['content-type'] || headers['Content-Type'] || '' };
+  const heavy = shellSignals || fetchSignals >= 4 || scriptHeavy || spaHeavy || gameOrRemoteBrowser;
+  return { scriptCount, moduleCount, fetchSignals, spa, shellSignals, heavy, gameOrRemoteBrowser, contentType: headers['content-type'] || headers['Content-Type'] || '' };
+}
+
+// Hosts that stay blank or unusable under Fast proxy even with the page accelerator.
+// On lean (Render Free) we still prefer Chromium for these when capacity allows,
+// because Accelerated Proxy never produces a usable signup/login surface.
+const FORCE_BROWSER_HOSTS = new Set([
+  "roblox.com", "www.roblox.com", "web.roblox.com", "create.roblox.com",
+  "browser.lol", "www.browser.lol",
+  "now.gg", "www.now.gg",
+  "geforce.com", "play.geforce.com"
+]);
+function hostNeedsRealBrowser(url) {
+  try {
+    const h = new URL(url).hostname.toLowerCase().replace(/^www\./, "");
+    if (FORCE_BROWSER_HOSTS.has(h) || FORCE_BROWSER_HOSTS.has("www." + h)) return true;
+    if (/(^|\.)roblox\.com$/.test(h) || /(^|\.)rbxcdn\.com$/.test(h)) return true;
+    if (/(^|\.)browser\.lol$/.test(h)) return true;
+  } catch {}
+  return false;
 }
 
 // Small helper for calling a fixed, trusted, official host (never a
@@ -3169,11 +3210,18 @@ app.post('/api/browser/capability', async (req, res) => {
     const challenge = detectChallenge(result.body?.toString('utf8') || '', result.contentType, result.status, { server: result.serverHeader, 'cf-mitigated': result.cfMitigated, finalUrl: result.finalUrl });
     // Lean (Render Free) mode: heavy/SPA pages are served by the fast proxy +
     // page-accelerator crawler instead of a 250 MB+ Chromium process.
+    // Exception: hosts known to stay blank under proxy (Roblox, browser.lol, …)
+    // still request BROWSER_ENGINE so the frontend can try Chromium when capacity allows.
     const lean = CFG.leanMode && !CFG.leanAutoBrowser;
-    const mode = challenge ? 'BROWSER_ENGINE' : signals.heavy ? (lean ? 'ACCELERATED_PROXY' : 'BROWSER_ENGINE') : 'FAST_PROXY';
-    res.json({ ok: true, url: result.finalUrl || raw, mode, lean: CFG.leanMode, challenge: challenge ? challenge.type : null, signals, status: result.status, contentType: result.contentType });
+    const forceBrowser = hostNeedsRealBrowser(result.finalUrl || raw) || signals.gameOrRemoteBrowser;
+    let mode = 'FAST_PROXY';
+    if (challenge || forceBrowser) mode = 'BROWSER_ENGINE';
+    else if (signals.heavy) mode = lean ? 'ACCELERATED_PROXY' : 'BROWSER_ENGINE';
+    res.json({ ok: true, url: result.finalUrl || raw, mode, lean: CFG.leanMode, challenge: challenge ? challenge.type : null, forceBrowser: !!forceBrowser, signals, status: result.status, contentType: result.contentType });
   } catch (e) {
-    res.json({ ok: true, url: raw, mode: CFG.leanMode ? 'ACCELERATED_PROXY' : 'BROWSER_ENGINE', lean: CFG.leanMode, reason: 'capability_probe_failed', error: e.message });
+    // On probe failure, still prefer Chromium for known-broken hosts.
+    const forceBrowser = hostNeedsRealBrowser(raw);
+    res.json({ ok: true, url: raw, mode: forceBrowser ? 'BROWSER_ENGINE' : (CFG.leanMode ? 'ACCELERATED_PROXY' : 'BROWSER_ENGINE'), lean: CFG.leanMode, forceBrowser, reason: 'capability_probe_failed', error: e.message });
   }
 });
 
@@ -3686,6 +3734,7 @@ function forwardProxyBrowserHeaders(req, targetUrl, sourceUrl, mode, baseHeaders
     // and requests carrying it are forced out of shared caching.
     const allow = [
       "accept-language", "dnt", "cache-control", "pragma", "priority",
+      "rsc", "next-action", "next-router-state-tree", "next-router-prefetch", "next-router-segment-prefetch", "next-url", "x-nextjs-data", "x-middleware-prefetch",
       "x-requested-with", "x-csrf-token", "x-xsrf-token",
       "x-goog-visitor-id", "x-goog-api-format-version", "x-goog-pageid",
       "x-youtube-client-name", "x-youtube-client-version", "x-youtube-bootstrap-logged-in",
@@ -3696,6 +3745,10 @@ function forwardProxyBrowserHeaders(req, targetUrl, sourceUrl, mode, baseHeaders
     for (const name of allow) {
       const value = req.get(name);
       if (value) out[name] = String(value).slice(0, 20000);
+    }
+    for (const name of ["if-none-match", "if-modified-since", "if-match", "if-unmodified-since", "sec-purpose"]) {
+      const value = req.get(name);
+      if (value) out[name] = String(value).slice(0, 4000);
     }
     // Web apps send many custom x-* API headers (x-goog-api-key, x-user-agent,
     // x-goog-authuser, x-goog-ext-*, x-client-data, x-api-key, ...). Relay them,
@@ -3711,12 +3764,14 @@ function forwardProxyBrowserHeaders(req, targetUrl, sourceUrl, mode, baseHeaders
     for (const name of [
       "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform", "sec-ch-ua-arch",
       "sec-ch-ua-bitness", "sec-ch-ua-full-version", "sec-ch-ua-full-version-list",
-      "sec-ch-ua-model", "sec-ch-ua-platform-version"
+      "sec-ch-ua-model", "sec-ch-ua-platform-version", "sec-gpc", "ect", "downlink", "rtt",
+      "sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest", "sec-fetch-user"
     ]) {
       const value = req.get(name);
       if (value) out[name] = String(value).slice(0, 2000);
     }
-    Object.assign(out, sameSiteFetchMetadata(targetUrl, sourceUrl, mode));
+    const synthesized = sameSiteFetchMetadata(targetUrl, sourceUrl, mode);
+    for (const [k, v] of Object.entries(synthesized)) if (!out[k]) out[k] = v;
   }
   for (const k of Object.keys(out)) if (out[k] === undefined || out[k] === null || out[k] === "undefined") delete out[k];
   return out;
@@ -3860,7 +3915,7 @@ async function proxyRequest(req, res, mode) {
   });
   const limitForContentType = (ct) => {
     const type = String(ct || "").toLowerCase();
-    if (type.includes("text/html") || type.includes("application/xhtml") || type.includes("text/css") || /javascript|ecmascript|json|xml/.test(type)) return CFG.maxProxyTextBytes;
+    if (type.includes("text/html") || type.includes("application/xhtml") || type.includes("text/css") || /javascript|ecmascript|json|xml|x-component|react-server/i.test(type)) return CFG.maxProxyTextBytes;
     if (type.startsWith("image/") || type.includes("svg")) return CFG.maxProxyImageBytes;
     if (type.startsWith("video/") || type.startsWith("audio/") || type.includes("application/pdf")) return CFG.maxProxyMediaBytes;
     return CFG.maxProxyOtherBytes;
@@ -3868,11 +3923,12 @@ async function proxyRequest(req, res, mode) {
   try {
     const browserKey = `${method} ${canonical}|ref=${referrer}|sid=${sid}|range=${headers.range || ""}|body=${body ? require("crypto").createHash("sha1").update(body).digest("hex") : ""}`;
     const browserPriority = mode === "view" ? 1000 : (looksLikeApiResource(canonical, accept, method) ? 980 : (/css|javascript|font|svg/i.test(accept) ? 900 : /image/i.test(accept) ? 800 : 700));
-    const requestLimit = mediaRequest ? CFG.maxProxyMediaBytes : (looksLikeApiResource(canonical, accept, method) ? CFG.proxyApiBodyBytes : CFG.maxProxyBodyBytes);
-    const retries = mediaRequest ? 1 : (looksLikeApiResource(canonical, accept, method) ? CFG.proxyApiRetries : CFG.maxRetries);
+    const isNextRsc = /text\/x-component|text\/x-react-server-components/i.test(String(accept || "")) || !!req.get("RSC") || !!req.get("Next-Router-State-Tree") || !!req.get("Next-Action") || !!req.get("Next-Url");
+    const requestLimit = mediaRequest ? CFG.maxProxyMediaBytes : (looksLikeApiResource(canonical, accept, method) || isNextRsc ? CFG.proxyApiBodyBytes : CFG.maxProxyBodyBytes);
+    const retries = mediaRequest ? 1 : (looksLikeApiResource(canonical, accept, method) || isNextRsc ? CFG.proxyApiRetries : CFG.maxRetries);
     const requestUserAgent = req.get("User-Agent") ? String(req.get("User-Agent")).slice(0, 2000) : "";
     const hasAuthorization = !!req.get("Authorization");
-    const result = await browserScheduler.request(browserKey, () => fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, requestId: req.veyraRequestId, userAgent: requestUserAgent || undefined, limit: requestLimit, retries, limitForContentType, noCache: method !== "GET" || mediaRequest || hasAuthorization, timeout: mediaRequest ? CFG.mediaRequestTimeoutMs : CFG.requestTimeoutMs, bodyTimeoutMs: mediaRequest ? CFG.mediaBodyTimeoutMs : CFG.bodyTimeoutMs, streamOversize: mode === "resource" }), { priority: browserPriority + (mediaRequest ? 30 : 0), host: hostOf(canonical), url: canonical });
+    const result = await browserScheduler.request(browserKey, () => fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, requestId: req.veyraRequestId, userAgent: requestUserAgent || undefined, limit: requestLimit, retries, limitForContentType, noCache: method !== "GET" || mediaRequest || hasAuthorization || isNextRsc, timeout: mediaRequest ? CFG.mediaRequestTimeoutMs : CFG.requestTimeoutMs, bodyTimeoutMs: mediaRequest ? CFG.mediaBodyTimeoutMs : CFG.bodyTimeoutMs, streamOversize: mode === "resource" }), { priority: browserPriority + (mediaRequest ? 30 : 0), host: hostOf(canonical), url: canonical });
   // Oversize bodies are streamed straight through (constant memory) instead of
   // buffered. Top-level non-HTML documents (a big image, PDF, video opened
   // directly) stream as well; only HTML must be buffered for rewriting.

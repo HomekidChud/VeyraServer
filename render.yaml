@@ -1,4 +1,4 @@
-# Veyra 8.16.2
+# Veyra 8.17.1
 services:
   - type: web
     name: VeyraServer
@@ -42,7 +42,7 @@ services:
       # Safe warm-up cap: media is never downloaded by the warm phase.
       - key: PROXY_WARM_MAX_BINARY_BYTES
         value: "786432"
-      # 8.16.2 Free-plan stability guardrails (keep proxy-first and prevent browser/crawler contention).
+      # 8.17.1 Free-plan compatibility and stability guardrails (keep proxy-first and prevent browser/crawler contention).
       - key: CRAWLER_PAGE_HARD_MS
         value: "5000"
       - key: PROXY_WARM_HARD_MS
@@ -57,3 +57,6 @@ services:
         value: "4"
       - key: MONGODB_CACHE_BODY_MAX_BYTES
         value: "786432"
+      # Let users complete site-owned security checks in the real Chromium fallback.
+      - key: CHALLENGE_AUTO_HANDOFF
+        value: "true"
