@@ -398,7 +398,12 @@ function installVeyraDevtools(emitFn, opts) {
       return { timing: { redirect: Math.round((nav.redirectEnd || 0) - (nav.redirectStart || 0)), dns: Math.round((nav.domainLookupEnd || 0) - (nav.domainLookupStart || 0)), connect: Math.round((nav.connectEnd || 0) - (nav.connectStart || 0)), ttfb: Math.round((nav.responseStart || 0) - (nav.requestStart || 0)), download: Math.round((nav.responseEnd || 0) - (nav.responseStart || 0)), domInteractive: Math.round(nav.domInteractive || 0), domContentLoaded: Math.round(nav.domContentLoadedEventEnd || 0), load: Math.round(nav.loadEventEnd || 0) }, paints, lcp, resources: { count: res.length, byType }, memory: mem, nodes: document.getElementsByTagName("*").length, now: Math.round(performance.now()) };
     },
     "ext.feature": p => { const f = FEATURES[p.name]; if (!f) throw new Error("Unknown feature " + p.name); f(!!p.on); return true; },
-    "ext.css": p => { extStyle("user-" + String(p.key).replace(/[^\w-]/g, ""), p.css ? String(p.css).slice(0, 200000) : ""); return true; },
+    "ext.css": p => {
+      const css = p.css ? String(p.css) : "";
+      if (/@import\b|url\s*\(|javascript\s*:|expression\s*\(|-moz-binding|behavior\s*:|@font-face|@namespace\b/i.test(css)) throw new Error("Veyra only allows isolated CSS extensions; imports, URLs and script-capable constructs are blocked.");
+      if (css.length > 120000) throw new Error("Extension CSS exceeds the 120 KB safety limit.");
+      extStyle("user-" + String(p.key).replace(/[^\w-]/g, ""), css.slice(0, 120000)); return true;
+    },
     "ext.zoom": p => { ext.zoom = Math.max(.25, Math.min(5, Number(p.zoom) || 1)); document.documentElement.style.zoom = ext.zoom === 1 ? "" : String(ext.zoom); return ext.zoom; },
     "ext.reader": () => readerView(),
     "ext.stats": () => pageStats(),

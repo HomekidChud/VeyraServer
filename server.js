@@ -760,7 +760,7 @@ function sendSessionExpired(req, res, mode, sid) {
 <body><main><h1>Session ended</h1><p>Veyra sessions last ${limit >= 60 ? `${Math.round(limit / 60)} minute${limit >= 120 ? "s" : ""}` : `${limit} seconds`}. This one has been deleted along with its cookies and history. Start a new session to keep browsing.</p></main>
 <script>try{top.postMessage({type:"veyra:session-expired",sessionId:${JSON.stringify(sid)}},"*")}catch(e){}</script></body></html>`);
 }
-function safeMethod(method) { return ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"].includes(String(method || "").toUpperCase()); }
+function safeMethod(method) { return ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"].includes(String(method || "").toUpperCase()); }
 
 // URL resolution and canonicalization.
 function normalizedSearch(url) {
@@ -3198,6 +3198,43 @@ app.post('/api/youtube/resolve', async (req, res) => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Veyra Extension Store — published CSS-only packages.
+// Packages are intentionally capability-limited: no scripts, background pages,
+// service workers, remote CSS imports, URLs or privileged permissions. This keeps
+// published extensions unable to read Veyra/session cookies or execute arbitrary
+// page code. The same validator is used for store responses and local packages.
+const EXT_STORE_FILE = path.join(__dirname, "extension-store.json");
+function safeExtensionCss(css) {
+  const v = String(css || "");
+  if (!v.trim() || v.length > 120000) throw new Error("Extension CSS is empty or exceeds 120 KB.");
+  if (/@import\b|url\s*\(|javascript\s*:|expression\s*\(|-moz-binding|behavior\s*:|@font-face|@namespace\b/i.test(v)) throw new Error("Extension CSS may not import, fetch, execute scripts, or load external resources.");
+  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(v)) throw new Error("Extension CSS contains control characters.");
+  let depth = 0; for (let i = 0; i < v.length; i++) { if (v[i] === "{") depth++; else if (v[i] === "}") { depth--; if (depth < 0) throw new Error("Extension CSS braces are unbalanced."); } }
+  if (depth !== 0) throw new Error("Extension CSS braces are unbalanced.");
+  return v;
+}
+function validateExtensionPackage(pkg) {
+  if (!pkg || typeof pkg !== "object" || Array.isArray(pkg)) throw new Error("Extension package must be an object.");
+  const id = String(pkg.id || "").trim(); if (!/^[a-z0-9][a-z0-9-_.]{1,63}$/i.test(id)) throw new Error("Invalid extension id.");
+  const name = String(pkg.name || "").trim(); if (!name || name.length > 80) throw new Error("Invalid extension name.");
+  const perms = Array.isArray(pkg.permissions) ? pkg.permissions.map(String) : []; if (perms.some(x => x !== "styles")) throw new Error("Only the styles permission is supported.");
+  for (const k of ["js","script","scripts","content_scripts","background","service_worker","web_accessible_resources","externally_connectable"]) if (pkg[k]) throw new Error(`Unsupported extension capability: ${k}`);
+  const files = pkg.files && typeof pkg.files === "object" ? pkg.files : {}; const css = safeExtensionCss(pkg.css ?? files["style.css"] ?? "");
+  const matches = pkg.matches == null ? [] : Array.isArray(pkg.matches) ? pkg.matches.map(String).slice(0, 30) : [];
+  if (matches.some(x => x.length > 120 || /[\r\n]/.test(x))) throw new Error("Invalid extension match pattern.");
+  const integrity = crypto.createHash("sha256").update(JSON.stringify({ id, version: String(pkg.version || "1.0.0"), matches, css })).digest("hex");
+  return { schema: "veyra-extension/v1", id, name, version: String(pkg.version || "1.0.0").slice(0, 20), description: String(pkg.description || "").slice(0, 300), author: String(pkg.author || "").slice(0, 100), publisher: String(pkg.publisher || "").slice(0, 100), permissions: ["styles"], matches, files: { "style.css": css }, published: !!pkg.published, verified: true, integrity };
+}
+function readExtensionStore() {
+  let raw = []; try { raw = JSON.parse(fs.readFileSync(EXT_STORE_FILE, "utf8")); } catch { raw = []; }
+  const out = []; for (const pkg of Array.isArray(raw) ? raw : []) { try { out.push(validateExtensionPackage(pkg)); } catch (e) { serverLog("warn", "STORE", `Rejected invalid published extension ${String(pkg?.id || "unknown")}: ${e.message}`); } }
+  return out;
+}
+app.get("/api/extensions/store", (req, res) => res.json({ ok: true, extensions: readExtensionStore() }));
+app.get("/api/extensions/store/:id", (req, res) => { const ext = readExtensionStore().find(x => x.id === req.params.id); if (!ext) return respondError(res, 404, "Extension not found.", "EXTENSION_NOT_FOUND"); res.json({ ok: true, extension: ext }); });
+app.post("/api/extensions/verify", (req, res) => { try { const extension = validateExtensionPackage(req.body || {}); res.json({ ok: true, safe: true, extension, policy: { scripts: false, cookieAccess: false, networkImports: false, permissions: ["styles"] } }); } catch (e) { res.status(400).json({ ok: false, safe: false, reason: e.message, code: "EXTENSION_SECURITY_REJECTED" }); } });
+
 const vpnErrStatus = code => ({ VPN_DISABLED: 503, VPN_NOT_CONFIGURED: 404, VPN_ALL_DOWN: 503, VPN_KILL_SWITCH: 503, VPN_TEST_FAILED: 502, VPN_NOT_CONNECTED: 409 })[code] || 400;
 app.get('/api/vpn/status', (req, res) => {
   res.json({ ok: true, ...vpnManager.status() });
@@ -3644,9 +3681,9 @@ function forwardProxyBrowserHeaders(req, targetUrl, sourceUrl, mode, baseHeaders
   const out = { ...baseHeaders };
   if (CFG.proxyForwardCompatHeaders) {
     // These headers are commonly used by real web applications and public web APIs
-    // (including modern YouTube/Google client APIs). We intentionally exclude
-    // Cookie/Authorization and all server-only credentials; the Veyra session jar
-    // handles cookies separately.
+    // (including modern YouTube/Google client APIs). Cookies are handled only by
+    // the Veyra session jar. Authorization is forwarded separately for target APIs
+    // and requests carrying it are forced out of shared caching.
     const allow = [
       "accept-language", "dnt", "cache-control", "pragma", "priority",
       "x-requested-with", "x-csrf-token", "x-xsrf-token",
@@ -3815,6 +3852,7 @@ async function proxyRequest(req, res, mode) {
     ...(req.get("Accept-Language") ? { "accept-language": String(req.get("Accept-Language")).slice(0, 1000) } : {}),
     ...(req.get("Upgrade-Insecure-Requests") ? { "upgrade-insecure-requests": String(req.get("Upgrade-Insecure-Requests")).slice(0, 20) } : {}),
     ...(req.get("Content-Type") ? { "content-type": String(req.get("Content-Type")).slice(0, 500) } : {}),
+    ...(req.get("Authorization") ? { authorization: String(req.get("Authorization")).slice(0, 20000) } : {}),
     ...(req.get("Range") ? { range: String(req.get("Range")).slice(0, 200) } : {}),
     ...(referrer ? { referer: referrer } : {}),
     // Do not manufacture an Origin header for top-level GET/HEAD navigations.
@@ -3833,7 +3871,8 @@ async function proxyRequest(req, res, mode) {
     const requestLimit = mediaRequest ? CFG.maxProxyMediaBytes : (looksLikeApiResource(canonical, accept, method) ? CFG.proxyApiBodyBytes : CFG.maxProxyBodyBytes);
     const retries = mediaRequest ? 1 : (looksLikeApiResource(canonical, accept, method) ? CFG.proxyApiRetries : CFG.maxRetries);
     const requestUserAgent = req.get("User-Agent") ? String(req.get("User-Agent")).slice(0, 2000) : "";
-    const result = await browserScheduler.request(browserKey, () => fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, requestId: req.veyraRequestId, userAgent: requestUserAgent || undefined, limit: requestLimit, retries, limitForContentType, noCache: method !== "GET" || mediaRequest, timeout: mediaRequest ? CFG.mediaRequestTimeoutMs : CFG.requestTimeoutMs, bodyTimeoutMs: mediaRequest ? CFG.mediaBodyTimeoutMs : CFG.bodyTimeoutMs, streamOversize: mode === "resource" }), { priority: browserPriority + (mediaRequest ? 30 : 0), host: hostOf(canonical), url: canonical });
+    const hasAuthorization = !!req.get("Authorization");
+    const result = await browserScheduler.request(browserKey, () => fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, requestId: req.veyraRequestId, userAgent: requestUserAgent || undefined, limit: requestLimit, retries, limitForContentType, noCache: method !== "GET" || mediaRequest || hasAuthorization, timeout: mediaRequest ? CFG.mediaRequestTimeoutMs : CFG.requestTimeoutMs, bodyTimeoutMs: mediaRequest ? CFG.mediaBodyTimeoutMs : CFG.bodyTimeoutMs, streamOversize: mode === "resource" }), { priority: browserPriority + (mediaRequest ? 30 : 0), host: hostOf(canonical), url: canonical });
   // Oversize bodies are streamed straight through (constant memory) instead of
   // buffered. Top-level non-HTML documents (a big image, PDF, video opened
   // directly) stream as well; only HTML must be buffered for rewriting.
@@ -3933,7 +3972,7 @@ app.get("/api/resource", async (req, res) => { try { await proxyRequest(req, res
 } });
 app.get("/api/download", async (req, res) => { try { req.query.download = "1"; await proxyRequest(req, res, "resource"); } catch (e) { respondError(res, 502, `Veyra download error: ${e.message}`, "DOWNLOAD_ERROR", { requestId: req.veyraRequestId }); } });
 app.post("/api/resource", async (req, res) => { try { await proxyRequest(req, res, "resource"); } catch (e) { respondError(res, 502, `Veyra resource request failed: ${e.message}`, "PROXY_RESOURCE_POST_ERROR", { requestId: req.veyraRequestId }); } });
-for (const method of ["put","patch","delete","head"]) app[method]("/api/resource", async (req,res)=>{ try { await proxyRequest(req,res,"resource"); } catch(e) { respondError(res,502,`Veyra resource ${method.toUpperCase()} request failed: ${e.message}`,"PROXY_RESOURCE_METHOD_ERROR",{requestId:req.veyraRequestId}); } });
+for (const method of ["put","patch","delete","head","options"]) app[method]("/api/resource", async (req,res)=>{ try { await proxyRequest(req,res,"resource"); } catch(e) { respondError(res,502,`Veyra resource ${method.toUpperCase()} request failed: ${e.message}`,"PROXY_RESOURCE_METHOD_ERROR",{requestId:req.veyraRequestId}); } });
 
 const OPEN_ENGINE_MODES = new Set(["auto", "proxy", "crawler", "browser", "combined"]);
 function normalizeOpenEngineMode(value) {
@@ -4482,7 +4521,7 @@ async function resolveEscapedChunk(sid, relative) {
   }
   return null;
 }
-const VEYRA_API_ROUTES = new Set(["view", "resource", "download", "form-get", "open", "crawl", "search", "suggest", "browser", "debug", "session", "sessions", "config", "vpn", "status", "health"]);
+const VEYRA_API_ROUTES = new Set(["view", "resource", "download", "form-get", "open", "crawl", "search", "suggest", "browser", "debug", "session", "sessions", "config", "vpn", "extensions", "status", "health"]);
 app.use(async (req, res, next) => {
   if (!CFG.proxyRelativeFallback || res.headersSent) return next();
   // Relative specifiers on a proxied page resolve against Veyra's /api/ path

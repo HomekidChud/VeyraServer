@@ -1,10 +1,19 @@
-## Veyra 8.16.2
+
+## 8.17.0 compatibility hardening
+
+- API proxy accepts `OPTIONS` in addition to the existing browser methods.
+- Explicit target `Authorization` headers are forwarded for API compatibility and force no-cache behavior.
+- Redirects remain hop-by-hop validated through the public-destination/SSRF checks.
+- The custom extension store serves only verified CSS-only packages.
+- Extension verification rejects scripts, background/service-worker capabilities, external CSS imports/resources and unsupported permissions.
+
+## Veyra 8.17.0
 
 ## Content-complete adaptive page loading
 
 Browsing crawls are bounded page accelerators. They do not expand same-origin navigation links during first-page acceleration. Critical assets receive bounded preload hints, inline script/style asset literals are warmed without executing page code, and crawler discovery is deferred until the page is usable.
 
-# Veyra Browser backend v8.16.2 — OmniCrawler / hybrid browser
+# Veyra Browser backend v8.17.0 — OmniCrawler / hybrid browser
 
 This release keeps the existing Express proxy, crawler, search index, browser scheduler, and browser-engine architecture and strengthens the scheduling/discovery path in place.
 

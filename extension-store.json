@@ -1,0 +1,66 @@
+[
+  {
+    "schema": "veyra-extension/v1",
+    "id": "focus-readable",
+    "name": "Focus + Readable",
+    "version": "1.0.0",
+    "description": "Improves text spacing and reduces visual clutter without touching page scripts.",
+    "author": "Veyra",
+    "publisher": "Veyra Store",
+    "permissions": ["styles"],
+    "matches": ["<all_urls>"],
+    "files": {
+      "style.css": "body{line-height:1.6!important}article,main,[role=main]{max-width:78ch!important}p,li,dd,blockquote{line-height:1.75!important}"
+    },
+    "published": true,
+    "verified": true
+  },
+  {
+    "schema": "veyra-extension/v1",
+    "id": "high-contrast",
+    "name": "High Contrast",
+    "version": "1.0.0",
+    "description": "Adds stronger contrast and focus outlines for readability and accessibility.",
+    "author": "Veyra",
+    "publisher": "Veyra Store",
+    "permissions": ["styles"],
+    "matches": ["<all_urls>"],
+    "files": {
+      "style.css": "body{background:#fff!important;color:#111!important}a{color:#003a9b!important;text-decoration-thickness:2px!important}button,input,select,textarea{outline-color:#003a9b!important}a:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:3px solid #003a9b!important;outline-offset:2px!important}"
+    },
+    "published": true,
+    "verified": true
+  },
+  {
+    "schema": "veyra-extension/v1",
+    "id": "image-fit",
+    "name": "Better Images",
+    "version": "1.0.0",
+    "description": "Keeps large images within the viewport and improves image presentation on article pages.",
+    "author": "Veyra",
+    "publisher": "Veyra Store",
+    "permissions": ["styles"],
+    "matches": ["<all_urls>"],
+    "files": {
+      "style.css": "img,video{max-width:100%!important;height:auto!important}article img,main img,[role=main] img{object-fit:contain!important}"
+    },
+    "published": true,
+    "verified": true
+  },
+  {
+    "schema": "veyra-extension/v1",
+    "id": "youtube-theater",
+    "name": "YouTube Theater",
+    "version": "1.0.0",
+    "description": "Expands the normal YouTube watch player area without changing YouTube scripts or APIs.",
+    "author": "Veyra",
+    "publisher": "Veyra Store",
+    "permissions": ["styles"],
+    "matches": ["youtube.com", "*.youtube.com"],
+    "files": {
+      "style.css": "ytd-watch-flexy #primary{max-width:none!important}#player-container-outer,#player-theater-container{max-width:100%!important}"
+    },
+    "published": true,
+    "verified": true
+  }
+]
