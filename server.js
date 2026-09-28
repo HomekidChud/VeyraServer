@@ -21,6 +21,9 @@ const { MongoStore } = require("./mongo-store");
 const youtubeCompat = require("./youtube");
 const mediaErrors = require("./media-errors");
 const { isMainThread } = require("worker_threads");
+const { NeuralRobotPool } = require("./neural-robots");
+const { ChallengeSolver } = require("./challenge-solver");
+const { CastServer, InternetConnectionManager } = require("./cast-server");
 // parse-worker.js loads this file inside worker threads to reuse the pure
 // rewrite / discovery functions. In that mode nothing long-lived is started.
 const IS_THREAD_WORKER = !isMainThread && process.env.VEYRA_THREAD_WORKER === "1";
@@ -4657,6 +4660,88 @@ load();
 </body></html>`;
 }
 app.get("/api/debug/status", (req, res) => res.json(buildStatusReport()));
+
+// ---------------------------------------------------------------------------
+// Neural Robot Workers — parallel crawling without Chromium
+const neuralRobotPool = new NeuralRobotPool({ maxWorkers: 8, log: (level, source, msg) => serverLog(level, source, msg) });
+app.get("/api/robots/status", (req, res) => res.json(neuralRobotPool.report()));
+app.get("/api/robots/log", (req, res) => res.json(neuralRobotPool.getLog(Math.min(100, Number(req.query.limit) || 50))));
+app.post("/api/robots/crawl", async (req, res) => {
+  try {
+    const seeds = req.body.seeds || (req.body.seed ? [req.body.seed] : []);
+    if (!seeds.length) return res.status(400).json({ error: "No seed URLs provided" });
+    const query = req.body.query || "";
+    const opts = { maxDepth: req.body.maxDepth || 3, maxPages: req.body.maxPages || 50 };
+    const result = await neuralRobotPool.startCrawl(seeds, query, opts);
+    res.json({ ok: true, results: result });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post("/api/robots/feedback", (req, res) => {
+  try { neuralRobotPool.sendFeedback(req.body.url, !!req.body.clicked, req.body.relevance || 0.5); res.json({ ok: true }); }
+  catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post("/api/robots/reset", (req, res) => { neuralRobotPool.resetAll(); res.json({ ok: true }); });
+
+// ---------------------------------------------------------------------------
+// Challenge Solver — security checks without Chromium
+const challengeSolver = new ChallengeSolver({ log: (level, source, msg) => serverLog(level, source, msg) });
+app.get("/api/challenge/status", (req, res) => res.json(challengeSolver.report()));
+app.post("/api/challenge/solve", async (req, res) => {
+  try {
+    const { url, html, statusCode, headers } = req.body;
+    if (!url) return res.status(400).json({ error: "URL required" });
+    const result = await challengeSolver.solve(url, html || "", statusCode || 403, headers || {});
+    res.json({ ok: !!result, result });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.get("/api/challenge/check", (req, res) => {
+  const html = req.query.html || "";
+  const statusCode = Number(req.query.statusCode) || 200;
+  res.json({ isChallenge: challengeSolver.isChallengePage(html, statusCode), type: challengeSolver.detectChallengeType(html) });
+});
+
+// ---------------------------------------------------------------------------
+// Cast Server — device mirroring (WebSocket or HTTP polling)
+let castServer = null;
+let internetManager = null;
+try {
+  castServer = new CastServer({ listen: () => {}, close: () => {} }, (level, source, msg) => serverLog(level, source, msg));
+  internetManager = new InternetConnectionManager();
+  serverLog("info", "CAST", `Cast server started in ${castServer.useWebSocket ? "WebSocket" : "HTTP polling"} mode`);
+} catch (e) { serverLog("warn", "CAST", `Cast server failed to start: ${e.message}`); }
+
+// Cast API routes (HTTP polling fallback works without ws)
+app.get("/api/cast/stats", (req, res) => res.json(castServer ? castServer.getStats() : { error: "Cast server not available" }));
+app.get("/api/cast/sessions", (req, res) => res.json(castServer ? castServer.listSessions() : { error: "Cast server not available" }));
+app.post("/api/cast/create", (req, res) => {
+  if (!castServer) return res.status(503).json({ error: "Cast server not available" });
+  const session = castServer.createSessionViaPoll();
+  res.json({ ok: true, sessionId: session.id, pairingCode: session.pairingCode, qrPayload: `veyra://casteddevice:/${session.id}?code=${session.pairingCode}`, qrUrl: `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(`veyra://casteddevice:/${session.id}?code=${session.pairingCode}`)}` });
+});
+app.get("/api/cast/poll/:sessionId", (req, res) => {
+  if (!castServer) return res.status(503).json({ error: "Cast server not available" });
+  const msgs = castServer.pollSession(req.params.sessionId);
+  res.json({ ok: true, messages: msgs });
+});
+app.post("/api/cast/push/:sessionId", (req, res) => {
+  if (!castServer) return res.status(503).json({ error: "Cast server not available" });
+  castServer.pushToPoll(req.params.sessionId, req.body);
+  res.json({ ok: true });
+});
+
+// Internet Connection Manager routes
+app.get("/api/internet/report", (req, res) => res.json(internetManager ? internetManager.report() : { error: "Internet manager not available" }));
+app.get("/api/internet/profile", (req, res) => res.json(internetManager ? internetManager.getProfile(req.query.sessionId) : { error: "Internet manager not available" }));
+app.post("/api/internet/profile", (req, res) => {
+  if (!internetManager) return res.status(503).json({ error: "Internet manager not available" });
+  internetManager.setProfile(req.body.sessionId, req.body.profile, req.body.config);
+  res.json({ ok: true });
+});
+app.get("/api/internet/test", async (req, res) => {
+  if (!internetManager) return res.status(503).json({ error: "Internet manager not available" });
+  try { const result = await internetManager.testConnection(req.query.sessionId); res.json(result); }
+  catch (e) { res.json({ ok: false, error: e.message, latency: 0, bandwidth: 0 }); }
+});
 app.get("/status", (req, res, next) => {
   if (!CFG.adminGate || isAdminRequest(req)) return next();
   // Direct navigation to the Render origin cannot carry the bearer token that

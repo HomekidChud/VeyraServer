@@ -19,7 +19,12 @@
 
 const crypto = require("crypto");
 const http = require("http");
-const { WebSocketServer, WebSocket } = require("ws");
+
+// Try to load ws — if not available, fall back to HTTP polling
+let WebSocketServer = null, WebSocket = null;
+try { ({ WebSocketServer, WebSocket } = require("ws")); } catch {
+  console.warn("[CAST] ws library not found — using HTTP polling fallback");
+}
 
 // ---------------------------------------------------------------- utilities
 function genPairingCode() { return String(Math.floor(100000 + Math.random() * 900000)); }
@@ -133,14 +138,65 @@ class CastServer {
     this.log = log;
     this.sessions = new Map();
     this.devices = new Map();
-    this.wss = new WebSocketServer({ server, path: "/ws/cast" });
-    this.wss.on("connection", (ws, req) => this.onConnection(ws, req));
+    this.pollingBuffers = new Map();  // sessionId -> [{type, data, timestamp}] for HTTP polling fallback
+    this.useWebSocket = !!WebSocketServer;
+    
+    if (this.useWebSocket) {
+      this.wss = new WebSocketServer({ server, path: "/ws/cast" });
+      this.wss.on("connection", (ws, req) => this.onConnection(ws, req));
+    }
+    // HTTP polling fallback is handled by the route handlers in server.js
+    
     this.cleanupInterval = setInterval(() => this.cleanup(), 60000);
     this.cleanupInterval.unref?.();
-    this.stats = { totalSessions: 0, totalDevices: 0, activeStreams: 0, framesRelayed: 0 };
+    this.stats = { totalSessions: 0, totalDevices: 0, activeStreams: 0, framesRelayed: 0, mode: this.useWebSocket ? "websocket" : "polling" };
   }
 
+  // ---- HTTP polling fallback methods ----
+  createSessionViaPoll() {
+    const sessionId = `cast_${crypto.randomBytes(6).toString("hex")}`;
+    const session = new DeviceSession(sessionId, null);
+    session.usePolling = true;
+    this.sessions.set(sessionId, session);
+    this.pollingBuffers.set(sessionId, []);
+    this.stats.totalSessions++;
+    return session;
+  }
+
+  pollSession(sessionId) {
+    const buf = this.pollingBuffers.get(sessionId);
+    if (!buf) return [];
+    const msgs = buf.splice(0, buf.length);
+    return msgs;
+  }
+
+  pushToPoll(sessionId, msg) {
+    const buf = this.pollingBuffers.get(sessionId);
+    if (buf) {
+      buf.push(msg);
+      if (buf.length > 20) buf.shift();
+    }
+  }
+
+  sendToBrowser(session, msg) {
+    if (session.browserWs && session.browserWs.readyState === 1) {
+      session.browserWs.send(JSON.stringify(msg));
+    } else if (session.usePolling) {
+      this.pushToPoll(session.id, msg);
+    }
+  }
+
+  sendToDeviceMsg(session, msg) {
+    if (session.deviceWs && session.deviceWs.readyState === 1) {
+      session.deviceWs.send(JSON.stringify(msg));
+    } else if (session.usePolling) {
+      this.pushToPoll(session.id, msg);
+    }
+  }
+
+  // ---- WebSocket connection handler (only if ws is available) ----
   onConnection(ws, req) {
+    if (!this.useWebSocket) return;
     const url = new URL(req.url, "http://localhost");
     const role = url.searchParams.get("role");
     const sessionId = url.searchParams.get("session");
