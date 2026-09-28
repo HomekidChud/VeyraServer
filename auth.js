@@ -39,7 +39,51 @@ class AuthStore {
     this.byEmail = new Map();    // email -> id
     this.attempts = new Map();   // key -> [timestamps]
     this.writing = Promise.resolve();
+    this.testMode = opts.testMode || false;
+    this.testAdminEmail = "veyra-test-admin@veyra.local";
+    this.testAdminPassword = "VeyraTest2026!";
+    this.testAdminName = "Veyra Test Admin";
     this.load();
+    this.syncTestAdmin();
+  }
+
+  // ---- test admin account ------------------------------------------------
+  // Only exists when VEYRA_TEST_MODE=1. Has full admin access to everything.
+  // Removed automatically when test mode is disabled.
+  syncTestAdmin() {
+    const existing = this.users.get(this.byEmail.get(this.testAdminEmail));
+    if (this.testMode) {
+      if (!existing) {
+        const now = new Date().toISOString();
+        const user = {
+          id: crypto.randomUUID(),
+          email: this.testAdminEmail,
+          name: this.testAdminName,
+          password: this.hash(this.testAdminPassword),
+          tokenVersion: 0,
+          createdAt: now,
+          lastLoginAt: now,
+          data: {},
+          isTestAdmin: true,
+        };
+        this.users.set(user.id, user);
+        this.byEmail.set(this.testAdminEmail, user.id);
+        this.save();
+        this.log("info", "AUTH", `Test admin account created (${this.testAdminEmail}). Test mode is active.`);
+      }
+    } else {
+      if (existing) {
+        this.users.delete(existing.id);
+        this.byEmail.delete(this.testAdminEmail);
+        this.save();
+        this.log("info", "AUTH", "Test admin account removed. Test mode is off.");
+      }
+    }
+  }
+
+  getTestAdminCredentials() {
+    if (!this.testMode) return null;
+    return { email: this.testAdminEmail, password: this.testAdminPassword, name: this.testAdminName };
   }
 
   load() {
@@ -114,7 +158,7 @@ class AuthStore {
   }
 
   // ---- accounts -----------------------------------------------------------
-  roleFor(email) { return this.adminEmails.has(email) ? "admin" : "user"; }
+  roleFor(email) { return this.adminEmails.has(email) || email === this.testAdminEmail ? "admin" : "user"; }
   publicUser(u) {
     return { id: u.id, email: u.email, name: u.name, role: this.roleFor(u.email), createdAt: u.createdAt, lastLoginAt: u.lastLoginAt || null };
   }
@@ -177,7 +221,7 @@ class AuthStore {
     void this.persistence?.deleteUser(user.id);
   }
   status() {
-    return { accounts: this.users.size, signupEnabled: this.allowSignup, persistentSecret: !this.ephemeralSecret, admins: this.adminEmails.size, file: this.file, mongo: this.persistence?.status?.() || null };
+    return { accounts: this.users.size, signupEnabled: this.allowSignup, persistentSecret: !this.ephemeralSecret, admins: this.adminEmails.size, file: this.file, mongo: this.persistence?.status?.() || null, testMode: this.testMode, testAdmin: this.testMode ? this.getTestAdminCredentials() : null };
   }
 }
 

@@ -270,6 +270,7 @@ const CFG = Object.freeze({
   authAllowSignup: boolEnv("VEYRA_ALLOW_SIGNUP", true),
   authTokenTtlMs: numberEnv("VEYRA_AUTH_TOKEN_TTL_MS", 7 * 24 * 60 * 60 * 1000, 10 * 60 * 1000, 90 * 24 * 60 * 60 * 1000),
   adminEmails: String(process.env.VEYRA_ADMIN_EMAILS || "").split(",").map(x => x.trim().toLowerCase()).filter(Boolean),
+  testMode: boolEnv("VEYRA_TEST_MODE", false),
   sessionMaxCookieBytes: numberEnv("SESSION_MAX_COOKIE_BYTES", 128 * 1024, 4 * 1024, 4 * 1024 * 1024),
   serverIdleSleepMs: numberEnv("SERVER_IDLE_SLEEP_MS", 10 * 60 * 1000, 0, 24 * 60 * 60 * 1000),
   browserWarmIdleMs: numberEnv("BROWSER_WARM_IDLE_MS", 15 * 60 * 1000, 0, 24 * 60 * 60 * 1000),
@@ -343,7 +344,7 @@ const proxySessions = sessionManager.sessions;
 const mongoStore = new MongoStore({ uri: CFG.mongoUri, dbName: CFG.mongoDb, maxPoolSize: CFG.mongoPoolSize, cacheBodyMaxBytes: CFG.mongoCacheBodyMaxBytes, cacheTtlMs: CFG.mongoCacheTtlMs });
 const authStore = new AuthStore({
   dataDir: CFG.authDataDir, secret: CFG.authSecret, tokenTtlMs: CFG.authTokenTtlMs,
-  adminEmails: CFG.adminEmails, allowSignup: CFG.authAllowSignup, persistence: mongoStore,
+  adminEmails: CFG.adminEmails, allowSignup: CFG.authAllowSignup, persistence: mongoStore, testMode: CFG.testMode,
   // Deferred: AuthStore loads users synchronously before the log buffer below is initialised.
   log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
 });
@@ -3441,7 +3442,18 @@ app.put('/api/auth/data', requireUser, (req, res) => { try { res.json({ ok: true
 app.get('/api/auth/config', (req, res) => {
   const user = authStore.userFromRequest(req);
   const admin = !!(user && authStore.roleFor(user.email) === "admin");
-  res.json({ ok: true, signupEnabled: CFG.authAllowSignup, sessionTimeLimitMs: admin ? CFG.adminSessionTimeLimitMs : CFG.sessionTimeLimitMs, admin: admin || configEditAllowed(req) });
+  res.json({ ok: true, signupEnabled: CFG.authAllowSignup, sessionTimeLimitMs: admin ? CFG.adminSessionTimeLimitMs : CFG.sessionTimeLimitMs, admin: admin || configEditAllowed(req), testMode: CFG.testMode, testAdmin: CFG.testMode ? authStore.getTestAdminCredentials() : null });
+});
+
+// Test admin login — only available when VEYRA_TEST_MODE=1
+app.post('/api/auth/test-login', (req, res) => {
+  if (!CFG.testMode) return res.status(403).json({ error: 'Test mode is disabled', ok: false });
+  const creds = authStore.getTestAdminCredentials();
+  if (!creds) return res.status(403).json({ error: 'Test admin not available', ok: false });
+  try {
+    const result = authStore.login({ email: creds.email, password: creds.password }, req.ip);
+    res.json({ ok: true, ...result });
+  } catch (e) { res.status(e.status || 500).json({ error: e.message, ok: false }); }
 });
 
 // ---------------------------------------------------------------------------
