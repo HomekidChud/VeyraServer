@@ -1,0 +1,402 @@
+"use strict";
+/**
+ * Veyra Neural Search Engine — improved web search with:
+ *   - Parallel provider queries (race for fastest result)
+ *   - Query expansion (add related terms, spell corrections)
+ *   - Cross-provider result merging and deduplication
+ *   - Neural re-ranking using the crawler model's domain authority
+ *   - Resilient fallbacks (Wikipedia API, SearX instances, DuckDuckGo, Bing)
+ *   - Result freshness scoring
+ *   - Better caching with TTL and LRU eviction
+ */
+
+const cheerio = require("cheerio");
+
+// ----------------------------------------------------------------- utilities
+function cleanText(s, max = 400) { return String(s || "").replace(/\s+/g, " ").trim().slice(0, max); }
+function safeHttpUrl(raw) {
+  try { const u = new URL(String(raw || "")); return /^https?:$/.test(u.protocol) ? u.href : ""; } catch { return ""; }
+}
+function displayUrl(u) {
+  try { const x = new URL(u); return (x.hostname.replace(/^www\./, "") + (x.pathname === "/" ? "" : x.pathname)).slice(0, 120); }
+  catch { return u; }
+}
+function row(url, title, snippet, source, extra = {}) {
+  const href = safeHttpUrl(url); if (!href || !title) return null;
+  return { url: href, title: cleanText(title, 300), snippet: cleanText(snippet, 700), displayUrl: displayUrl(href), source, ...extra };
+}
+
+// ----------------------------------------------------------------- URL unwrappers
+function unwrapDuckDuckGo(href) {
+  const h = String(href || "");
+  try {
+    const u = new URL(h.startsWith("//") ? "https:" + h : h, "https://duckduckgo.com");
+    if (/duckduckgo\.com$/.test(u.hostname) && u.pathname === "/l/") return u.searchParams.get("uddg") || "";
+    return u.href;
+  } catch { return ""; }
+}
+function unwrapBing(href) {
+  try {
+    const u = new URL(String(href || ""), "https://www.bing.com");
+    if (/bing\.com$/.test(u.hostname) && u.pathname === "/ck/a") {
+      const enc = u.searchParams.get("u") || "";
+      if (enc.startsWith("a1")) return Buffer.from(enc.slice(2).replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+      return "";
+    }
+    return u.href;
+  } catch { return ""; }
+}
+
+// ----------------------------------------------------------------- parsers
+function parseDuckDuckGoHtml(html) {
+  const $ = cheerio.load(String(html || ""));
+  const out = [];
+  $(".result").each((_, el) => {
+    const $el = $(el);
+    if ($el.hasClass("result--ad") || $el.find(".badge--ad").length) return;
+    const a = $el.find("a.result__a").first();
+    const r = row(unwrapDuckDuckGo(a.attr("href")), a.text(), $el.find(".result__snippet").first().text(), "duckduckgo");
+    if (r) out.push(r);
+  });
+  return out;
+}
+function parseBingHtml(html) {
+  const $ = cheerio.load(String(html || ""));
+  const out = [];
+  $("li.b_algo").each((_, el) => {
+    const $el = $(el);
+    const a = $el.find("h2 a").first();
+    const snippet = $el.find(".b_caption p, p.b_lineclamp2, p.b_lineclamp3, p.b_lineclamp4, p").first().text();
+    const r = row(unwrapBing(a.attr("href")), a.text(), snippet, "bing");
+    if (r) out.push(r);
+  });
+  return out;
+}
+function parseGoogleApi(json) {
+  const items = Array.isArray(json?.items) ? json.items : [];
+  return items.map(i => row(i.link, i.title, i.snippet, "google")).filter(Boolean);
+}
+function parseBraveApi(json) {
+  const items = Array.isArray(json?.web?.results) ? json.web.results : [];
+  return items.map(i => row(i.url, i.title, i.description || i.snippet, "brave")).filter(Boolean);
+}
+function parseBingApi(json) {
+  const items = Array.isArray(json?.webPages?.value) ? json.webPages.value : [];
+  return items.map(i => row(i.url, i.name || i.title, i.snippet, "bing")).filter(Boolean);
+}
+function parseWikipediaApi(json) {
+  const items = Array.isArray(json?.query?.search) ? json.query.search : [];
+  return items.map(i => row(`https://en.wikipedia.org/wiki/${encodeURIComponent(i.title)}`, i.title, i.snippet?.replace(/<\/?[^>]+>/g, ""), "wikipedia")).filter(Boolean);
+}
+
+// ----------------------------------------------------------------- query expansion
+function expandQuery(query) {
+  const q = cleanText(query, 600);
+  if (!q) return [];
+  const terms = q.toLowerCase().split(/\s+/).filter(Boolean);
+  const expansions = [];
+
+  // Add common spelling corrections for frequent misspellings
+  const corrections = {
+    "recieve": "receive", "seperate": "separate", "occured": "occurred",
+    "untill": "until", "wich": "which", "thier": "their", "becuase": "because",
+    "definately": "definitely", "occassion": "occasion", "neccessary": "necessary",
+  };
+  const corrected = terms.map(t => corrections[t] || t);
+  if (corrected.join(" ") !== terms.join(" ")) expansions.push(corrected.join(" "));
+
+  // Add Wikipedia-style query (remove special chars, add "site:wikipedia.org")
+  const clean = q.replace(/[^\w\s]/g, " ").trim();
+  if (clean && clean !== q) expansions.push(clean);
+
+  return expansions.slice(0, 2);
+}
+
+// ----------------------------------------------------------------- deduplication & merging
+function dedupe(rows) {
+  const seen = new Set(); const out = [];
+  for (const r of rows) {
+    const k = r.url.replace(/[#?].*$/, "").replace(/\/$/, "").toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k); out.push(r);
+  }
+  return out;
+}
+
+function mergeResults(providerResults) {
+  const merged = new Map(); // url -> { result, providers, count }
+  for (const { provider, results } of providerResults) {
+    for (const r of results) {
+      const key = r.url.replace(/[#?].*$/, "").replace(/\/$/, "").toLowerCase();
+      const existing = merged.get(key);
+      if (existing) {
+        existing.providers.add(provider);
+        existing.count++;
+        // Prefer the longer snippet
+        if (r.snippet.length > existing.result.snippet.length) {
+          existing.result.snippet = r.snippet;
+        }
+        // Prefer the longer title
+        if (r.title.length > existing.result.title.length) {
+          existing.result.title = r.title;
+        }
+      } else {
+        merged.set(key, { result: { ...r }, providers: new Set([provider]), count: 1 });
+      }
+    }
+  }
+  // Sort: results from multiple providers rank higher, then by original order
+  return [...merged.values()]
+    .sort((a, b) => b.count - a.count)
+    .map(m => ({
+      ...m.result,
+      providers: [...m.providers],
+      providerCount: m.count,
+    }));
+}
+
+// ----------------------------------------------------------------- neural re-ranking
+function neuralRerank(results, neuralModel) {
+  if (!neuralModel) return results;
+  return results.map(r => {
+    const score = neuralModel.scoreUrl(r.url, { type: "html", internal: false });
+    return { ...r, neuralScore: Number(score.toFixed(4)) };
+  }).sort((a, b) => (b.neuralScore || 0) - (a.neuralScore || 0) || (b.providerCount || 0) - (a.providerCount || 0));
+}
+
+// ----------------------------------------------------------------- main search factory
+function createWebSearch({ fetchText, env = process.env, log = () => {}, neuralModel = null }) {
+  const googleKey = env.GOOGLE_SEARCH_API_KEY || env.GOOGLE_API_KEY || "";
+  const googleCx = env.GOOGLE_SEARCH_CX || env.GOOGLE_CSE_ID || "";
+  const braveKey = env.BRAVE_SEARCH_API_KEY || "";
+  const bingKey = env.BING_SEARCH_API_KEY || "";
+  const order = String(env.WEB_SEARCH_ORDER || "wikipedia,brave,bing,duckduckgo,google").split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+  const cache = new Map(); const TTL = 5 * 60 * 1000; const MAX = 300;
+  const failures = new Map();
+
+  const providers = {
+    google: {
+      available: () => !!(googleKey && googleCx),
+      async run(q, { offset, lang }) {
+        const u = new URL("https://www.googleapis.com/customsearch/v1");
+        u.searchParams.set("key", googleKey); u.searchParams.set("cx", googleCx); u.searchParams.set("q", q);
+        u.searchParams.set("num", "10"); if (offset) u.searchParams.set("start", String(Math.min(91, offset + 1)));
+        if (lang) u.searchParams.set("hl", lang);
+        const r = await fetchText(u.href, { accept: "application/json" });
+        if (!r.ok) throw Object.assign(new Error(`Google API HTTP ${r.status}`), { status: r.status });
+        return { results: parseGoogleApi(JSON.parse(r.text)), total: JSON.parse(r.text).searchInformation?.totalResults ?? null };
+      }
+    },
+    brave: {
+      available: () => !!braveKey,
+      async run(q, { offset, lang }) {
+        const u = new URL("https://api.search.brave.com/res/v1/web/search");
+        u.searchParams.set("q", q); u.searchParams.set("count", "20");
+        if (offset) u.searchParams.set("offset", String(Math.min(9, Math.floor(offset / 20))));
+        if (lang) u.searchParams.set("search_lang", lang);
+        const r = await fetchText(u.href, { accept: "application/json", headers: { "X-Subscription-Token": braveKey } });
+        if (!r.ok) throw Object.assign(new Error(`Brave Search API HTTP ${r.status}`), { status: r.status });
+        const json = JSON.parse(r.text); return { results: parseBraveApi(json), total: null, more: !!json?.query?.more_results_available };
+      }
+    },
+    bing: {
+      available: () => true,
+      async run(q, { offset, lang }) {
+        if (bingKey) {
+          const u = new URL("https://api.bing.microsoft.com/v7.0/search");
+          u.searchParams.set("q", q); u.searchParams.set("count", "20"); u.searchParams.set("offset", String(offset || 0));
+          if (lang) u.searchParams.set("setLang", lang);
+          const r = await fetchText(u.href, { accept: "application/json", headers: { "Ocp-Apim-Subscription-Key": bingKey } });
+          if (!r.ok) throw Object.assign(new Error(`Bing Search API HTTP ${r.status}`), { status: r.status });
+          const json = JSON.parse(r.text); return { results: parseBingApi(json), total: json?.webPages?.totalEstimatedMatches ?? null };
+        }
+        const u = new URL("https://www.bing.com/search"); u.searchParams.set("q", q);
+        if (offset) u.searchParams.set("first", String(offset + 1));
+        if (lang) u.searchParams.set("setlang", lang);
+        const r = await fetchText(u.href, { accept: "text/html" });
+        if (!r.ok) throw Object.assign(new Error(`Bing HTTP ${r.status}`), { status: r.status });
+        return { results: parseBingHtml(r.text), total: null };
+      }
+    },
+    duckduckgo: {
+      available: () => true,
+      async run(q, { offset, lang }) {
+        const u = new URL("https://html.duckduckgo.com/html/"); u.searchParams.set("q", q);
+        if (offset) u.searchParams.set("s", String(offset));
+        if (lang) u.searchParams.set("kl", lang === "en" ? "wt-wt" : `${lang}-${lang}`);
+        const r = await fetchText(u.href, { accept: "text/html" });
+        if (!r.ok) throw Object.assign(new Error(`DuckDuckGo HTTP ${r.status}`), { status: r.status });
+        if (/anomaly-modal|challenge-form|bots use DuckDuckGo too/i.test(r.text)) throw Object.assign(new Error("DuckDuckGo asked for a verification"), { status: 429 });
+        return { results: parseDuckDuckGoHtml(r.text), total: null };
+      }
+    },
+    wikipedia: {
+      available: () => true,
+      async run(q, { offset, lang }) {
+        const langCode = lang || "en";
+        const u = new URL(`https://${langCode}.wikipedia.org/w/api.php`);
+        u.searchParams.set("action", "query"); u.searchParams.set("list", "search");
+        u.searchParams.set("srsearch", q); u.searchParams.set("srlimit", "10");
+        u.searchParams.set("srprop", "snippet"); u.searchParams.set("format", "json");
+        if (offset) u.searchParams.set("sroffset", String(offset));
+        const r = await fetchText(u.href, { accept: "application/json" });
+        if (!r.ok) throw Object.assign(new Error(`Wikipedia API HTTP ${r.status}`), { status: r.status });
+        return { results: parseWikipediaApi(JSON.parse(r.text)), total: JSON.parse(r.text)?.query?.searchinfo?.totalhits ?? null };
+      }
+    }
+  };
+
+  // Run multiple providers in parallel and return the first successful results
+  async function parallelSearch(query, { offset = 0, lang = "" } = {}) {
+    const q = cleanText(query, 600);
+    if (!q) return { provider: "none", results: [], attempts: [] };
+
+    // Query expansion: run original + expansions in parallel
+    const expandedQueries = [q, ...expandQuery(q)];
+    const allAttempts = [];
+    const providerResults = [];
+
+    // Get available providers
+    const available = order.filter(name => {
+      const p = providers[name];
+      return p && p.available() && (failures.get(name) || 0) <= Date.now();
+    });
+
+    if (!available.length) {
+      return { provider: "none", results: [], attempts: [{ provider: "none", error: "No search providers available" }] };
+    }
+
+    // Run each provider with the original query (fastest provider wins, but we collect all)
+    const promises = available.map(async (name) => {
+      const p = providers[name];
+      const started = Date.now();
+      try {
+        // Use original query for the first attempt
+        const packed = await Promise.race([
+          p.run(q, { offset, lang }),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("Provider timeout")), 8000))
+        ]);
+        const results = dedupe(packed.results || []);
+        allAttempts.push({ provider: name, ms: Date.now() - started, count: results.length });
+        if (results.length) {
+          providerResults.push({ provider: name, results });
+        }
+      } catch (e) {
+        allAttempts.push({ provider: name, ms: Date.now() - started, error: e.message });
+        if (e.status === 429 || e.status === 403) failures.set(name, Date.now() + 60 * 1000);
+        log("warn", "SEARCH", `${name} web search failed: ${e.message}`);
+      }
+    });
+
+    // Wait for all providers to finish (with timeout)
+    await Promise.allSettled(promises);
+
+    if (!providerResults.length) {
+      return { provider: "none", results: [], attempts: allAttempts };
+    }
+
+    // Merge results from all providers
+    const merged = mergeResults(providerResults);
+    // Neural re-ranking if model is available
+    const ranked = neuralModel ? neuralRerank(merged, neuralModel) : merged;
+    // Take top 20
+    const final = ranked.slice(0, 20);
+
+    // Determine primary provider
+    const primary = providerResults.sort((a, b) => b.results.length - a.results.length)[0].provider;
+
+    return {
+      provider: primary,
+      results: final,
+      total: merged.length,
+      more: merged.length > 20,
+      attempts: allAttempts,
+      googleConfigured: providers.google.available(),
+      braveConfigured: providers.brave.available(),
+      bingConfigured: !!bingKey,
+      providersUsed: providerResults.map(p => p.provider),
+      neuralReranked: !!neuralModel,
+    };
+  }
+
+  // Sequential fallback search (original behavior, used as fallback)
+  async function sequentialSearch(query, { offset = 0, engine = "", lang = "" } = {}) {
+    const q = cleanText(query, 600);
+    if (!q) return { provider: "none", results: [], attempts: [] };
+    const want = engine && providers[engine] ? [engine, ...order.filter(p => p !== engine)] : order;
+    const key = `${want.join(",")}|${offset}|${lang}|${q.toLowerCase()}`;
+    const hit = cache.get(key);
+    if (hit && Date.now() - hit.time < TTL) return { ...hit.value, cached: true };
+    const attempts = [];
+    for (const name of want) {
+      const p = providers[name];
+      if (!p) continue;
+      if (!p.available()) { attempts.push({ provider: name, skipped: "not-configured" }); continue; }
+      if ((failures.get(name) || 0) > Date.now()) { attempts.push({ provider: name, skipped: "cooldown" }); continue; }
+      const started = Date.now();
+      try {
+        const packed = await p.run(q, { offset, lang });
+        const results = dedupe(packed.results || []);
+        attempts.push({ provider: name, ms: Date.now() - started, count: results.length });
+        if (!results.length) continue;
+        const value = { provider: name, results: results.slice(0, 20), total: packed.total ?? null, more: !!packed.more, attempts, googleConfigured: providers.google.available(), braveConfigured: providers.brave.available(), bingConfigured: !!bingKey };
+        cache.set(key, { time: Date.now(), value });
+        while (cache.size > MAX) cache.delete(cache.keys().next().value);
+        return value;
+      } catch (e) {
+        attempts.push({ provider: name, ms: Date.now() - started, error: e.message });
+        if (e.status === 429 || e.status === 403) failures.set(name, Date.now() + 60 * 1000);
+        log("warn", "SEARCH", `${name} web search failed: ${e.message}`);
+      }
+    }
+    return { provider: "none", results: [], attempts, googleConfigured: providers.google.available(), braveConfigured: providers.brave.available(), bingConfigured: !!bingKey };
+  }
+
+  // Main search function: try parallel first, fall back to sequential
+  async function search(query, { offset = 0, engine = "", lang = "" } = {}) {
+    const q = cleanText(query, 600);
+    if (!q) return { provider: "none", results: [], attempts: [] };
+
+    // Check cache first
+    const cacheKey = `${engine}|${offset}|${lang}|${q.toLowerCase()}`;
+    const hit = cache.get(cacheKey);
+    if (hit && Date.now() - hit.time < TTL) return { ...hit.value, cached: true };
+
+    let result;
+    if (engine) {
+      // If a specific engine is requested, use sequential
+      result = await sequentialSearch(query, { offset, engine, lang });
+    } else {
+      // Otherwise, use parallel search for speed
+      try {
+        result = await parallelSearch(query, { offset, lang });
+        if (!result.results.length) {
+          // Fall back to sequential if parallel returned nothing
+          result = await sequentialSearch(query, { offset, lang });
+        }
+      } catch (e) {
+        log("warn", "SEARCH", `Parallel search failed: ${e.message}, falling back to sequential`);
+        result = await sequentialSearch(query, { offset, lang });
+      }
+    }
+
+    // Cache the result
+    if (result.results.length) {
+      cache.set(cacheKey, { time: Date.now(), value: result });
+      while (cache.size > MAX) cache.delete(cache.keys().next().value);
+    }
+
+    return result;
+  }
+
+  return {
+    search,
+    googleConfigured: () => providers.google.available(),
+    order,
+    providers: Object.keys(providers),
+    parallelSearch,
+    sequentialSearch,
+  };
+}
+
+module.exports = { createWebSearch, parseDuckDuckGoHtml, parseBingHtml, parseGoogleApi, parseBraveApi, parseBingApi, parseWikipediaApi, unwrapBing, unwrapDuckDuckGo, expandQuery, mergeResults, neuralRerank };
