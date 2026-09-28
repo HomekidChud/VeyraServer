@@ -18,6 +18,8 @@ const { SessionManager } = require("./session-manager");
 const { AuthStore } = require("./auth");
 const { WorkerPool } = require("./worker-pool");
 const { MongoStore } = require("./mongo-store");
+const youtubeCompat = require("./youtube");
+const mediaErrors = require("./media-errors");
 const { isMainThread } = require("worker_threads");
 // parse-worker.js loads this file inside worker threads to reuse the pure
 // rewrite / discovery functions. In that mode nothing long-lived is started.
@@ -3123,9 +3125,43 @@ function browserCapabilitySignals(html = "", headers = {}) {
   return { scriptCount, moduleCount, fetchSignals, spa, shellSignals, heavy, contentType: headers['content-type'] || headers['Content-Type'] || '' };
 }
 
+// Small helper for calling a fixed, trusted, official host (never a
+// user-supplied destination) with a bounded timeout. Not routed through the
+// general proxy fetch path because it never touches arbitrary/user URLs, so
+// the SSRF checks that matter for proxied destinations don't apply here.
+async function fetchOfficialJson(url, { timeoutMs = 6000 } = {}) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await undiciFetch(url, { signal: controller.signal, headers: { accept: "application/json" } });
+    return res;
+  } finally { clearTimeout(t); }
+}
+
 app.post('/api/browser/capability', async (req, res) => {
   const raw = normalizeUrl(String(req.body?.url || ''));
   if (!raw) return respondError(res, 400, 'Invalid URL.', 'INVALID_URL');
+
+  // YouTube gets a dedicated, instant path: parsing the URL tells us
+  // everything we need (no point fetching/scoring the HTML shell first).
+  // See backend/youtube.js — this never inspects or serves googlevideo
+  // media, only decides between OFFICIAL_EMBED and BROWSER_ENGINE.
+  if (youtubeCompat.isYoutubeUrl(raw)) {
+    const parsed = youtubeCompat.parseYoutubeUrl(raw);
+    if (parsed) {
+      return res.json({
+        ok: true,
+        url: raw,
+        mode: 'OFFICIAL_EMBED',
+        lean: CFG.leanMode,
+        youtube: { videoId: parsed.videoId, kind: parsed.kind, embedUrl: youtubeCompat.buildEmbedUrl(parsed, req.get('origin') || undefined) },
+      });
+    }
+    // youtube.com/youtu.be URL we couldn't extract a video ID from (e.g. the
+    // homepage, a channel page, /results search page): treat like any other
+    // JS-heavy page rather than guessing at a player.
+  }
+
   try {
     await assertPublicUrl(raw);
     const result = await fetchCached(raw, { accept: 'text/html,application/xhtml+xml', limit: Math.min(CFG.maxProxyTextBytes, 1024 * 1024), timeout: CFG.requestTimeoutMs, retries: 0, referrer: '' });
@@ -3139,6 +3175,27 @@ app.post('/api/browser/capability', async (req, res) => {
   } catch (e) {
     res.json({ ok: true, url: raw, mode: CFG.leanMode ? 'ACCELERATED_PROXY' : 'BROWSER_ENGINE', lean: CFG.leanMode, reason: 'capability_probe_failed', error: e.message });
   }
+});
+
+// Explicit embeddability check via YouTube's own public oEmbed endpoint.
+// Used before committing to OFFICIAL_EMBED so a genuinely embed-disabled
+// video reports YOUTUBE_EMBED_DISABLED instead of showing a blank/broken
+// player and retrying forever.
+app.post('/api/youtube/resolve', async (req, res) => {
+  const raw = normalizeUrl(String(req.body?.url || ''));
+  if (!raw || !youtubeCompat.isYoutubeUrl(raw)) return respondError(res, 400, 'Not a YouTube URL.', 'INVALID_URL');
+  const parsed = youtubeCompat.parseYoutubeUrl(raw);
+  if (!parsed) return respondError(res, 400, 'No playable video ID found in this URL.', 'YOUTUBE_NO_VIDEO_ID');
+  const check = await youtubeCompat.checkEmbeddable(parsed.videoId, fetchOfficialJson);
+  if (!check.ok) return res.json({ ok: false, code: check.code, videoId: parsed.videoId });
+  res.json({
+    ok: true,
+    videoId: parsed.videoId,
+    title: check.title,
+    authorName: check.authorName,
+    thumbnailUrl: check.thumbnailUrl,
+    embedUrl: youtubeCompat.buildEmbedUrl(parsed, req.get('origin') || undefined),
+  });
 });
 
 const vpnErrStatus = code => ({ VPN_DISABLED: 503, VPN_NOT_CONFIGURED: 404, VPN_ALL_DOWN: 503, VPN_KILL_SWITCH: 503, VPN_TEST_FAILED: 502, VPN_NOT_CONNECTED: 409 })[code] || 400;

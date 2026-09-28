@@ -11,7 +11,8 @@
     "dev": "node --watch server.js",
     "config": "node config.js",
     "test:static": "node tests/e2e-hardening-static.mjs",
-    "test:youtube-compat": "node tests/youtube-compat-static.mjs"
+    "test:youtube-compat": "node tests/youtube-compat-static.mjs",
+    "test:youtube-media-errors": "node tests/youtube-and-media-errors.mjs"
   },
   "engines": {
     "node": ">=20"
