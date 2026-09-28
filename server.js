@@ -1210,6 +1210,20 @@ async function fetchBuffer(url, opts = {}) {
   }
   throw new Error("Too many redirects.");
 }
+// API-first web search. HTML scraping remains only as a fallback for Bing/DDG
+// when an official API key is not configured; it is never used for Google.
+const webSearch = createWebSearch({
+  fetchText: async (url, opts = {}) => {
+    const r = await fetchBuffer(url, {
+      headers: opts.headers || {}, accept: opts.accept || "application/json", timeout: 12000,
+      retries: 1, limit: 2 * 1024 * 1024
+    });
+    return { ok: r.ok, status: r.status, text: r.body.toString("utf8"), finalUrl: r.finalUrl };
+  },
+  env: process.env,
+  log: (level, source, message) => serverLog(level, source, message)
+});
+
 function cacheGet(map, key, ttl) {
   const item = map.get(key);
   if (!item) return null;
@@ -1523,8 +1537,8 @@ function challengeFallbackHtml(url, info, sid = "") {
     ["Bing", `https://www.bing.com/search?q=${encodeURIComponent(query)}`],
     ["Brave Search", `https://search.brave.com/search?q=${encodeURIComponent(query)}`],
     ["DuckDuckGo", `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`]
-  ].map(([n, h]) => `<a class="secondary" href="${escapeHtml(makeViewUrl(h, sid))}">Search “${escapeHtml(query)}” on ${n}</a>`).join("") : "";
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#10151d;color:#eaf0f6;font:15px/1.5 system-ui,sans-serif}.card{max-width:650px;margin:24px;padding:32px;background:#171e28;border:1px solid #303a48;border-radius:18px;box-shadow:0 20px 60px #0008}.ey{font-size:11px;letter-spacing:.15em;text-transform:uppercase;color:#86a9d5}.card h1{font-size:26px;margin:10px 0}.card p{color:#aab5c4}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px}.actions a{display:inline-block;padding:10px 15px;border-radius:9px;text-decoration:none}.primary{background:#4b82c9;color:#fff}.secondary{border:1px solid #3a4657;color:#dce5ef}.secondary:hover{background:#1f2835}</style></head><body><main class="card"><div class="ey">Veyra Browser</div><h1>${escapeHtml(title)}</h1><p>${why}</p><div class="actions"><a class="primary" href="#" id="veyraChromium">Verify in real Chromium</a>${alt}<a class="secondary" href="${safe}" target="_blank" rel="noopener noreferrer">Open directly in a new tab</a><a class="secondary" href="${escapeHtml(makeViewUrl(url, sid))}">Retry through Veyra</a></div><p style="font-size:13px;margin-top:18px">Chromium shows the site's own check so <b>you</b> can complete it. Veyra never solves or bypasses it for you.</p></main><script>(function(){var m={type:"veyra:challenge",url:${JSON.stringify(String(url)).replace(/</g, "\\u003c")},kind:${JSON.stringify(String(info?.type || "verification"))},auto:${process.env.CHALLENGE_AUTO_HANDOFF == null ? "true" : /^(1|true|yes|on)$/i.test(String(process.env.CHALLENGE_AUTO_HANDOFF)) ? "true" : "false"}};try{if(parent!==window)parent.postMessage(m,"*")}catch(e){}var b=document.getElementById("veyraChromium");if(b)b.onclick=function(e){e.preventDefault();m.auto=false;m.manual=true;try{parent.postMessage(m,"*")}catch(x){}}})();</script></body></html>`;
+  ].map(([n, h]) => `<a class="secondary" href="${escapeHtml(h)}" target="_blank" rel="noopener noreferrer">Open “${escapeHtml(query)}” on ${n}</a>`).join("") : "";
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#10151d;color:#eaf0f6;font:15px/1.5 system-ui,sans-serif}.card{max-width:650px;margin:24px;padding:32px;background:#171e28;border:1px solid #303a48;border-radius:18px;box-shadow:0 20px 60px #0008}.ey{font-size:11px;letter-spacing:.15em;text-transform:uppercase;color:#86a9d5}.card h1{font-size:26px;margin:10px 0}.card p{color:#aab5c4}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px}.actions a{display:inline-block;padding:10px 15px;border-radius:9px;text-decoration:none}.primary{background:#4b82c9;color:#fff}.secondary{border:1px solid #3a4657;color:#dce5ef}.secondary:hover{background:#1f2835}</style></head><body><main class="card"><div class="ey">Veyra Browser</div><h1>${escapeHtml(title)}</h1><p>${why}</p><div class="actions"><a class="primary" href="#" id="veyraChromium">Verify in real Chromium</a>${alt}<a class="secondary" href="${safe}" target="_blank" rel="noopener noreferrer">Open directly in a new tab</a><a class="secondary" href="${escapeHtml(makeViewUrl(url, sid))}">Retry through Veyra</a></div><p style="font-size:13px;margin-top:18px">Chromium shows the site's own check so <b>you</b> can complete it. Veyra does not solve, evade, or weaken CAPTCHA/anti-bot checks.</p></main><script>(function(){var m={type:"veyra:challenge",url:${JSON.stringify(String(url)).replace(/</g, "\\u003c")},kind:${JSON.stringify(String(info?.type || "verification"))},auto:${process.env.CHALLENGE_AUTO_HANDOFF == null ? "true" : /^(1|true|yes|on)$/i.test(String(process.env.CHALLENGE_AUTO_HANDOFF)) ? "true" : "false"}};try{if(parent!==window)parent.postMessage(m,"*")}catch(e){}var b=document.getElementById("veyraChromium");if(b)b.onclick=function(e){e.preventDefault();m.auto=false;m.manual=true;try{parent.postMessage(m,"*")}catch(x){}}})();</script></body></html>`;
 }
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m])); }
 
@@ -3470,6 +3484,128 @@ app.put('/api/config', (req, res) => {
     const preview = veyraConfigModule.publicSummary(veyraConfigModule.loadConfig());
     res.json({ ok: true, saved: true, renderYamlUpdated: yaml, validation, preview, note: 'Saved. `npm run dev` restarts automatically; otherwise restart the server. On Render, commit + push to redeploy.' });
   } catch (e) { respondError(res, 400, e.message, e.code || 'CONFIG_SAVE_FAILED', { validation: e.validation }); }
+});
+
+function requireLiveProxySession(sid) {
+  const id = String(sid || "");
+  if (!id) throw Object.assign(new Error("A Veyra session is required for a Chromium tab."), { code: "SESSION_REQUIRED", status: 400 });
+  if (sessionManager.checkLimit(id)) throw Object.assign(new Error("This Veyra session reached its time limit and was deleted."), { code: "SESSION_EXPIRED", status: 410 });
+  const rec = sessionManager.peek(id);
+  if (!rec) throw Object.assign(new Error("Veyra session not found. Start a new session."), { code: "SESSION_NOT_FOUND", status: 404 });
+  sessionManager.touch(id);
+  return rec;
+}
+
+async function browserVpnProfileForSession(sid) {
+  const id = String(sid || "");
+  if (!id || !vpnManager?.playwrightProxy) return null;
+  const proxy = await vpnManager.playwrightProxy(id).catch(() => undefined);
+  if (!proxy) return null;
+  return {
+    id: vpnManager.profileForSession?.(id)?.id || null,
+    proxy,
+    contextHints: vpnManager.browserContextHints?.(id) || {}
+  };
+}
+
+function browserSessionOrThrow(browserSid) {
+  const s = browserEngine.sessions.get(String(browserSid || ""));
+  if (!s) throw Object.assign(new Error("Browser session not found."), { code: "BROWSER_SESSION_NOT_FOUND", status: 404 });
+  if (s.proxySessionId) requireLiveProxySession(s.proxySessionId);
+  return s;
+}
+
+app.post('/api/browser/session', async (req, res) => {
+  if (!CFG.browserEnabled) return respondError(res, 503, "Chromium browsing is disabled on this server.", "BROWSER_ENGINE_UNAVAILABLE");
+  try {
+    const proxySessionId = String(req.body?.proxySessionId || req.body?.sessionId || "");
+    requireLiveProxySession(proxySessionId);
+    const url = normalizeUrl(String(req.body?.url || ""));
+    if (!url) return respondError(res, 400, "Invalid browser URL.", "INVALID_URL");
+    await assertPublicUrl(url);
+    const tabId = String(req.body?.tabId || "");
+    const jobId = String(req.body?.jobId || "");
+    const vpnProfile = await browserVpnProfileForSession(proxySessionId);
+    const session = await browserEngine.create(tabId, url, jobId, vpnProfile, { proxySessionId, fastStart: !!req.body?.fastStart });
+    sessionManager.linkBrowser(proxySessionId, session.id);
+    res.status(201).json({ ok: true, session });
+  } catch (e) {
+    const status = e.status || (e.code === "BROWSER_CAPACITY" ? 429 : e.code === "SESSION_EXPIRED" ? 410 : 502);
+    respondError(res, status, e.message, e.code || "BROWSER_CREATE_FAILED");
+  }
+});
+
+app.get('/api/browser/session/:sid', (req, res) => {
+  try { const s = browserSessionOrThrow(req.params.sid); res.json({ ok: true, session: browserEngine.public(s) }); }
+  catch (e) { respondError(res, e.status || 404, e.message, e.code || "BROWSER_SESSION_NOT_FOUND"); }
+});
+app.post('/api/browser/session/:sid/navigate', async (req, res) => {
+  try {
+    const s = browserSessionOrThrow(req.params.sid);
+    const url = normalizeUrl(String(req.body?.url || ""));
+    if (!url) throw Object.assign(new Error("Invalid browser URL."), { code: "INVALID_URL", status: 400 });
+    await browserEngine.navigateSession(s, url, { fast: !!req.body?.fastStart });
+    res.json({ ok: true, session: browserEngine.public(s) });
+  } catch (e) { respondError(res, e.status || 502, e.message, e.code || "BROWSER_NAVIGATION_ERROR"); }
+});
+app.post('/api/browser/session/:sid/input', async (req, res) => {
+  try { browserSessionOrThrow(req.params.sid); const session = await browserEngine.input(req.params.sid, req.body || {}); res.json({ ok: true, session }); }
+  catch (e) { respondError(res, e.status || 502, e.message, e.code || "BROWSER_INPUT_ERROR"); }
+});
+app.post('/api/browser/session/:sid/history', async (req, res) => {
+  try { browserSessionOrThrow(req.params.sid); const session = await browserEngine.history(req.params.sid, String(req.body?.direction || "reload")); res.json({ ok: true, session }); }
+  catch (e) { respondError(res, e.status || 502, e.message, e.code || "BROWSER_HISTORY_ERROR"); }
+});
+app.post('/api/browser/session/:sid/stop', async (req, res) => {
+  try { browserSessionOrThrow(req.params.sid); const session = await browserEngine.stopNavigation(req.params.sid); res.json({ ok: true, session }); }
+  catch (e) { respondError(res, e.status || 502, e.message, e.code || "BROWSER_STOP_ERROR"); }
+});
+app.delete('/api/browser/session/:sid', async (req, res) => {
+  try {
+    const s = browserSessionOrThrow(req.params.sid);
+    const owner = s.proxySessionId;
+    const result = await browserEngine.stop(req.params.sid);
+    if (owner) sessionManager.unlinkBrowser(owner, req.params.sid);
+    res.json(result);
+  } catch (e) { respondError(res, e.status || 404, e.message, e.code || "BROWSER_STOP_ERROR"); }
+});
+app.get('/api/browser/session/:sid/screenshot', async (req, res) => {
+  try { browserSessionOrThrow(req.params.sid); const image = await browserEngine.screenshot(req.params.sid); if (!image) return res.status(503).type('text/plain').send('Chromium screenshot unavailable.'); res.setHeader('Cache-Control', 'no-store'); res.type('png').send(image); }
+  catch (e) { respondError(res, e.status || 404, e.message, e.code || "BROWSER_SCREENSHOT_ERROR"); }
+});
+
+// Local Veyra index search.
+app.get('/api/search', (req, res) => {
+  try {
+    const query = String(req.query.q || "").trim().slice(0, CFG.maxSearchQueryChars);
+    const offset = Math.max(0, Number(req.query.offset || 0) || 0);
+    const limit = Math.min(CFG.maxSearchResults, Math.max(1, Number(req.query.limit || 10) || 10));
+    const started = Date.now();
+    const result = localSearch(query, offset, limit);
+    res.json({ ok: true, ...result, provider: "veyra-index", responseTimeMs: Date.now() - started });
+  } catch (e) { respondError(res, 500, e.message, "SEARCH_ERROR"); }
+});
+app.get('/api/search/stats', (req, res) => res.json({ ok: true, ...searchIndexStats() }));
+app.get('/api/search/suggest', (req, res) => {
+  const q = String(req.query.q || "").trim().slice(0, CFG.maxSearchQueryChars);
+  const limit = Math.min(12, Math.max(1, Number(req.query.limit || 8) || 8));
+  res.json({ ok: true, suggestions: localSearchSuggestions(q, limit) });
+});
+app.get('/api/search/web', async (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim().slice(0, 600);
+    if (!q) return res.json({ ok: true, provider: "none", results: [], attempts: [], responseTimeMs: 0 });
+    const engine = String(req.query.engine || "").trim().toLowerCase();
+    const validEngine = new Set(["google", "brave", "bing", "duckduckgo", ""]);
+    const selected = validEngine.has(engine) ? engine : "";
+    const offset = Math.max(0, Number(req.query.offset || 0) || 0);
+    const lang = String(req.query.lang || "en").slice(0, 16);
+    const started = Date.now();
+    const result = await webSearch.search(q, { offset, engine: selected, lang });
+    res.json({ ok: true, ...result, source: "web", responseTimeMs: Date.now() - started });
+  } catch (e) {
+    respondError(res, 502, `Veyra web search failed: ${e.message}`, "SEARCH_WEB_ERROR");
+  }
 });
 
 app.get('/api/browser/status', (req, res) => res.json({ ok: true, ...browserEngine.status(), config: { backend: CFG.browserBackend, enabled: CFG.browserEnabled, headless: CFG.browserHeadless, maxSessions: CFG.maxBrowserSessions, maxPages: CFG.maxBrowserPages, maxContexts: CFG.maxBrowserContexts } }));

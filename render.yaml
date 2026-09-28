@@ -1,4 +1,4 @@
-# Veyra 8.17.1
+# Veyra 8.17.2
 services:
   - type: web
     name: VeyraServer
@@ -28,11 +28,18 @@ services:
       # 8.16: Veyra Shield level (low | medium | high | under_attack).
       - key: SHIELD_LEVEL
         value: medium
-      # 8.16: optional Google results via the official Custom Search JSON API.
+      # 8.17.2: web search is API-first so normal results do not depend on
+      # search-engine HTML pages that may challenge a cloud IP.
+      - key: BRAVE_SEARCH_API_KEY
+        sync: false
+      - key: BING_SEARCH_API_KEY
+        sync: false
       - key: GOOGLE_SEARCH_API_KEY
         sync: false
       - key: GOOGLE_SEARCH_CX
         sync: false
+      - key: WEB_SEARCH_ORDER
+        value: brave,bing,duckduckgo,google
       - key: MONGODB_DB
         value: veyra
       - key: MONGODB_MAX_POOL_SIZE
@@ -42,7 +49,7 @@ services:
       # Safe warm-up cap: media is never downloaded by the warm phase.
       - key: PROXY_WARM_MAX_BINARY_BYTES
         value: "786432"
-      # 8.17.1 Free-plan compatibility and stability guardrails (keep proxy-first and prevent browser/crawler contention).
+           # 8.17.2 Free-plan compatibility and stability guardrails (keep proxy-first and prevent browser/crawler contention).
       - key: CRAWLER_PAGE_HARD_MS
         value: "5000"
       - key: PROXY_WARM_HARD_MS

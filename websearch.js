@@ -1,12 +1,8 @@
 "use strict";
-// Web search providers for Veyra's built-in results page.
-//
-// Google no longer serves result HTML to clients without JavaScript, and its
-// result pages must not be machine-parsed. Google results are therefore
-// supported the official way — the Programmable Search (Custom Search JSON)
-// API when GOOGLE_SEARCH_API_KEY + GOOGLE_SEARCH_CX are set — and the frontend
-// can always open google.com itself in the real Chromium engine. Without keys
-// the page falls back to providers that publish no-JS HTML endpoints.
+// Veyra web-search providers.
+// Search-engine HTML is treated only as a last-resort fallback. Preferred
+// providers use their official APIs so a datacenter IP never has to solve a
+// search-engine CAPTCHA just to return normal results.
 
 const cheerio = require("cheerio");
 
@@ -17,7 +13,7 @@ function safeHttpUrl(raw) {
 function displayUrl(u) { try { const x = new URL(u); return (x.hostname.replace(/^www\./, "") + (x.pathname === "/" ? "" : x.pathname)).slice(0, 120); } catch { return u; } }
 function row(url, title, snippet, source) {
   const href = safeHttpUrl(url); if (!href || !title) return null;
-  return { url: href, title: cleanText(title, 300), snippet: cleanText(snippet, 500), displayUrl: displayUrl(href), source };
+  return { url: href, title: cleanText(title, 300), snippet: cleanText(snippet, 700), displayUrl: displayUrl(href), source };
 }
 
 function unwrapDuckDuckGo(href) {
@@ -68,6 +64,14 @@ function parseGoogleApi(json) {
   const items = Array.isArray(json?.items) ? json.items : [];
   return items.map(i => row(i.link, i.title, i.snippet, "google")).filter(Boolean);
 }
+function parseBraveApi(json) {
+  const items = Array.isArray(json?.web?.results) ? json.web.results : [];
+  return items.map(i => row(i.url, i.title, i.description || i.snippet, "brave")).filter(Boolean);
+}
+function parseBingApi(json) {
+  const items = Array.isArray(json?.webPages?.value) ? json.webPages.value : [];
+  return items.map(i => row(i.url, i.name || i.title, i.snippet, "bing")).filter(Boolean);
+}
 
 function dedupe(rows) {
   const seen = new Set(); const out = [];
@@ -79,9 +83,11 @@ function dedupe(rows) {
 function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
   const googleKey = env.GOOGLE_SEARCH_API_KEY || env.GOOGLE_API_KEY || "";
   const googleCx = env.GOOGLE_SEARCH_CX || env.GOOGLE_CSE_ID || "";
-  const order = String(env.WEB_SEARCH_ORDER || "google,duckduckgo,bing").split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+  const braveKey = env.BRAVE_SEARCH_API_KEY || "";
+  const bingKey = env.BING_SEARCH_API_KEY || "";
+  const order = String(env.WEB_SEARCH_ORDER || "brave,bing,duckduckgo,google").split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
   const cache = new Map(); const TTL = 5 * 60 * 1000; const MAX = 200;
-  const failures = new Map(); // provider -> cooldown-until (blocked / captcha)
+  const failures = new Map();
 
   const providers = {
     google: {
@@ -93,7 +99,40 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
         if (lang) u.searchParams.set("hl", lang);
         const r = await fetchText(u.href, { accept: "application/json" });
         if (!r.ok) throw Object.assign(new Error(`Google API HTTP ${r.status}`), { status: r.status });
-        return parseGoogleApi(JSON.parse(r.text));
+        return { results: parseGoogleApi(JSON.parse(r.text)), total: JSON.parse(r.text).searchInformation?.totalResults ?? null };
+      }
+    },
+    brave: {
+      available: () => !!braveKey,
+      async run(q, { offset, lang }) {
+        const u = new URL("https://api.search.brave.com/res/v1/web/search");
+        u.searchParams.set("q", q); u.searchParams.set("count", "20");
+        if (offset) u.searchParams.set("offset", String(Math.min(9, Math.floor(offset / 20))));
+        if (lang) u.searchParams.set("search_lang", lang);
+        const r = await fetchText(u.href, { accept: "application/json", headers: { "X-Subscription-Token": braveKey } });
+        if (!r.ok) throw Object.assign(new Error(`Brave Search API HTTP ${r.status}`), { status: r.status });
+        const json = JSON.parse(r.text); return { results: parseBraveApi(json), total: null, more: !!json?.query?.more_results_available };
+      }
+    },
+    bing: {
+      // Prefer the official Bing API when a key is available. Without one,
+      // the HTML endpoint is retained as a non-guaranteed fallback.
+      available: () => true,
+      async run(q, { offset, lang }) {
+        if (bingKey) {
+          const u = new URL("https://api.bing.microsoft.com/v7.0/search");
+          u.searchParams.set("q", q); u.searchParams.set("count", "20"); u.searchParams.set("offset", String(offset || 0));
+          if (lang) u.searchParams.set("setLang", lang);
+          const r = await fetchText(u.href, { accept: "application/json", headers: { "Ocp-Apim-Subscription-Key": bingKey } });
+          if (!r.ok) throw Object.assign(new Error(`Bing Search API HTTP ${r.status}`), { status: r.status });
+          const json = JSON.parse(r.text); return { results: parseBingApi(json), total: json?.webPages?.totalEstimatedMatches ?? null };
+        }
+        const u = new URL("https://www.bing.com/search"); u.searchParams.set("q", q);
+        if (offset) u.searchParams.set("first", String(offset + 1));
+        if (lang) u.searchParams.set("setlang", lang);
+        const r = await fetchText(u.href, { accept: "text/html" });
+        if (!r.ok) throw Object.assign(new Error(`Bing HTTP ${r.status}`), { status: r.status });
+        return { results: parseBingHtml(r.text), total: null };
       }
     },
     duckduckgo: {
@@ -105,24 +144,13 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
         const r = await fetchText(u.href, { accept: "text/html" });
         if (!r.ok) throw Object.assign(new Error(`DuckDuckGo HTTP ${r.status}`), { status: r.status });
         if (/anomaly-modal|challenge-form|bots use DuckDuckGo too/i.test(r.text)) throw Object.assign(new Error("DuckDuckGo asked for a verification"), { status: 429 });
-        return parseDuckDuckGoHtml(r.text);
-      }
-    },
-    bing: {
-      available: () => true,
-      async run(q, { offset, lang }) {
-        const u = new URL("https://www.bing.com/search"); u.searchParams.set("q", q);
-        if (offset) u.searchParams.set("first", String(offset + 1));
-        if (lang) u.searchParams.set("setlang", lang);
-        const r = await fetchText(u.href, { accept: "text/html" });
-        if (!r.ok) throw Object.assign(new Error(`Bing HTTP ${r.status}`), { status: r.status });
-        return parseBingHtml(r.text);
+        return { results: parseDuckDuckGoHtml(r.text), total: null };
       }
     }
   };
 
   async function search(query, { offset = 0, engine = "", lang = "" } = {}) {
-    const q = cleanText(query, 256);
+    const q = cleanText(query, 600);
     if (!q) return { provider: "none", results: [], attempts: [] };
     const want = engine && providers[engine] ? [engine, ...order.filter(p => p !== engine)] : order;
     const key = `${want.join(",")}|${offset}|${lang}|${q.toLowerCase()}`;
@@ -136,22 +164,23 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       if ((failures.get(name) || 0) > Date.now()) { attempts.push({ provider: name, skipped: "cooldown" }); continue; }
       const started = Date.now();
       try {
-        const results = dedupe(await p.run(q, { offset, lang }));
+        const packed = await p.run(q, { offset, lang });
+        const results = dedupe(packed.results || []);
         attempts.push({ provider: name, ms: Date.now() - started, count: results.length });
         if (!results.length) continue;
-        const value = { provider: name, results: results.slice(0, 20), attempts, googleConfigured: providers.google.available() };
+        const value = { provider: name, results: results.slice(0, 20), total: packed.total ?? null, more: !!packed.more, attempts, googleConfigured: providers.google.available(), braveConfigured: providers.brave.available(), bingConfigured: !!bingKey };
         cache.set(key, { time: Date.now(), value });
         while (cache.size > MAX) cache.delete(cache.keys().next().value);
         return value;
       } catch (e) {
         attempts.push({ provider: name, ms: Date.now() - started, error: e.message });
-        if (e.status === 429 || e.status === 403) failures.set(name, Date.now() + 5 * 60 * 1000);
+        if (e.status === 429 || e.status === 403) failures.set(name, Date.now() + 60 * 1000);
         log("warn", "SEARCH", `${name} web search failed: ${e.message}`);
       }
     }
-    return { provider: "none", results: [], attempts, googleConfigured: providers.google.available() };
+    return { provider: "none", results: [], attempts, googleConfigured: providers.google.available(), braveConfigured: providers.brave.available(), bingConfigured: !!bingKey };
   }
   return { search, googleConfigured: () => providers.google.available(), order };
 }
 
-module.exports = { createWebSearch, parseDuckDuckGoHtml, parseBingHtml, parseGoogleApi, unwrapBing, unwrapDuckDuckGo };
+module.exports = { createWebSearch, parseDuckDuckGoHtml, parseBingHtml, parseGoogleApi, parseBraveApi, parseBingApi, unwrapBing, unwrapDuckDuckGo };
