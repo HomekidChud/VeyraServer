@@ -333,10 +333,21 @@ class BrowserEngine {
       // JavaScript-heavy application to finish every subresource. We then give
       // the page short best-effort paint windows. This avoids 30s dead waits on
       // sites such as YouTube while still capturing a useful interactive page.
-      const response = await session.page.goto(url, {
-        waitUntil: 'commit',
-        timeout: this.cfg.browserNavigationTimeoutMs
-      });
+      let response;
+      try {
+        response = await session.page.goto(url, {
+          waitUntil: 'commit',
+          timeout: this.cfg.browserNavigationTimeoutMs
+        });
+      } catch (gotoError) {
+        // Some React/Next-style sites immediately replace the document while the
+        // initial navigation is committing. Playwright may surface that race as
+        // net::ERR_ABORTED even though the browser is already on the real page.
+        // Treat it as recoverable when a non-blank document is now present.
+        const current = safeUrl(session.page.url());
+        if (!/ERR_ABORTED/i.test(String(gotoError?.message || '')) || !current || current === 'about:blank') throw gotoError;
+        this.pushConsole(session, 'info', `Navigation reported ERR_ABORTED after document handoff; continuing with ${sanitizeUrl(current)}`);
+      }
       await session.page.waitForLoadState('domcontentloaded', { timeout: Math.min(8000, this.cfg.browserPageTimeoutMs) }).catch(() => {});
       await session.page.waitForLoadState('load', { timeout: options.fast ? 1800 : Math.min(4000, this.cfg.browserPageTimeoutMs) }).catch(() => {});
       session.canonicalUrl = safeUrl(session.page.url()) || url;

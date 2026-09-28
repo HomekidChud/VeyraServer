@@ -67,3 +67,5 @@ services:
       # Let users complete site-owned security checks in the real Chromium fallback.
       - key: CHALLENGE_AUTO_HANDOFF
         value: "true"
+      - key: BROWSER_EVICT_MIN_IDLE_MS
+        value: "15000"
