@@ -26,6 +26,7 @@ const { ChallengeSolver } = require("./challenge-solver");
 const { CastServer, InternetConnectionManager } = require("./cast-server");
 const { AIAnswerEngine } = require("./ai-answer");
 const { RenewingManager } = require("./renewing-system");
+const fullPage = require("./full-page.js");
 // parse-worker.js loads this file inside worker threads to reuse the pure
 // rewrite / discovery functions. In that mode nothing long-lived is started.
 const IS_THREAD_WORKER = !isMainThread && process.env.VEYRA_THREAD_WORKER === "1";
@@ -2946,7 +2947,7 @@ class CooperativeRobotPool {
       if (this.job.pageAccelerator && this.job.pageAcceleratorHardDeadlineAt && Date.now() >= this.job.pageAcceleratorHardDeadlineAt) {
         this.job.fastPhaseComplete = true;
         this.job.stopRequested = true;
-        this.job.stopReason = "page-warm-deadline";
+        this.job.stopReason = "page-accelerator-budget";
         this.job.warmDeadlineAt = 0;
         try { this.job.controller.abort(); } catch {}
         this.job.statusText = "Page accelerator time budget reached; stopping background work.";
@@ -2958,13 +2959,16 @@ class CooperativeRobotPool {
         this.job.warmDeadlineAt = 0;
         if (!this.job.pageAcceleratorHardDeadlineAt || Date.now() >= this.job.pageAcceleratorHardDeadlineAt) {
           this.job.stopRequested = true;
-          this.job.stopReason = "page-warm-deadline";
+          this.job.stopReason = "page-accelerator-budget";
           try { this.job.controller.abort(); } catch {}
           this.job.statusText = "Page accelerator time budget reached; stopping background work.";
           this.event("page-accelerator-stopped", { warmMs: CFG.crawlerPageWarmMs, hardMs: CFG.crawlerPageHardMs });
           break;
         }
-        this.job.statusText = "Critical page resources warmed; finishing only in-flight requests…";
+        // Critical phase done, but the accelerator keeps warming the remaining
+        // required assets in the background until the hard budget — the crawler
+        // still collects the FULL page instead of stopping at first paint.
+        this.job.statusText = "Critical page resources warmed; finishing required assets in the background";
       }
       if (!this.job.robotsReady) { await sleep(5); continue; }
       if (this.job.counts.bytesScanned >= CFG.maxScanBytes) { this.job.stopRequested = true; this.job.stopReason = "scan-byte-limit"; break; }
@@ -3010,7 +3014,7 @@ async function runCrawl(job) {
     if (job.status === "challenge") job.statusText = "Security verification required; crawl stopped.";
     else if (job.stopRequested && job.stopReason === "scan-byte-limit") { job.status = "done"; job.statusText = `Scan budget reached (${bytesLabel(CFG.maxScanBytes)}).`; }
     else if (job.stopRequested && job.stopReason === "resource-limit") { job.status = "done"; job.statusText = `Resource safety limit reached (${CFG.maxResources.toLocaleString()}).`; }
-    else if (job.pageAccelerator && job.stopReason === "page-warm-deadline") { job.status = "done"; job.statusText = `Page accelerator budget reached — ${job.processed.toLocaleString()} resources processed.`; }
+    else if (job.pageAccelerator && job.stopReason === "page-accelerator-budget") { job.status = "done"; job.statusText = `Page accelerator budget reached — ${job.processed.toLocaleString()} resources processed.`; }
     else if (job.pageAccelerator && job.fastPhaseComplete) { job.status = "done"; job.statusText = `Required page assets finished — ${job.processed.toLocaleString()} resources scanned.`; }
     else if (job.stopRequested && job.stopReason === "abandoned") { job.status = "stopped"; job.statusText = "Stopped automatically — nobody has checked this crawl for a while (CRAWL_ABANDON_MS)."; }
     else if (job.stopRequested && job.stopReason === "shutdown") { job.status = "stopped"; job.statusText = "Stopped — server is shutting down."; }
@@ -3235,10 +3239,15 @@ app.post('/api/browser/capability', async (req, res) => {
     // still request BROWSER_ENGINE so the frontend can try Chromium when capacity allows.
     const lean = CFG.leanMode && !CFG.leanAutoBrowser;
     const forceBrowser = hostNeedsRealBrowser(result.finalUrl || raw) || signals.gameOrRemoteBrowser;
+    // Full-page fast proxy: when the page's own embedded state (Next.js
+    // __NEXT_DATA__/RSC flight, Nuxt, Redux/Apollo state, JSON-LD, …) is enough
+    // for the proxy to deliver the full page, never escalate to Chromium —
+    // Chromium stays reserved for pages with no extractable state.
+    signals.fullPage = fullPage.hasFullPageState(result.body?.toString('utf8') || '');
     let mode = 'FAST_PROXY';
     if (challenge || forceBrowser) mode = 'BROWSER_ENGINE';
-    else if (signals.heavy) mode = lean ? 'ACCELERATED_PROXY' : 'BROWSER_ENGINE';
-    res.json({ ok: true, url: result.finalUrl || raw, mode, lean: CFG.leanMode, challenge: challenge ? challenge.type : null, forceBrowser: !!forceBrowser, signals, status: result.status, contentType: result.contentType });
+    else if (signals.heavy) mode = (lean || signals.fullPage) ? 'ACCELERATED_PROXY' : 'BROWSER_ENGINE';
+    res.json({ ok: true, url: result.finalUrl || raw, mode, lean: CFG.leanMode, challenge: challenge ? challenge.type : null, forceBrowser: !!forceBrowser, signals, fullPage: signals.fullPage, status: result.status, contentType: result.contentType });
   } catch (e) {
     // On probe failure, still prefer Chromium for known-broken hosts.
     const forceBrowser = hostNeedsRealBrowser(raw);
@@ -4153,8 +4162,19 @@ async function proxyRequest(req, res, mode) {
   }
   if (mode === "resource" && /javascript|ecmascript/i.test(result.contentType || "")) noteScriptDir(sid, result.finalUrl || canonical);
   let payload = result.body;
+  let fullPageEnhanced = false;
   try {
-    if (!download && mode === "view" && (/html|xhtml|^$/.test(result.contentType.toLowerCase()))) payload = Buffer.from(await rewriteOffThread("rewriteHtml", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteHtml), "utf8");
+    if (!download && mode === "view" && (/html|xhtml|^$/.test(result.contentType.toLowerCase()))) {
+      // Full-page fast proxy ("proxy+ full page"): when the upstream document is
+      // just a JS shell but embeds renderable state (Next.js/Nuxt/Redux/JSON-LD),
+      // render the full readable page server-side BEFORE rewriting so every
+      // link/image inside it is proxied like the rest of the document. This is
+      // what lets heavy SPAs load fully through the fast pipeline without
+      // launching a slow Chromium session.
+      const enhanced = fullPage.enhanceFullPage(payload.toString("utf8"), result.finalUrl || canonical);
+      if (enhanced.enhanced) { payload = Buffer.from(enhanced.html, "utf8"); fullPageEnhanced = true; }
+      payload = Buffer.from(await rewriteOffThread("rewriteHtml", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteHtml), "utf8");
+    }
     else if (!download && mode === "resource" && result.contentType.toLowerCase().includes("text/css")) payload = Buffer.from(await rewriteOffThread("rewriteCss", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteCssText), "utf8");
     else if (!download && mode === "resource" && /javascript|ecmascript/.test(result.contentType.toLowerCase())) payload = Buffer.from(await rewriteOffThread("rewriteJs", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteJsText), "utf8");
     else if (!download && mode === "resource" && /mpegurl|dash\+xml/i.test(result.contentType.toLowerCase())) payload = Buffer.from(rewriteMediaManifest(payload.toString("utf8"), result.finalUrl || canonical, sid), "utf8");
@@ -4171,6 +4191,7 @@ async function proxyRequest(req, res, mode) {
   res.setHeader("X-Veyra-Session-ID", sid);
   res.setHeader("X-Veyra-Content-Type", result.contentType || "application/octet-stream");
   res.setHeader("X-Veyra-Proxy-Mode", mode);
+  if (fullPageEnhanced) res.setHeader("X-Veyra-Full-Page", "1");
   if (result.etag) res.setHeader("ETag", result.etag);
   if (result.lastModified) res.setHeader("Last-Modified", result.lastModified);
   const outputStatus = (result.status >= 300 && result.status < 400) ? 200 : result.status;
@@ -4243,7 +4264,10 @@ app.post("/api/open", async (req, res) => {
     const crawlerEnabled = shouldStartCrawlerForEngineMode(engineMode);
     const oldId = activeByRoot.get(root); const old = oldId && jobs.get(oldId);
     const wantsPageAccelerator = engineMode !== "exhaustive";
-    if (crawlerEnabled && old && !old.done && !old.stopRequested && !!old.pageAccelerator === wantsPageAccelerator) return res.status(202).json({ jobId: old.id, url: root, viewUrl: makeViewUrl(root), engineMode, crawlerEnabled: true });
+    // Reuse an existing job only when it is a page accelerator (or the
+    // accelerator is disabled): a background seed/full-site crawl must never be
+    // hijacked by a browsing request, and an exhaustive request gets its own job.
+    if (crawlerEnabled && old && !old.done && !old.stopRequested && (!CFG.crawlerPageAccelerator || old.pageAccelerator)) return res.status(202).json({ jobId: old.id, url: root, viewUrl: makeViewUrl(root), engineMode, crawlerEnabled: true });
     const openSid = String(req.body?.sessionId || req.body?.sid || "");
     if (openSid && sessionManager.checkLimit(openSid)) return respondError(res, 410, "This Veyra session reached its time limit and was deleted.", "SESSION_EXPIRED");
     if (!crawlerEnabled) return res.status(200).json({ ok: true, jobId: null, url: root, viewUrl: makeViewUrl(root), state: "disabled", engineMode, crawlerEnabled: false });
@@ -4704,6 +4728,41 @@ load();
 </body></html>`;
 }
 app.get("/api/debug/status", (req, res) => res.json(buildStatusReport()));
+// Client-side log sink. Deliberately NOT admin-gated: the frontend (and the
+// proxied page's bridge) need to report errors/warnings from the user's own
+// browser so operators can diagnose real-session failures. Entries are
+// strictly bounded (ring buffer, size caps) and never executed.
+const clientLogBuffer = [];
+app.post("/api/debug/client-log", (req, res) => {
+  try {
+    const entry = req.body && typeof req.body === "object" ? req.body : {};
+    const level = ["error", "warn", "info", "debug"].includes(String(entry.level)) ? String(entry.level) : "info";
+    clientLogBuffer.push({ time: new Date().toISOString(), source: "CLIENT", level, message: String(entry.message || "").slice(0, 2000), url: String(entry.url || "").slice(0, 500), sessionId: String(entry.sessionId || "").slice(0, 64) });
+    if (clientLogBuffer.length > 500) clientLogBuffer.splice(0, clientLogBuffer.length - 500);
+    res.json({ ok: true, buffered: clientLogBuffer.length });
+  } catch (e) { respondError(res, 400, "Invalid client log entry.", "CLIENT_LOG_INVALID"); }
+});
+app.get("/api/debug/client-log", requireAdmin, (req, res) => res.json({ ok: true, logs: clientLogBuffer.slice(-200) }));
+// DevTools bridge script. The runtime injected into every proxied page loads
+// this on demand (dtLoad) and calls window.installVeyraDevtools(). Served
+// unauthenticated on purpose: it runs inside the user's own session page and
+// contains no secrets — just the CDP-like bridge.
+app.get("/api/devtools/bridge.js", (req, res) => {
+  try {
+    const { source } = require("./devtools-bridge");
+    res.type("application/javascript").setHeader("Cache-Control", "public, max-age=300").send(`${source}\nwindow.installVeyraDevtools = installVeyraDevtools;\n`);
+  } catch (e) { respondError(res, 500, "DevTools bridge unavailable.", "DEVTOOLS_BRIDGE_UNAVAILABLE"); }
+});
+// Admin-only system diagnostics (memory, event loop, versions, capacity).
+// Returns 403 for guests in production so the route never leaks internals.
+app.get("/api/debug/system", requireAdmin, (req, res) => {
+  const mem = process.memoryUsage();
+  res.json({ ok: true, generatedAt: new Date().toISOString(), uptimeSec: Math.floor(process.uptime()),
+    version: VEYRA_VERSION, node: process.version,
+    memory: { rssMb: Math.round(mem.rss / 1048576), heapUsedMb: Math.round(mem.heapUsed / 1048576), heapTotalMb: Math.round(mem.heapTotal / 1048576), externalMb: Math.round(mem.external / 1048576) },
+    load: { crawlerJobs: jobs.size, activeCrawls: activeCrawlCount(), queueDepth: crawlQueue.length, browserSessions: browserEngine.sessions.size, vpnConnections: vpnManager.status().connections },
+    fullPageProxy: { enabled: true, version: fullPage.VERSION } });
+});
 
 // ---------------------------------------------------------------------------
 // Neural Robot Workers — parallel crawling without Chromium
@@ -4788,6 +4847,12 @@ app.get("/api/internet/test", async (req, res) => {
 });
 app.get("/status", (req, res, next) => {
   if (!CFG.adminGate || isAdminRequest(req)) return next();
+  // Only genuine browser navigations (Accept: text/html) are redirected to the
+  // admin diagnostics view inside the Veyra app. Non-browser clients — curl,
+  // fetch, monitoring probes — get a clean 403 instead of a redirect that they
+  // would silently follow to an unrelated 200 page.
+  const acceptsHtml = /text\/html/i.test(String(req.get("Accept") || ""));
+  if (!acceptsHtml) return res.status(403).type("html").send("<!doctype html><title>Veyra</title><body style=\"font:15px system-ui;background:#0e1014;color:#e8eaee;display:grid;place-items:center;min-height:100vh;margin:0\"><p>This page is for Veyra administrators. Open it from the Veyra app while signed in as an admin, or send the X-Veyra-Admin-Token header.</p></body>");
   // Direct navigation to the Render origin cannot carry the bearer token that
   // Veyra stores in the frontend localStorage. Send the browser to the admin
   // diagnostics view inside the Veyra app, whose API client attaches that token.
@@ -4931,7 +4996,7 @@ if (require.main === module && CFG.processRole !== "worker") {
     await authStore.ready;
     await mongoStore.connect();
     await hydrateSearchFromMongo();
-    app.listen(PORT, "0.0.0.0", () => {
+    const httpServer = app.listen(PORT, "0.0.0.0", () => {
       serverLog("info", "SYSTEM", `Veyra server listening on ${PORT}`);
       serverLog("info", "CONFIG", `Plan ${VEYRA_CONFIG.plan.label} (${CFG.plan}, ${VEYRA_CONFIG.plan.ramMb}MB / ${VEYRA_CONFIG.plan.cpu} CPU, via ${VEYRA_CONFIG.planSource}) — ${CFG.maxActiveJobs} crawlers × ${CFG.maxActiveFetches} fetches, ${CFG.parseWorkers} parse workers, ${CFG.maxProxySessions} sessions, ${CFG.maxBrowserSessions} browser sessions.`);
       serverLog("info", "MONGO", mongoStore.status().configured ? `MongoDB configured (${CFG.mongoDb}); persistence/cache is fail-open.` : "MongoDB not configured; using local/ephemeral persistence where applicable.");
@@ -4939,6 +5004,12 @@ if (require.main === module && CFG.processRole !== "worker") {
       for (const w of VEYRA_CONFIG.warnings) serverLog("warn", "CONFIG", w);
       pumpIndexSeeds().catch(e => serverLog("warn", "SEARCH", `Seed startup failed: ${e.message}`));
       if (CFG.indexRefreshMs > 0) setInterval(() => pumpIndexSeeds().catch(e => serverLog("warn", "SEARCH", `Seed scheduler failed: ${e.message}`)), 30000).unref();
+      // Upgrade the cast server to WebSocket mode now that a real http.Server
+      // exists (device mirroring streams much better over /ws/cast).
+      try {
+        castServer = new CastServer(httpServer, (level, source, msg) => serverLog(level, source, msg));
+        serverLog("info", "CAST", `Cast server upgraded to ${castServer.useWebSocket ? "WebSocket" : "HTTP polling"} mode`);
+      } catch (e) { serverLog("warn", "CAST", `Cast WebSocket upgrade kept polling mode: ${e.message}`); }
     });
   };
   startServer().catch(err => {

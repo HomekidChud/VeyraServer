@@ -139,8 +139,13 @@ class CastServer {
     this.sessions = new Map();
     this.devices = new Map();
     this.pollingBuffers = new Map();  // sessionId -> [{type, data, timestamp}] for HTTP polling fallback
-    this.useWebSocket = !!WebSocketServer;
-    
+    // WebSocket mode needs a REAL http.Server instance (ws attaches listeners
+    // with server.on). A plain object — or anything without .on — must fall
+    // back to HTTP polling mode instead of throwing and disabling casting
+    // entirely (which left /api/cast/* returning 503 on Render).
+    const isRealServer = !!(server && typeof server.on === "function" && typeof server.listen === "function");
+    this.useWebSocket = !!WebSocketServer && isRealServer;
+
     if (this.useWebSocket) {
       this.wss = new WebSocketServer({ server, path: "/ws/cast" });
       this.wss.on("connection", (ws, req) => this.onConnection(ws, req));

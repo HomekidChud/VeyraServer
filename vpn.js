@@ -450,7 +450,10 @@ class VpnManager {
     this.connections.set(sid, {
       sid, profileId: profile.id, requested: requested || "auto", region: opts.region || "", group: opts.group || profile.group,
       connectedAt: Date.now(), lastUsed: Date.now(), seq, stickyTag: this.stickyTag(sid, seq), requests: 0, failovers: 0,
-      lastRotatedAt: Date.now(), rotationCount: 0
+      // lastRotatedAt starts at 0: the rotation rate limit only applies BETWEEN
+      // rotations. Connecting must not arm the limiter, otherwise the first
+      // user-requested rotate right after connect is wrongly rejected.
+      lastRotatedAt: 0, rotationCount: 0
     });
     this.resetSessionAgent(sid);
     if (this.health.get(profile.id)?.checkedAt === 0) void this.checkProfile(profile.id).catch(() => {});
