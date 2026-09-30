@@ -95,8 +95,23 @@ class SessionManager {
     rec.requests = 0;
     return rec;
   }
-  expiresAt(rec) { const limit = rec?.timeLimitMs ?? this.timeLimitMs; return limit ? rec.createdAt + limit : null; }
-  remainingMs(rec) { const limit = rec?.timeLimitMs ?? this.timeLimitMs; return limit ? Math.max(0, rec.createdAt + limit - this.now()) : null; }
+  expiresAt(rec) { const limit = rec?.timeLimitMs ?? this.timeLimitMs; return limit ? rec.createdAt + limit + (rec.renewedMs || 0) : null; }
+  remainingMs(rec) { const limit = rec?.timeLimitMs ?? this.timeLimitMs; return limit ? Math.max(0, rec.createdAt + limit + (rec.renewedMs || 0) - this.now()) : null; }
+  // Session renewal (ad reward). Extends the session's wall-clock deadline by
+  // `ms`, bounded so a session can never outlive the hard TTL. Returns the new
+  // expiry so callers can hand it straight back to the client.
+  renew(sid, ms) {
+    const rec = this.sessions.get(sid);
+    if (!rec) throw Object.assign(new Error("Session not found."), { code: "SESSION_NOT_FOUND", status: 404 });
+    const limit = rec.timeLimitMs ?? this.timeLimitMs;
+    if (!limit) return { renewed: false, reason: "no-limit", remainingMs: this.remainingMs(rec) };
+    const add = Math.max(1000, Math.min(60 * 60 * 1000, Number(ms) || 0));
+    const newRemaining = Math.min(this.hardTtlMs, this.remainingMs(rec) + add);
+    rec.renewedMs = (rec.renewedMs || 0) + Math.max(0, newRemaining - this.remainingMs(rec));
+    rec.renewCount = (rec.renewCount || 0) + 1;
+    this.log("info", "SESSION", `Session ${sid.slice(0, 8)} renewed by +${Math.round(add / 1000)}s (renewal #${rec.renewCount}).`);
+    return { renewed: true, expiresAt: this.expiresAt(rec), remainingMs: this.remainingMs(rec), renewCount: rec.renewCount };
+  }
   isTerminated(sid) {
     const at = this.tombstones.get(sid);
     if (at == null) return false;
@@ -109,7 +124,7 @@ class SessionManager {
     if (this.isTerminated(sid)) return true;
     const rec = this.sessions.get(sid);
     const limit = rec?.timeLimitMs ?? this.timeLimitMs;
-    if (rec && limit && this.now() - rec.createdAt >= limit) { this.expire(sid, "limit"); return true; }
+    if (rec && limit && this.now() - rec.createdAt >= limit + (rec.renewedMs || 0)) { this.expire(sid, "limit"); return true; }
     return false;
   }
   tombstone(sid) {
@@ -167,7 +182,7 @@ class SessionManager {
     if (this.timeLimitMs || [...this.sessions.values()].some(rec => rec.timeLimitMs)) {
       for (const [sid, rec] of [...this.sessions]) {
         const limit = rec.timeLimitMs ?? this.timeLimitMs;
-        if (limit && t - rec.createdAt >= limit) { this.expire(sid, "limit"); n += 1; }
+        if (limit && t - rec.createdAt >= limit + (rec.renewedMs || 0)) { this.expire(sid, "limit"); n += 1; }
       }
       for (const [sid, at] of this.tombstones) { if (t - at <= this.tombstoneTtlMs) break; this.tombstones.delete(sid); }
     }

@@ -445,6 +445,8 @@ const workerPool = (!IS_THREAD_WORKER && CFG.parseWorkers > 0 && (require.main =
 // Session lifecycle hooks: an expired/closed session releases everything it held.
 sessionManager.on("expire", (sid, rec, reason) => {
   try { vpnManager.disconnect?.(sid); } catch {}
+  // Ad-renewal state dies with the session so a fresh session starts clean.
+  try { renewingManager?.clearSession(sid); } catch {}
   // Crawl jobs started by this session stop with it.
   try { for (const j of jobs.values()) if (j.sessionId === sid && !j.done && !j.stopRequested) { if (!j.started) dequeueCrawl(j); j.stopRequested = true; j.stopReason = `session-${reason}`; } } catch {}
   if (reason === "limit") serverLog("info", "SESSION", `Session ${sid.slice(0, 8)}… reached its ${Math.round((rec.timeLimitMs ?? CFG.sessionTimeLimitMs) / 1000)}s time limit and was deleted.`);
@@ -3663,7 +3665,15 @@ app.post('/api/renew/watch/:adId', (req, res) => {
 app.post('/api/renew/complete/:watchId', (req, res) => {
   try {
     const result = renewingManager.completeWatch(req.params.watchId);
-    res.json({ ok: true, ...result });
+    // Actually extend the session's deadline on the server — without this the
+    // ad reward never reached the session timer.
+    let renewal = null;
+    try {
+      const watch = renewingManager.getWatch?.(req.params.watchId);
+      const sid = watch?.sessionId || String(req.body?.sessionId || "");
+      if (sid) renewal = sessionManager.renew(sid, result.rewardMs);
+    } catch (e) { return res.status(410).json({ error: `Session expired before the ad finished: ${e.message}`, ok: false, code: "SESSION_EXPIRED" }); }
+    res.json({ ok: true, ...result, session: renewal });
   } catch (e) { res.status(400).json({ error: e.message, ok: false }); }
 });
 // Admin-only ad management
@@ -4728,6 +4738,28 @@ load();
 </body></html>`;
 }
 app.get("/api/debug/status", (req, res) => res.json(buildStatusReport()));
+// Live admin diagnostics for the admin panel. All admin-gated so guests and
+// regular users can never read another session's traffic or the server log.
+app.get("/api/debug/jobs", requireAdmin, (req, res) => {
+  res.json({ ok: true, jobs: [...jobs.values()].slice(-100).reverse().map(j => ({
+    id: j.id, url: j.url, status: j.status, statusText: j.statusText, done: !!j.done, seed: !!j.seed,
+    pageAccelerator: !!j.pageAccelerator, processed: j.counts?.processed ?? 0, linkCount: j.linkCount ?? j.links?.size ?? 0,
+    createdAt: j.createdAt, finishedAt: j.finishedAt, sessionId: j.sessionId || null,
+  })) });
+});
+app.get("/api/debug/requests", requireAdmin, (req, res) => {
+  const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 120));
+  res.json({ ok: true, requests: requestLog.slice(-limit).reverse() });
+});
+app.get("/api/debug/logs", requireAdmin, (req, res) => {
+  const level = String(req.query.level || "").toLowerCase();
+  const source = String(req.query.source || "").toLowerCase();
+  const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 200));
+  // source=server → server log ring; source=browser → the client-log sink.
+  let logs = source === "browser" ? clientLogBuffer : serverLogs;
+  if (["error", "warn", "info", "debug"].includes(level)) logs = logs.filter(l => l.level === level);
+  res.json({ ok: true, logs: logs.slice(-limit).reverse() });
+});
 // Client-side log sink. Deliberately NOT admin-gated: the frontend (and the
 // proxied page's bridge) need to report errors/warnings from the user's own
 // browser so operators can diagnose real-session failures. Entries are
@@ -4808,7 +4840,7 @@ app.get("/api/challenge/check", (req, res) => {
 let castServer = null;
 let internetManager = null;
 try {
-  castServer = new CastServer({ listen: () => {}, close: () => {} }, (level, source, msg) => serverLog(level, source, msg));
+  castServer = new CastServer({ listen: () => {}, close: () => {} }, (level, source, msg) => serverLog(level, source, msg), { frontendUrl: CFG.frontendUrl });
   internetManager = new InternetConnectionManager();
   serverLog("info", "CAST", `Cast server started in ${castServer.useWebSocket ? "WebSocket" : "HTTP polling"} mode`);
 } catch (e) { serverLog("warn", "CAST", `Cast server failed to start: ${e.message}`); }
@@ -4819,7 +4851,7 @@ app.get("/api/cast/sessions", (req, res) => res.json(castServer ? castServer.lis
 app.post("/api/cast/create", (req, res) => {
   if (!castServer) return res.status(503).json({ error: "Cast server not available" });
   const session = castServer.createSessionViaPoll();
-  res.json({ ok: true, sessionId: session.id, pairingCode: session.pairingCode, qrPayload: `veyra://casteddevice:/${session.id}?code=${session.pairingCode}`, qrUrl: `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(`veyra://casteddevice:/${session.id}?code=${session.pairingCode}`)}` });
+  res.json({ ok: true, sessionId: session.id, pairingCode: session.pairingCode, qrPayload: castServer.buildQrPayload(session.id, session.pairingCode), qrUrl: castServer.buildQrUrl(session.id, session.pairingCode) });
 });
 app.get("/api/cast/poll/:sessionId", (req, res) => {
   if (!castServer) return res.status(503).json({ error: "Cast server not available" });
@@ -5007,7 +5039,7 @@ if (require.main === module && CFG.processRole !== "worker") {
       // Upgrade the cast server to WebSocket mode now that a real http.Server
       // exists (device mirroring streams much better over /ws/cast).
       try {
-        castServer = new CastServer(httpServer, (level, source, msg) => serverLog(level, source, msg));
+        castServer = new CastServer(httpServer, (level, source, msg) => serverLog(level, source, msg), { frontendUrl: CFG.frontendUrl });
         serverLog("info", "CAST", `Cast server upgraded to ${castServer.useWebSocket ? "WebSocket" : "HTTP polling"} mode`);
       } catch (e) { serverLog("warn", "CAST", `Cast WebSocket upgrade kept polling mode: ${e.message}`); }
     });

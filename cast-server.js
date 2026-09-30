@@ -134,8 +134,9 @@ class DeviceSession {
 
 // ---------------------------------------------------------------- cast server
 class CastServer {
-  constructor(server, log = () => {}) {
+  constructor(server, log = () => {}, opts = {}) {
     this.log = log;
+    this.frontendUrl = typeof opts.frontendUrl === "string" && /^https:\/\//.test(opts.frontendUrl) ? opts.frontendUrl : "";
     this.sessions = new Map();
     this.devices = new Map();
     this.pollingBuffers = new Map();  // sessionId -> [{type, data, timestamp}] for HTTP polling fallback
@@ -263,15 +264,29 @@ class CastServer {
     });
 
     // Send session info + QR data
-    const qrPayload = `veyra://casteddevice:/${sessionId}?code=${session.pairingCode}`;
+    const qrPayload = this.buildQrPayload(sessionId, session.pairingCode);
     ws.send(JSON.stringify({
       type: "session_created",
       sessionId,
       pairingCode: session.pairingCode,
       qrPayload,
-      qrUrl: `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qrPayload)}`,
+      qrUrl: this.buildQrUrl(sessionId, session.pairingCode),
       timestamp: now(),
     }));
+  }
+
+  // QR payloads must be real HTTPS links. A custom veyra:// scheme cannot be
+  // opened by any phone — camera apps report "no usable data found". The QR
+  // now opens the Veyra frontend's cast page which auto-joins as the device.
+  buildQrPayload(sessionId, pairingCode) {
+    if (this.frontendUrl) {
+      const base = this.frontendUrl.endsWith("/") ? this.frontendUrl : this.frontendUrl + "/";
+      return `${base}cast?session=${encodeURIComponent(sessionId)}&code=${encodeURIComponent(pairingCode)}`;
+    }
+    return `veyra://casteddevice:/${sessionId}?code=${pairingCode}`;
+  }
+  buildQrUrl(sessionId, pairingCode) {
+    return `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(this.buildQrPayload(sessionId, pairingCode))}`;
   }
 
   handleDevice(ws, sessionId, code, deviceId, req) {

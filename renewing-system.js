@@ -25,6 +25,22 @@
 
 const crypto = require("crypto");
 
+// Extract a YouTube video ID from a watch/short/youtu.be URL or a bare ID.
+// Returns null for anything that is not recognisably YouTube.
+function extractYoutubeId(input) {
+  const s = String(input || "").trim();
+  if (/^[a-zA-Z0-9_-]{11}$/.test(s)) return s;
+  try {
+    const u = new URL(s.startsWith("http") ? s : `https://${s}`);
+    const host = u.hostname.replace(/^www\./, "");
+    if (host === "youtu.be") return /^\/?([a-zA-Z0-9_-]{11})/.exec(u.pathname)?.[1] || null;
+    if (host.endsWith("youtube.com")) {
+      return u.searchParams.get("v") || /^\/(?:embed|shorts|live)\/([a-zA-Z0-9_-]{11})/.exec(u.pathname)?.[1] || null;
+    }
+  } catch {}
+  return null;
+}
+
 class RenewingManager {
   constructor(opts = {}) {
     this.ads = new Map();
@@ -40,13 +56,17 @@ class RenewingManager {
    */
   addAd({ title, type, url, durationSec, rewardMs, description, imageUrl }) {
     if (!title || !type) throw new Error("Title and type are required");
-    if (!["video", "link", "banner", "interactive"].includes(type)) {
-      throw new Error("Type must be: video, link, banner, or interactive");
+    if (!["video", "youtube", "link", "banner", "interactive"].includes(type)) {
+      throw new Error("Type must be: video, youtube, link, banner, or interactive");
     }
+    if (type === "youtube" && !extractYoutubeId(url)) throw new Error("A YouTube ad needs a valid YouTube video URL or 11-character video ID.");
     const ad = {
       id: crypto.randomUUID(),
       title: String(title).slice(0, 200),
       type,
+      // YouTube ads: normalise any YouTube URL/ID to a clean 11-char video ID
+      // so the frontend can embed the official player without script injection.
+      youtubeId: type === "youtube" ? extractYoutubeId(url) : undefined,
       url: String(url || "").slice(0, 2048),
       durationSec: Math.min(300, Math.max(5, Number(durationSec) || 15)),
       rewardMs: Math.min(30 * 60 * 1000, Math.max(30 * 1000, Number(rewardMs) || this.defaultRewardMs)),
@@ -129,12 +149,20 @@ class RenewingManager {
         title: ad.title,
         type: ad.type,
         url: ad.url,
+        youtubeId: ad.youtubeId,
         durationSec: ad.durationSec,
         description: ad.description,
         imageUrl: ad.imageUrl,
       },
       rewardMs: ad.rewardMs,
     };
+  }
+
+  /**
+   * Look up a watch (completed or not) — used when granting the reward.
+   */
+  getWatch(watchId) {
+    return this.watches.get(watchId) || null;
   }
 
   /**
