@@ -101,6 +101,13 @@ function expandQuery(query) {
     "recieve": "receive", "seperate": "separate", "occured": "occurred",
     "untill": "until", "wich": "which", "thier": "their", "becuase": "because",
     "definately": "definitely", "occassion": "occasion", "neccessary": "necessary",
+    "teh": "the", "adn": "and", "nad": "and", "taht": "that", "thier": "their",
+    "adress": "address", "enviroment": "environment", "goverment": "government",
+    "independant": "independent", "knowlege": "knowledge", "liason": "liaison",
+    "noticable": "noticeable", "occassionally": "occasionally", "perseverence": "perseverance",
+    "posession": "possession", "prefered": "preferred", "priviledge": "privilege",
+    "recomend": "recommend", "rythm": "rhythm", "succesfully": "successfully",
+    "truely": "truly", "unfortunatly": "unfortunately", "wierd": "weird",
   };
   const corrected = terms.map(t => corrections[t] || t);
   if (corrected.join(" ") !== terms.join(" ")) expansions.push(corrected.join(" "));
@@ -109,7 +116,21 @@ function expandQuery(query) {
   const clean = q.replace(/[^\w\s]/g, " ").trim();
   if (clean && clean !== q) expansions.push(clean);
 
-  return expansions.slice(0, 2);
+  // Add quoted exact match for multi-word queries
+  if (terms.length > 1) expansions.push(`"${q}"`);
+
+  // Add common synonyms for better coverage
+  const synonyms = {
+    "how": "guide tutorial", "what": "definition meaning", "where": "location map",
+    "when": "date timeline", "why": "reason explanation", "who": "person biography",
+    "best": "top rated recommended", "free": "no cost", "cheap": "affordable budget",
+    "fast": "quick speed", "easy": "simple beginner", "new": "latest 2024 2025",
+    "review": "comparison test", "download": "get install", "buy": "purchase price",
+  };
+  const synTerms = terms.map(t => synonyms[t] || t).filter(t => t.includes(" "));
+  if (synTerms.length) expansions.push([...terms, ...synTerms].join(" ").split(" ").filter((v, i, a) => a.indexOf(v) === i).join(" "));
+
+  return expansions.slice(0, 4);
 }
 
 // ----------------------------------------------------------------- deduplication & merging
@@ -124,7 +145,7 @@ function dedupe(rows) {
 }
 
 function mergeResults(providerResults) {
-  const merged = new Map(); // url -> { result, providers, count }
+  const merged = new Map(); // url -> { result, providers, count, totalScore }
   for (const { provider, results } of providerResults) {
     for (const r of results) {
       const key = r.url.replace(/[#?].*$/, "").replace(/\/$/, "").toLowerCase();
@@ -140,28 +161,54 @@ function mergeResults(providerResults) {
         if (r.title.length > existing.result.title.length) {
           existing.result.title = r.title;
         }
+        // Track position for ranking (lower position = better)
+        if (!existing.positions) existing.positions = [];
+        existing.positions.push(r.position || 999);
       } else {
-        merged.set(key, { result: { ...r }, providers: new Set([provider]), count: 1 });
+        merged.set(key, { result: { ...r }, providers: new Set([provider]), count: 1, positions: [r.position || 999] });
       }
     }
   }
-  // Sort: results from multiple providers rank higher, then by original order
+  // Sort: results from multiple providers rank higher, then by average position
   return [...merged.values()]
-    .sort((a, b) => b.count - a.count)
+    .sort((a, b) => {
+      // Multi-provider boost: appearing in 2+ providers is a strong relevance signal
+      const aMulti = a.count >= 2 ? 1 : 0;
+      const bMulti = b.count >= 2 ? 1 : 0;
+      if (aMulti !== bMulti) return bMulti - aMulti;
+      // Average position across providers (lower = appeared earlier in results)
+      const aAvgPos = a.positions.reduce((s, p) => s + p, 0) / a.positions.length;
+      const bAvgPos = b.positions.reduce((s, p) => s + p, 0) / b.positions.length;
+      return aAvgPos - bAvgPos;
+    })
     .map(m => ({
       ...m.result,
       providers: [...m.providers],
       providerCount: m.count,
+      avgPosition: m.positions.reduce((s, p) => s + p, 0) / m.positions.length,
     }));
 }
 
 // ----------------------------------------------------------------- neural re-ranking
 function neuralRerank(results, neuralModel) {
   if (!neuralModel) return results;
+  // Enhanced re-ranking: combine neural score with provider count and freshness
   return results.map(r => {
-    const score = neuralModel.scoreUrl(r.url, { type: "html", internal: false });
-    return { ...r, neuralScore: Number(score.toFixed(4)) };
-  }).sort((a, b) => (b.neuralScore || 0) - (a.neuralScore || 0) || (b.providerCount || 0) - (a.providerCount || 0));
+    const neuralScore = neuralModel.scoreUrl(r.url, { type: "html", internal: false });
+    // Freshness boost: recent results get a small boost
+    let freshnessScore = 0;
+    if (r.date) {
+      const age = Date.now() - new Date(r.date).getTime();
+      if (age < 7 * 86400000) freshnessScore = 0.1; // Within a week
+      else if (age < 30 * 86400000) freshnessScore = 0.05; // Within a month
+    }
+    // Provider count boost: results from multiple sources are more authoritative
+    const providerBoost = Math.min(0.15, (r.providerCount - 1) * 0.05);
+    // Domain authority from neural model
+    const authorityScore = Math.min(0.2, neuralScore * 0.3);
+    const combinedScore = neuralScore + freshnessScore + providerBoost + authorityScore;
+    return { ...r, neuralScore: Number(combinedScore.toFixed(4)) };
+  }).sort((a, b) => (b.neuralScore || 0) - (a.neuralScore || 0) || (b.providerCount || 0) - (a.providerCount || 0) || (a.avgPosition || 999) - (b.avgPosition || 999));
 }
 
 // ----------------------------------------------------------------- main search factory
@@ -170,7 +217,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {}, neuralM
   const googleCx = env.GOOGLE_SEARCH_CX || env.GOOGLE_CSE_ID || "";
   const braveKey = env.BRAVE_SEARCH_API_KEY || "";
   const bingKey = env.BING_SEARCH_API_KEY || "";
-  const order = String(env.WEB_SEARCH_ORDER || "wikipedia,brave,bing,duckduckgo,google").split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+  const order = String(env.WEB_SEARCH_ORDER || "wikipedia,duckduckgo,bing,brave,google,searx,startpage").split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
   const cache = new Map(); const TTL = 5 * 60 * 1000; const MAX = 300;
   const failures = new Map();
 
@@ -243,6 +290,47 @@ function createWebSearch({ fetchText, env = process.env, log = () => {}, neuralM
         if (!r.ok) throw Object.assign(new Error(`Wikipedia API HTTP ${r.status}`), { status: r.status });
         return { results: parseWikipediaApi(JSON.parse(r.text)), total: JSON.parse(r.text)?.query?.searchinfo?.totalhits ?? null };
       }
+    },
+    searx: {
+      available: () => true,
+      async run(q, { offset, lang }) {
+        const instances = ["https://searx.be", "https://search.bus-hit.me", "https://searx.tiekoetter.com"];
+        for (const base of instances) {
+          try {
+            const u = new URL(base + "/search");
+            u.searchParams.set("q", q); u.searchParams.set("format", "json");
+            u.searchParams.set("categories", "general");
+            if (lang) u.searchParams.set("language", lang);
+            if (offset) u.searchParams.set("pageno", String(Math.min(5, Math.floor(offset / 10) + 2)));
+            const r = await fetchText(u.href, { accept: "application/json", headers: { "User-Agent": "VeyraSearch/1.0" } });
+            if (!r.ok) continue;
+            const json = JSON.parse(r.text);
+            const results = (json.results || []).map(item => row(item.url, item.title, item.content, "searx")).filter(Boolean);
+            if (results.length) return { results, total: json.number_of_results || null };
+          } catch { continue; }
+        }
+        return { results: [], total: null };
+      }
+    },
+    startpage: {
+      available: () => true,
+      async run(q, { offset, lang }) {
+        const u = new URL("https://www.startpage.com/sp/search");
+        u.searchParams.set("query", q);
+        if (lang) u.searchParams.set("language", lang === "en" ? "english" : lang);
+        const r = await fetchText(u.href, { accept: "text/html" });
+        if (!r.ok) throw Object.assign(new Error(`Startpage HTTP ${r.status}`), { status: r.status });
+        const $ = cheerio.load(r.text);
+        const out = [];
+        $(".w-gl__result").each((_, el) => {
+          const $el = $(el);
+          const a = $el.find("a.w-gl__result-title").first();
+          const snippet = $el.find(".w-gl__description").first().text();
+          const r2 = row(a.attr("href"), a.text(), snippet, "startpage");
+          if (r2) out.push(r2);
+        });
+        return { results: out, total: null };
+      }
     }
   };
 
@@ -299,8 +387,8 @@ function createWebSearch({ fetchText, env = process.env, log = () => {}, neuralM
     const merged = mergeResults(providerResults);
     // Neural re-ranking if model is available
     const ranked = neuralModel ? neuralRerank(merged, neuralModel) : merged;
-    // Take top 20
-    const final = ranked.slice(0, 20);
+    // Take top 25
+    const final = ranked.slice(0, 25);
 
     // Determine primary provider
     const primary = providerResults.sort((a, b) => b.results.length - a.results.length)[0].provider;

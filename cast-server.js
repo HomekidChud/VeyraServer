@@ -363,6 +363,62 @@ class CastServer {
     }
   }
 
+  // ---- HTTP polling fallback for devices (mobile/Android) ----
+  joinDeviceViaPoll(sessionId, code, deviceId, deviceInfo) {
+    const session = this.sessions.get(sessionId);
+    if (!session) return { ok: false, error: "Invalid session" };
+    if (code !== session.pairingCode) return { ok: false, error: "Invalid pairing code" };
+    
+    // Register device via polling
+    session.deviceId = deviceId || genDeviceId();
+    session.deviceName = deviceInfo?.name || "Phone";
+    session.deviceType = deviceInfo?.type || "phone";
+    session.connectionType = deviceInfo?.connection || "wifi";
+    session.networkStrength = deviceInfo?.networkStrength || 100;
+    session.pairedAt = now();
+    session.status = "paired";
+    session.usePolling = true;
+    
+    // Create a device-specific polling buffer
+    if (!this.pollingBuffers.has(`device:${session.deviceId}`)) {
+      this.pollingBuffers.set(`device:${session.deviceId}`, []);
+    }
+    
+    this.devices.set(session.deviceId, session);
+    this.stats.totalDevices++;
+    
+    // Notify browser
+    this.sendToBrowser(session, {
+      type: "device_paired",
+      deviceId: session.deviceId,
+      deviceName: session.deviceName,
+      deviceType: session.deviceType,
+      connectionType: session.connectionType,
+      networkStrength: session.networkStrength,
+      timestamp: now(),
+    });
+    
+    return { ok: true, deviceId: session.deviceId, session: session.stats() };
+  }
+  
+  pollDevice(deviceId) {
+    const session = this.devices.get(deviceId);
+    if (!session) return { ok: false, error: "Device not found" };
+    const key = `device:${deviceId}`;
+    const buf = this.pollingBuffers.get(key);
+    if (!buf) return { ok: true, messages: [] };
+    const msgs = buf.splice(0, buf.length);
+    return { ok: true, messages: msgs };
+  }
+  
+  pushToDevicePoll(deviceId, msg) {
+    const key = `device:${deviceId}`;
+    if (!this.pollingBuffers.has(key)) this.pollingBuffers.set(key, []);
+    const buf = this.pollingBuffers.get(key);
+    buf.push(msg);
+    if (buf.length > 20) buf.shift();
+  }
+
   getStats() {
     return {
       ...this.stats,
