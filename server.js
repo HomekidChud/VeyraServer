@@ -3363,6 +3363,46 @@ app.get('/api/vpn/ip', async (req, res) => {
   try { res.json({ ok: true, ...(await vpnManager.exitIpForSession(sid)) }); }
   catch (e) { respondError(res, vpnErrStatus(e.code) === 400 ? 502 : vpnErrStatus(e.code), e.message, e.code || 'VPN_IP_ERROR'); }
 });
+// Custom VPN provider — user-supplied VPN configuration
+app.post('/api/vpn/custom', (req, res) => {
+  const { name, type, server, apiKey, username, password, region, config } = req.body || {};
+  if (!name) return respondError(res, 400, 'VPN name is required', 'VPN_NAME_REQUIRED');
+  // Validate type
+  const validTypes = ['socks5', 'http', 'https', 'wireguard', 'api'];
+  if (!validTypes.includes(type)) return respondError(res, 400, 'Invalid VPN type', 'VPN_INVALID_TYPE');
+  // For wireguard, validate config has required sections
+  if (type === 'wireguard' && config) {
+    if (!/\[Interface\]/i.test(config) || !/\[Peer\]/i.test(config)) {
+      return respondError(res, 400, 'WireGuard config needs [Interface] and [Peer] sections', 'VPN_INVALID_WG_CONFIG');
+    }
+  }
+  // Store the custom VPN profile (in-memory, per server instance)
+  const profileId = `custom_${Date.now().toString(36)}`;
+  try {
+    const profile = vpnManager.parseProfile({
+      id: profileId,
+      name: String(name).slice(0, 100),
+      type: type === 'api' ? 'socks5' : type,
+      server: server || '',
+      username: username || '',
+      password: password || '',
+      region: region || '',
+      wireguard: type === 'wireguard' ? config : undefined,
+      config: type === 'wireguard' ? config : undefined,
+      provider: 'User Custom'
+    });
+    if (profile) {
+      vpnManager.profiles.set(profileId, profile);
+      vpnManager.health.set(profileId, { healthy: null, failures: 0, checkedAt: 0, latencyMs: null, exitIp: null, lastError: null, successes: 0 });
+      serverLog('info', 'VPN', `Custom VPN profile added: ${name} (${type})`);
+      res.json({ ok: true, profileId, profile: vpnManager.publicProfile(profile) });
+    } else {
+      respondError(res, 400, 'Invalid VPN configuration', 'VPN_INVALID_CONFIG');
+    }
+  } catch (e) {
+    respondError(res, 400, e.message, 'VPN_ADD_FAILED');
+  }
+});
 
 // ---------------------------------------------------------------------------
 // Sessions — explicit close (frontend: navigator.sendBeacon on tab close) and stats.
@@ -4861,6 +4901,25 @@ app.get("/api/cast/poll/:sessionId", (req, res) => {
 app.post("/api/cast/push/:sessionId", (req, res) => {
   if (!castServer) return res.status(503).json({ error: "Cast server not available" });
   castServer.pushToPoll(req.params.sessionId, req.body);
+  res.json({ ok: true });
+});
+// Device-side HTTP polling routes (for mobile/Android devices without WebSocket)
+app.post("/api/cast/device/join", (req, res) => {
+  if (!castServer) return res.status(503).json({ error: "Cast server not available" });
+  const { sessionId, code, deviceId, name, type, connection } = req.body || {};
+  const result = castServer.joinDeviceViaPoll(sessionId, code, deviceId, { name, type, connectionType: connection });
+  if (!result.ok) return res.status(400).json(result);
+  res.json(result);
+});
+app.get("/api/cast/device/poll/:deviceId", (req, res) => {
+  if (!castServer) return res.status(503).json({ error: "Cast server not available" });
+  const result = castServer.pollDevice(req.params.deviceId);
+  if (!result.ok) return res.status(404).json(result);
+  res.json(result);
+});
+app.post("/api/cast/device/push/:deviceId", (req, res) => {
+  if (!castServer) return res.status(503).json({ error: "Cast server not available" });
+  castServer.pushToDevicePoll(req.params.deviceId, req.body);
   res.json({ ok: true });
 });
 
