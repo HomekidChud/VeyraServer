@@ -3639,7 +3639,7 @@ app.delete('/api/browser/session/:sid', async (req, res) => {
   } catch (e) { respondError(res, e.status || 404, e.message, e.code || "BROWSER_STOP_ERROR"); }
 });
 app.get('/api/browser/session/:sid/screenshot', async (req, res) => {
-  try { browserSessionOrThrow(req.params.sid); const image = await browserEngine.screenshot(req.params.sid); if (!image) return res.status(503).type('text/plain').send('Chromium screenshot unavailable.'); res.setHeader('Cache-Control', 'no-store'); res.type('png').send(image); }
+  try { browserSessionOrThrow(req.params.sid); const image = await browserEngine.screenshot(req.params.sid); if (!image) return res.status(503).type('text/plain').send('Chromium screenshot unavailable.'); res.setHeader('Cache-Control', 'no-store'); res.type('jpeg').send(image); }
   catch (e) { respondError(res, e.status || 404, e.message, e.code || "BROWSER_SCREENSHOT_ERROR"); }
 });
 

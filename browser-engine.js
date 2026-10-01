@@ -398,7 +398,11 @@ class BrowserEngine {
   async capture(session, force = false) {
     if (!force && session.screenshot && Date.now() - session.screenshotAt < 250) return session.screenshot;
     try {
-      session.screenshot = await session.page.screenshot({ type: 'png' });
+      // JPEG is 5-10x smaller than PNG for page screenshots — critical for
+      // the polling loop where the frontend fetches a fresh image every ~1.5s.
+      // Quality 80 is visually lossless for text/UI and halves transfer time
+      // on constrained Render Free instances.
+      session.screenshot = await session.page.screenshot({ type: 'jpeg', quality: 80 });
       session.screenshotAt = Date.now();
       return session.screenshot;
     } catch (e) {
@@ -412,14 +416,23 @@ class BrowserEngine {
     if (s.status === 'CLOSED') throw new Error('Browser session is closed.');
     s.lastUsed = Date.now();
     const kind = String(action?.type || '');
-    if (kind === 'click') await p.mouse.click(Number(action.x) || 0, Number(action.y) || 0, { button: action.button || 'left' });
+    // Move the mouse to the target before clicking — many sites (and
+    // Cloudflare Turnstile) check for pointer movement, not just the final
+    // click coordinates. A real user always moves to the element first.
+    if (kind === 'click') {
+      await p.mouse.move(Number(action.x) || 0, Number(action.y) || 0, { steps: 5 });
+      await p.mouse.click(Number(action.x) || 0, Number(action.y) || 0, { button: action.button || 'left' });
+    }
     else if (kind === 'dblclick') await p.mouse.dblclick(Number(action.x) || 0, Number(action.y) || 0);
     else if (kind === 'wheel') await p.mouse.wheel(Number(action.deltaX) || 0, Number(action.deltaY) || 0);
     else if (kind === 'type') await p.keyboard.insertText(String(action.text || '').slice(0, 10000));
     else if (kind === 'key') await p.keyboard.press(String(action.key || '').slice(0, 100));
-    else if (kind === 'hover') await p.mouse.move(Number(action.x) || 0, Number(action.y) || 0);
+    else if (kind === 'hover') await p.mouse.move(Number(action.x) || 0, Number(action.y) || 0, { steps: 5 });
     else throw new Error('Unsupported browser input action.');
-    await new Promise(r => setTimeout(r, 40));
+    // Wait for the page to react before re-screenshotting. 40ms was too short
+    // for Cloudflare Turnstile and SPA frameworks (React/Vue) which need
+    // 200-500ms to process a click and re-render.
+    await new Promise(r => setTimeout(r, 200));
     s.canonicalUrl = safeUrl(p.url()) || s.canonicalUrl;
     s.title = await p.title().catch(() => s.title || '');
     const challenge = await this.detectVerification(p);
