@@ -143,21 +143,27 @@ class AutoConnectEngine {
   findRule(url, region, time) {
     const host = (() => { try { return new URL(url).hostname.toLowerCase(); } catch { return ""; } })();
     const now = time || new Date();
-    const hh = String(now.getHours()).padStart(2, "0");
-    const mm = String(now.getMinutes()).padStart(2, "0");
-    const currentTime = `${hh}:${mm}`;
+    const currentMinutes = now.getHours() * 60 + now.getMinutes();
 
     const matched = this.rules
       .filter(r => r.enabled)
       .filter(r => {
         if (r.domain) {
-          const pattern = r.domain.replace(/\*/g, ".*");
-          return new RegExp(`^${pattern}$`, "i").test(host);
+          // Use host-matching semantics instead of regex to avoid injection
+          const pattern = r.domain.toLowerCase();
+          const bare = pattern.replace(/^\./, "").replace(/^\*\./, "");
+          if (pattern.startsWith("*.")) return host.endsWith("." + bare);
+          return host === bare || host.endsWith("." + bare);
         }
         if (r.region && region && r.region.toUpperCase() === region.toUpperCase()) return true;
         if (r.timeRange) {
-          const [start, end] = r.timeRange.split("-");
-          return currentTime >= start && currentTime <= end;
+          const [start, end] = r.timeRange.split("-").map(t => {
+            const [h, m] = t.trim().split(":").map(Number);
+            return h * 60 + m;
+          });
+          // Handle ranges that cross midnight (e.g. 22:00-08:00)
+          if (start < end) return currentMinutes >= start && currentMinutes <= end;
+          return currentMinutes >= start || currentMinutes <= end;
         }
         return false;
       })

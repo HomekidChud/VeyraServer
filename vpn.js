@@ -44,7 +44,7 @@ function hostMatches(host, patterns) {
   const h = String(host || "").toLowerCase().replace(/^\[|\]$/g, "");
   for (const p of patterns) {
     if (!p) continue;
-    if (p === "<local>") { if (!h.includes(".")) return true; continue; }
+    if (p === "<local>") { if (!net.isIP(h) && !h.includes(".")) return true; continue; }
     if (p.includes("/") && net.isIP(h)) { if (cidrContains(p, h)) return true; continue; }
     if (p.startsWith("*.")) { if (h.endsWith(p.slice(1))) return true; continue; }
     const bare = p.replace(/^\./, "");
@@ -54,18 +54,40 @@ function hostMatches(host, patterns) {
 }
 function cidrContains(cidr, ip) {
   const [range, bitsRaw] = cidr.split("/");
+  if (!/^\d+$/.test(String(bitsRaw || "").trim())) return false;
+  const bits = Number(bitsRaw);
+  if (bits < 0) return false;
   if (net.isIPv4(range) && net.isIPv4(ip)) {
-    const bits = Number(bitsRaw);
+    if (bits > 32) return false;
     const toInt = a => a.split(".").reduce((n, o) => (n << 8) + Number(o), 0) >>> 0;
     const mask = bits === 0 ? 0 : (~0 << (32 - bits)) >>> 0;
     return (toInt(range) & mask) === (toInt(ip) & mask);
+  }
+  if (net.isIPv6(range) && net.isIPv6(ip)) {
+    if (bits > 128) return false;
+    const toBuf = a => {
+      const expanded = expandIpv6(a);
+      const parts = expanded.split(":").flatMap(h => [parseInt(h, 16) >> 8, parseInt(h, 16) & 255]);
+      return Buffer.from(parts);
+    };
+    const r = toBuf(range), v = toBuf(ip);
+    const fullBytes = Math.floor(bits / 8), remainder = bits % 8;
+    if (fullBytes > 0 && r.subarray(0, fullBytes).compare(v.subarray(0, fullBytes)) !== 0) return false;
+    if (remainder > 0) {
+      const mask = ~0 << (8 - remainder) & 0xff;
+      if ((r[fullBytes] & mask) !== (v[fullBytes] & mask)) return false;
+    }
+    return true;
   }
   return false;
 }
 function privateIp(ip) {
   if (net.isIPv4(ip)) return ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4"].some(c => cidrContains(c, ip));
   const v = String(ip).toLowerCase();
-  return v === "::" || v === "::1" || v.startsWith("fc") || v.startsWith("fd") || v.startsWith("fe80") || v.startsWith("::ffff:127.") || v.startsWith("::ffff:10.") || v.startsWith("::ffff:192.168.");
+  // IPv4-mapped IPv6 (::ffff:a.b.c.d) — extract the embedded IPv4 and check it
+  const mapped = v.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i);
+  if (mapped && net.isIPv4(mapped[1])) return privateIp(mapped[1]);
+  return v === "::" || v === "::1" || cidrContains("fc00::/7", v) || cidrContains("fe80::/10", v);
 }
 
 // ---------------------------------------------------------------------------
@@ -89,9 +111,17 @@ function parseProfile(raw, fallbackId = "") {
     if (!/\[Interface\]/i.test(wgConfig) || !/\[Peer\]/i.test(wgConfig)) return null;
   } else {
     let u;
-    try { u = new URL(server); } catch { return null; }
+    try { u = new URL(server); } catch {
+      // Allow bare endpoints like [2a02:c7c:...:2520]:1080 when type is known
+      if (type && ["http", "https", "socks5", "socks", "socks5h"].includes(type)) {
+        const scheme = type === "socks" || type === "socks5h" ? "socks5" : type;
+        try { u = new URL(`${scheme}://${server}`); } catch { return null; }
+      } else return null;
+    }
     const proto = u.protocol.replace(":", "").toLowerCase();
     type = type || ({ http: "http", https: "https", socks: "socks5", socks5: "socks5", socks5h: "socks5" })[proto] || "";
+    // Normalize type aliases
+    type = type === "socks" || type === "socks5h" ? "socks5" : type;
     if (!["http", "https", "socks5"].includes(type)) return null;
     host = u.hostname.replace(/^\[|\]$/g, "");
     port = Number(u.port) || (type === "https" ? 443 : type === "http" ? 8080 : 1080);
@@ -203,15 +233,20 @@ async function socks5Handshake(sock, target, port, username, password, timeoutMs
   const reader = socketReader(sock);
   const timer = setTimeout(() => sock.destroy(vpnError("SOCKS5 gateway did not answer in time", "VPN_TIMEOUT")), timeoutMs);
   try {
+    if (!Number.isFinite(port) || port < 1 || port > 65535) throw vpnError("Invalid target port for SOCKS5.", "VPN_PROTOCOL");
     const methods = username || password ? [0x00, 0x02] : [0x00];
     sock.write(Buffer.from([0x05, methods.length, ...methods]));
     const [ver, method] = await reader.read(2);
     if (ver !== 0x05) throw vpnError("Upstream is not a SOCKS5 server.", "VPN_PROTOCOL");
     if (method === 0xff) throw vpnError("SOCKS5 gateway accepted none of our auth methods.", "VPN_AUTH_FAILED");
+    if (!methods.includes(method)) throw vpnError("SOCKS5 gateway selected an auth method we did not offer.", "VPN_PROTOCOL");
     if (method === 0x02) {
-      const u = Buffer.from(username), p = Buffer.from(password);
+      const u = Buffer.from(username || ""), p = Buffer.from(password || "");
+      if (u.length > 255) throw vpnError("SOCKS5 username exceeds 255 bytes.", "VPN_PROTOCOL");
+      if (p.length > 255) throw vpnError("SOCKS5 password exceeds 255 bytes.", "VPN_PROTOCOL");
       sock.write(Buffer.concat([Buffer.from([0x01, u.length]), u, Buffer.from([p.length]), p]));
-      const [, st] = await reader.read(2);
+      const [sVer, st] = await reader.read(2);
+      if (sVer !== 0x01) throw vpnError("Malformed SOCKS5 auth sub-negotiation.", "VPN_PROTOCOL");
       if (st !== 0x00) throw vpnError("SOCKS5 gateway rejected the credentials.", "VPN_AUTH_FAILED");
     }
     let addr;
@@ -228,15 +263,29 @@ async function socks5Handshake(sock, target, port, username, password, timeoutMs
     const [v2, rep, , atyp] = await reader.read(4);
     if (v2 !== 0x05) throw vpnError("Malformed SOCKS5 reply.", "VPN_PROTOCOL");
     if (rep !== 0x00) throw vpnError(`SOCKS5 gateway could not reach ${target}:${port} (${SOCKS_REPLIES[rep] || rep}).`, "VPN_CONNECT_REFUSED");
+    if (atyp !== 0x01 && atyp !== 0x03 && atyp !== 0x04) throw vpnError("SOCKS5 gateway returned an unsupported address type.", "VPN_PROTOCOL");
     const len = atyp === 0x01 ? 4 : atyp === 0x04 ? 16 : (await reader.read(1))[0];
     await reader.read(len + 2);
   } finally { clearTimeout(timer); reader.release(); }
 }
 function expandIpv6(ip) {
-  const [head, tail = ""] = ip.split("::");
-  const h = head ? head.split(":") : [], t = tail ? tail.split(":") : [];
-  const fill = Array(8 - h.length - t.length).fill("0");
-  return (ip.includes("::") ? [...h, ...fill, ...t] : h).map(x => x || "0").join(":");
+  // Handle IPv4-embedded IPv6 like ::ffff:192.0.2.1
+  const embedded = ip.match(/^(.*?)::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i);
+  if (embedded) {
+    const head = embedded[1] ? embedded[1].replace(/:$/, "").split(":") : [];
+    const ipv4 = embedded[2].split(".").map(Number);
+    const tail = [((ipv4[0] << 8) | ipv4[1]).toString(16), ((ipv4[2] << 8) | ipv4[3]).toString(16)];
+    const fill = Array(Math.max(0, 6 - head.length)).fill("0");
+    return [...head, ...fill, ...tail].map(x => x.padStart(4, "0")).join(":");
+  }
+  const [headRaw, tailRaw = ""] = ip.split("::");
+  const h = headRaw ? headRaw.split(":") : [];
+  const t = tailRaw ? tailRaw.split(":") : [];
+  if (ip.includes("::")) {
+    const fill = Array(Math.max(0, 8 - h.length - t.length)).fill("0");
+    return [...h, ...fill, ...t].map(x => x || "0").join(":");
+  }
+  return h.map(x => x || "0").join(":");
 }
 
 // ---------------------------------------------------------------------------
@@ -389,6 +438,74 @@ class VpnManager {
     }
     if (!this.defaultProfileId && this.profiles.size) this.defaultProfileId = this.profiles.keys().next().value;
     if (this.profiles.size) this.log("info", "VPN", `Loaded ${this.profiles.size} VPN profile(s): ${[...this.profiles.values()].map(p => `${p.id} (${p.type})`).join(", ")}.`);
+  }
+
+  // ---- profile management (mutations route through here so tunnels/agents stay consistent) ----
+  parseProfile(raw, fallbackId = "") { return parseProfile(raw, fallbackId); }
+
+  addProfile(rawOrProfile) {
+    // Accept either a raw config object or an already-parsed profile.
+    // Detect already-parsed profiles by the presence of parsed-only fields.
+    let profile;
+    if (rawOrProfile && rawOrProfile.id && rawOrProfile.type && rawOrProfile.host !== undefined && rawOrProfile.wgConfig !== undefined) {
+      // Already parsed (has host and wgConfig fields)
+      profile = rawOrProfile;
+    } else {
+      profile = parseProfile(rawOrProfile);
+    }
+    if (!profile || !profile.id) return null;
+
+    // Clean up any existing state for this profile id
+    const oldAgent = this.profileAgents.get(profile.id);
+    if (oldAgent) { this.profileAgents.delete(profile.id); oldAgent.close().catch(() => {}); }
+    const oldTunnel = this.tunnels.get(profile.id);
+    if (oldTunnel) { oldTunnel.stop("profile replaced"); this.tunnels.delete(profile.id); }
+
+    this.profiles.set(profile.id, profile);
+    if (!this.health.has(profile.id))
+      this.health.set(profile.id, { healthy: null, failures: 0, checkedAt: 0, latencyMs: null, exitIp: null, lastError: null, successes: 0 });
+    if (profile.type === "wireguard") this.tunnels.set(profile.id, new WireGuardTunnel(profile, { bin: this.wireproxyBin, log: this.log, idleMs: this.wgIdleMs }));
+    if (!this.defaultProfileId) this.defaultProfileId = profile.id;
+
+    // Reset session agents for sessions using this profile so they pick up the new tunnel/credentials
+    for (const [sid, conn] of this.connections) {
+      if (conn.profileId === profile.id) this.resetSessionAgent(sid);
+    }
+    return profile;
+  }
+
+  removeProfile(id) {
+    const pid = String(id || "");
+    if (!pid) return;
+    // Stop WireGuard tunnel if any
+    const tunnel = this.tunnels.get(pid);
+    if (tunnel) { tunnel.stop("profile deleted"); this.tunnels.delete(pid); }
+    // Close pooled profile agent
+    const agent = this.profileAgents.get(pid);
+    if (agent) { this.profileAgents.delete(pid); agent.close().catch(() => {}); }
+    this.profiles.delete(pid);
+    this.health.delete(pid);
+    // Disconnect or fail over sessions using this profile
+    for (const [sid, conn] of this.connections) {
+      if (conn.profileId === pid) {
+        const alt = this.pickProfile({ region: conn.region, group: conn.group, exclude: [pid] });
+        if (alt) { conn.profileId = alt.id; conn.failovers += 1; this.resetSessionAgent(sid); this.log("info", "VPN", `Profile ${pid} removed; session ${sid.slice(0,8)}… moved to ${alt.id}.`); }
+        else { this.disconnect(sid); this.log("info", "VPN", `Profile ${pid} removed; session ${sid.slice(0,8)}… disconnected.`); }
+      }
+    }
+    if (this.defaultProfileId === pid) this.defaultProfileId = this.profiles.size ? this.profiles.keys().next().value : "";
+  }
+
+  // Whether VPN is required for a given session's outbound requests.
+  // A session requires VPN only if it is connected, or always-on is set.
+  // This prevents the kill switch from blocking normal direct browsing when
+  // VPN is enabled but the session hasn't opted in.
+  requiresVpnForSession(sid) {
+    const key = String(sid || "");
+    return this.enabledForUse() && (this.alwaysOn || this.connections.has(key));
+  }
+  requiresVpnForCrawler() {
+    return this.enabledForUse() && !!this.crawlerProfileId;
   }
 
   // ---- public views (never include servers or credentials) ----
@@ -566,6 +683,8 @@ class VpnManager {
       sock?.destroy();
       this.stats.tunnelFailures += 1;
       // Only count gateway-level failures against the profile, not "site unreachable".
+      // For SOCKS5, VPN_CONNECT_REFUSED means the destination site was unreachable.
+      // For HTTP/HTTPS, a refused CONNECT could be the gateway itself rejecting.
       if (e.code !== "VPN_CONNECT_REFUSED" || profile.type !== "socks5") this.notePassive(profile.id, false, e.message);
       throw e;
     }
@@ -589,8 +708,10 @@ class VpnManager {
         if (opts.protocol !== "https:") return callback(null, sock);
         const secure = tls.connect({ socket: sock, servername: net.isIP(host) ? undefined : (opts.servername || host), ALPNProtocols: ["http/1.1"] });
         const t = setTimeout(() => secure.destroy(vpnError("TLS handshake through VPN timed out", "VPN_TIMEOUT")), this.connectTimeoutMs);
-        secure.once("secureConnect", () => { clearTimeout(t); callback(null, secure); });
-        secure.once("error", e => { clearTimeout(t); callback(e, null); });
+        const onSecure = () => { clearTimeout(t); secure.off("error", onErr); callback(null, secure); };
+        const onErr = e => { clearTimeout(t); callback(e, null); };
+        secure.once("secureConnect", onSecure);
+        secure.once("error", onErr);
       }, e => callback(e, null));
     };
   }
@@ -629,7 +750,15 @@ class VpnManager {
       const r = await fetch(this.healthUrl, { dispatcher, signal: controller.signal, headers: { "user-agent": "VeyraVPNHealth/2.0", accept: "application/json,text/plain" } });
       const text = (await r.text()).slice(0, 2000);
       let exitIp = null;
-      try { exitIp = JSON.parse(text).ip || null; } catch { exitIp = (text.match(/\b\d{1,3}(?:\.\d{1,3}){3}\b|\b[0-9a-f:]{6,}\b/i) || [null])[0]; }
+      try {
+        const j = JSON.parse(text);
+        exitIp = j.ip || j.query || j.origin || j.IP || null;
+      } catch {}
+      if (!exitIp) {
+        // Extract IP candidates and validate with net.isIP
+        const candidates = text.match(/\d{1,3}(?:\.\d{1,3}){3}|[0-9a-f]{1,4}(?::[0-9a-f]{1,4}){2,7}/gi) || [];
+        for (const c of candidates) { if (net.isIP(c)) { exitIp = c; break; } }
+      }
       return { ok: r.status >= 200 && r.status < 500, status: r.status, exitIp, latencyMs: Date.now() - started };
     } finally { clearTimeout(timer); }
   }
@@ -783,4 +912,4 @@ class VpnManager {
   }
 }
 
-module.exports = { VpnManager, parseProfile, hostMatches, socks5Handshake, httpConnectHandshake, WireGuardTunnel, loadProfilesFromEnv, privateIp };
+module.exports = { VpnManager, parseProfile, hostMatches, cidrContains, privateIp, expandIpv6, socks5Handshake, httpConnectHandshake, WireGuardTunnel, loadProfilesFromEnv };

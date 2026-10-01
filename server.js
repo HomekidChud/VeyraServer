@@ -1125,8 +1125,8 @@ async function fetchBuffer(url, opts = {}) {
         if (cached?.etag) reqHeaders.set("if-none-match", cached.etag);
         if (cached?.lastModified) reqHeaders.set("if-modified-since", cached.lastModified);
         const vpnEnabledForRequest = sessionId
-          ? !!vpnManager.enabledForUse?.()
-          : !!vpnManager.enabledForUse?.() && !!vpnManager.crawlerProfileId;
+          ? vpnManager.requiresVpnForSession?.(sessionId) ?? false
+          : vpnManager.requiresVpnForCrawler?.() ?? false;
         const suppliedDispatcher = opts.dispatcher || (sessionId ? vpnManager.dispatcherForSession(sessionId) : vpnManager.dispatcherForCrawler());
         if (vpnEnabledForRequest && !suppliedDispatcher && vpnManager.killSwitch) {
           const e = Object.assign(new Error('Veyra VPN is unavailable and the kill switch blocked a direct upstream connection.'), { code: 'VPN_KILL_SWITCH' });
@@ -3372,7 +3372,11 @@ app.get('/api/vpn/list', async (req, res) => {
     const dbProfiles = mongoStore.enabled ? (await mongoStore.loadVpnProfiles()) : [];
     const envProfiles = vpnManager.list().map(p => ({ ...p, source: 'env' }));
     const envIds = new Set(envProfiles.map(p => p.id));
-    const db = dbProfiles.filter(p => !envIds.has(p.id)).map(p => ({ ...p, source: 'db' }));
+    // Sanitize DB profiles through publicProfile to avoid leaking credentials
+    const db = dbProfiles.filter(p => !envIds.has(p.id)).map(p => {
+      const profile = vpnManager.parseProfile(p);
+      return profile ? { ...vpnManager.publicProfile(profile), source: 'db' } : null;
+    }).filter(Boolean);
     res.json({ ok: true, profiles: [...envProfiles, ...db], envCount: envProfiles.length, dbCount: db.length });
   } catch (e) { respondError(res, 500, e.message, 'VPN_LIST_ERROR'); }
 });
@@ -3406,10 +3410,8 @@ app.post('/api/vpn/custom', async (req, res) => {
       source: 'db',
       createdAt: new Date().toISOString(),
     };
-    const profile = vpnManager.parseProfile(profileData);
+    const profile = vpnManager.addProfile(profileData);
     if (!profile) return respondError(res, 400, 'Invalid VPN configuration', 'VPN_INVALID_CONFIG');
-    vpnManager.profiles.set(profileId, profile);
-    vpnManager.health.set(profileId, { healthy: null, failures: 0, checkedAt: 0, latencyMs: null, exitIp: null, lastError: null, successes: 0 });
     // Persist to MongoDB so it survives restarts
     if (mongoStore.enabled) await mongoStore.saveVpnProfile(profileData);
     serverLog('info', 'VPN', `VPN profile saved: ${name} (${type}) [${mongoStore.enabled ? 'persisted' : 'in-memory only'}]`);
@@ -3422,8 +3424,7 @@ app.post('/api/vpn/custom', async (req, res) => {
 app.delete('/api/vpn/custom/:profileId', async (req, res) => {
   const pid = String(req.params.profileId || '');
   if (!pid) return respondError(res, 400, 'Profile ID is required', 'VPN_ID_REQUIRED');
-  vpnManager.profiles.delete(pid);
-  vpnManager.health.delete(pid);
+  vpnManager.removeProfile(pid);
   if (mongoStore.enabled) await mongoStore.deleteVpnProfile(pid);
   serverLog('info', 'VPN', `VPN profile deleted: ${pid}`);
   res.json({ ok: true, deleted: pid });
@@ -5115,14 +5116,15 @@ if (require.main === module && CFG.processRole !== "worker") {
     if (mongoStore.enabled) {
       try {
         const dbProfiles = await mongoStore.loadVpnProfiles();
+        let loaded = 0;
         for (const p of dbProfiles) {
-          const profile = vpnManager.parseProfile(p);
-          if (profile && !vpnManager.profiles.has(profile.id)) {
-            vpnManager.profiles.set(profile.id, profile);
-            vpnManager.health.set(profile.id, { healthy: null, failures: 0, checkedAt: 0, latencyMs: null, exitIp: null, lastError: null, successes: 0 });
+          const candidate = vpnManager.parseProfile(p);
+          if (candidate && !vpnManager.profiles.has(candidate.id)) {
+            vpnManager.addProfile(candidate);
+            loaded++;
           }
         }
-        serverLog('info', 'VPN', `Loaded ${dbProfiles.length} VPN profile(s) from MongoDB.`);
+        serverLog('info', 'VPN', `Loaded ${loaded} VPN profile(s) from MongoDB.`);
       } catch (e) { serverLog('warn', 'VPN', `Failed to load VPN profiles from MongoDB: ${e.message}`); }
     }
     await hydrateSearchFromMongo();
