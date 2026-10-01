@@ -217,7 +217,9 @@ server.listen(PORT, "::", async () => {
 
   // Auto-detect public IP
   const publicIP = await fetchPublicIP();
-  const serverAddr = publicIP ? formatHost(publicIP, PORT) : `<your-public-ip>:${PORT}`;
+  const hostAddr = publicIP ? formatHost(publicIP, PORT) : `<your-public-ip>:${PORT}`;
+  // Veyra's parseProfile expects a full URL with protocol prefix (socks5://host:port)
+  const serverAddr = `socks5://${hostAddr}`;
 
   const veyraConfig = {
     name: NAME,
