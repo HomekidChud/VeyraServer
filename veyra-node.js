@@ -32,6 +32,7 @@
 const net = require("net");
 const crypto = require("crypto");
 const os = require("os");
+const https = require("https");
 
 const args = Object.fromEntries(process.argv.slice(2).map(a => {
   const [k, ...v] = a.replace(/^--/, "").split("=");
@@ -45,8 +46,31 @@ const NAME = args.name || "VeyraVPN Node";
 const REGION = args.region || "";
 const PRINT_JSON = args["print-json"] || args.json || false;
 
+// ---- Helpers ----
+
+function formatHost(ip, port) {
+  // IPv6 addresses need brackets in host:port format
+  if (ip.includes(":")) return `[${ip}]:${port}`;
+  return `${ip}:${port}`;
+}
+
+function fetchPublicIP() {
+  return new Promise(resolve => {
+    const req = https.get("https://api64.ipify.org?format=json", res => {
+      let data = "";
+      res.on("data", chunk => data += chunk);
+      res.on("end", () => {
+        try { resolve(JSON.parse(data).ip); }
+        catch { resolve(null); }
+      });
+    });
+    req.on("error", () => resolve(null));
+    req.setTimeout(4000, () => { req.destroy(); resolve(null); });
+  });
+}
+
 // ---- SOCKS5 server ----
-const STATES = { AUTH: 0, REQ: 1, PIPE: 2 };
+const STATES = { AUTH: 0, AUTH2: 1, REQ: 2, PIPE: 3 };
 
 function newSession() {
   return { state: STATES.AUTH, buf: Buffer.alloc(0), target: null, port: null, remote: null };
@@ -68,7 +92,7 @@ function handleAuth(session, sock) {
     return;
   }
   sock.write(Buffer.from([0x05, 0x02])); // Select username/password
-  session.state = STATES.REQ;
+  session.state = STATES.AUTH2;
 }
 
 function handleAuth2(session, sock) {
@@ -155,40 +179,54 @@ const server = net.createServer(sock => {
     session.buf = session.buf.length ? Buffer.concat([session.buf, data]) : data;
     if (session.buf.length > 65536) { sock.end(); return; }
 
-    if (session.state === STATES.AUTH) {
-      handleAuth(session, sock);
-      // Fall through to handle auth step 2 if we have data
-    }
-    if (session.state === STATES.REQ) {
-      // Check if we're in the auth step (username/password sub-negotiation)
-      if (session.buf.length >= 2 && session.buf[0] === 0x01) {
+    // Process all complete messages in the buffer (handles pipelined data)
+    let progress = true;
+    while (progress && session.buf.length > 0 && session.state !== STATES.PIPE) {
+      progress = false;
+
+      if (session.state === STATES.AUTH) {
+        const before = session.buf.length;
+        handleAuth(session, sock);
+        progress = session.buf.length !== before;
+      }
+      if (session.state === STATES.AUTH2) {
+        const before = session.buf.length;
         handleAuth2(session, sock);
-      } else {
+        progress = session.buf.length !== before;
+      }
+      if (session.state === STATES.REQ) {
+        const before = session.buf.length;
         handleRequest(session, sock);
+        progress = session.buf.length !== before;
       }
     }
   });
   sock.on("error", () => {});
 });
 
-server.listen(PORT, "0.0.0.0", () => {
-  // Get local IPs for display
+// Listen on :: for dual-stack IPv4+IPv6 (ipv6Only defaults to false in Node.js)
+server.listen(PORT, "::", async () => {
+  // Get local IPs for display (both IPv4 and IPv6)
   const nets = os.networkInterfaces();
   const ips = [];
   for (const name of Object.keys(nets)) {
-    for (const net of nets[name]) {
-      if (net.family === "IPv4" && !net.internal) ips.push({ name, address: net.address });
+    for (const iface of nets[name]) {
+      if (!iface.internal) ips.push({ name, address: iface.address, family: iface.family });
     }
   }
+
+  // Auto-detect public IP
+  const publicIP = await fetchPublicIP();
+  const serverAddr = publicIP ? formatHost(publicIP, PORT) : `<your-public-ip>:${PORT}`;
 
   const veyraConfig = {
     name: NAME,
     type: "socks5",
-    server: `<your-public-ip>:${PORT}`,
+    server: serverAddr,
     username: USER,
     password: PASS,
     region: REGION,
-    note: "Replace <your-public-ip> with your public IP. Run 'curl ifconfig.me' to find it.",
+    note: publicIP ? "Auto-detected public IP." : "Replace <your-public-ip> with your public IP. Run 'curl ifconfig.me' to find it.",
   };
 
   if (PRINT_JSON) {
@@ -204,17 +242,20 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`  Port:     ${PORT}`);
   console.log(`  Username: ${USER}`);
   console.log(`  Password: ${PASS}`);
+  if (publicIP) {
+    console.log(`  Public IP: ${publicIP}`);
+    console.log(`  Dual-stack: IPv4 + IPv6`);
+  }
   console.log("");
   console.log("  Local IPs:");
-  for (const ip of ips) console.log(`    ${ip.name}: ${ip.address}:${PORT}`);
+  for (const ip of ips) console.log(`    ${ip.name} (${ip.family}): ${formatHost(ip.address, PORT)}`);
   console.log("");
   console.log("  To add this to Veyra Browser:");
-  console.log("    1. Find your public IP: curl ifconfig.me");
-  console.log("    2. In Veyra: VPN → Add Profile");
-  console.log("    3. Type: SOCKS5");
-  console.log(`    4. Server: <your-public-ip>:${PORT}`);
-  console.log(`    5. Username: ${USER}`);
-  console.log(`    6. Password: ${PASS}`);
+  console.log("    1. In Veyra: VPN -> Add Profile");
+  console.log("    2. Type: SOCKS5");
+  console.log(`    3. Server: ${serverAddr}`);
+  console.log(`    4. Username: ${USER}`);
+  console.log(`    5. Password: ${PASS}`);
   console.log("");
   console.log("  Or import this JSON config:");
   console.log(JSON.stringify(veyraConfig, null, 2));
