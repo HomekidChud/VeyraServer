@@ -3363,45 +3363,70 @@ app.get('/api/vpn/ip', async (req, res) => {
   try { res.json({ ok: true, ...(await vpnManager.exitIpForSession(sid)) }); }
   catch (e) { respondError(res, vpnErrStatus(e.code) === 400 ? 502 : vpnErrStatus(e.code), e.message, e.code || 'VPN_IP_ERROR'); }
 });
-// Custom VPN provider — user-supplied VPN configuration
-app.post('/api/vpn/custom', (req, res) => {
-  const { name, type, server, apiKey, username, password, region, config } = req.body || {};
+// Custom VPN profiles — MongoDB-persisted CRUD
+// Users can add, list, update, delete, and test their own VPN profiles.
+// These are layered on top of env-var profiles (which always load on startup).
+// Supported types: wireguard, socks5, http, https
+app.get('/api/vpn/list', async (req, res) => {
+  try {
+    const dbProfiles = mongoStore.enabled ? (await mongoStore.loadVpnProfiles()) : [];
+    const envProfiles = vpnManager.list().map(p => ({ ...p, source: 'env' }));
+    const envIds = new Set(envProfiles.map(p => p.id));
+    const db = dbProfiles.filter(p => !envIds.has(p.id)).map(p => ({ ...p, source: 'db' }));
+    res.json({ ok: true, profiles: [...envProfiles, ...db], envCount: envProfiles.length, dbCount: db.length });
+  } catch (e) { respondError(res, 500, e.message, 'VPN_LIST_ERROR'); }
+});
+
+app.post('/api/vpn/custom', async (req, res) => {
+  const { name, type, server, username, password, region, config, id } = req.body || {};
   if (!name) return respondError(res, 400, 'VPN name is required', 'VPN_NAME_REQUIRED');
-  // Validate type
-  const validTypes = ['socks5', 'http', 'https', 'wireguard', 'api'];
-  if (!validTypes.includes(type)) return respondError(res, 400, 'Invalid VPN type', 'VPN_INVALID_TYPE');
+  const validTypes = ['socks5', 'http', 'https', 'wireguard'];
+  if (!validTypes.includes(type)) return respondError(res, 400, `Invalid VPN type. Supported: ${validTypes.join(', ')}`, 'VPN_INVALID_TYPE');
   // For wireguard, validate config has required sections
   if (type === 'wireguard' && config) {
     if (!/\[Interface\]/i.test(config) || !/\[Peer\]/i.test(config)) {
       return respondError(res, 400, 'WireGuard config needs [Interface] and [Peer] sections', 'VPN_INVALID_WG_CONFIG');
     }
   }
-  // Store the custom VPN profile (in-memory, per server instance)
-  const profileId = `custom_${Date.now().toString(36)}`;
+  if (type !== 'wireguard' && !server) {
+    return respondError(res, 400, 'Server address is required for proxy-type VPNs', 'VPN_SERVER_REQUIRED');
+  }
+  const profileId = id || `custom_${Date.now().toString(36)}`;
   try {
-    const profile = vpnManager.parseProfile({
+    const profileData = {
       id: profileId,
       name: String(name).slice(0, 100),
-      type: type === 'api' ? 'socks5' : type,
+      type,
       server: server || '',
       username: username || '',
       password: password || '',
       region: region || '',
-      wireguard: type === 'wireguard' ? config : undefined,
-      config: type === 'wireguard' ? config : undefined,
-      provider: 'User Custom'
-    });
-    if (profile) {
-      vpnManager.profiles.set(profileId, profile);
-      vpnManager.health.set(profileId, { healthy: null, failures: 0, checkedAt: 0, latencyMs: null, exitIp: null, lastError: null, successes: 0 });
-      serverLog('info', 'VPN', `Custom VPN profile added: ${name} (${type})`);
-      res.json({ ok: true, profileId, profile: vpnManager.publicProfile(profile) });
-    } else {
-      respondError(res, 400, 'Invalid VPN configuration', 'VPN_INVALID_CONFIG');
-    }
+      config: type === 'wireguard' ? config : '',
+      provider: 'User Custom',
+      source: 'db',
+      createdAt: new Date().toISOString(),
+    };
+    const profile = vpnManager.parseProfile(profileData);
+    if (!profile) return respondError(res, 400, 'Invalid VPN configuration', 'VPN_INVALID_CONFIG');
+    vpnManager.profiles.set(profileId, profile);
+    vpnManager.health.set(profileId, { healthy: null, failures: 0, checkedAt: 0, latencyMs: null, exitIp: null, lastError: null, successes: 0 });
+    // Persist to MongoDB so it survives restarts
+    if (mongoStore.enabled) await mongoStore.saveVpnProfile(profileData);
+    serverLog('info', 'VPN', `VPN profile saved: ${name} (${type}) [${mongoStore.enabled ? 'persisted' : 'in-memory only'}]`);
+    res.json({ ok: true, profileId, profile: vpnManager.publicProfile(profile), persisted: mongoStore.enabled });
   } catch (e) {
     respondError(res, 400, e.message, 'VPN_ADD_FAILED');
   }
+});
+
+app.delete('/api/vpn/custom/:profileId', async (req, res) => {
+  const pid = String(req.params.profileId || '');
+  if (!pid) return respondError(res, 400, 'Profile ID is required', 'VPN_ID_REQUIRED');
+  vpnManager.profiles.delete(pid);
+  vpnManager.health.delete(pid);
+  if (mongoStore.enabled) await mongoStore.deleteVpnProfile(pid);
+  serverLog('info', 'VPN', `VPN profile deleted: ${pid}`);
+  res.json({ ok: true, deleted: pid });
 });
 
 // ---------------------------------------------------------------------------
@@ -5086,6 +5111,20 @@ if (require.main === module && CFG.processRole !== "worker") {
   const startServer = async () => {
     await authStore.ready;
     await mongoStore.connect();
+    // Load MongoDB-persisted VPN profiles on startup (layered on env-var profiles)
+    if (mongoStore.enabled) {
+      try {
+        const dbProfiles = await mongoStore.loadVpnProfiles();
+        for (const p of dbProfiles) {
+          const profile = vpnManager.parseProfile(p);
+          if (profile && !vpnManager.profiles.has(profile.id)) {
+            vpnManager.profiles.set(profile.id, profile);
+            vpnManager.health.set(profile.id, { healthy: null, failures: 0, checkedAt: 0, latencyMs: null, exitIp: null, lastError: null, successes: 0 });
+          }
+        }
+        serverLog('info', 'VPN', `Loaded ${dbProfiles.length} VPN profile(s) from MongoDB.`);
+      } catch (e) { serverLog('warn', 'VPN', `Failed to load VPN profiles from MongoDB: ${e.message}`); }
+    }
     await hydrateSearchFromMongo();
     const httpServer = app.listen(PORT, "0.0.0.0", () => {
       serverLog("info", "SYSTEM", `Veyra server listening on ${PORT}`);

@@ -32,7 +32,8 @@ class MongoStore {
           this.db.collection("search_documents").createIndex({ url: 1 }, { unique: true }).catch(() => {}),
           this.db.collection("search_documents").createIndex({ host: 1 }).catch(() => {}),
           this.db.collection("crawl_runs").createIndex({ finishedAt: -1 }).catch(() => {}),
-          this.db.collection("crawl_runs").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }).catch(() => {})
+          this.db.collection("crawl_runs").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }).catch(() => {}),
+          this.db.collection("vpn_profiles").createIndex({ id: 1 }, { unique: true }).catch(() => {})
         ]);
         this.connected = true; this.disabledReason = ""; this.retryAfter = 0; return true;
       } catch (e) {
@@ -71,6 +72,29 @@ class MongoStore {
   async upsertSearchDocument(doc) { if (!doc?.url) return; const safe = { ...doc, termFreq: Object.fromEntries(doc.termFreq instanceof Map ? doc.termFreq.entries() : Object.entries(doc.termFreq || {})) }; delete safe._id; this.stats.writes += 1; void this.withDb(db => db.collection("search_documents").updateOne({ url: safe.url }, { $set: safe }, { upsert: true })); }
   async deleteSearchDocument(url) { if (!url) return; this.stats.writes += 1; void this.withDb(db => db.collection("search_documents").deleteOne({ url })); }
   async saveCrawlSummary(job) { if (!job?.id) return; const doc = { id: String(job.id), root: job.root, createdAt: job.createdAt, startedAt: job.startedAt || null, finishedAt: job.finishedAt || null, status: job.status, statusText: job.statusText, pageAccelerator: !!job.pageAccelerator, counts: job.counts || {}, resourceCount: job.resources?.length || 0, linkCount: job.links?.length || 0, expiresAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000) }; this.stats.writes += 1; void this.withDb(db => db.collection("crawl_runs").updateOne({ id: doc.id }, { $set: doc }, { upsert: true })); }
+
+  // ---- VPN profile persistence ----
+  // Stored separately from env-var profiles. Env profiles are always loaded on
+  // startup; Mongo profiles are layered on top and survive restarts.
+  async loadVpnProfiles() {
+    const rows = await this.withDb(db => db.collection("vpn_profiles").find({}, { projection: { _id: 0 } }).limit(500).toArray());
+    return Array.isArray(rows) ? rows : [];
+  }
+  async saveVpnProfile(profile) {
+    if (!profile?.id) return;
+    const doc = { ...profile, updatedAt: new Date().toISOString() };
+    this.stats.writes += 1;
+    void this.withDb(db => db.collection("vpn_profiles").updateOne({ id: doc.id }, { $set: doc }, { upsert: true }));
+  }
+  async deleteVpnProfile(id) {
+    if (!id) return;
+    this.stats.writes += 1;
+    void this.withDb(db => db.collection("vpn_profiles").deleteOne({ id: String(id) }));
+  }
+  async listVpnProfiles() {
+    const rows = await this.withDb(db => db.collection("vpn_profiles").find({}, { projection: { _id: 0, config: 0 } }).limit(500).toArray());
+    return Array.isArray(rows) ? rows : [];
+  }
   status() { return { configured: !!this.uri, enabled: this.enabled, connected: this.connected, db: this.dbName, poolSize: this.maxPoolSize, cacheBodyMaxBytes: this.cacheBodyMaxBytes, cacheTtlMs: this.cacheTtlMs, retryAfter: this.retryAfter || null, disabledReason: this.disabledReason || null, stats: { ...this.stats } }; }
   async close() { this.connected = false; try { await this.client?.close(); } catch {} this.client = null; this.db = null; }
 }
