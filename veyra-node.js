@@ -70,7 +70,7 @@ function fetchPublicIP() {
 }
 
 // ---- SOCKS5 server ----
-const STATES = { AUTH: 0, AUTH2: 1, REQ: 2, PIPE: 3 };
+const STATES = { AUTH: 0, AUTH2: 1, REQ: 2, CONNECTING: 3, PIPE: 4 };
 
 function newSession() {
   return { state: STATES.AUTH, buf: Buffer.alloc(0), target: null, port: null, remote: null };
@@ -144,7 +144,7 @@ function handleRequest(session, sock) {
   } else if (atyp === 0x04) { // IPv6
     if (session.buf.length < 22) return;
     const parts = [];
-    for (let i = 4; i < 20; i += 2) parts.push(((session.buf[i] << 8) | session.buf[i+1]).toString(16));
+    for (let i = 4; i < 20; i += 2) parts.push(((session.buf[i] << 8) | session.buf[i+1]).toString(16).padStart(4, "0"));
     target = parts.join(":");
     port = session.buf.readUInt16BE(20);
     headerLen = 22;
@@ -155,6 +155,9 @@ function handleRequest(session, sock) {
   }
 
   session.buf = session.buf.subarray(headerLen);
+  // Set CONNECTING state immediately so the while loop doesn't re-enter
+  // handleRequest before the async net.connect callback fires.
+  session.state = STATES.CONNECTING;
 
   // Connect to the target
   const remote = net.connect(port, target, () => {
@@ -165,23 +168,28 @@ function handleRequest(session, sock) {
     remote.pipe(sock);
   });
   remote.on("error", () => {
+    if (session.state === STATES.PIPE) return; // already piped, let close handle it
     sock.write(Buffer.from([0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
     sock.end();
   });
-  sock.on("error", () => remote.destroy());
-  remote.on("close", () => sock.end());
-  sock.on("close", () => remote.destroy());
+  sock.on("error", () => { try { remote.destroy(); } catch {} });
+  remote.on("close", () => { try { sock.end(); } catch {} });
+  sock.on("close", () => { try { remote.destroy(); } catch {} });
 }
 
 const server = net.createServer(sock => {
   const session = newSession();
+  // Idle timeout: drop connections that never authenticate or send a request
+  sock.setTimeout(30000, () => { sock.end(); });
   sock.on("data", data => {
+    // Reset idle timeout on activity
+    sock.setTimeout(120000);
     session.buf = session.buf.length ? Buffer.concat([session.buf, data]) : data;
     if (session.buf.length > 65536) { sock.end(); return; }
 
     // Process all complete messages in the buffer (handles pipelined data)
     let progress = true;
-    while (progress && session.buf.length > 0 && session.state !== STATES.PIPE) {
+    while (progress && session.buf.length > 0 && session.state < STATES.CONNECTING) {
       progress = false;
 
       if (session.state === STATES.AUTH) {
