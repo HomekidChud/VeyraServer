@@ -1246,12 +1246,24 @@ async function fetchBuffer(url, opts = {}) {
         const contentType = response.headers.get("content-type") || "";
         const bodyLimit = typeof opts.limitForContentType === "function" ? opts.limitForContentType(contentType, response.headers) : limit;
         const body = await readBodyLimited(response, bodyLimit, !!opts.streamOversize, opts.bodyTimeoutMs ?? CFG.bodyTimeoutMs, upstreamSignal);
+        const upstreamEncoding = response.headers.get("content-encoding") || "";
+        const headerLength = response.headers.get("content-length") || "";
+        // undici transparently decompresses content-encoding responses, so the
+        // upstream content-length describes the COMPRESSED byte count, not the
+        // bytes Veyra actually serves. Forwarding it as-is makes every client
+        // (browser iframe, curl, Chromium) stop reading at the compressed size
+        // and silently truncate the resource mid-file — the root cause of SPA
+        // shells (YouTube etc.) never hydrating under the fast proxy. Advertise
+        // the true decompressed length when the full body was buffered; advertise
+        // nothing when streaming or truncating so the response is chunked.
+        const contentLength = body.body && !body.truncated && body.body.length
+          ? String(body.body.length)
+          : (upstreamEncoding ? "" : (method === "HEAD" || !body.truncated ? headerLength : ""));
         return {
           ok: response.ok,
           status: response.status,
           finalUrl: current,
           contentType,
-          contentEncoding: response.headers.get("content-encoding") || "",
           cacheControl: response.headers.get("cache-control") || "",
           etag: response.headers.get("etag") || "",
           lastModified: response.headers.get("last-modified") || "",
@@ -1261,7 +1273,8 @@ async function fetchBuffer(url, opts = {}) {
           linkHeader: response.headers.get("link") || "",
           contentDisposition: response.headers.get("content-disposition") || "",
           setCookieHeader: response.headers.get("set-cookie") || "",
-          contentLength: response.headers.get("content-length") || "",
+          contentEncoding: upstreamEncoding,
+          contentLength,
           serverHeader: response.headers.get("server") || "",
           cfMitigated: response.headers.get("cf-mitigated") || "",
           xFrameOptions: response.headers.get("x-frame-options") || "",
@@ -4262,6 +4275,10 @@ async function streamOversizeResponse(req, res, result, ctx) {
   if (ctx.download) res.setHeader("content-disposition", `attachment; filename="${safeDownloadFilename(result.finalUrl || ctx.canonical, type)}"`);
   if (result.contentRange) res.setHeader("content-range", result.contentRange);
   if (result.acceptRanges) res.setHeader("accept-ranges", result.acceptRanges);
+  // Only advertise a length that matches the bytes actually streamed. When the
+  // upstream was compressed (undici already decoded it), result.contentLength is
+  // empty and the response is sent chunked instead — the client must not stop at
+  // the compressed size.
   if (result.contentLength) res.setHeader("content-length", result.contentLength);
   if (result.etag) res.setHeader("ETag", result.etag);
   if (result.lastModified) res.setHeader("Last-Modified", result.lastModified);
@@ -4431,7 +4448,12 @@ async function proxyRequest(req, res, mode) {
   if (result.lastModified) res.setHeader("Last-Modified", result.lastModified);
   const outputStatus = (result.status >= 300 && result.status < 400) ? 200 : result.status;
   const transformedText = (mode === "view" && /html|xhtml|^$/i.test(result.contentType || "")) || (mode === "resource" && /(?:text\/css|javascript|ecmascript)/i.test(result.contentType || ""));
-  if (result.contentLength && !transformedText && !result.truncated) res.setHeader("content-length", result.contentLength);
+  // Serve the exact payload byte count: the upstream content-length can describe
+  // compressed bytes that undici already decoded, so never forward it blindly.
+  if (!transformedText && !result.truncated) {
+    const outLength = payload && payload.length ? payload.length : Number(result.contentLength) || 0;
+    if (outLength) res.setHeader("content-length", outLength);
+  }
   res.status(outputStatus).send(payload);
   if (mode === "view" && !result.truncated && !result.tooLarge && /html|xhtml|^$/i.test(result.contentType || "")) {
     void warmPageResources(result.body.toString("utf8"), result.finalUrl || canonical, sid);
