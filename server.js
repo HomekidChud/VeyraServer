@@ -4348,6 +4348,21 @@ async function proxyRequest(req, res, mode) {
   const sourceOrigin = sourceUrl ? new URL(sourceUrl).origin : "";
   const sid = normalizeSessionId(req.query.sid);
   if (sessionManager.checkLimit(sid)) return sendSessionExpired(req, res, mode, sid);
+  // Optional passive sign-in probes (YouTube embeds accounts.google.com/ServiceLogin
+  // with passive=true in a hidden iframe). Google rejects the proxied request with
+  // 401, and the site's boot error handling can then derail the whole page into an
+  // error document. The probe is optional by definition — a signed-out session is
+  // its normal result — so answer it locally with an inert page.
+  if (mode === "view") {
+    try {
+      const u = new URL(canonical);
+      if (/^(?:[a-z0-9-]+\.)?accounts\.google\.com$/i.test(u.hostname) && /\/ServiceLogin/i.test(u.pathname) && (u.searchParams.get("passive") === "true" || u.searchParams.has("uilel"))) {
+        res.setHeader("X-Veyra-Soft-Blocked", "passive-signin");
+        res.setHeader("Cache-Control", "no-store");
+        return res.status(200).type("html").send("<!doctype html><title></title>");
+      }
+    } catch {}
+  }
   { const rec = sessionManager.touch(sid); const exp = sessionManager.expiresAt(rec); if (exp) res.setHeader("X-Veyra-Session-Expires", new Date(exp).toISOString());
     // Tracker/ad blocking extension: answered locally, never fetched upstream.
     if (rec.prefs?.blockTrackers && isTrackerHost(new URL(canonical).hostname)) {
