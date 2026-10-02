@@ -3316,6 +3316,13 @@ app.get("/api/extensions/store/:id", (req, res) => { const ext = readExtensionSt
 app.post("/api/extensions/verify", (req, res) => { try { const extension = validateExtensionPackage(req.body || {}); res.json({ ok: true, safe: true, extension, policy: { scripts: false, cookieAccess: false, networkImports: false, permissions: ["styles"] } }); } catch (e) { res.status(400).json({ ok: false, safe: false, reason: e.message, code: "EXTENSION_SECURITY_REJECTED" }); } });
 
 const vpnErrStatus = code => ({ VPN_DISABLED: 503, VPN_NOT_CONFIGURED: 404, VPN_ALL_DOWN: 503, VPN_KILL_SWITCH: 503, VPN_TEST_FAILED: 502, VPN_NOT_CONNECTED: 409 })[code] || 400;
+
+// Health check — used by the frontend's wakeServer() to detect when the server
+// has spun up after idle sleep on Render's free plan. Must return { ok: true }
+// quickly and without requiring a session.
+app.get('/health', (req, res) => res.json({ ok: true, uptime: Math.round(process.uptime()), plan: VEYRA_CONFIG.plan.label, time: new Date().toISOString() }));
+app.get('/api/health', (req, res) => res.json({ ok: true, uptime: Math.round(process.uptime()), plan: VEYRA_CONFIG.plan.label, time: new Date().toISOString() }));
+
 app.get('/api/vpn/status', (req, res) => {
   res.json({ ok: true, ...vpnManager.status() });
 });
