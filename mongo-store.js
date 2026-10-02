@@ -33,7 +33,11 @@ class MongoStore {
           this.db.collection("search_documents").createIndex({ host: 1 }).catch(() => {}),
           this.db.collection("crawl_runs").createIndex({ finishedAt: -1 }).catch(() => {}),
           this.db.collection("crawl_runs").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }).catch(() => {}),
-          this.db.collection("vpn_profiles").createIndex({ id: 1 }, { unique: true }).catch(() => {})
+          this.db.collection("vpn_profiles").createIndex({ id: 1 }, { unique: true }).catch(() => {}),
+          this.db.collection("snapshots").createIndex({ proxySid: 1, url: 1 }, { unique: true }).catch(() => {}),
+          this.db.collection("snapshots").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }).catch(() => {}),
+          this.db.collection("session_cookies").createIndex({ sid: 1 }, { unique: true }).catch(() => {}),
+          this.db.collection("session_cookies").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }).catch(() => {})
         ]);
         this.connected = true; this.disabledReason = ""; this.retryAfter = 0; return true;
       } catch (e) {
@@ -94,6 +98,83 @@ class MongoStore {
   async listVpnProfiles() {
     const rows = await this.withDb(db => db.collection("vpn_profiles").find({}, { projection: { _id: 0, config: 0 } }).limit(500).toArray());
     return Array.isArray(rows) ? rows : [];
+  }
+
+  // ---- Snapshot persistence (failover safety net) ----
+  // Stores last-good HTML snapshots so they survive restarts and don't consume
+  // Render RAM. Each snapshot is gzipped for storage efficiency.
+  async putSnapshot(proxySid, snapshot) {
+    if (!proxySid || !snapshot?.url || !snapshot.html) return;
+    const bodyGzip = zlib.gzipSync(Buffer.from(snapshot.html), { level: 4 }).toString("base64");
+    const doc = {
+      proxySid, url: snapshot.url, title: snapshot.title || "", contentType: snapshot.contentType || "text/html",
+      status: snapshot.status || 200, capturedAt: new Date(),
+      bodyGzip, expiresAt: new Date(Date.now() + 30 * 60 * 1000) // 30 min TTL
+    };
+    this.stats.writes += 1;
+    void this.withDb(db => db.collection("snapshots").updateOne(
+      { proxySid, url: snapshot.url }, { $set: doc }, { upsert: true }
+    ));
+  }
+  async getSnapshot(proxySid, url) {
+    if (!proxySid || !url) return null;
+    this.stats.reads += 1;
+    const doc = await this.withDb(db => db.collection("snapshots").findOne(
+      { proxySid, url }, { projection: { _id: 0 } }
+    ));
+    if (!doc?.bodyGzip) return null;
+    if (doc.expiresAt && Date.parse(doc.expiresAt) <= Date.now()) return null;
+    try {
+      this.stats.hits += 1;
+      const html = zlib.gunzipSync(Buffer.from(doc.bodyGzip, "base64")).toString("utf8");
+      return { url: doc.url, title: doc.title || "", contentType: doc.contentType || "text/html", status: doc.status || 200, html, capturedAt: Date.parse(doc.capturedAt) || Date.now() };
+    } catch { return null; }
+  }
+  async getLatestSnapshot(proxySid) {
+    if (!proxySid) return null;
+    this.stats.reads += 1;
+    const doc = await this.withDb(db => db.collection("snapshots").findOne(
+      { proxySid }, { projection: { _id: 0 }, sort: { capturedAt: -1 } }
+    ));
+    if (!doc?.bodyGzip) return null;
+    try {
+      this.stats.hits += 1;
+      const html = zlib.gunzipSync(Buffer.from(doc.bodyGzip, "base64")).toString("utf8");
+      return { url: doc.url, title: doc.title || "", contentType: doc.contentType || "text/html", status: doc.status || 200, html, capturedAt: Date.parse(doc.capturedAt) || Date.now() };
+    } catch { return null; }
+  }
+  async clearSnapshots(proxySid) {
+    if (!proxySid) return;
+    this.stats.writes += 1;
+    void this.withDb(db => db.collection("snapshots").deleteMany({ proxySid }));
+  }
+
+  // ---- Session cookie persistence ----
+  // Stores per-session cookie jars so users don't get logged out on server
+  // restart or redeploy. Cookies are small (bounded by maxCookieBytes).
+  async putSessionCookies(sid, cookies) {
+    if (!sid || !Array.isArray(cookies) || !cookies.length) return;
+    const doc = { sid, cookies, updatedAt: new Date(), expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000) };
+    this.stats.writes += 1;
+    void this.withDb(db => db.collection("session_cookies").updateOne(
+      { sid }, { $set: doc }, { upsert: true }
+    ));
+  }
+  async getSessionCookies(sid) {
+    if (!sid) return null;
+    this.stats.reads += 1;
+    const doc = await this.withDb(db => db.collection("session_cookies").findOne(
+      { sid }, { projection: { _id: 0 } }
+    ));
+    if (!doc?.cookies) return null;
+    if (doc.expiresAt && Date.parse(doc.expiresAt) <= Date.now()) return null;
+    this.stats.hits += 1;
+    return doc.cookies;
+  }
+  async deleteSessionCookies(sid) {
+    if (!sid) return;
+    this.stats.writes += 1;
+    void this.withDb(db => db.collection("session_cookies").deleteOne({ sid }));
   }
   status() { return { configured: !!this.uri, enabled: this.enabled, connected: this.connected, db: this.dbName, poolSize: this.maxPoolSize, cacheBodyMaxBytes: this.cacheBodyMaxBytes, cacheTtlMs: this.cacheTtlMs, retryAfter: this.retryAfter || null, disabledReason: this.disabledReason || null, stats: { ...this.stats } }; }
   async close() { this.connected = false; try { await this.client?.close(); } catch {} this.client = null; this.db = null; }

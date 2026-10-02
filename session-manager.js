@@ -83,6 +83,8 @@ class SessionManager {
       this.sessions.set(sid, rec);
       this.stats.created += 1;
       this.enforceCap();
+      // Hydrate cookies from MongoDB if available (set by _hydrateFromMongo)
+      if (this._hydrateFn) { try { this._hydrateFn(sid, rec); } catch {} }
     } else {
       this.sessions.delete(sid);
       this.sessions.set(sid, rec);
@@ -163,7 +165,9 @@ class SessionManager {
     return bytes;
   }
 
-  // ---- verification pause ----
+  // Set a hydration function that loads persisted cookies from MongoDB
+  // when a new session record is created. Called synchronously inside touch().
+  setHydrateFn(fn) { this._hydrateFn = fn; }
   // Pause session expiry for captcha/challenge pages. The Chromium context
   // stays alive for human-assisted solving instead of falling back.
   pauseForVerification(sid, reason = 'challenge') {

@@ -207,8 +207,8 @@ const CFG = Object.freeze({
   mongoUri: process.env.MONGODB_URI || "",
   mongoDb: process.env.MONGODB_DB || "veyra",
   mongoPoolSize: numberEnv("MONGODB_MAX_POOL_SIZE", 2, 1, 4),
-  mongoCacheBodyMaxBytes: numberEnv("MONGODB_CACHE_BODY_MAX_BYTES", 512 * 1024, 16 * 1024, 768 * 1024),
-  mongoCacheTtlMs: numberEnv("MONGODB_CACHE_TTL_MS", 5 * 60 * 1000, 10 * 1000, 24 * 60 * 60 * 1000),
+  mongoCacheBodyMaxBytes: numberEnv("MONGODB_CACHE_BODY_MAX_BYTES", 768 * 1024, 16 * 1024, 768 * 1024),
+  mongoCacheTtlMs: numberEnv("MONGODB_CACHE_TTL_MS", 15 * 60 * 1000, 10 * 1000, 24 * 60 * 60 * 1000),
   mongoSharedCache: boolEnv("MONGODB_SHARED_CACHE", true),
   userAgent: process.env.VEYRA_USER_AGENT || `VeyraBrowseCrawler/${VEYRA_VERSION} (+https://github.com/HomekidChud/VeyraServer)`,
   frontendOrigins: csvEnv("FRONTEND_ORIGIN", ["*"]),
@@ -454,7 +454,9 @@ const failoverController = IS_THREAD_WORKER ? null : new FailoverController({
 });
 
 // Snapshot store: safety net for Chromium crashes — serves last good HTML instantly
+// Backed by MongoDB so snapshots survive restarts and don't consume Render RAM
 const snapshotStore = IS_THREAD_WORKER ? null : new SnapshotStore({
+  mongo: mongoStore,
   log: (level, source, message) => serverLog(level, source, message)
 });
 
@@ -470,6 +472,10 @@ if (!IS_THREAD_WORKER) {
       // Sync Playwright cookies into the session manager's cookie jar
       if (storageState?.cookies && proxySessionId) {
         sessionManager.importPlaywrightCookies(proxySessionId, storageState.cookies);
+        // Persist to MongoDB so cookies survive restarts
+        if (mongoStore.enabled) {
+          mongoStore.putSessionCookies(proxySessionId, storageState.cookies).catch(() => {});
+        }
       }
     },
     onVerification: (session, challenge) => {
@@ -493,6 +499,8 @@ sessionManager.on("expire", (sid, rec, reason) => {
   // Clear failover breaker and snapshots for this session
   if (failoverController) failoverController.breakers.delete(sid);
   if (snapshotStore) snapshotStore.clearSession(sid);
+  // Clear persisted cookies from MongoDB
+  if (mongoStore.enabled) mongoStore.deleteSessionCookies(sid).catch(() => {});
   return browserEngine.stopForProxySession?.(sid);
 });
 sessionManager.on("sleep", async () => {
@@ -506,6 +514,19 @@ sessionManager.on("sleep", async () => {
 });
 sessionManager.on("wake", () => { for (const j of jobs.values()) if (j.seed && !j.done && !runtimeGuard.critical) j.backgroundPaused = false; });
 if (!IS_THREAD_WORKER) sessionManager.start();
+
+// Hydrate session cookies from MongoDB on session creation (fire-and-forget).
+// This means users don't get logged out on server restart — the first request
+// may not have cookies yet, but subsequent ones will after hydration completes.
+if (!IS_THREAD_WORKER && mongoStore.enabled) {
+  sessionManager.setHydrateFn((sid, rec) => {
+    mongoStore.getSessionCookies(sid).then(cookies => {
+      if (cookies && cookies.length) {
+        sessionManager.importPlaywrightCookies(sid, cookies);
+      }
+    }).catch(() => {});
+  });
+}
 
 const browserEngineTimer = IS_THREAD_WORKER ? null : setInterval(() => {
   browserEngine.expireIdle().catch(() => {});
@@ -3313,7 +3334,8 @@ app.post('/api/browser/capability', async (req, res) => {
     if (mode === 'BROWSER_ENGINE' && failoverInfo && failoverInfo.state === 'open') {
       mode = 'FAST_PROXY';
     }
-    res.json({ ok: true, url: result.finalUrl || raw, mode, lean: CFG.leanMode, challenge: challenge ? challenge.type : null, forceBrowser: !!forceBrowser, signals, fullPage: signals.fullPage, status: result.status, contentType: result.contentType, failover: failoverInfo, snapshot: snapshotStore ? snapshotStore.has(proxySessionId, result.finalUrl || raw) : false });
+    const hasSnapshot = snapshotStore ? await snapshotStore.has(proxySessionId, result.finalUrl || raw) : false;
+    res.json({ ok: true, url: result.finalUrl || raw, mode, lean: CFG.leanMode, challenge: challenge ? challenge.type : null, forceBrowser: !!forceBrowser, signals, fullPage: signals.fullPage, status: result.status, contentType: result.contentType, failover: failoverInfo, snapshot: hasSnapshot });
   } catch (e) {
     // On probe failure, still prefer Chromium for known-broken hosts.
     const forceBrowser = hostNeedsRealBrowser(raw);
@@ -4449,7 +4471,7 @@ app.get("/api/view", async (req, res) => { try { await proxyRequest(req, res, "v
   const snapSid = normalizeSessionId(req.query.sid);
   const snapUrl = mergeStrayProxyParams(req, firstValidUrl([req.query.url, req.query.target, req.query.u], req.get('Origin') || undefined)) || proxyRefererCanonical(req);
   if (snapshotStore && snapSid && snapUrl) {
-    const snap = snapshotStore.get(snapSid, snapUrl);
+    const snap = await snapshotStore.get(snapSid, snapUrl);
     if (snap) {
       res.setHeader("X-Veyra-Snapshot", "1");
       res.setHeader("X-Veyra-Fast-Limited", "1");

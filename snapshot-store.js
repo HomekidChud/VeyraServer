@@ -27,9 +27,10 @@ class SnapshotStore {
     this.maxAssets = opts.maxAssets || MAX_ASSET_SNAPSHOTS;
     this.maxAssetBytes = opts.maxAssetBytes || MAX_ASSET_BYTES;
     this.log = opts.log || (() => {});
+    this.mongo = opts.mongo || null; // MongoDB backing store (optional)
     // sessions Map: proxySid → Map<canonicalUrl, snapshot>
     this.sessions = new Map();
-    this.stats = { stored: 0, served: 0, evicted: 0, expired: 0 };
+    this.stats = { stored: 0, served: 0, servedFromMongo: 0, evicted: 0, expired: 0, mongoWrites: 0, mongoHits: 0, mongoMisses: 0 };
   }
 
   _getSession(proxySid) {
@@ -91,32 +92,58 @@ class SnapshotStore {
     }
 
     this.stats.stored++;
+    // Persist to MongoDB (fire-and-forget, gzipped)
+    if (this.mongo) {
+      this.stats.mongoWrites++;
+      this.mongo.putSnapshot(proxySid, snapshot).catch(() => {});
+    }
     return true;
   }
 
   // Retrieve the last good snapshot for a URL in a session.
-  get(proxySid, url) {
+  // Falls back to MongoDB if not in memory.
+  async get(proxySid, url) {
     if (!proxySid || !url) return null;
     const store = this.sessions.get(proxySid);
-    if (!store) return null;
-    const snap = store.get(url);
-    if (!snap) return null;
-
-    // LRU refresh
-    store.delete(url);
-    store.set(url, snap);
-
-    this.stats.served++;
-    return snap;
+    if (store) {
+      const snap = store.get(url);
+      if (snap) {
+        // LRU refresh
+        store.delete(url);
+        store.set(url, snap);
+        this.stats.served++;
+        return snap;
+      }
+    }
+    // Fall back to MongoDB
+    if (this.mongo) {
+      const snap = await this.mongo.getSnapshot(proxySid, url);
+      if (snap) {
+        this.stats.servedFromMongo++;
+        this.stats.mongoHits++;
+        // Hydrate in-memory cache
+        const memStore = this._getSession(proxySid);
+        memStore.set(url, snap);
+        return snap;
+      }
+      this.stats.mongoMisses++;
+    }
+    return null;
   }
 
   // Get any snapshot for a session (the most recent one)
-  getLatest(proxySid) {
+  async getLatest(proxySid) {
     if (!proxySid) return null;
     const store = this.sessions.get(proxySid);
-    if (!store || !store.size) return null;
-    const entries = [...store.values()];
-    return entries[entries.length - 1] || null;
+    if (store && store.size) {
+      const entries = [...store.values()];
+      return entries[entries.length - 1] || null;
+    }
+    // Fall back to MongoDB
+    if (this.mongo) {
+      return await this.mongo.getLatestSnapshot(proxySid);
+    }
+    return null;
   }
 
   // Get a cached asset body for the proxy cache
@@ -132,10 +159,15 @@ class SnapshotStore {
   }
 
   // Check if a snapshot exists for this URL
-  has(proxySid, url) {
+  async has(proxySid, url) {
     if (!proxySid || !url) return false;
     const store = this.sessions.get(proxySid);
-    return store ? store.has(url) : false;
+    if (store && store.has(url)) return true;
+    if (this.mongo) {
+      const snap = await this.mongo.getSnapshot(proxySid, url);
+      return !!snap;
+    }
+    return false;
   }
 
   // Feed a crawl result into the store (for the crawler safety net)
@@ -151,6 +183,8 @@ class SnapshotStore {
     const n = store.size;
     this.sessions.delete(proxySid);
     this.stats.expired += n;
+    // Also clear from MongoDB
+    if (this.mongo) this.mongo.clearSnapshots(proxySid).catch(() => {});
     return n;
   }
 
@@ -178,6 +212,7 @@ class SnapshotStore {
       sessions: this.sessions.size,
       totalSnapshots,
       totalAssets,
+      mongoEnabled: !!this.mongo,
       stats: { ...this.stats }
     };
   }
