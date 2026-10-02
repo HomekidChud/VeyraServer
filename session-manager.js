@@ -33,6 +33,10 @@ class SessionManager {
     this.lastActivity = this.now();
     this.sleeping = false;
     this.timer = null;
+    // Verification pause: when a captcha/challenge is detected, pause session
+    // expiry so the Chromium context stays alive for human-assisted solving.
+    // Keyed by proxy session id → { until: timestamp, reason: string }
+    this.pausedSessions = new Map();
   }
   start() {
     if (this.timer) return this;
@@ -58,12 +62,14 @@ class SessionManager {
   touch(sid) {
     const t = this.now();
     let rec = this.sessions.get(sid);
+    // If session is paused for verification, skip expiry checks
+    const paused = this.isPaused(sid);
     const recordLimit = rec?.timeLimitMs ?? this.timeLimitMs;
-    if (rec && recordLimit && t - rec.createdAt >= recordLimit) {
+    if (rec && !paused && recordLimit && t - rec.createdAt >= recordLimit) {
       this.expire(sid, "limit");
       rec = null;
     }
-    if (rec && (t - rec.lastUsed > this.idleTtlMs || t - rec.createdAt > this.hardTtlMs)) {
+    if (rec && !paused && (t - rec.lastUsed > this.idleTtlMs || t - rec.createdAt > this.hardTtlMs)) {
       this.expire(sid, "idle");
       rec = null;
     }
@@ -122,6 +128,7 @@ class SessionManager {
   checkLimit(sid) {
     if (!sid) return false;
     if (this.isTerminated(sid)) return true;
+    if (this.isPaused(sid)) return false; // paused for verification
     const rec = this.sessions.get(sid);
     const limit = rec?.timeLimitMs ?? this.timeLimitMs;
     if (rec && limit && this.now() - rec.createdAt >= limit + (rec.renewedMs || 0)) { this.expire(sid, "limit"); return true; }
@@ -156,6 +163,71 @@ class SessionManager {
     return bytes;
   }
 
+  // ---- verification pause ----
+  // Pause session expiry for captcha/challenge pages. The Chromium context
+  // stays alive for human-assisted solving instead of falling back.
+  pauseForVerification(sid, reason = 'challenge') {
+    if (!sid) return;
+    this.pausedSessions.set(sid, { until: 0, reason, startedAt: this.now() });
+    this.log("info", "SESSION", `Session ${sid.slice(0, 8)}… paused for verification (${reason}). Expiry suspended.`);
+  }
+  resumeFromVerification(sid) {
+    const p = this.pausedSessions.get(sid);
+    if (!p) return false;
+    this.pausedSessions.delete(sid);
+    // Touch the session to reset idle timer
+    const rec = this.sessions.get(sid);
+    if (rec) rec.lastUsed = this.now();
+    this.log("info", "SESSION", `Session ${sid.slice(0, 8)}… resumed from verification.`);
+    return true;
+  }
+  isPaused(sid) {
+    if (!sid) return false;
+    return this.pausedSessions.has(sid);
+  }
+  pausedInfo(sid) {
+    return this.pausedSessions.get(sid) || null;
+  }
+
+  // ---- Playwright storage state sync ----
+  // Import Playwright cookies into the session's cookie jar
+  importPlaywrightCookies(sid, cookies) {
+    if (!sid || !Array.isArray(cookies)) return;
+    const rec = this.sessions.get(sid);
+    if (!rec) return;
+    for (const c of cookies) {
+      if (!c || !c.name) continue;
+      const key = `${c.domain || ''}|${c.path || '/'}|${c.name}`;
+      rec.cookies.set(key, {
+        name: c.name,
+        value: String(c.value || ''),
+        domain: String(c.domain || '').toLowerCase(),
+        path: c.path || '/',
+        secure: !!c.secure,
+        hostOnly: !c.domain || c.domain === 'localhost',
+        expiresAt: c.expires > 0 ? c.expires * 1000 : 0,
+        httpOnly: !!c.httpOnly,
+        sameSite: c.sameSite || 'Lax'
+      });
+    }
+    this.trimCookies(rec);
+  }
+  // Export session cookies as Playwright cookie format
+  exportPlaywrightCookies(sid) {
+    const rec = this.sessions.get(sid);
+    if (!rec) return [];
+    return [...rec.cookies.values()].map(c => ({
+      name: c.name, value: c.value, domain: c.domain, path: c.path || '/',
+      secure: !!c.secure, httpOnly: !!c.httpOnly, sameSite: c.sameSite || 'Lax',
+      expires: c.expiresAt > 0 ? Math.floor(c.expiresAt / 1000) : -1
+    }));
+  }
+  // Get a storageState object compatible with Playwright's context creation
+  getStorageState(sid) {
+    const cookies = this.exportPlaywrightCookies(sid);
+    return { cookies, origins: [] };
+  }
+
   linkBrowser(sid, browserSessionId) { const rec = this.sessions.get(sid); if (rec) rec.browserSessions.add(browserSessionId); }
   unlinkBrowser(sid, browserSessionId) { const rec = this.sessions.get(sid); if (rec) rec.browserSessions.delete(browserSessionId); }
 
@@ -163,6 +235,8 @@ class SessionManager {
     const rec = this.sessions.get(sid);
     if (!rec) return false;
     this.sessions.delete(sid);
+    // Clear verification pause if active
+    this.pausedSessions.delete(sid);
     if (reason === "limit" || reason === "client") this.tombstone(sid);
     if (reason === "limit") this.stats.expiredLimit += 1;
     else if (reason === "idle") this.stats.expiredIdle += 1;
@@ -188,6 +262,7 @@ class SessionManager {
     }
     // Map is LRU-ordered, so stop at the first session that is still fresh.
     for (const [sid, rec] of this.sessions) {
+      if (this.isPaused(sid)) continue; // don't expire paused (verification) sessions
       if (t - rec.lastUsed <= this.idleTtlMs && t - rec.createdAt <= this.hardTtlMs) break;
       this.expire(sid, "idle"); n += 1;
     }
@@ -206,7 +281,10 @@ class SessionManager {
     const t = this.now();
     const minIdle = level === "critical" ? 20000 : 120000;
     let n = 0;
-    for (const [sid, rec] of [...this.sessions]) if (t - rec.lastUsed > minIdle) { this.expire(sid, "pressure"); n += 1; }
+    for (const [sid, rec] of [...this.sessions]) {
+      if (this.isPaused(sid)) continue; // don't shed verification sessions
+      if (t - rec.lastUsed > minIdle) { this.expire(sid, "pressure"); n += 1; }
+    }
     if (n) this.log("warn", "SESSION", `Memory ${level}: released ${n} idle session(s).`);
     return n;
   }
@@ -219,7 +297,8 @@ class SessionManager {
       active: this.sessions.size, max: this.maxSessions, timeLimitMs: this.timeLimitMs, tombstones: this.tombstones.size, idleTtlMs: this.idleTtlMs, hardTtlMs: this.hardTtlMs,
       cookies, browserSessions: browsers, oldestSessionAgeMs: oldest,
       sleeping: this.sleeping, serverIdleMs: this.serverIdleMs, idleForMs: t - this.lastActivity, stats: { ...this.stats },
-      sessions: [...this.sessions.entries()].slice(-100).reverse().map(([id, rec]) => ({ id: id.slice(0, 8) + "…", ageMs: t - rec.createdAt, remainingMs: this.remainingMs(rec), timeLimitMs: rec.timeLimitMs ?? this.timeLimitMs, requests: rec.requests || 0, cookies: rec.cookies.size, browserSessions: rec.browserSessions.size, userId: rec.userId ? String(rec.userId).slice(0, 8) : null }))
+      sessions: [...this.sessions.entries()].slice(-100).reverse().map(([id, rec]) => ({ id: id.slice(0, 8) + "…", ageMs: t - rec.createdAt, remainingMs: this.remainingMs(rec), timeLimitMs: rec.timeLimitMs ?? this.timeLimitMs, requests: rec.requests || 0, cookies: rec.cookies.size, browserSessions: rec.browserSessions.size, userId: rec.userId ? String(rec.userId).slice(0, 8) : null, paused: this.isPaused(id) })),
+      pausedSessions: this.pausedSessions.size
     };
   }
 }

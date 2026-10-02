@@ -27,6 +27,8 @@ const { CastServer, InternetConnectionManager } = require("./cast-server");
 const { AIAnswerEngine } = require("./ai-answer");
 const { RenewingManager } = require("./renewing-system");
 const fullPage = require("./full-page.js");
+const { FailoverController } = require("./browser-failover.js");
+const { SnapshotStore } = require("./snapshot-store.js");
 // parse-worker.js loads this file inside worker threads to reuse the pure
 // rewrite / discovery functions. In that mode nothing long-lived is started.
 const IS_THREAD_WORKER = !isMainThread && process.env.VEYRA_THREAD_WORKER === "1";
@@ -442,6 +444,43 @@ const workerPool = (!IS_THREAD_WORKER && CFG.parseWorkers > 0 && (require.main =
   ? new WorkerPool({ size: CFG.parseWorkers, taskTimeoutMs: CFG.parseWorkerTimeoutMs, heapMb: CFG.parseWorkerHeapMb, log: (level, source, message) => serverLog(level, source, message) })
   : null;
 
+// Failover controller: circuit breaker + memory pre-check for BROWSER_ENGINE → FAST_PROXY
+const failoverController = IS_THREAD_WORKER ? null : new FailoverController({
+  failureThreshold: numberEnv("FAILOVER_FAILURE_THRESHOLD", 3, 1, 10),
+  cooldownMs: numberEnv("FAILOVER_COOLDOWN_MS", 60000, 5000, 300000),
+  memoryThreshold: floatEnv("FAILOVER_MEMORY_THRESHOLD", 0.80, 0.50, 0.99),
+  memoryCritical: floatEnv("FAILOVER_MEMORY_CRITICAL", 0.90, 0.60, 0.99),
+  log: (level, source, message) => serverLog(level, source, message)
+});
+
+// Snapshot store: safety net for Chromium crashes — serves last good HTML instantly
+const snapshotStore = IS_THREAD_WORKER ? null : new SnapshotStore({
+  log: (level, source, message) => serverLog(level, source, message)
+});
+
+// Wire failover callbacks into the browser engine
+if (!IS_THREAD_WORKER) {
+  browserEngine.setFailoverCallbacks({
+    onCrash: (session, reason) => {
+      if (session?.proxySessionId) {
+        failoverController.recordBrowserResult(session.proxySessionId, false, reason);
+      }
+    },
+    onStorageState: (proxySessionId, storageState) => {
+      // Sync Playwright cookies into the session manager's cookie jar
+      if (storageState?.cookies && proxySessionId) {
+        sessionManager.importPlaywrightCookies(proxySessionId, storageState.cookies);
+      }
+    },
+    onVerification: (session, challenge) => {
+      // Pause session expiry so the Chromium context stays alive for captcha solving
+      if (session?.proxySessionId) {
+        sessionManager.pauseForVerification(session.proxySessionId, challenge?.type || 'challenge');
+      }
+    }
+  });
+}
+
 // Session lifecycle hooks: an expired/closed session releases everything it held.
 sessionManager.on("expire", (sid, rec, reason) => {
   try { vpnManager.disconnect?.(sid); } catch {}
@@ -451,6 +490,9 @@ sessionManager.on("expire", (sid, rec, reason) => {
   try { for (const j of jobs.values()) if (j.sessionId === sid && !j.done && !j.stopRequested) { if (!j.started) dequeueCrawl(j); j.stopRequested = true; j.stopReason = `session-${reason}`; } } catch {}
   if (reason === "limit") serverLog("info", "SESSION", `Session ${sid.slice(0, 8)}… reached its ${Math.round((rec.timeLimitMs ?? CFG.sessionTimeLimitMs) / 1000)}s time limit and was deleted.`);
   try { scriptDirsBySession.delete(sid); } catch {}
+  // Clear failover breaker and snapshots for this session
+  if (failoverController) failoverController.breakers.delete(sid);
+  if (snapshotStore) snapshotStore.clearSession(sid);
   return browserEngine.stopForProxySession?.(sid);
 });
 sessionManager.on("sleep", async () => {
@@ -465,7 +507,18 @@ sessionManager.on("sleep", async () => {
 sessionManager.on("wake", () => { for (const j of jobs.values()) if (j.seed && !j.done && !runtimeGuard.critical) j.backgroundPaused = false; });
 if (!IS_THREAD_WORKER) sessionManager.start();
 
-const browserEngineTimer = IS_THREAD_WORKER ? null : setInterval(() => browserEngine.expireIdle().catch(() => {}), 30000);
+const browserEngineTimer = IS_THREAD_WORKER ? null : setInterval(() => {
+  browserEngine.expireIdle().catch(() => {});
+  // Cleanup failover breakers and snapshots for expired sessions
+  if (failoverController) {
+    const activeIds = new Set([...sessionManager.sessions.keys()]);
+    failoverController.cleanup(activeIds);
+  }
+  if (snapshotStore) {
+    const activeIds = new Set([...sessionManager.sessions.keys()]);
+    snapshotStore.cleanup(activeIds);
+  }
+}, 30000);
 browserEngineTimer?.unref?.();
 const runtimeMemoryLimitBytes = MEMORY_LIMIT_MB ? MEMORY_LIMIT_MB * 1024 * 1024 : 0;
 const memoryGuardTimer = IS_THREAD_WORKER ? null : setInterval(() => {
@@ -476,6 +529,8 @@ const memoryGuardTimer = IS_THREAD_WORKER ? null : setInterval(() => {
     const prev = runtimeGuard.pressure;
     runtimeGuard.pressure = ratio >= 0.78;
     runtimeGuard.critical = ratio >= 0.90;
+    // Feed failover controller memory state
+    if (failoverController) failoverController.updateMemory(ratio);
     if (runtimeGuard.pressure) { clearHotCachesForPressure(); sessionManager.shed(runtimeGuard.critical ? "critical" : "pressure"); }
     if (runtimeGuard.critical) {
       browserEngine.shedIdle(20000).catch(() => {});
@@ -1572,6 +1627,9 @@ function rewriteJsText(text, base, sid = "") {
     /(\bimport\s+(?:[^'"`;()]*?\s+from\s+)?|\bexport\s+[^'"`;()]*?\s+from\s+)(["'])([^"']+)\2(?=\s*(?:;|$|\n|\r|assert\b|with\b))/gm
   ];
   let out = String(text || "");
+  // Neutralize service worker registrations on proxied pages — they break the proxy
+  // by trying to register a SW scope that can't be served through /api/view.
+  out = out.replace(/navigator\.serviceWorker\.register\s*\(/g, 'navigator.serviceWorker.register=function(){return Promise.reject(new Error("Service workers are not available in Veyra proxy mode."))};navigator.serviceWorker.register(');
   for (const re of patterns) {
     out = out.replace(re, (m, prefix, quote, spec) => {
       const u = resolveResource(spec, base);
@@ -3209,6 +3267,7 @@ async function fetchOfficialJson(url, { timeoutMs = 6000 } = {}) {
 app.post('/api/browser/capability', async (req, res) => {
   const raw = normalizeUrl(String(req.body?.url || ''));
   if (!raw) return respondError(res, 400, 'Invalid URL.', 'INVALID_URL');
+  const proxySessionId = String(req.body?.proxySessionId || req.body?.sessionId || "");
 
   // YouTube gets a dedicated, instant path: parsing the URL tells us
   // everything we need (no point fetching/scoring the HTML shell first).
@@ -3249,7 +3308,12 @@ app.post('/api/browser/capability', async (req, res) => {
     let mode = 'FAST_PROXY';
     if (challenge || forceBrowser) mode = 'BROWSER_ENGINE';
     else if (signals.heavy) mode = (lean || signals.fullPage) ? 'ACCELERATED_PROXY' : 'BROWSER_ENGINE';
-    res.json({ ok: true, url: result.finalUrl || raw, mode, lean: CFG.leanMode, challenge: challenge ? challenge.type : null, forceBrowser: !!forceBrowser, signals, fullPage: signals.fullPage, status: result.status, contentType: result.contentType });
+    // If the circuit breaker is open for this session, suggest FAST_PROXY
+    const failoverInfo = failoverController ? failoverController.breakerStatus(proxySessionId) : null;
+    if (mode === 'BROWSER_ENGINE' && failoverInfo && failoverInfo.state === 'open') {
+      mode = 'FAST_PROXY';
+    }
+    res.json({ ok: true, url: result.finalUrl || raw, mode, lean: CFG.leanMode, challenge: challenge ? challenge.type : null, forceBrowser: !!forceBrowser, signals, fullPage: signals.fullPage, status: result.status, contentType: result.contentType, failover: failoverInfo, snapshot: snapshotStore ? snapshotStore.has(proxySessionId, result.finalUrl || raw) : false });
   } catch (e) {
     // On probe failure, still prefer Chromium for known-broken hosts.
     const forceBrowser = hostNeedsRealBrowser(raw);
@@ -3446,7 +3510,7 @@ function sessionInfo(sid, rec) {
     idleExpiresInMs: Math.max(0, CFG.sessionIdleTtlMs - (Date.now() - rec.lastUsed)), cookies: rec.cookies.size, requests: rec.requests,
     serverTime: new Date().toISOString(), incognito: !!rec.incognito, vpn: vpnManager.sessionInfo?.(sid) || null };
 }
-app.get('/api/sessions', requireAdmin, (req, res) => res.json({ ok: true, ...sessionManager.report(), vpnConnections: vpnManager.status().connections, browser: { sessions: browserEngine.sessions.size, running: !!browserEngine.browser } }));
+app.get('/api/sessions', requireAdmin, (req, res) => res.json({ ok: true, ...sessionManager.report(), vpnConnections: vpnManager.status().connections, browser: { sessions: browserEngine.sessions.size, running: !!browserEngine.browser }, failover: failoverController ? failoverController.report() : null, snapshots: snapshotStore ? snapshotStore.report() : null }));
 // Start a fresh browsing session. The frontend shows a countdown from expiresAt.
 app.post('/api/session', (req, res) => {
   const user = authStore.userFromRequest(req);
@@ -3622,17 +3686,52 @@ app.post('/api/browser/session', async (req, res) => {
   try {
     const proxySessionId = String(req.body?.proxySessionId || req.body?.sessionId || "");
     requireLiveProxySession(proxySessionId);
+    // Circuit breaker check: should we attempt Chromium for this session?
+    if (failoverController) {
+      const check = failoverController.shouldUseChromium(proxySessionId);
+      if (!check.allow) {
+        return res.status(429).json({
+          ok: false,
+          code: "BROWSER_FAILOVER",
+          error: `Chromium is in cooldown for this session. Using fast proxy instead.`,
+          fallbackMode: "FAST_PROXY",
+          retryAfterMs: check.retryAfterMs,
+          reason: check.reason
+        });
+      }
+    }
     const url = normalizeUrl(String(req.body?.url || ""));
     if (!url) return respondError(res, 400, "Invalid browser URL.", "INVALID_URL");
     await assertPublicUrl(url);
     const tabId = String(req.body?.tabId || "");
     const jobId = String(req.body?.jobId || "");
     const vpnProfile = await browserVpnProfileForSession(proxySessionId);
-    const session = await browserEngine.create(tabId, url, jobId, vpnProfile, { proxySessionId, fastStart: !!req.body?.fastStart });
+    // Pass shared storage state (cookies from the fast proxy session) so
+    // Chromium starts with the same session, not logged out.
+    const storageState = sessionManager.getStorageState(proxySessionId);
+    const session = await browserEngine.create(tabId, url, jobId, vpnProfile, { proxySessionId, fastStart: !!req.body?.fastStart, storageState });
     sessionManager.linkBrowser(proxySessionId, session.id);
+    // Record success in the circuit breaker
+    if (failoverController) failoverController.recordBrowserResult(proxySessionId, true);
     res.status(201).json({ ok: true, session });
   } catch (e) {
+    // Record failure in the circuit breaker
+    const proxySessionId = String(req.body?.proxySessionId || req.body?.sessionId || "");
+    if (failoverController && proxySessionId) {
+      const errorType = e.code === 'BROWSER_CAPACITY' ? 'capacity' :
+        e.code === 'BROWSER_ENGINE_UNAVAILABLE' ? 'unavailable' :
+        /timeout/i.test(e.message || '') ? 'timeout' : 'error';
+      failoverController.recordBrowserResult(proxySessionId, false, errorType);
+    }
     const status = e.status || (e.code === "BROWSER_CAPACITY" ? 429 : e.code === "SESSION_EXPIRED" ? 410 : 502);
+    // If this is a capacity or engine error, hint the frontend to use fast proxy
+    if (e.code === "BROWSER_CAPACITY" || e.code === "BROWSER_ENGINE_UNAVAILABLE") {
+      return res.status(status).json({
+        ok: false, code: e.code, error: e.message,
+        fallbackMode: "FAST_PROXY",
+        retryAfterMs: e.code === "BROWSER_CAPACITY" ? 5000 : 30000
+      });
+    }
     respondError(res, status, e.message, e.code || "BROWSER_CREATE_FAILED");
   }
 });
@@ -3647,6 +3746,16 @@ app.post('/api/browser/session/:sid/navigate', async (req, res) => {
     const url = normalizeUrl(String(req.body?.url || ""));
     if (!url) throw Object.assign(new Error("Invalid browser URL."), { code: "INVALID_URL", status: 400 });
     await browserEngine.navigateSession(s, url, { fast: !!req.body?.fastStart });
+    // Capture snapshot after successful navigation (safety net)
+    if (snapshotStore && s.proxySessionId) {
+      try {
+        const html = await s.page.content().catch(() => '');
+        const title = await s.page.title().catch(() => s.title || '');
+        snapshotStore.snapshot(s.proxySessionId, {
+          html, url: s.canonicalUrl, title, contentType: 'text/html', status: 200, headers: {}, assets: []
+        });
+      } catch {}
+    }
     res.json({ ok: true, session: browserEngine.public(s) });
   } catch (e) { respondError(res, e.status || 502, e.message, e.code || "BROWSER_NAVIGATION_ERROR"); }
 });
@@ -3710,7 +3819,28 @@ app.get('/api/search/web', async (req, res) => {
   }
 });
 
-app.get('/api/browser/status', (req, res) => res.json({ ok: true, ...browserEngine.status(), config: { backend: CFG.browserBackend, enabled: CFG.browserEnabled, headless: CFG.browserHeadless, maxSessions: CFG.maxBrowserSessions, maxPages: CFG.maxBrowserPages, maxContexts: CFG.maxBrowserContexts } }));
+app.get('/api/browser/status', (req, res) => res.json({ ok: true, ...browserEngine.status(), failover: failoverController ? failoverController.report() : null, snapshots: snapshotStore ? snapshotStore.report() : null, config: { backend: CFG.browserBackend, enabled: CFG.browserEnabled, headless: CFG.browserHeadless, maxSessions: CFG.maxBrowserSessions, maxPages: CFG.maxBrowserPages, maxContexts: CFG.maxBrowserContexts } }));
+
+// Reset the circuit breaker for a session (user clicked "Retry full browser")
+app.post('/api/browser/retry', async (req, res) => {
+  try {
+    const proxySessionId = String(req.body?.proxySessionId || req.body?.sessionId || "");
+    if (!proxySessionId) return respondError(res, 400, "Missing session id.", "INVALID_SESSION");
+    if (failoverController) failoverController.reset(proxySessionId);
+    if (sessionManager.isPaused(proxySessionId)) sessionManager.resumeFromVerification(proxySessionId);
+    res.json({ ok: true, message: "Circuit breaker reset. Chromium will be retried." });
+  } catch (e) { respondError(res, 502, e.message, e.code || "RETRY_FAILED"); }
+});
+
+// Resume from verification (user solved the captcha)
+app.post('/api/browser/resume-verification', async (req, res) => {
+  try {
+    const proxySessionId = String(req.body?.proxySessionId || req.body?.sessionId || "");
+    if (!proxySessionId) return respondError(res, 400, "Missing session id.", "INVALID_SESSION");
+    sessionManager.resumeFromVerification(proxySessionId);
+    res.json({ ok: true, message: "Session resumed from verification." });
+  } catch (e) { respondError(res, 502, e.message, e.code || "RESUME_FAILED"); }
+});
 
 // AI Search Answer — reads search results and generates a summary
 const aiAnswerEngine = new AIAnswerEngine();
@@ -4314,6 +4444,20 @@ app.get("/api/form-get/:target/:sid", async (req, res) => {
   }
 });
 app.get("/api/view", async (req, res) => { try { await proxyRequest(req, res, "view"); } catch (e) {
+  // Snapshot safety net: if the proxy failed but we have a cached snapshot,
+  // serve it read-only while Chromium recovers.
+  const snapSid = normalizeSessionId(req.query.sid);
+  const snapUrl = mergeStrayProxyParams(req, firstValidUrl([req.query.url, req.query.target, req.query.u], req.get('Origin') || undefined)) || proxyRefererCanonical(req);
+  if (snapshotStore && snapSid && snapUrl) {
+    const snap = snapshotStore.get(snapSid, snapUrl);
+    if (snap) {
+      res.setHeader("X-Veyra-Snapshot", "1");
+      res.setHeader("X-Veyra-Fast-Limited", "1");
+      res.setHeader("X-Veyra-Canonical-URL", snap.url);
+      res.setHeader("Cache-Control", "no-store");
+      return res.status(200).type("html").send(snap.html);
+    }
+  }
   const message = e.upstreamMessage || e.message;
   const upstreamCode = e.upstreamCode || networkErrorCode(e) || null;
   const publicCode = e.code === "VPN_KILL_SWITCH" ? "VPN_KILL_SWITCH" : /^UPSTREAM_[A-Z0-9_]+$/.test(String(e.code || "")) ? e.code : "PROXY_VIEW_ERROR";
@@ -4735,6 +4879,8 @@ function buildStatusReport() {
       info: issues.filter(i => i.severity === "info").length
     },
     browser: browserEngine.status(),
+    failover: failoverController ? failoverController.report() : null,
+    snapshots: snapshotStore ? snapshotStore.report() : null,
     config: veyraConfigModule.publicSummary(VEYRA_CONFIG),
     capacity: runtimeConfigSummary(),
     sessions: sessionManager.report(),

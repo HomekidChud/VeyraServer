@@ -45,6 +45,36 @@ class BrowserEngine {
     this.sessions = new Map();
     this.startPromise = null;
     this.creatingSessions = 0;
+    // Failover hooks: set by server.js
+    this.onCrash = null;        // (session, reason) => void
+    this.onStorageState = null; // (proxySessionId, storageState) => void
+    this.onVerification = null; // (session, challenge) => void
+  }
+
+  // Set callbacks for failover integration
+  setFailoverCallbacks({ onCrash, onStorageState, onVerification }) {
+    this.onCrash = onCrash || null;
+    this.onStorageState = onStorageState || null;
+    this.onVerification = onVerification || null;
+  }
+
+  // Export Playwright storageState (cookies + localStorage) for a session
+  async exportStorageState(sid) {
+    const s = this.sessions.get(String(sid));
+    if (!s || !s.context) return null;
+    try {
+      return await s.context.storageState();
+    } catch { return null; }
+  }
+
+  // Import a storage state (cookies) into a new context
+  async _applyStorageState(context, storageState) {
+    if (!storageState || !Array.isArray(storageState.cookies)) return;
+    try {
+      await context.addCookies(storageState.cookies);
+    } catch {}
+    // localStorage is per-origin; Playwright applies it via storageState on context creation
+    // but we can't set it after the fact easily. Cookies are the critical part.
   }
 
   async ensureBrowser() {
@@ -89,6 +119,12 @@ class BrowserEngine {
             session.status = 'ERROR';
             session.error = 'Chromium disconnected unexpectedly.';
             session.screenshot = null;
+            // Export storage state before the context is fully gone (best-effort)
+            if (this.onStorageState && session.proxySessionId) {
+              try { this.onStorageState(session.proxySessionId, { cookies: [], origins: [] }); } catch {}
+            }
+            // Notify failover controller for each lost session
+            if (this.onCrash) try { this.onCrash(session, 'browser_disconnect'); } catch {}
           }
           if (lost.length) this.log('warn', 'BROWSER', `Chromium disconnected unexpectedly; cleared ${lost.length} browser session(s).`);
         });
@@ -183,6 +219,10 @@ class BrowserEngine {
 
       // DevTools bridge + console eval must work on sites with strict CSP.
       contextOptions.bypassCSP = true;
+      // Apply shared storage state if available (cookie sync from fast proxy)
+      if (extra.storageState) {
+        contextOptions.storageState = extra.storageState;
+      }
       let context = null;
       let page = null;
       try {
@@ -256,6 +296,8 @@ class BrowserEngine {
       session.error = 'Chromium page crashed.';
       session.screenshot = null;
       this.pushConsole(session, 'error', 'Chromium page crashed; the page will be recovered on the next navigation.');
+      // Notify failover controller
+      if (this.onCrash) try { this.onCrash(session, 'page_crash'); } catch {}
     });
     page.on('requestfailed', req => this.pushNetwork(session, {
       type: 'requestfailed', method: req.method(), url: sanitizeUrl(req.url()), error: req.failure()?.errorText || 'request failed', resourceType: req.resourceType()
@@ -356,11 +398,20 @@ class BrowserEngine {
       if (challenge) {
         session.status = 'VERIFICATION_REQUIRED';
         session.verification = challenge;
+        // Notify server.js to pause session expiry and keep Chromium alive
+        if (this.onVerification) try { this.onVerification(session, challenge); } catch {}
       } else {
         session.status = 'NORMAL';
       }
       if (response && response.status() >= 400 && !challenge) session.error = `HTTP ${response.status()}`;
       await this.capture(session, true);
+      // Export storage state after successful navigation (cookie sync)
+      if (this.onStorageState && session.proxySessionId) {
+        try {
+          const state = await session.context.storageState();
+          this.onStorageState(session.proxySessionId, state);
+        } catch {}
+      }
       return this.public(session);
     } catch (e) {
       session.status = 'ERROR';
@@ -477,6 +528,13 @@ class BrowserEngine {
 
   async stop(sid) {
     const s = this.get(sid);
+    // Export storage state before closing the context (cookie sync back)
+    if (this.onStorageState && s.proxySessionId) {
+      try {
+        const state = await s.context.storageState();
+        this.onStorageState(s.proxySessionId, state);
+      } catch {}
+    }
     s.status = 'CLOSED';
     clearTimeout(s.browserPoll);
     await s.context.close().catch(() => {});
@@ -551,7 +609,8 @@ class BrowserEngine {
       network: s.network.slice(-120),
       downloads: s.downloads.slice(0, 50),
       vpnProfileId: s.vpnProfileId || null,
-      capacity: this.capacity()
+      capacity: this.capacity(),
+      proxySessionId: s.proxySessionId || null
     };
   }
 
