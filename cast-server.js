@@ -196,7 +196,7 @@ class CastServer {
     if (session.deviceWs && session.deviceWs.readyState === 1) {
       session.deviceWs.send(JSON.stringify(msg));
     } else if (session.usePolling) {
-      this.pushToPoll(session.id, msg);
+      if (session.deviceId) this.pushToDevicePoll(session.deviceId, msg);
     }
   }
 
@@ -419,6 +419,33 @@ class CastServer {
     if (buf.length > 20) buf.shift();
   }
 
+  // Browser commands use this path when the WebSocket transport is unavailable.
+  // Keep it separate from pushToPoll(), which is the device -> browser frame path.
+  sendToDevice(sessionId, msg) {
+    const session = this.sessions.get(String(sessionId));
+    if (!session || session.status === "disconnected") return { ok: false, error: "Session not found" };
+    this.sendToDeviceMsg(session, msg);
+    return { ok: true };
+  }
+
+  closeSession(sessionId, reason = "client_closed") {
+    const id = String(sessionId);
+    const session = this.sessions.get(id);
+    if (!session) return { ok: true, closed: false };
+    if (session.status === "streaming") this.stats.activeStreams = Math.max(0, this.stats.activeStreams - 1);
+    this.sendToBrowser(session, { type: "device_disconnected", reason, timestamp: now() });
+    this.sendToDeviceMsg(session, { type: "browser_disconnected", reason, timestamp: now() });
+    try { if (session.browserWs?.readyState === WebSocket.OPEN) session.browserWs.close(1000, reason); } catch {}
+    try { if (session.deviceWs?.readyState === WebSocket.OPEN) session.deviceWs.close(1000, reason); } catch {}
+    if (session.deviceId) {
+      this.devices.delete(session.deviceId);
+      this.pollingBuffers.delete(`device:${session.deviceId}`);
+    }
+    this.pollingBuffers.delete(id);
+    this.sessions.delete(id);
+    return { ok: true, closed: true };
+  }
+
   getStats() {
     return {
       ...this.stats,
@@ -436,7 +463,7 @@ class CastServer {
   close() {
     clearInterval(this.cleanupInterval);
     for (const session of this.sessions.values()) session.disconnect("server_shutdown");
-    this.wss.close();
+    this.wss?.close();
   }
 }
 

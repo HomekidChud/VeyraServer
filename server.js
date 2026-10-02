@@ -5116,12 +5116,10 @@ app.get("/api/challenge/check", (req, res) => {
 // ---------------------------------------------------------------------------
 // Cast Server — device mirroring (WebSocket or HTTP polling)
 let castServer = null;
-let internetManager = null;
-try {
-  castServer = new CastServer({ listen: () => {}, close: () => {} }, (level, source, msg) => serverLog(level, source, msg), { frontendUrl: CFG.frontendUrl });
-  internetManager = new InternetConnectionManager();
-  serverLog("info", "CAST", `Cast server started in ${castServer.useWebSocket ? "WebSocket" : "HTTP polling"} mode`);
-} catch (e) { serverLog("warn", "CAST", `Cast server failed to start: ${e.message}`); }
+// Cast needs the real HTTP server so WebSocket upgrades are attached to the
+// listening server. Do not create a throwaway polling instance before listen:
+// it leaks a cleanup timer and used to race the real instance below.
+let internetManager = new InternetConnectionManager();
 
 // Cast API routes (HTTP polling fallback works without ws)
 app.get("/api/cast/stats", (req, res) => res.json(castServer ? castServer.getStats() : { error: "Cast server not available" }));
@@ -5140,6 +5138,16 @@ app.post("/api/cast/push/:sessionId", (req, res) => {
   if (!castServer) return res.status(503).json({ error: "Cast server not available" });
   castServer.pushToPoll(req.params.sessionId, req.body);
   res.json({ ok: true });
+});
+app.post("/api/cast/send/:sessionId", (req, res) => {
+  if (!castServer) return res.status(503).json({ error: "Cast server not available" });
+  const result = castServer.sendToDevice(req.params.sessionId, req.body || {});
+  if (!result.ok) return res.status(404).json(result);
+  res.json(result);
+});
+app.post("/api/cast/close/:sessionId", (req, res) => {
+  if (!castServer) return res.status(503).json({ error: "Cast server not available" });
+  res.json(castServer.closeSession(req.params.sessionId, String(req.body?.reason || "client_closed")));
 });
 // Device-side HTTP polling routes (for mobile/Android devices without WebSocket)
 app.post("/api/cast/device/join", (req, res) => {
