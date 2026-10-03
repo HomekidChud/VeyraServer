@@ -22,6 +22,8 @@ const youtubeCompat = require("./youtube");
 const mediaErrors = require("./media-errors");
 const { isMainThread } = require("worker_threads");
 const { NeuralRobotPool } = require("./neural-robots");
+const { NeuralCrawlerModel } = require("./neural-crawler");
+const { NeuralLearningWorker } = require("./neural-learning");
 const { ChallengeSolver } = require("./challenge-solver");
 const { CastServer, InternetConnectionManager } = require("./cast-server");
 const { AIAnswerEngine } = require("./ai-answer");
@@ -295,6 +297,19 @@ const CFG = Object.freeze({
   maxCrossOriginResources: Math.min(numberEnv("MAX_CROSS_ORIGIN_RESOURCES", P.maxCrossOriginResources, 0, 10000), P.maxCrossOriginResources),
   skipLowValueThirdParty: boolEnv("SKIP_LOW_VALUE_THIRD_PARTY", true),
   playwrightBrowsersPath: process.env.PLAYWRIGHT_BROWSERS_PATH || "0"
+});
+try { fs.mkdirSync(CFG.authDataDir, { recursive: true }); } catch {}
+const neuralModel = new NeuralCrawlerModel({
+  savePath: process.env.NEURAL_MODEL_PATH || path.join(CFG.authDataDir, "neural-model.json"),
+  saveIntervalMs: numberEnv("NEURAL_MODEL_SAVE_INTERVAL_MS", 60000, 5000, 86400000)
+});
+neuralModel.load();
+const neuralTrainer = new NeuralLearningWorker({
+  model: neuralModel,
+  intervalMs: numberEnv("NEURAL_TRAIN_INTERVAL_MS", 5000, 250, 300000),
+  batchSize: numberEnv("NEURAL_TRAIN_BATCH_SIZE", 32, 1, 256),
+  maxQueue: numberEnv("NEURAL_TRAIN_QUEUE_MAX", 5000, 100, 100000),
+  log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
 });
 
 // Dedicated direct HTTP dispatcher. Hosted environments can have mixed IPv4/IPv6
@@ -2106,13 +2121,16 @@ function localSearch(query, offset, limit) {
     score += 0.25 / (1 + ageDays);
     if (score > 0) candidateScores.set(doc.url, score);
   }
-  const ranked = [...candidateScores.entries()].sort((a,b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  const ranked = [...candidateScores.entries()].map(([url, score]) => {
+    const neural = neuralModel.scoreUrl(url, { type: "html", internal: true });
+    return [url, score + (neural - 0.5) * 0.35, neural];
+  }).sort((a,b) => b[1] - a[1] || a[0].localeCompare(b[0]));
   const total = ranked.length;
-  const results = ranked.slice(offset, offset + limit).map(([url, score]) => {
+  const results = ranked.slice(offset, offset + limit).map(([url, score, neuralScore]) => {
     const doc = searchIndex.get(url);
     return {
       title: doc.title, url: doc.url, snippet: makeSearchSnippet(doc, parsed), displayUrl: doc.displayUrl,
-      favicon: doc.favicon || searchFavicon(doc.url), source: "veyra-index", score: Number(score.toFixed(4)),
+      favicon: doc.favicon || searchFavicon(doc.url), source: "veyra-index", score: Number(score.toFixed(4)), neuralScore: Number(neuralScore.toFixed(4)),
       indexedAt: doc.indexedAt, lang: doc.lang, domain: doc.host
     };
   });
@@ -5076,7 +5094,20 @@ app.get("/api/debug/system", requireAdmin, (req, res) => {
 
 // ---------------------------------------------------------------------------
 // Neural Robot Workers — parallel crawling without Chromium
-const neuralRobotPool = new NeuralRobotPool({ maxWorkers: 8, log: (level, source, msg) => serverLog(level, source, msg) });
+const neuralRobotPool = new NeuralRobotPool({ maxWorkers: 8, neuralModel, log: (level, source, msg) => serverLog(level, source, msg) });
+if (!IS_THREAD_WORKER) neuralTrainer.start();
+app.get("/api/neural/stats", (req, res) => res.json({ ok: true, model: neuralModel.report(), trainer: neuralTrainer.report() }));
+app.post("/api/neural/feedback", (req, res) => {
+  const accepted = neuralTrainer.enqueue({
+    url: req.body?.url,
+    positive: req.body?.positive,
+    weight: req.body?.weight,
+    context: req.body?.context
+  });
+  if (!accepted) return res.status(400).json({ ok: false, error: "A public http(s) URL is required." });
+  res.json({ ok: true, queued: neuralTrainer.report().queueSize });
+});
+app.post("/api/neural/reset", (req, res) => { neuralTrainer.queue.length = 0; neuralModel.reset(); neuralModel.save(); res.json({ ok: true }); });
 app.get("/api/robots/status", (req, res) => res.json(neuralRobotPool.report()));
 app.get("/api/robots/log", (req, res) => res.json(neuralRobotPool.getLog(Math.min(100, Number(req.query.limit) || 50))));
 app.post("/api/robots/crawl", async (req, res) => {
@@ -5372,6 +5403,7 @@ if (require.main === module && CFG.processRole !== "worker") {
   const shutdown = async signal => {
     if (shuttingDown) return; shuttingDown = true;
     serverLog("info", "SYSTEM", `${signal} received — shutting down.`);
+    neuralTrainer.stop();
     for (const j of jobs.values()) if (!j.done) { j.stopRequested = true; j.stopReason = "shutdown"; j.controller?.abort?.(); }
     const force = setTimeout(() => process.exit(0), 8000); force.unref();
     await Promise.allSettled([

@@ -218,6 +218,7 @@ class NeuralCrawlerModel {
     this.feedbackHistory.push({ url, positive: feedback.positive, weight, ts: now() });
     if (this.feedbackHistory.length > this.maxHistory) this.feedbackHistory.shift();
 
+    this.trainingExamples += 1;
     this.stats.trained++;
     this.maybeSave();
   }

@@ -182,18 +182,8 @@ class NeuralRobot {
       return Math.min(score, 1.0);
     }
 
-    const features = {
-      domainAuthority: 0.5,
-      linkContextScore: 0.5,
-      contentTypeScore: 1.0,  // HTML
-      depthScore: Math.max(0, 1 - depth * 0.2),
-      freshnessScore: 0.5,
-      relevanceScore: this.textRelevance(pageInfo.text + " " + pageInfo.title, query),
-      internalLinkScore: 0.5,
-      resourceTypeScore: 0.8,
-      clickProbability: 0.5,
-      domainDiversity: 0.5,
-    };
+    const features = [0.5, 0.5, 1.0, Math.max(0, 1 - depth * 0.2), 0.5,
+      this.textRelevance(pageInfo.text + " " + pageInfo.title, query), 0.5, 0.8, 0.5, 0.5];
     return this.neuralModel.score(features);
   }
 
@@ -342,20 +332,12 @@ class NeuralRobot {
    */
   learn(url, clicked, relevance) {
     if (this.neuralModel && typeof this.neuralModel.train === "function") {
-      const features = {
-        domainAuthority: 0.5,
-        linkContextScore: 0.5,
-        contentTypeScore: 1.0,
-        depthScore: 0.5,
-        freshnessScore: 0.5,
-        relevanceScore: relevance,
-        internalLinkScore: 0.5,
-        resourceTypeScore: 0.8,
-        clickProbability: clicked ? 1.0 : 0.0,
-        domainDiversity: 0.5,
-      };
-      const target = clicked ? 1.0 : 0.0;
-      this.neuralModel.train(features, target);
+      this.neuralModel.train({
+        url,
+        positive: !!clicked,
+        weight: Math.max(0.05, Math.min(5, Number(relevance) || 0.5)),
+        context: { type: "html", relevanceScore: Number(relevance) || 0.5 }
+      });
       this.onFeedback(url, clicked, relevance);
     }
   }
