@@ -3694,6 +3694,68 @@ app.get('/api/auth/config', (req, res) => {
   res.json({ ok: true, signupEnabled: CFG.authAllowSignup, sessionTimeLimitMs: admin ? CFG.adminSessionTimeLimitMs : CFG.sessionTimeLimitMs, admin: admin || configEditAllowed(req), testMode: CFG.testMode, testAdmin: CFG.testMode ? authStore.getTestAdminCredentials() : null });
 });
 
+// ---------------------------------------------------------------------------
+// Developer platform — authenticated workspaces, API keys, billing profile,
+// and public pricing. API keys are hashed at rest and shown only once.
+function platformData(user) {
+  const data = authStore.getData(user) || {};
+  const p = data.platform && typeof data.platform === "object" ? data.platform : {};
+  if (!Array.isArray(p.workspaces)) p.workspaces = [];
+  if (!p.billing || typeof p.billing !== "object") p.billing = { status: "required" };
+  return { ...data, platform: p };
+}
+function savePlatformData(user, data) { authStore.setData(user, data); return data.platform; }
+function platformOwner(user) { return authStore.roleFor(user.email) === "admin"; }
+function platformPublicKey(k) { return { id: k.id, name: k.name, prefix: k.prefix, createdAt: k.createdAt, lastUsedAt: k.lastUsedAt || null, revokedAt: k.revokedAt || null }; }
+function platformPublicWorkspace(w) { return { id: w.id, name: w.name, slug: w.slug, description: w.description || "", createdAt: w.createdAt, keys: (w.keys || []).filter(k => !k.revokedAt).map(platformPublicKey) }; }
+function platformSlug(name) { return String(name || "workspace").toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "workspace"; }
+const PLATFORM_PRICING = [
+  { id: "owner", name: "Owner", price: 0, unit: "forever", description: "Included for Veyra owners and administrators.", features: ["Unlimited workspaces", "API keys", "Platform documentation"] },
+  { id: "developer", name: "Developer", price: 0, unit: "during beta", description: "Free while the API platform is in beta. Billing profile required.", features: ["3 workspaces", "10 API keys per workspace", "Usage dashboard"] },
+  { id: "team", name: "Team", price: 19, unit: "per month", description: "For small teams shipping on Veyra.", features: ["10 workspaces", "50 API keys per workspace", "Team support"] }
+];
+app.get('/api/platform/pricing', (req, res) => res.json({ ok: true, currency: "USD", plans: PLATFORM_PRICING }));
+app.get('/api/platform/overview', requireUser, (req, res) => {
+  const d = platformData(req.veyraUser), owner = platformOwner(req.veyraUser);
+  res.json({ ok: true, owner, billing: owner ? { status: "owner_free", provider: null } : d.platform.billing, workspaces: d.platform.workspaces.map(platformPublicWorkspace), limits: owner ? { workspaces: 999, keysPerWorkspace: 999 } : { workspaces: 3, keysPerWorkspace: 10 }, pricing: PLATFORM_PRICING });
+});
+app.post('/api/platform/billing/setup', requireUser, (req, res) => {
+  if (platformOwner(req.veyraUser)) return res.json({ ok: true, billing: { status: "owner_free", provider: null } });
+  const email = String(req.body?.billingEmail || req.veyraUser.email).trim().toLowerCase();
+  const company = String(req.body?.company || "").trim().slice(0, 100);
+  if (!email.includes("@")) return respondError(res, 400, "Enter a valid billing email.", "BILLING_EMAIL_INVALID");
+  const d = platformData(req.veyraUser); d.platform.billing = { status: "configured", provider: "manual-profile", billingEmail: email, company, updatedAt: new Date().toISOString() }; savePlatformData(req.veyraUser, d);
+  res.json({ ok: true, billing: d.platform.billing, note: "Billing profile saved. No payment method was collected." });
+});
+app.post('/api/platform/workspaces', requireUser, (req, res) => {
+  const d = platformData(req.veyraUser), owner = platformOwner(req.veyraUser);
+  if (!owner && d.platform.workspaces.length >= 3) return respondError(res, 402, "Your Developer plan allows 3 workspaces. Upgrade to create more.", "PLATFORM_PLAN_LIMIT");
+  const name = String(req.body?.name || "").trim().slice(0, 80);
+  if (name.length < 2) return respondError(res, 400, "Workspace name must be at least 2 characters.", "WORKSPACE_NAME_INVALID");
+  const base = platformSlug(name); let slug = base, n = 2; while (d.platform.workspaces.some(w => w.slug === slug)) slug = `${base}-${n++}`;
+  const w = { id: crypto.randomUUID(), name, slug, description: String(req.body?.description || "").trim().slice(0, 240), createdAt: new Date().toISOString(), keys: [] };
+  d.platform.workspaces.push(w); savePlatformData(req.veyraUser, d); res.status(201).json({ ok: true, workspace: platformPublicWorkspace(w) });
+});
+app.patch('/api/platform/workspaces/:id', requireUser, (req, res) => {
+  const d = platformData(req.veyraUser), w = d.platform.workspaces.find(x => x.id === req.params.id); if (!w) return respondError(res, 404, "Workspace not found.", "WORKSPACE_NOT_FOUND");
+  if (req.body?.name != null) { const name = String(req.body.name).trim().slice(0, 80); if (name.length < 2) return respondError(res, 400, "Workspace name is too short.", "WORKSPACE_NAME_INVALID"); w.name = name; }
+  if (req.body?.description != null) w.description = String(req.body.description).trim().slice(0, 240);
+  savePlatformData(req.veyraUser, d); res.json({ ok: true, workspace: platformPublicWorkspace(w) });
+});
+app.delete('/api/platform/workspaces/:id', requireUser, (req, res) => {
+  const d = platformData(req.veyraUser), before = d.platform.workspaces.length; d.platform.workspaces = d.platform.workspaces.filter(x => x.id !== req.params.id); if (before === d.platform.workspaces.length) return respondError(res, 404, "Workspace not found.", "WORKSPACE_NOT_FOUND"); savePlatformData(req.veyraUser, d); res.json({ ok: true, deleted: true });
+});
+app.post('/api/platform/workspaces/:id/keys', requireUser, (req, res) => {
+  const d = platformData(req.veyraUser), w = d.platform.workspaces.find(x => x.id === req.params.id); if (!w) return respondError(res, 404, "Workspace not found.", "WORKSPACE_NOT_FOUND");
+  const owner = platformOwner(req.veyraUser); if (!owner && d.platform.billing.status !== "configured") return respondError(res, 402, "Set up billing before creating API keys.", "BILLING_REQUIRED");
+  if (!owner && w.keys.filter(k => !k.revokedAt).length >= 10) return respondError(res, 402, "This workspace reached its API key limit.", "PLATFORM_KEY_LIMIT");
+  const raw = `vyr_live_${crypto.randomBytes(24).toString("base64url")}`; const now = new Date().toISOString(); const key = { id: crypto.randomUUID(), name: String(req.body?.name || "Default key").trim().slice(0, 80) || "Default key", prefix: raw.slice(0, 16), hash: crypto.createHash("sha256").update(raw).digest("hex"), createdAt: now, lastUsedAt: null, revokedAt: null };
+  w.keys.push(key); savePlatformData(req.veyraUser, d); res.status(201).json({ ok: true, key: raw, keyInfo: platformPublicKey(key), warning: "Copy this key now. Veyra will not show it again." });
+});
+app.delete('/api/platform/workspaces/:workspaceId/keys/:keyId', requireUser, (req, res) => {
+  const d = platformData(req.veyraUser), w = d.platform.workspaces.find(x => x.id === req.params.workspaceId), k = w?.keys?.find(x => x.id === req.params.keyId); if (!k) return respondError(res, 404, "API key not found.", "API_KEY_NOT_FOUND"); k.revokedAt = new Date().toISOString(); savePlatformData(req.veyraUser, d); res.json({ ok: true, revoked: true });
+});
+
 // Test admin login — only available when VEYRA_TEST_MODE=1
 app.post('/api/auth/test-login', (req, res) => {
   if (!CFG.testMode) return res.status(403).json({ error: 'Test mode is disabled', ok: false });
