@@ -27,6 +27,8 @@ function evidenceText(value) {
     .replace(/\s+/g, " ").trim();
   if (!text || /\b(?:casino|gambling|betting|jackpot|wager)\b/i.test(text)) return "";
   if (/[{}[\];]{3,}/.test(text) && text.length > 120) return "";
+  if (/CLIENT_CANARY_STATE|USER_DEFINED|(?:\\u[0-9a-f]{4}){2,}|(?:window|globalThis|self)\s*[.(]|\b(?:set\s*\(|document\.cookie|webpackJsonp)\b/i.test(text)) return "";
+  if (/enjoy the videos and music you love|upload original content|share it all with friends/i.test(text)) return "";
   // Providers occasionally return stylesheet fragments or browser chrome as
   // snippets. Neither is evidence and must never reach the answer model.
   if (/(?:^|\s)[.#]?[\w-]+\s*\{[^}]+\}/.test(text) || /(?:font-family|margin|padding|line-height|display|background(?:-color)?|ssrcss-)/i.test(text)) return "";

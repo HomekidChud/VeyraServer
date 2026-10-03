@@ -23,9 +23,10 @@ const { RenewingManager } = require("./renewing-system");
   const evidence = ai.buildEvidence("what is the capital of Wales", { type: "definition", subject: "capital of Wales" }, [], [
     { url: "https://example.com/css", title: "CSS", snippet: "ssrcss-1-Weather{font-family:Arial; display:block}" },
     { url: "https://example.com/nav", title: "Nav", snippet: "Jump to content Tools Tools move to sidebar hide Actions Read Edit View history" },
+    { url: "https://example.com/config", title: "Config", snippet: 'set({"CLIENT_CANARY_STATE":"none","DEVICE":"USER_DEFINED\\u0026cos\\u003d"}) Enjoy the videos and music you love, upload original content.' },
     { url: "https://example.com/cardiff", title: "Capital of Wales", snippet: "Cardiff is the capital of Wales." }
   ]);
-  assert.strictEqual(evidence.length, 1, "CSS and navigation snippets must not become evidence");
+  assert.strictEqual(evidence.length, 1, "CSS, navigation and config snippets must not become evidence");
   assert.strictEqual(evidence[0].title, "Capital of Wales");
   assert(ai.followUps("what is Cardiff", { type: "definition", subject: "Cardiff" }).length === 2);
 
