@@ -2141,6 +2141,33 @@ function localSearchSuggestions(query, limit = 8) {
   const source = prefix ? [...termCounts.keys()].filter(t => t.startsWith(prefix)) : [...termCounts.keys()];
   return source.sort((a,b) => (termCounts.get(b) || 0) - (termCounts.get(a) || 0) || a.localeCompare(b)).slice(0, limit);
 }
+function editDistance(a, b) {
+  const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let left = prev[0]; prev[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const above = prev[j], cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      prev[j] = Math.min(prev[j] + 1, prev[j - 1] + 1, left + cost); left = above;
+    }
+  }
+  return prev[b.length];
+}
+function correctSearchQuery(query) {
+  const original = String(query || "").trim().slice(0, CFG.maxSearchQueryChars);
+  const dictionary = new Set([...termCounts.keys(), ..."university javascript browser search information technology science history definition example domains youtube reddit twitter".split(/\s+/)]);
+  const words = original.split(/(\s+)/);
+  let changed = false;
+  const corrected = words.map(part => {
+    if (!/^[A-Za-z]{4,}$/.test(part)) return part;
+    const lower = part.toLowerCase(); if (dictionary.has(lower)) return part;
+    const candidates = [...dictionary].filter(x => Math.abs(x.length - lower.length) <= 2);
+    let best = null, bestDistance = 3;
+    for (const candidate of candidates) { const d = editDistance(lower, candidate); if (d < bestDistance) { best = candidate; bestDistance = d; } }
+    if (!best) return part;
+    changed = true; return /^[A-Z]/.test(part) ? best[0].toUpperCase() + best.slice(1) : best;
+  }).join("");
+  return { original, corrected: changed ? corrected : original, changed };
+}
 function searchIndexStats() {
   const domains = new Set([...searchIndex.values()].map(d => d.host).filter(Boolean));
   const latest = [...searchIndex.values()].sort((a,b) => Date.parse(b.indexedAt || 0) - Date.parse(a.indexedAt || 0))[0];
@@ -3855,6 +3882,7 @@ app.get('/api/search/suggest', (req, res) => {
   const limit = Math.min(12, Math.max(1, Number(req.query.limit || 8) || 8));
   res.json({ ok: true, suggestions: localSearchSuggestions(q, limit) });
 });
+app.get('/api/search/correct', (req, res) => res.json({ ok: true, ...correctSearchQuery(req.query.q || "") }));
 app.get('/api/search/web', async (req, res) => {
   try {
     const q = String(req.query.q || "").trim().slice(0, 600);
