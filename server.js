@@ -104,6 +104,10 @@ const CFG = Object.freeze({
   // Lean mode never launches Chromium automatically; the user can still pick
   // "Chromium" explicitly (or be handed over to it on a security challenge).
   leanAutoBrowser: boolEnv("LEAN_AUTO_BROWSER", false),
+  // Render Free cannot keep Chromium resident reliably. YouTube therefore
+  // stays on the HTTP proxy unless a deployment explicitly opts out.
+  youtubeFastProxyOnly: boolEnv("YT_FAST_PROXY_ONLY", LEAN_MODE),
+  youtubeMaxHeight: numberEnv("YT_MAX_HEIGHT", 360, 144, 1080),
   processRole: enumEnv("PROCESS_ROLE", "web", ["web", "worker", "all"]),
   // CRAWLER_ROBOTS is the logical crawler fleet. Actual simultaneous network
   // fetches are bounded independently by MAX_ACTIVE_FETCHES. The fleet is virtual
@@ -1280,6 +1284,7 @@ async function fetchBuffer(url, opts = {}) {
           finalUrl: current,
           contentType,
           cacheControl: response.headers.get("cache-control") || "",
+          vary: response.headers.get("vary") || "",
           etag: response.headers.get("etag") || "",
           lastModified: response.headers.get("last-modified") || "",
           expires: response.headers.get("expires") || "",
@@ -3361,6 +3366,9 @@ app.post('/api/browser/capability', async (req, res) => {
   // See backend/youtube.js — this never inspects or serves googlevideo
   // media, only decides between OFFICIAL_EMBED and BROWSER_ENGINE.
   if (youtubeCompat.isYoutubeUrl(raw)) {
+    if (CFG.youtubeFastProxyOnly) {
+      return res.json({ ok: true, url: raw, mode: 'FAST_PROXY', lean: CFG.leanMode, youtubeFastProxyOnly: true });
+    }
     const parsed = youtubeCompat.parseYoutubeUrl(raw);
     if (parsed) {
       return res.json({
@@ -4234,6 +4242,18 @@ function sameSiteFetchMetadata(targetUrl, sourceUrl, mode) {
 
 function forwardProxyBrowserHeaders(req, targetUrl, sourceUrl, mode, baseHeaders = {}) {
   const out = { ...baseHeaders };
+  // YouTube's /youtubei/* endpoints validate the site context. The browser
+  // runtime supplies `from` for subrequests; normalize it to the upstream site
+  // rather than leaking the Veyra API origin into Origin/Referer checks.
+  try {
+    const target = new URL(targetUrl);
+    if (/(^|\.)youtube\.com$|(^|\.)youtu\.be$/i.test(target.hostname)) {
+      const siteOrigin = `https://${target.hostname.replace(/^m\./i, "www.")}`;
+      if (sourceUrl) out.referer = sourceUrl;
+      else if (mode !== "view") out.referer = `${siteOrigin}/`;
+      if (String(req.method || "GET").toUpperCase() !== "GET" && String(req.method || "GET").toUpperCase() !== "HEAD") out.origin = siteOrigin;
+    }
+  } catch {}
   if (CFG.proxyForwardCompatHeaders) {
     // These headers are commonly used by real web applications and public web APIs
     // (including modern YouTube/Google client APIs). Cookies are handled only by
@@ -4465,7 +4485,11 @@ async function proxyRequest(req, res, mode) {
   }
   if (result.stream) result.stream.cancel();
   if (result.tooLarge || (download && result.bytes > CFG.maxDownloadBytes)) return respondError(res, 413, "The upstream response exceeds Veyra's safety limit.", "RESPONSE_TOO_LARGE");
-  const staticResource = mode === "resource" && !download && !result.setCookieHeader && !cookieHeader(sid, canonical) && /^(?:text\/css|application\/(?:javascript|x-javascript)|text\/javascript|image\/|font\/)/i.test(result.contentType || "");
+  const responseCacheControl = String(result.cacheControl || "").toLowerCase();
+  const responseVary = String(result.vary || "").toLowerCase();
+  const requestHasAuth = !!req.get("Authorization");
+  const privateResponse = /(?:^|[\s,])(?:private|no-store)(?:[=\s,]|$)/i.test(responseCacheControl) || /(?:^|[\s,])cookie(?:[\s,]|$)/i.test(responseVary);
+  const staticResource = mode === "resource" && !download && !result.setCookieHeader && !requestHasAuth && !privateResponse && !cookieHeader(sid, canonical) && /^(?:text\/css|application\/(?:javascript|x-javascript)|text\/javascript|image\/|font\/)/i.test(result.contentType || "");
   const upstreamHeaders = {
     "content-type": result.contentType || (mode === "view" ? "text/html; charset=utf-8" : "application/octet-stream"),
     "cache-control": download ? "no-store" : mode === "view" ? "no-store" : staticResource ? "public, max-age=60, stale-while-revalidate=300" : "public, max-age=15",

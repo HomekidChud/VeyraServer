@@ -4,7 +4,7 @@ services:
     name: VeyraServer
     runtime: node
     plan: free
-    buildCommand: npm install && npx playwright install chromium && node install-wireproxy.js
+    buildCommand: npm install && node install-wireproxy.js
     startCommand: npm start
     healthCheckPath: /health
     envVars:
@@ -14,8 +14,14 @@ services:
         value: https://homekidchud.github.io
       - key: NODE_VERSION
         value: "20"
-      - key: PLAYWRIGHT_BROWSERS_PATH
-        value: "0"
+      # Chromium is intentionally disabled on Free; YouTube uses the fast
+      # proxy and does not depend on a sleeping/evicted browser process.
+      - key: BROWSER_ENABLED
+        value: "false"
+      - key: YT_FAST_PROXY_ONLY
+        value: "true"
+      - key: YT_MAX_HEIGHT
+        value: "360"
       # Keep in sync with `plan:` above (npm run config -- plan <name> does both).
       # "auto" also works: Veyra detects the instance's RAM/CPU from cgroups.
       - key: VEYRA_ENV
