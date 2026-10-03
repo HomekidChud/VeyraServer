@@ -560,7 +560,10 @@ class VpnManager {
     const requested = String(profileId || "").trim();
     let profile = requested && requested !== "auto" ? this.profiles.get(requested) : null;
     if (requested && requested !== "auto" && !profile) throw vpnError(`Unknown VPN profile "${requested}".`, "VPN_NOT_CONFIGURED");
-    if (!profile) profile = this.pickProfile({ region: opts.region, group: opts.group }) || this.profiles.get(this.defaultProfileId);
+    if (profile && this.health.get(profile.id)?.healthy === false) throw vpnError(`VPN profile "${profile.name}" is currently unhealthy.`, "VPN_ALL_DOWN");
+    // Do not bypass health selection with the default profile. That previously
+    // returned connected:true for a dead exit and failed only on first use.
+    if (!profile) profile = this.pickProfile({ region: opts.region, group: opts.group });
     if (!profile) throw vpnError("Every VPN profile is currently failing health checks.", "VPN_ALL_DOWN");
     const prev = this.connections.get(sid);
     const seq = prev ? prev.seq : 0;

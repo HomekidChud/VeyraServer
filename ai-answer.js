@@ -27,6 +27,10 @@ function evidenceText(value) {
     .replace(/\s+/g, " ").trim();
   if (!text || /\b(?:casino|gambling|betting|jackpot|wager)\b/i.test(text)) return "";
   if (/[{}[\];]{3,}/.test(text) && text.length > 120) return "";
+  // Providers occasionally return stylesheet fragments or browser chrome as
+  // snippets. Neither is evidence and must never reach the answer model.
+  if (/(?:^|\s)[.#]?[\w-]+\s*\{[^}]+\}/.test(text) || /(?:font-family|margin|padding|line-height|display|background(?:-color)?|ssrcss-)/i.test(text)) return "";
+  if (/\b(?:jump to content|tools tools|read edit view history|what links here|sign in|navigation menu)\b/i.test(text)) return "";
   return text;
 }
 function htmlToText(html) {
@@ -163,7 +167,8 @@ class AIAnswerEngine {
         if (/cookie|privacy policy|sign in|navigation|javascript required/i.test(text)) score -= 0.25;
         return { text, score, i };
       }).filter(x => x.score > 0.05).sort((a,b) => b.score - a.score).slice(0, 5);
-      if (!scored.length && c.snippet) scored.push({ text: c.snippet, score: 0.12, i: 0 });
+      // Do not force an unmatched snippet into the evidence set. The previous
+      // fallback made unrelated provider results look like confident answers.
       if (scored.length) out.push({ id: `S${out.length + 1}`, url: c.url, title: c.title || results.find(r => r.url === c.url)?.title || c.url, rank: c.rank, matched: scored.map(x => x.text), score: scored[0].score });
     }
     return out.sort((a,b) => b.score - a.score || a.rank - b.rank).slice(0, 6).map((x, i) => ({ ...x, id: `S${i + 1}` }));

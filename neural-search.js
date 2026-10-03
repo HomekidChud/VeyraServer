@@ -189,6 +189,33 @@ function mergeResults(providerResults) {
     }));
 }
 
+function searchTerms(query) {
+  const stop = new Set(["the", "a", "an", "of", "in", "on", "at", "to", "for", "and", "or", "is", "are", "was", "were", "who", "what", "when", "where", "why", "how"]);
+  return [...new Set(String(query || "").toLowerCase().replace(/https?:\/\/\S+/g, " ").replace(/[^a-z0-9]+/g, " ").split(/\s+/).filter(t => t.length > 1 && !stop.has(t)))];
+}
+function relevanceScore(result, query) {
+  const terms = searchTerms(query); if (!terms.length) return 0;
+  const title = String(result.title || "").toLowerCase();
+  const text = `${title} ${String(result.snippet || "").toLowerCase()}`;
+  const titleHits = terms.filter(t => title.includes(t)).length;
+  const textHits = terms.filter(t => text.includes(t)).length;
+  const phrase = String(query || "").trim().toLowerCase().replace(/^\"|\"$/g, "");
+  let score = (titleHits / terms.length) * 0.7 + (textHits / terms.length) * 0.3;
+  if (phrase.length > 3 && text.includes(phrase)) score += 0.25;
+  return Math.min(1, score);
+}
+function rankRelevant(results, query) {
+  const multiWord = searchTerms(query).length > 1;
+  const terms = searchTerms(query);
+  return results.map((r, i) => {
+    const text = `${String(r.title || "")} ${String(r.snippet || "")}`.toLowerCase();
+    return { ...r, queryRelevance: Number(relevanceScore(r, query).toFixed(4)), queryTermHits: terms.filter(t => text.includes(t)).length, _position: i };
+  })
+    .sort((a, b) => b.queryRelevance - a.queryRelevance || (a.avgPosition || a._position) - (b.avgPosition || b._position))
+    .filter(r => r.queryRelevance >= (multiWord ? 0.18 : 0.08) && (!multiWord || r.queryTermHits >= Math.min(2, terms.length)))
+    .map(({ _position, queryTermHits, ...r }) => r);
+}
+
 // ----------------------------------------------------------------- neural re-ranking
 function neuralRerank(results, neuralModel) {
   if (!neuralModel) return results;
@@ -386,7 +413,13 @@ function createWebSearch({ fetchText, env = process.env, log = () => {}, neuralM
     // Merge results from all providers
     const merged = mergeResults(providerResults);
     // Neural re-ranking if model is available
-    const ranked = neuralModel ? neuralRerank(merged, neuralModel) : merged;
+    // Query relevance must dominate domain authority. Previously an unrelated
+    // high-authority/local result could outrank pages that actually matched
+    // the user's words (for example car dealers for “capital of Wales”).
+    const relevant = rankRelevant(merged, q);
+    const ranked = neuralModel
+      ? neuralRerank(relevant, neuralModel).sort((a, b) => (b.queryRelevance || 0) - (a.queryRelevance || 0) || (b.neuralScore || 0) - (a.neuralScore || 0))
+      : relevant;
     // Take top 25
     const final = ranked.slice(0, 25);
 
@@ -427,7 +460,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {}, neuralM
         const results = dedupe(packed.results || []);
         attempts.push({ provider: name, ms: Date.now() - started, count: results.length });
         if (!results.length) continue;
-        const value = { provider: name, results: results.slice(0, 20), total: packed.total ?? null, more: !!packed.more, attempts, googleConfigured: providers.google.available(), braveConfigured: providers.brave.available(), bingConfigured: !!bingKey };
+        const value = { provider: name, results: rankRelevant(results, q).slice(0, 20), total: packed.total ?? null, more: !!packed.more, attempts, googleConfigured: providers.google.available(), braveConfigured: providers.brave.available(), bingConfigured: !!bingKey };
         cache.set(key, { time: Date.now(), value });
         while (cache.size > MAX) cache.delete(cache.keys().next().value);
         return value;
