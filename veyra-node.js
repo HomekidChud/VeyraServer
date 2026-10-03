@@ -10,11 +10,8 @@
  * Quick start:
  *   node veyra-node.js
  *
- * Then in Veyra Browser → VPN → Add Profile:
- *   Type: socks5
- *   Server: <your-public-ip>:1080
- *   Username: veyra
- *   Password: <the generated token>
+ * Then paste the temporary code printed by this script into:
+ *   Veyra Browser → Settings → Veyra VPN → Paste Veyra Node code
  *
  * Or import the JSON config Veyra generates automatically.
  *
@@ -24,7 +21,9 @@
  *   --pass=<token>     password (default: auto-generated)
  *   --name=My Node     profile name
  *   --region=UK        region label
+ *   --public-ip=1.2.3.4 override automatic public-IP detection
  *   --print-json      print Veyra import JSON and exit
+ *   --code-minutes=10 enrollment-code lifetime (default: 10 minutes)
  *
  * No dependencies — pure Node.js, runs anywhere Node 18+ is installed.
  */
@@ -44,7 +43,9 @@ const USER = args.user || "veyra";
 const PASS = args.pass || crypto.randomBytes(12).toString("base64url");
 const NAME = args.name || "VeyraVPN Node";
 const REGION = args.region || "";
+const PUBLIC_IP_OVERRIDE = String(args["public-ip"] || "").trim();
 const PRINT_JSON = args["print-json"] || args.json || false;
+const CODE_MINUTES = Math.max(1, Math.min(60, Number(args["code-minutes"]) || 10));
 
 // ---- Helpers ----
 
@@ -67,6 +68,24 @@ function fetchPublicIP() {
     req.on("error", () => resolve(null));
     req.setTimeout(4000, () => { req.destroy(); resolve(null); });
   });
+}
+
+function makeNodeCode(config, publicIP) {
+  const payload = {
+    v: 1,
+    nonce: crypto.randomBytes(8).toString("hex"),
+    expiresAt: Date.now() + CODE_MINUTES * 60 * 1000,
+    name: config.name,
+    type: config.type,
+    server: config.server,
+    username: config.username,
+    password: config.password,
+    region: config.region || "",
+    publicIp: publicIP || ""
+  };
+  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const checksum = crypto.createHash("sha256").update(body).digest("hex").slice(0, 16);
+  return `VNODE1.${body}.${checksum}`;
 }
 
 // ---- SOCKS5 server ----
@@ -224,7 +243,8 @@ server.listen(PORT, "::", async () => {
   }
 
   // Auto-detect public IP
-  const publicIP = await fetchPublicIP();
+  if (PUBLIC_IP_OVERRIDE && !net.isIP(PUBLIC_IP_OVERRIDE)) throw new Error("--public-ip must be a valid IPv4 or IPv6 address");
+  const publicIP = PUBLIC_IP_OVERRIDE || await fetchPublicIP();
   const hostAddr = publicIP ? formatHost(publicIP, PORT) : `<your-public-ip>:${PORT}`;
   // Veyra's parseProfile expects a full URL with protocol prefix (socks5://host:port)
   const serverAddr = `socks5://${hostAddr}`;
@@ -238,6 +258,7 @@ server.listen(PORT, "::", async () => {
     region: REGION,
     note: publicIP ? "Auto-detected public IP." : "Replace <your-public-ip> with your public IP. Run 'curl ifconfig.me' to find it.",
   };
+  const nodeCode = makeNodeCode(veyraConfig, publicIP);
 
   if (PRINT_JSON) {
     console.log(JSON.stringify(veyraConfig, null, 2));
@@ -259,6 +280,12 @@ server.listen(PORT, "::", async () => {
   console.log("");
   console.log("  Local IPs:");
   for (const ip of ips) console.log(`    ${ip.name} (${ip.family}): ${formatHost(ip.address, PORT)}`);
+  console.log("");
+  console.log(`  Temporary Veyra Node code (expires in ${CODE_MINUTES} minutes):`);
+  console.log(`  ${nodeCode}`);
+  console.log("");
+  console.log("  Paste it in Veyra Settings → Veyra VPN → Paste Veyra Node code.");
+  console.log("  Treat this code like a password; anyone with it can use this node until it expires.");
   console.log("");
   console.log("  To add this to Veyra Browser:");
   console.log("    1. In Veyra: VPN -> Add Profile");
