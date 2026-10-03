@@ -56,17 +56,25 @@ function formatHost(ip, port) {
 }
 
 function fetchPublicIP() {
+  const endpoints = ["https://api4.ipify.org?format=json", "https://api64.ipify.org?format=json"];
   return new Promise(resolve => {
-    const req = https.get("https://api64.ipify.org?format=json", res => {
-      let data = "";
-      res.on("data", chunk => data += chunk);
-      res.on("end", () => {
-        try { resolve(JSON.parse(data).ip); }
-        catch { resolve(null); }
+    const attempt = index => {
+      if (index >= endpoints.length) return resolve(null);
+      const req = https.get(endpoints[index], res => {
+        let data = "";
+        res.on("data", chunk => data += chunk);
+        res.on("end", () => {
+          try {
+            const ip = JSON.parse(data).ip;
+            if (net.isIP(ip)) return resolve(ip);
+          } catch {}
+          attempt(index + 1);
+        });
       });
-    });
-    req.on("error", () => resolve(null));
-    req.setTimeout(4000, () => { req.destroy(); resolve(null); });
+      req.on("error", () => attempt(index + 1));
+      req.setTimeout(4000, () => { req.destroy(); attempt(index + 1); });
+    };
+    attempt(0);
   });
 }
 
@@ -88,7 +96,7 @@ function makeNodeCode(config, publicIP) {
   return `VNODE1.${body}.${checksum}`;
 }
 
-function testLocalSocks() {
+function testLocalSocks(targetHost = "api4.ipify.org") {
   return new Promise(resolve => {
     const sock = net.connect(PORT, "127.0.0.1");
     let state = "greeting", buf = Buffer.alloc(0), finished = false;
@@ -107,14 +115,14 @@ function testLocalSocks() {
       if (state === "auth" && buf.length >= 2) {
         if (buf[1] !== 0) return fail("SOCKS5 credentials were rejected locally");
         buf = buf.subarray(2); state = "connect";
-        const host = Buffer.from("api64.ipify.org");
+        const host = Buffer.from(targetHost);
         sock.write(Buffer.concat([Buffer.from([5, 1, 0, 3, host.length]), host, Buffer.from([0, 443])]));
       }
       if (state === "connect" && buf.length >= 5) {
         const atyp = buf[3], need = atyp === 1 ? 10 : atyp === 4 ? 22 : atyp === 3 && buf.length >= 5 ? 7 + buf[4] : 0;
         if (!need || buf.length < need) return;
         if (buf[1] !== 0) return fail(`outbound SOCKS connect failed (reply ${buf[1]})`);
-        clearTimeout(timer); done({ ok: true, reason: "authenticated SOCKS5 connection reached api64.ipify.org:443" });
+        clearTimeout(timer); done({ ok: true, reason: `authenticated SOCKS5 connection reached ${targetHost}:443` });
       }
     });
     sock.on("connect", () => sock.write(Buffer.from([5, 1, 2])));
@@ -122,11 +130,13 @@ function testLocalSocks() {
 }
 
 async function runDiagnostics(publicIP, ips) {
-  const local = await testLocalSocks();
+  const targetHost = net.isIPv4(publicIP) ? "api4.ipify.org" : "api64.ipify.org";
+  const local = await testLocalSocks(targetHost);
   const privateLocal = ips.filter(x => /^(10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[0-1])\.|100\.(6[4-9]|[7-9]\d)\.|fe80:)/i.test(x.address));
   console.log("  Self-test:");
   console.log(`    ${publicIP ? "PASS" : "WARN"} public IP detection${publicIP ? ` (${publicIP})` : " — use --public-ip=x.x.x.x"}`);
   console.log(`    ${local.ok ? "PASS" : "FAIL"} ${local.reason}`);
+  if (net.isIPv6(publicIP)) console.log("    WARN public IPv6 detected; Veyra must have IPv6 egress and your network must allow inbound IPv6 TCP.");
   if (privateLocal.length && publicIP) console.log("    WARN local interfaces are private/CGNAT; mobile data or router NAT may block Veyra inbound access.");
   console.log("    INFO external reachability cannot be proven from inside the node; Veyra must reach this public IP and port.");
   return local;
