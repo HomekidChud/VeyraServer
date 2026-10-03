@@ -10,6 +10,15 @@ services:
     envVars:
       - key: VEYRA_FRONTEND_URL
         value: https://homekidchud.github.io/VeyraBrowser/
+      - key: PLATFORM_URL
+        value: https://homekidchud.github.io/VeyraBrowser/dev/platform
+      # Configure these secrets in the Render dashboard, never in Git.
+      - key: RESEND_API_KEY
+        sync: false
+      - key: PLATFORM_EMAIL_FROM
+        sync: false
+      - key: PLATFORM_EARLY_ACCESS_URL
+        sync: false
       - key: FRONTEND_ORIGIN
         value: https://homekidchud.github.io
       - key: NODE_VERSION

@@ -3712,12 +3712,49 @@ function platformSlug(name) { return String(name || "workspace").toLowerCase().t
 const PLATFORM_PRICING = [
   { id: "owner", name: "Owner", price: 0, unit: "forever", description: "Included for Veyra owners and administrators.", features: ["Unlimited workspaces", "API keys", "Platform documentation"] },
   { id: "developer", name: "Developer", price: 0, unit: "during beta", description: "Free while the API platform is in beta. Billing profile required.", features: ["3 workspaces", "10 API keys per workspace", "Usage dashboard"] },
+  { id: "early_access", name: "Early access", price: 2.99, unit: "per month", description: "Priority access while the platform opens in waves.", features: ["Priority queue placement", "Early platform access", "Founder feedback channel"] },
   { id: "team", name: "Team", price: 19, unit: "per month", description: "For small teams shipping on Veyra.", features: ["10 workspaces", "50 API keys per workspace", "Team support"] }
 ];
+const PLATFORM_WAITLIST_FILE = path.join(CFG.authDataDir, "platform-waitlist.json");
+function readPlatformWaitlist() { try { const rows = JSON.parse(fs.readFileSync(PLATFORM_WAITLIST_FILE, "utf8")); return Array.isArray(rows) ? rows : []; } catch { return []; } }
+function writePlatformWaitlist(rows) { fs.mkdirSync(path.dirname(PLATFORM_WAITLIST_FILE), { recursive: true }); const tmp = `${PLATFORM_WAITLIST_FILE}.tmp`; fs.writeFileSync(tmp, JSON.stringify(rows, null, 2)); fs.renameSync(tmp, PLATFORM_WAITLIST_FILE); if (mongoStore.enabled) void mongoStore.replacePlatformWaitlist(rows); }
+if (mongoStore.enabled) void mongoStore.loadPlatformWaitlist().then(rows => { const local = readPlatformWaitlist(); if (rows.length) writePlatformWaitlist(rows); else if (local.length) void mongoStore.replacePlatformWaitlist(local); }).catch(() => {});
+function publicWaitlistEntry(x) { return { id: x.id, email: x.email, name: x.name || "", plan: x.plan, status: x.status, position: x.position || null, createdAt: x.createdAt, acceptedAt: x.acceptedAt || null, emailStatus: x.emailStatus || "pending" }; }
+async function sendPlatformEmail({ to, subject, html }) {
+  const key = String(process.env.RESEND_API_KEY || "").trim(), from = String(process.env.PLATFORM_EMAIL_FROM || "").trim();
+  if (!key || !from) { serverLog("info", "PLATFORM_EMAIL", `Email delivery not configured; would send ${subject} to ${to}`); return { sent: false, status: "not_configured" }; }
+  try {
+    const r = await fetch("https://api.resend.com/emails", { method: "POST", headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" }, body: JSON.stringify({ from, to: [to], subject, html }) });
+    if (!r.ok) throw new Error(`Resend returned ${r.status}`);
+    return { sent: true, status: "sent" };
+  } catch (e) { serverLog("warn", "PLATFORM_EMAIL", `Could not send email to ${to}: ${e.message}`); return { sent: false, status: "failed", error: e.message }; }
+}
+app.post('/api/platform/waitlist', async (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase(), name = String(req.body?.name || "").trim().slice(0, 100), plan = req.body?.plan === "early_access" ? "early_access" : "developer";
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return respondError(res, 400, "Enter a valid email address.", "WAITLIST_EMAIL_INVALID");
+  const rows = readPlatformWaitlist(), existing = rows.find(x => x.email === email);
+  if (existing) return res.json({ ok: true, alreadyJoined: true, entry: publicWaitlistEntry(existing), earlyAccessPrice: 2.99 });
+  const active = rows.filter(x => x.status === "pending").length;
+  const entry = { id: crypto.randomUUID(), email, name, plan, status: "pending", position: active + 1, createdAt: new Date().toISOString(), emailStatus: "pending" };
+  rows.push(entry); writePlatformWaitlist(rows);
+  const emailResult = await sendPlatformEmail({ to: email, subject: "You’re on the Veyra platform waitlist", html: `<p>Hi ${escapeHtml(name || "there")},</p><p>You’re in the queue for the Veyra Developer Platform. We’ll email you when your access is ready.</p>${plan === "early_access" ? `<p>You selected early access at <strong>$2.99/month</strong>. We’ll include the secure checkout link when your place is ready.</p>` : ""}<p>— The Veyra team</p>` });
+  entry.emailStatus = emailResult.status; writePlatformWaitlist(rows);
+  res.status(201).json({ ok: true, entry: publicWaitlistEntry(entry), earlyAccessPrice: 2.99, message: "You’re on the list." });
+});
+app.get('/api/platform/waitlist/status', (req, res) => { const email = String(req.query.email || "").trim().toLowerCase(); const x = readPlatformWaitlist().find(v => v.email === email); res.json({ ok: true, entry: x ? publicWaitlistEntry(x) : null }); });
+app.get('/api/platform/waitlist', requireAdmin, (req, res) => { const rows = readPlatformWaitlist(); res.json({ ok: true, total: rows.length, pending: rows.filter(x => x.status === "pending").length, entries: rows.map(publicWaitlistEntry) }); });
+app.post('/api/platform/waitlist/:id/accept', requireAdmin, async (req, res) => {
+  const rows = readPlatformWaitlist(), x = rows.find(v => v.id === req.params.id); if (!x) return respondError(res, 404, "Waitlist entry not found.", "WAITLIST_NOT_FOUND");
+  x.status = "accepted"; x.acceptedAt = new Date().toISOString(); x.emailStatus = "pending"; writePlatformWaitlist(rows);
+  const base = String(process.env.PLATFORM_URL || "https://homekidchud.github.io/VeyraBrowser/dev/platform").replace(/\/$/, ""), checkout = String(process.env.PLATFORM_EARLY_ACCESS_URL || "").trim();
+  const result = await sendPlatformEmail({ to: x.email, subject: "Your Veyra platform access is ready", html: `<p>Hi ${escapeHtml(x.name || "there")},</p><p>Your Veyra Developer Platform access is ready.</p><p><a href="${escapeHtml(base)}">Open the Veyra platform</a> and sign in to create your workspace.</p>${x.plan === "early_access" ? `<p>Early access is <strong>$2.99/month</strong>. ${checkout ? `<a href="${escapeHtml(checkout)}">Continue to secure checkout</a>.` : "A checkout link will be added by the Veyra team."}</p>` : ""}<p>Keep your API keys private and rotate them regularly.</p>` });
+  x.emailStatus = result.status; writePlatformWaitlist(rows); res.json({ ok: true, entry: publicWaitlistEntry(x), email: result });
+});
 app.get('/api/platform/pricing', (req, res) => res.json({ ok: true, currency: "USD", plans: PLATFORM_PRICING }));
 app.get('/api/platform/overview', requireUser, (req, res) => {
   const d = platformData(req.veyraUser), owner = platformOwner(req.veyraUser);
-  res.json({ ok: true, owner, billing: owner ? { status: "owner_free", provider: null } : d.platform.billing, workspaces: d.platform.workspaces.map(platformPublicWorkspace), limits: owner ? { workspaces: 999, keysPerWorkspace: 999 } : { workspaces: 3, keysPerWorkspace: 10 }, pricing: PLATFORM_PRICING });
+  const waitlist = owner ? readPlatformWaitlist() : [];
+  res.json({ ok: true, owner, billing: owner ? { status: "owner_free", provider: null } : d.platform.billing, workspaces: d.platform.workspaces.map(platformPublicWorkspace), limits: owner ? { workspaces: 999, keysPerWorkspace: 999 } : { workspaces: 3, keysPerWorkspace: 10 }, pricing: PLATFORM_PRICING, waitlist: owner ? { total: waitlist.length, pending: waitlist.filter(x => x.status === "pending").length, entries: waitlist.map(publicWaitlistEntry) } : null });
 });
 app.post('/api/platform/billing/setup', requireUser, (req, res) => {
   if (platformOwner(req.veyraUser)) return res.json({ ok: true, billing: { status: "owner_free", provider: null } });

@@ -225,6 +225,15 @@ class MongoStore {
     this.stats.writes += 1;
     void this.withDb(db => db.collection("session_cookies").deleteOne({ sid }));
   }
+  async loadPlatformWaitlist() {
+    const rows = await this.withDb(db => db.collection("platform_waitlist").find({}, { projection: { _id: 0 } }).sort({ createdAt: 1 }).limit(100000).toArray());
+    return Array.isArray(rows) ? rows : [];
+  }
+  async replacePlatformWaitlist(rows) {
+    if (!Array.isArray(rows)) return;
+    this.stats.writes += 1;
+    return this.withDb(async db => { const c = db.collection("platform_waitlist"); await c.deleteMany({}); if (rows.length) await c.insertMany(JSON.parse(JSON.stringify(rows))); });
+  }
   status() { return { configured: !!this.uri, enabled: this.enabled, connected: this.connected, db: this.dbName, poolSize: this.maxPoolSize, cacheBodyMaxBytes: this.cacheBodyMaxBytes, cacheTtlMs: this.cacheTtlMs, retryAfter: this.retryAfter || null, disabledReason: this.disabledReason || null, stats: { ...this.stats } }; }
   async close() { this.connected = false; try { await this.client?.close(); } catch {} this.client = null; this.db = null; }
 }
