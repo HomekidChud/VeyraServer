@@ -250,7 +250,15 @@ class NeuralCrawlerModel {
   save() {
     if (!this.savePath) return;
     try {
-      const data = {
+      const data = this.serialize();
+      fs.writeFileSync(this.savePath, JSON.stringify(data, null, 2));
+    } catch (e) {
+      // Silent fail — model persistence is best-effort
+    }
+  }
+
+  serialize() {
+    return {
         version: 1,
         weights: Array.from(this.weights),
         bias: this.bias,
@@ -259,11 +267,21 @@ class NeuralCrawlerModel {
         domainClickCounts: Object.fromEntries(this.domainClickCounts),
         domainVisitCounts: Object.fromEntries(this.domainVisitCounts),
         savedAt: new Date().toISOString(),
-      };
-      fs.writeFileSync(this.savePath, JSON.stringify(data, null, 2));
-    } catch (e) {
-      // Silent fail — model persistence is best-effort
-    }
+    };
+  }
+
+  loadData(data) {
+    if (!data || data.version !== 1) return false;
+    const w = data.weights || [];
+    for (let i = 0; i < NUM_FEATURES && i < w.length; i++) this.weights[i] = Number(w[i]) || 0;
+    this.bias = Number(data.bias) || 0;
+    this.trainingExamples = Number(data.trainingExamples) || 0;
+    if (data.stats) Object.assign(this.stats, data.stats);
+    this.domainClickCounts.clear();
+    for (const [k, v] of Object.entries(data.domainClickCounts || {})) this.domainClickCounts.set(k, Number(v) || 0);
+    this.domainVisitCounts.clear();
+    for (const [k, v] of Object.entries(data.domainVisitCounts || {})) this.domainVisitCounts.set(k, Number(v) || 0);
+    return true;
   }
 
   // Load model weights from disk
@@ -271,20 +289,7 @@ class NeuralCrawlerModel {
     if (!this.savePath) return false;
     try {
       if (!fs.existsSync(this.savePath)) return false;
-      const data = JSON.parse(fs.readFileSync(this.savePath, "utf8"));
-      if (data.version !== 1) return false;
-      const w = data.weights || [];
-      for (let i = 0; i < NUM_FEATURES && i < w.length; i++) this.weights[i] = w[i];
-      this.bias = data.bias || 0;
-      this.trainingExamples = data.trainingExamples || 0;
-      if (data.stats) Object.assign(this.stats, data.stats);
-      if (data.domainClickCounts) {
-        for (const [k, v] of Object.entries(data.domainClickCounts)) this.domainClickCounts.set(k, v);
-      }
-      if (data.domainVisitCounts) {
-        for (const [k, v] of Object.entries(data.domainVisitCounts)) this.domainVisitCounts.set(k, v);
-      }
-      return true;
+      return this.loadData(JSON.parse(fs.readFileSync(this.savePath, "utf8")));
     } catch {
       return false;
     }

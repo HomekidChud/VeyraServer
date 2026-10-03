@@ -37,7 +37,11 @@ class MongoStore {
           this.db.collection("snapshots").createIndex({ proxySid: 1, url: 1 }, { unique: true }).catch(() => {}),
           this.db.collection("snapshots").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }).catch(() => {}),
           this.db.collection("session_cookies").createIndex({ sid: 1 }, { unique: true }).catch(() => {}),
-          this.db.collection("session_cookies").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }).catch(() => {})
+          this.db.collection("session_cookies").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }).catch(() => {}),
+          this.db.collection("neural_feedback").createIndex({ id: 1 }, { unique: true }).catch(() => {}),
+          this.db.collection("neural_feedback").createIndex({ status: 1, createdAt: 1 }).catch(() => {}),
+          this.db.collection("neural_feedback").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }).catch(() => {}),
+          this.db.collection("neural_models").createIndex({ id: 1 }, { unique: true }).catch(() => {})
         ]);
         this.connected = true; this.disabledReason = ""; this.retryAfter = 0; return true;
       } catch (e) {
@@ -83,6 +87,43 @@ class MongoStore {
     if (!doc || (doc.expiresAt && Date.parse(doc.expiresAt) <= Date.now())) return null;
     this.stats.hits += 1;
     return doc;
+  }
+
+  // ---- Neural learning persistence ----
+  async enqueueNeuralFeedback(feedback) {
+    if (!feedback?.id || !feedback?.url) return false;
+    const doc = {
+      id: String(feedback.id), url: String(feedback.url), positive: !!feedback.positive,
+      weight: Number(feedback.weight) || 1, context: feedback.context || {}, status: "queued",
+      createdAt: new Date(feedback.createdAt || Date.now()), updatedAt: new Date(),
+      expiresAt: new Date(Date.now() + 90 * 24 * 60 * 60 * 1000)
+    };
+    const result = await this.withDb(db => db.collection("neural_feedback").updateOne({ id: doc.id }, { $setOnInsert: doc }, { upsert: true }));
+    if (result == null) return false;
+    this.stats.writes += 1;
+    return true;
+  }
+  async loadQueuedNeuralFeedback(limit = 5000) {
+    const rows = await this.withDb(db => db.collection("neural_feedback").find({ status: "queued" }, { projection: { _id: 0 } }).sort({ createdAt: 1 }).limit(Math.max(1, Number(limit) || 1000)).toArray());
+    this.stats.reads += 1;
+    return Array.isArray(rows) ? rows : [];
+  }
+  async markNeuralFeedbackProcessed(id, error = "") {
+    if (!id) return;
+    this.stats.writes += 1;
+    void this.withDb(db => db.collection("neural_feedback").updateOne({ id: String(id) }, { $set: { status: error ? "error" : "processed", error: error || null, processedAt: new Date(), updatedAt: new Date() } }));
+  }
+  async saveNeuralModel(id, data) {
+    if (!id || !data) return;
+    const doc = { id: String(id), ...data, updatedAt: new Date() };
+    this.stats.writes += 1;
+    return this.withDb(db => db.collection("neural_models").updateOne({ id: doc.id }, { $set: doc }, { upsert: true }));
+  }
+  async loadNeuralModel(id) {
+    if (!id) return null;
+    this.stats.reads += 1;
+    const doc = await this.withDb(db => db.collection("neural_models").findOne({ id: String(id) }, { projection: { _id: 0, id: 0 } }));
+    return doc || null;
   }
 
   // ---- VPN profile persistence ----

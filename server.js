@@ -299,18 +299,6 @@ const CFG = Object.freeze({
   playwrightBrowsersPath: process.env.PLAYWRIGHT_BROWSERS_PATH || "0"
 });
 try { fs.mkdirSync(CFG.authDataDir, { recursive: true }); } catch {}
-const neuralModel = new NeuralCrawlerModel({
-  savePath: process.env.NEURAL_MODEL_PATH || path.join(CFG.authDataDir, "neural-model.json"),
-  saveIntervalMs: numberEnv("NEURAL_MODEL_SAVE_INTERVAL_MS", 60000, 5000, 86400000)
-});
-neuralModel.load();
-const neuralTrainer = new NeuralLearningWorker({
-  model: neuralModel,
-  intervalMs: numberEnv("NEURAL_TRAIN_INTERVAL_MS", 5000, 250, 300000),
-  batchSize: numberEnv("NEURAL_TRAIN_BATCH_SIZE", 32, 1, 256),
-  maxQueue: numberEnv("NEURAL_TRAIN_QUEUE_MAX", 5000, 100, 100000),
-  log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
-});
 
 // Dedicated direct HTTP dispatcher. Hosted environments can have mixed IPv4/IPv6
 // reachability; Undici's family selection avoids turning a reachable public
@@ -365,6 +353,18 @@ const sessionManager = new SessionManager({
 });
 const proxySessions = sessionManager.sessions;
 const mongoStore = new MongoStore({ uri: CFG.mongoUri, dbName: CFG.mongoDb, maxPoolSize: CFG.mongoPoolSize, cacheBodyMaxBytes: CFG.mongoCacheBodyMaxBytes, cacheTtlMs: CFG.mongoCacheTtlMs });
+const neuralModel = new NeuralCrawlerModel({
+  savePath: process.env.NEURAL_MODEL_PATH || path.join(CFG.authDataDir, "neural-model.json"),
+  saveIntervalMs: numberEnv("NEURAL_MODEL_SAVE_INTERVAL_MS", 60000, 5000, 86400000)
+});
+neuralModel.load();
+const neuralTrainer = new NeuralLearningWorker({
+  model: neuralModel, persistence: mongoStore, modelId: "relevance-v1",
+  intervalMs: numberEnv("NEURAL_TRAIN_INTERVAL_MS", 5000, 250, 300000),
+  batchSize: numberEnv("NEURAL_TRAIN_BATCH_SIZE", 32, 1, 256),
+  maxQueue: numberEnv("NEURAL_TRAIN_QUEUE_MAX", 5000, 100, 100000),
+  log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
+});
 const authStore = new AuthStore({
   dataDir: CFG.authDataDir, secret: CFG.authSecret, tokenTtlMs: CFG.authTokenTtlMs,
   adminEmails: CFG.adminEmails, allowSignup: CFG.authAllowSignup, persistence: mongoStore, testMode: CFG.testMode,
@@ -5135,17 +5135,17 @@ app.get("/api/debug/system", requireAdmin, (req, res) => {
 // ---------------------------------------------------------------------------
 // Neural Robot Workers — parallel crawling without Chromium
 const neuralRobotPool = new NeuralRobotPool({ maxWorkers: 8, neuralModel, log: (level, source, msg) => serverLog(level, source, msg) });
-if (!IS_THREAD_WORKER) neuralTrainer.start();
-app.get("/api/neural/stats", (req, res) => res.json({ ok: true, model: neuralModel.report(), trainer: neuralTrainer.report() }));
-app.post("/api/neural/feedback", (req, res) => {
-  const accepted = neuralTrainer.enqueue({
+app.get("/api/neural/stats", (req, res) => res.json({ ok: true, mongo: mongoStore.status(), model: neuralModel.report(), trainer: neuralTrainer.report() }));
+app.post("/api/neural/feedback", async (req, res) => {
+  const accepted = await neuralTrainer.enqueuePersistent({
     url: req.body?.url,
     positive: req.body?.positive,
     weight: req.body?.weight,
-    context: req.body?.context
+    context: req.body?.context,
+    accepted: req.body?.accepted
   });
   if (!accepted) return res.status(400).json({ ok: false, error: "A public http(s) URL is required." });
-  res.json({ ok: true, queued: neuralTrainer.report().queueSize });
+  res.json({ ok: true, queued: neuralTrainer.report().queueSize, durable: mongoStore.connected });
 });
 app.post("/api/neural/reset", (req, res) => { neuralTrainer.queue.length = 0; neuralModel.reset(); neuralModel.save(); res.json({ ok: true }); });
 app.get("/api/robots/status", (req, res) => res.json(neuralRobotPool.report()));
@@ -5160,8 +5160,12 @@ app.post("/api/robots/crawl", async (req, res) => {
     res.json({ ok: true, results: result });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-app.post("/api/robots/feedback", (req, res) => {
-  try { neuralRobotPool.sendFeedback(req.body.url, !!req.body.clicked, req.body.relevance || 0.5); res.json({ ok: true }); }
+app.post("/api/robots/feedback", async (req, res) => {
+  try {
+    const accepted = await neuralTrainer.enqueuePersistent({ url: req.body.url, positive: !!req.body.clicked, weight: req.body.relevance || 0.5, context: { type: "html", source: "robot" } });
+    if (!accepted) return res.status(400).json({ ok: false, error: "A public http(s) URL is required." });
+    res.json({ ok: true, queued: neuralTrainer.report().queueSize, durable: mongoStore.connected });
+  }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 app.post("/api/robots/reset", (req, res) => { neuralRobotPool.resetAll(); res.json({ ok: true }); });
@@ -5398,11 +5402,26 @@ async function hydrateSearchFromMongo() {
   try { const rows = await mongoStore.loadSearchDocuments(CFG.maxIndexDocs); let loaded = 0; for (const row of rows) { if (!row?.url) continue; const doc = { ...row, termFreq: new Map(Object.entries(row.termFreq || {})) }; delete doc._id; addIndexedDocument(doc); loaded += 1; } mongoStore.stats.hydrated += loaded; if (loaded) serverLog("info", "MONGO", `Hydrated ${loaded} search document(s) from MongoDB.`); return loaded; } catch (e) { serverLog("warn", "MONGO", `Search index hydration skipped: ${e.message}`); return 0; }
 }
 
+async function hydrateNeuralFromMongo() {
+  if (!mongoStore.enabled || !mongoStore.connected) return { model: false, feedback: 0 };
+  let modelLoaded = false, feedbackLoaded = 0;
+  try {
+    const snapshot = await mongoStore.loadNeuralModel("relevance-v1");
+    if (snapshot && neuralModel.loadData(snapshot)) modelLoaded = true;
+    const queued = await mongoStore.loadQueuedNeuralFeedback(neuralTrainer.maxQueue);
+    for (const item of queued) if (neuralTrainer.enqueue(item)) feedbackLoaded += 1;
+    if (modelLoaded || feedbackLoaded) serverLog("info", "NEURAL", `Hydrated model=${modelLoaded} and ${feedbackLoaded} queued feedback event(s) from MongoDB.`);
+  } catch (e) { serverLog("warn", "NEURAL", `Mongo neural hydration skipped: ${e.message}`); }
+  return { model: modelLoaded, feedback: feedbackLoaded };
+}
+
 if (require.main === module && CFG.processRole !== "worker") {
   let shuttingDown = false;
   const startServer = async () => {
     await authStore.ready;
     await mongoStore.connect();
+    await hydrateNeuralFromMongo();
+    neuralTrainer.start();
     // Load MongoDB-persisted VPN profiles on startup (layered on env-var profiles)
     if (mongoStore.enabled) {
       try {
@@ -5443,7 +5462,7 @@ if (require.main === module && CFG.processRole !== "worker") {
   const shutdown = async signal => {
     if (shuttingDown) return; shuttingDown = true;
     serverLog("info", "SYSTEM", `${signal} received — shutting down.`);
-    neuralTrainer.stop();
+    await neuralTrainer.stop();
     for (const j of jobs.values()) if (!j.done) { j.stopRequested = true; j.stopReason = "shutdown"; j.controller?.abort?.(); }
     const force = setTimeout(() => process.exit(0), 8000); force.unref();
     await Promise.allSettled([
