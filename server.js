@@ -2520,8 +2520,16 @@ function rewriteMediaManifest(text, base, sid='') {
 function createJob(root, options = {}) {
   const id = crypto.randomUUID();
   const pageAccelerator = !!options.pageAccelerator;
+  const host = (() => { try { return new URL(root).hostname.toLowerCase(); } catch { return ""; } })();
+  // YouTube serves a very large HTML shell and discovers critical scripts
+  // after the initial response. The normal Render-Free 5s wall can expire
+  // immediately after the root document, so keep this exception bounded and
+  // host-specific instead of turning normal browsing into a full crawl.
+  const youtubeAccelerator = pageAccelerator && /(^|\.)youtube\.com$|(^|\.)youtu\.be$/.test(host);
+  const pageWarmMs = youtubeAccelerator ? Math.max(CFG.crawlerPageWarmMs, 9000) : CFG.crawlerPageWarmMs;
+  const pageHardMs = youtubeAccelerator ? Math.max(CFG.crawlerPageHardMs, 16000) : CFG.crawlerPageHardMs;
   return {
-    id, root, url: root, createdAt: now(), pageAccelerator, warmDeadlineAt: pageAccelerator ? Date.now() + CFG.crawlerPageWarmMs : 0, pageAcceleratorHardDeadlineAt: pageAccelerator ? Date.now() + CFG.crawlerPageHardMs : 0, fastPhaseComplete: false, finishedAt: null, done: false, stopRequested: false, status: "queued", statusText: "Queued",
+    id, root, url: root, createdAt: now(), pageAccelerator, pageAcceleratorWarmMs: pageWarmMs, pageAcceleratorHardMs: pageHardMs, warmDeadlineAt: pageAccelerator ? Date.now() + pageWarmMs : 0, pageAcceleratorHardDeadlineAt: pageAccelerator ? Date.now() + pageHardMs : 0, fastPhaseComplete: false, finishedAt: null, done: false, stopRequested: false, status: "queued", statusText: "Queued",
     pageFrontier: new PriorityFrontier(CFG.maxPendingQueue), resourceFrontier: new PriorityFrontier(CFG.maxPendingQueue), criticalResourceFrontier: new PriorityFrontier(Math.min(CFG.maxPendingQueue, CFG.criticalResourceBudget * 4)), visited: new Set(), discovered: new Set(), retryCounts: new Map(),
     resources: [], links: [], logs: [], logSeq: 0, sourceDir: path.join(ROOT, id), sourceFiles: 0, textBytesStored: 0,
     activeWorkers: 0, activeHtmlWorkers: 0, activeAssetWorkers: 0, processed: 0, pagesDiscovered: 0, resourcesScheduled: 0, crossOriginResources: 0, sitemapLoading: false, browserDiscoveredCount: 0, browserDiscoveredHosts: new Set(),
@@ -3090,7 +3098,7 @@ class CooperativeRobotPool {
         this.job.warmDeadlineAt = 0;
         try { this.job.controller.abort(); } catch {}
         this.job.statusText = "Page accelerator time budget reached; stopping background work.";
-        this.event("page-accelerator-hard-stop", { hardMs: CFG.crawlerPageHardMs });
+        this.event("page-accelerator-hard-stop", { hardMs: this.job.pageAcceleratorHardMs || CFG.crawlerPageHardMs });
         break;
       }
       if (this.job.pageAccelerator && this.job.warmDeadlineAt && Date.now() >= this.job.warmDeadlineAt) {
@@ -3101,7 +3109,7 @@ class CooperativeRobotPool {
           this.job.stopReason = "page-accelerator-budget";
           try { this.job.controller.abort(); } catch {}
           this.job.statusText = "Page accelerator time budget reached; stopping background work.";
-          this.event("page-accelerator-stopped", { warmMs: CFG.crawlerPageWarmMs, hardMs: CFG.crawlerPageHardMs });
+          this.event("page-accelerator-stopped", { warmMs: this.job.pageAcceleratorWarmMs || CFG.crawlerPageWarmMs, hardMs: this.job.pageAcceleratorHardMs || CFG.crawlerPageHardMs });
           break;
         }
         // Critical phase done, but the accelerator keeps warming the remaining
