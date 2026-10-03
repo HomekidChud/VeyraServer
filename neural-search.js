@@ -215,6 +215,13 @@ function rankRelevant(results, query) {
     .filter(r => r.queryRelevance >= (multiWord ? 0.18 : 0.08) && (!multiWord || r.queryTermHits >= Math.min(2, terms.length)))
     .map(({ _position, queryTermHits, ...r }) => r);
 }
+function analyzeQuery(query) {
+  const q = cleanText(query, 600), lower = q.toLowerCase(), operators = {};
+  for (const key of ["site", "intitle", "inurl", "before", "after"]) { const m = lower.match(new RegExp(`\\b${key}:([^\\s]+)`, "i")); if (m) operators[key] = m[1]; }
+  const intent = /^(how|steps|guide)\b/i.test(q) ? "howto" : /^(what|define|meaning)\b/i.test(q) ? "definition" : /^(who|when|where|which|is|are|can|does|did)\b/i.test(q) || /\?$/.test(q) ? "fact" : "explore";
+  const facets = Object.entries(operators).map(([k, v]) => `${k}:${v}`);
+  return { intent, operators, facets, normalized: q.replace(/\b(?:site|intitle|inurl|before|after):\S+/gi, "").replace(/\s+/g, " ").trim() };
+}
 
 // ----------------------------------------------------------------- neural re-ranking
 function neuralRerank(results, neuralModel) {
@@ -437,6 +444,8 @@ function createWebSearch({ fetchText, env = process.env, log = () => {}, neuralM
       bingConfigured: !!bingKey,
       providersUsed: providerResults.map(p => p.provider),
       neuralReranked: !!neuralModel,
+      query: analyzeQuery(q),
+      ranking: { method: neuralModel ? "query-relevance + neural authority" : "query-relevance", explained: true },
     };
   }
 
@@ -460,7 +469,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {}, neuralM
         const results = dedupe(packed.results || []);
         attempts.push({ provider: name, ms: Date.now() - started, count: results.length });
         if (!results.length) continue;
-        const value = { provider: name, results: rankRelevant(results, q).slice(0, 20), total: packed.total ?? null, more: !!packed.more, attempts, googleConfigured: providers.google.available(), braveConfigured: providers.brave.available(), bingConfigured: !!bingKey };
+        const value = { provider: name, results: rankRelevant(results, q).slice(0, 20), total: packed.total ?? null, more: !!packed.more, attempts, googleConfigured: providers.google.available(), braveConfigured: providers.brave.available(), bingConfigured: !!bingKey, query: analyzeQuery(q), ranking: { method: "query-relevance", explained: true } };
         cache.set(key, { time: Date.now(), value });
         while (cache.size > MAX) cache.delete(cache.keys().next().value);
         return value;

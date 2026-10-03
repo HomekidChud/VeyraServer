@@ -84,6 +84,7 @@ class AIAnswerEngine {
     const local = this.localSynthesis(q, intent, evidence);
     const llm = await this.synthesizeWithLLM(q, intent, evidence).catch(() => null);
     const answer = llm || local;
+    const relatedQueries = this.followUps(q, intent);
     return {
       hasAnswer: !!answer?.answer,
       answer: answer?.answer || "",
@@ -95,6 +96,9 @@ class AIAnswerEngine {
       intent: intent.type,
       query: q,
       generatedBy: llm ? `llm:${this.model}` : "local-grounded-fallback",
+      relatedQueries,
+      readingTimeMinutes: Math.max(1, Math.ceil(String(answer?.answer || "").split(/\s+/).filter(Boolean).length / 220)),
+      grounding: { mode: "multi-source", sourceIds: evidence.map(e => e.id), citationRequired: true },
       responseTimeMs: Date.now() - started,
     };
   }
@@ -180,6 +184,15 @@ class AIAnswerEngine {
     for (const p of picks) { const key = p.text.toLowerCase().replace(/\W/g, "").slice(0, 100); if (!seen.has(key)) { seen.add(key); dedup.push(p); } }
     const answer = dedup.slice(0, 2).map(p => p.text).join(" ").slice(0, 900);
     return { answer, keyPoints: dedup.slice(0, 4).map(p => `${p.text} [${p.id}]`), caveats: evidence.length < 2 ? ["Only one readable source was available, so verify important details."] : [], confidence: Math.min(0.78, 0.25 + evidence.length * 0.08 + (dedup[0]?.score || 0) * 0.4) };
+  }
+  followUps(query, intent) {
+    const subject = intent.subject || query;
+    const out = intent.type === "definition"
+      ? [`How is ${subject} used today?`, `Why is ${subject} important?`]
+      : intent.type === "howto"
+        ? [`What are common mistakes with ${subject}?`, `What tools are needed for ${subject}?`]
+        : [`What are the latest developments about ${subject}?`, `What are the main sources for ${subject}?`];
+    return out.filter(x => x.toLowerCase() !== String(query).toLowerCase()).slice(0, 2);
   }
 
   async synthesizeWithLLM(query, intent, evidence) {

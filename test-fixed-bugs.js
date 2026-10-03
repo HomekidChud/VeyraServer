@@ -3,6 +3,7 @@ const assert = require("assert");
 const { createWebSearch } = require("./neural-search");
 const { AIAnswerEngine } = require("./ai-answer");
 const { VpnManager } = require("./vpn");
+const { RenewingManager } = require("./renewing-system");
 
 (async () => {
   const search = createWebSearch({
@@ -15,6 +16,8 @@ const { VpnManager } = require("./vpn");
   const found = await search.search("capital of Wales", { engine: "wikipedia", lang: "en" });
   assert.strictEqual(found.results[0].title, "Capital of Wales", "relevance ranking should prefer the matching title");
   assert(found.results.every(r => r.title !== "Capital One"), "unrelated results should be filtered");
+  assert.strictEqual(found.query.intent, "explore");
+  assert(found.ranking.explained);
 
   const ai = new AIAnswerEngine();
   const evidence = ai.buildEvidence("what is the capital of Wales", { type: "definition", subject: "capital of Wales" }, [], [
@@ -24,6 +27,15 @@ const { VpnManager } = require("./vpn");
   ]);
   assert.strictEqual(evidence.length, 1, "CSS and navigation snippets must not become evidence");
   assert.strictEqual(evidence[0].title, "Capital of Wales");
+  assert(ai.followUps("what is Cardiff", { type: "definition", subject: "Cardiff" }).length === 2);
+
+  const unpaid = new RenewingManager({ billingRequired: true, billingStatus: "not_configured" });
+  assert.throws(() => unpaid.addAd({ title: "Sponsor", type: "banner", url: "https://example.com" }), /active advertising subscription/);
+  const paid = new RenewingManager({ billingRequired: true, billingStatus: "active" });
+  const ad = paid.addAd({ title: "Sponsor", type: "banner", url: "https://example.com", expiryDays: 1 });
+  assert.strictEqual(paid.getActiveAds().length, 1);
+  ad.expiresAt = Date.now() - 1;
+  assert.strictEqual(paid.getActiveAds().length, 0, "expired campaigns must leave delivery rotation");
 
   const vpn = new VpnManager(() => {}, { VPN_ENABLED: "1", VPN_PROXY_SERVER: "socks5://127.0.0.1:9" });
   const profile = vpn.get();

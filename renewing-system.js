@@ -49,17 +49,25 @@ class RenewingManager {
     this.maxAdsPerSession = opts.maxAdsPerSession || 5;
     this.sessionAdCount = new Map();  // sessionId -> count
     this.log = opts.log || (() => {});
+    this.billingRequired = opts.billingRequired !== false;
+    this.billingStatus = String(opts.billingStatus || process.env.ADS_BILLING_STATUS || "not_configured").toLowerCase();
+    this.subscriptionUrl = String(opts.subscriptionUrl || process.env.ADS_SUBSCRIPTION_URL || "").slice(0, 2048);
   }
 
   /**
    * Add an advertisement (admin only).
    */
-  addAd({ title, type, url, durationSec, rewardMs, description, imageUrl }) {
+  addAd({ title, type, url, durationSec, rewardMs, description, imageUrl, expiresAt, expiryDays = 30 }) {
+    if (this.billingRequired && this.billingStatus !== "active") {
+      const e = new Error("An active advertising subscription is required before campaigns can run."); e.code = "ADS_BILLING_REQUIRED"; e.subscriptionUrl = this.subscriptionUrl; throw e;
+    }
     if (!title || !type) throw new Error("Title and type are required");
     if (!["video", "youtube", "link", "banner", "interactive"].includes(type)) {
       throw new Error("Type must be: video, youtube, link, banner, or interactive");
     }
     if (type === "youtube" && !extractYoutubeId(url)) throw new Error("A YouTube ad needs a valid YouTube video URL or 11-character video ID.");
+    const parsedExpiry = expiresAt ? Date.parse(expiresAt) : Date.now() + Math.min(365, Math.max(1, Number(expiryDays) || 30)) * 86400000;
+    if (!Number.isFinite(parsedExpiry) || parsedExpiry <= Date.now()) throw new Error("Campaign expiry must be a future date.");
     const ad = {
       id: crypto.randomUUID(),
       title: String(title).slice(0, 200),
@@ -73,6 +81,7 @@ class RenewingManager {
       description: String(description || "").slice(0, 500),
       imageUrl: String(imageUrl || "").slice(0, 2048),
       createdAt: Date.now(),
+      expiresAt: parsedExpiry,
       active: true,
       watchCount: 0,
       clickCount: 0,
@@ -114,7 +123,8 @@ class RenewingManager {
    * Get active ads for users to watch.
    */
   getActiveAds() {
-    return [...this.ads.values()].filter(a => a.active);
+    const now = Date.now();
+    return [...this.ads.values()].filter(a => a.active && a.expiresAt > now);
   }
   recordClick(id) {
     const ad = this.ads.get(id);
@@ -128,7 +138,7 @@ class RenewingManager {
    */
   watchAd(adId, sessionId) {
     const ad = this.ads.get(adId);
-    if (!ad || !ad.active) throw new Error("Ad not found or inactive");
+    if (!ad || !ad.active || ad.expiresAt <= Date.now()) throw new Error("Ad not found, expired, or inactive");
     if (!sessionId) throw new Error("Session ID required");
 
     // Check session ad limit
@@ -251,9 +261,10 @@ class RenewingManager {
       totalRenewals: [...this.sessionAdCount.values()].reduce((a, b) => a + b, 0),
       maxAdsPerSession: this.maxAdsPerSession,
       defaultRewardMs: this.defaultRewardMs,
+      billing: { required: this.billingRequired, status: this.billingStatus, subscriptionUrl: this.subscriptionUrl || null },
       ads: [...this.ads.values()].map(a => ({
         id: a.id, title: a.title, type: a.type, active: a.active,
-        watchCount: a.watchCount, clickCount: a.clickCount || 0, durationSec: a.durationSec, rewardMs: a.rewardMs,
+        watchCount: a.watchCount, clickCount: a.clickCount || 0, durationSec: a.durationSec, rewardMs: a.rewardMs, expiresAt: a.expiresAt,
       })),
     };
   }

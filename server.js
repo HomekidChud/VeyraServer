@@ -4052,7 +4052,7 @@ app.get('/api/answer/status', (req, res) => res.json(aiAnswerEngine.report()));
 
 // ---------------------------------------------------------------------------
 // Renewing System — session renewal via ads
-const renewingManager = new RenewingManager({ log: (level, source, msg) => serverLog(level, source, msg) });
+const renewingManager = new RenewingManager({ log: (level, source, msg) => serverLog(level, source, msg), billingRequired: true, billingStatus: process.env.ADS_BILLING_STATUS || "not_configured", subscriptionUrl: process.env.ADS_SUBSCRIPTION_URL || "" });
 app.get('/api/renew/ads', (req, res) => res.json({ ok: true, ads: renewingManager.getActiveAds() }));
 app.get('/api/renew/status/:sessionId', (req, res) => res.json(renewingManager.getSessionStatus(req.params.sessionId)));
 app.post('/api/renew/click/:adId', (req, res) => res.json({ ok: renewingManager.recordClick(req.params.adId) }));
@@ -4079,7 +4079,7 @@ app.post('/api/renew/complete/:watchId', (req, res) => {
 // Admin-only ad management
 app.post('/api/renew/ads', requireAdmin, (req, res) => {
   try { const ad = renewingManager.addAd(req.body); res.json({ ok: true, ad }); }
-  catch (e) { res.status(400).json({ error: e.message, ok: false }); }
+  catch (e) { res.status(e.code === "ADS_BILLING_REQUIRED" ? 402 : 400).json({ error: e.message, ok: false, code: e.code || "AD_INVALID", subscriptionUrl: e.subscriptionUrl || renewingManager.subscriptionUrl || null }); }
 });
 app.delete('/api/renew/ads/:id', requireAdmin, (req, res) => {
   const ok = renewingManager.removeAd(req.params.id); res.json({ ok });
@@ -4090,7 +4090,7 @@ app.post('/api/renew/ads/:id/toggle', requireAdmin, (req, res) => {
 app.get('/api/renew/report', requireAdmin, (req, res) => res.json(renewingManager.report()));
 // Owner-facing ad center API. It reuses the verified renewal inventory and report.
 app.get('/api/platform/ads', requireAdmin, (req, res) => res.json({ ok: true, report: renewingManager.report() }));
-app.post('/api/platform/ads', requireAdmin, (req, res) => { try { res.status(201).json({ ok: true, ad: renewingManager.addAd(req.body || {}) }); } catch (e) { res.status(400).json({ ok: false, error: e.message }); } });
+app.post('/api/platform/ads', requireAdmin, (req, res) => { try { res.status(201).json({ ok: true, ad: renewingManager.addAd(req.body || {}) }); } catch (e) { res.status(e.code === "ADS_BILLING_REQUIRED" ? 402 : 400).json({ ok: false, error: e.message, code: e.code || "AD_INVALID", subscriptionUrl: e.subscriptionUrl || renewingManager.subscriptionUrl || null }); } });
 app.post('/api/platform/ads/:id/toggle', requireAdmin, (req, res) => { const ad = renewingManager.toggleAd(req.params.id); if (!ad) return res.status(404).json({ ok: false, error: 'Campaign not found' }); res.json({ ok: true, ad }); });
 app.delete('/api/platform/ads/:id', requireAdmin, (req, res) => { const ok = renewingManager.removeAd(req.params.id); if (!ok) return res.status(404).json({ ok: false, error: 'Campaign not found' }); res.json({ ok: true }); });
 async function warmRenderedBrowserPage(browserSessionId, sid) {
