@@ -5391,16 +5391,39 @@ app.get("/api/internet", (req, res) => {
 });
 app.get("/api/internet/report", (req, res) => res.json(internetManager ? { ok: true, ...internetManager.report() } : { ok: false, error: "Internet manager not available", code: "INTERNET_UNAVAILABLE" }));
 app.get("/api/internet/profile", (req, res) => res.json(internetManager ? { ok: true, sessionId: internetSessionId(req), profile: internetManager.getProfile(internetSessionId(req)) } : { ok: false, error: "Internet manager not available", code: "INTERNET_UNAVAILABLE" }));
-app.post("/api/internet/profile", (req, res) => {
+app.post("/api/internet/profile", async (req, res) => {
   if (!internetManager) return res.status(503).json({ ok: false, error: "Internet manager not available", code: "INTERNET_UNAVAILABLE" });
   try {
-    const sid = internetSessionId(req), profile = internetManager.setProfile(sid, req.body?.profile || req.body?.profileId, req.body?.config && typeof req.body.config === "object" ? req.body.config : {});
-    res.json({ ok: true, sessionId: sid, profile, note: "Profile selection saved; host network routing was not changed." });
-  } catch (e) { respondError(res, 400, e.message, e.code || "INTERNET_PROFILE_ERROR"); }
+    const sid = internetSessionId(req), id = String(req.body?.profile || req.body?.profileId || "auto").trim().toLowerCase();
+    const config = req.body?.config && typeof req.body.config === "object" ? req.body.config : {};
+    const selected = internetManager.setProfile(sid, id, config);
+    // Automatic/server-local profiles do not need a tunnel. Any profile that
+    // is meant to change Veyra's egress must supply a real proxy or WireGuard
+    // endpoint; the browser's Wi-Fi/SSID cannot be reached from this server.
+    if (["auto", "lan"].includes(id)) {
+      vpnManager.disconnect(sid);
+      res.json({ ok: true, sessionId: sid, profile: selected, transport: { mode: "direct", connected: false } });
+      return;
+    }
+    const transportId = `internet_${crypto.createHash("sha256").update(sid).digest("hex").slice(0, 16)}`;
+    const raw = config.wireguard || config.config
+      ? { id: transportId, name: `${id} internet`, type: "wireguard", config: String(config.wireguard || config.config), provider: id }
+      : { id: transportId, name: `${id} internet`, type: String(config.type || "").toLowerCase(), server: String(config.proxy || config.server || ""), username: String(config.username || ""), password: String(config.password || ""), provider: id };
+    const parsed = vpnManager.addProfile(raw);
+    if (!parsed) return respondError(res, 400, "A valid proxy URL or WireGuard configuration is required for this internet profile.", "INTERNET_TRANSPORT_REQUIRED");
+    const health = await vpnManager.checkProfile(parsed.id);
+    const connected = vpnManager.connect(sid, parsed.id, { source: "internet" });
+    sessionRecord(sid).vpnProfileId = parsed.id;
+    res.json({ ok: true, sessionId: sid, profile: selected, transport: { mode: parsed.type, connected: true, vpn: connected, health } });
+  } catch (e) { respondError(res, e.status || vpnErrStatus(e.code), e.message, e.code || "INTERNET_PROFILE_ERROR"); }
 });
-const testInternet = (req, res) => {
+const testInternet = async (req, res) => {
   if (!internetManager) return res.status(503).json({ ok: false, error: "Internet manager not available", code: "INTERNET_UNAVAILABLE" });
-  try { res.json({ ok: true, sessionId: internetSessionId(req), ...internetManager.testConnection(internetSessionId(req)) }); }
+  try {
+    const sid = internetSessionId(req), vpn = vpnManager.sessionInfo?.(sid);
+    if (vpn?.connected) return res.json({ ok: true, sessionId: sid, transport: "vpn", ...(await vpnManager.exitIpForSession(sid)) });
+    res.json({ ok: true, sessionId: sid, transport: "direct", ...internetManager.testConnection(sid) });
+  }
   catch (e) { respondError(res, 400, e.message, e.code || "INTERNET_TEST_ERROR"); }
 };
 app.get("/api/internet/test", testInternet);

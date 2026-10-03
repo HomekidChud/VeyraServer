@@ -502,7 +502,7 @@ class VpnManager {
   // VPN is enabled but the session hasn't opted in.
   requiresVpnForSession(sid) {
     const key = String(sid || "");
-    return this.enabledForUse() && (this.alwaysOn || this.connections.has(key));
+    return (this.enabledForUse() || this.connections.has(key)) && (this.alwaysOn || this.connections.has(key));
   }
   requiresVpnForCrawler() {
     return this.enabledForUse() && !!this.crawlerProfileId;
@@ -553,7 +553,7 @@ class VpnManager {
   }
 
   connect(sessionId, profileId = "", opts = {}) {
-    if (!this.enabled) throw vpnError("Veyra VPN is disabled on this server.", "VPN_DISABLED");
+    if (!this.enabled && opts.source !== "internet") throw vpnError("Veyra VPN is disabled on this server.", "VPN_DISABLED");
     if (!this.profiles.size) throw vpnError("No configured Veyra VPN profile is available.", "VPN_NOT_CONFIGURED");
     const sid = String(sessionId || "").trim();
     if (!sid) throw vpnError("Missing Veyra session id.", "VPN_SESSION_REQUIRED");
@@ -720,7 +720,7 @@ class VpnManager {
   }
   dispatcherForSession(sessionId) {
     const sid = String(sessionId || "");
-    if (!sid || !this.enabled) return undefined;
+    if (!sid || (!this.enabled && !this.connections.has(sid))) return undefined;
     if (!this.ensureConnection(sid)) return undefined;
     let agent = this.sessionAgents.get(sid);
     if (!agent) {
