@@ -4055,6 +4055,7 @@ app.get('/api/answer/status', (req, res) => res.json(aiAnswerEngine.report()));
 const renewingManager = new RenewingManager({ log: (level, source, msg) => serverLog(level, source, msg) });
 app.get('/api/renew/ads', (req, res) => res.json({ ok: true, ads: renewingManager.getActiveAds() }));
 app.get('/api/renew/status/:sessionId', (req, res) => res.json(renewingManager.getSessionStatus(req.params.sessionId)));
+app.post('/api/renew/click/:adId', (req, res) => res.json({ ok: renewingManager.recordClick(req.params.adId) }));
 app.post('/api/renew/watch/:adId', (req, res) => {
   try {
     const result = renewingManager.watchAd(req.params.adId, req.body.sessionId);
@@ -4087,6 +4088,11 @@ app.post('/api/renew/ads/:id/toggle', requireAdmin, (req, res) => {
   const ad = renewingManager.toggleAd(req.params.id); res.json({ ok: !!ad, ad });
 });
 app.get('/api/renew/report', requireAdmin, (req, res) => res.json(renewingManager.report()));
+// Owner-facing ad center API. It reuses the verified renewal inventory and report.
+app.get('/api/platform/ads', requireAdmin, (req, res) => res.json({ ok: true, report: renewingManager.report() }));
+app.post('/api/platform/ads', requireAdmin, (req, res) => { try { res.status(201).json({ ok: true, ad: renewingManager.addAd(req.body || {}) }); } catch (e) { res.status(400).json({ ok: false, error: e.message }); } });
+app.post('/api/platform/ads/:id/toggle', requireAdmin, (req, res) => { const ad = renewingManager.toggleAd(req.params.id); if (!ad) return res.status(404).json({ ok: false, error: 'Campaign not found' }); res.json({ ok: true, ad }); });
+app.delete('/api/platform/ads/:id', requireAdmin, (req, res) => { const ok = renewingManager.removeAd(req.params.id); if (!ok) return res.status(404).json({ ok: false, error: 'Campaign not found' }); res.json({ ok: true }); });
 async function warmRenderedBrowserPage(browserSessionId, sid) {
   const controller = new AbortController();
   const hardTimer = setTimeout(() => controller.abort(), Math.max(500, CFG.proxyWarmHardMs));

@@ -75,6 +75,7 @@ class RenewingManager {
       createdAt: Date.now(),
       active: true,
       watchCount: 0,
+      clickCount: 0,
     };
     this.ads.set(ad.id, ad);
     this.log("info", "RENEW", `Ad added: ${ad.title} (${ad.type}, ${ad.durationSec}s, +${ad.rewardMs / 1000}s reward)`);
@@ -114,6 +115,12 @@ class RenewingManager {
    */
   getActiveAds() {
     return [...this.ads.values()].filter(a => a.active);
+  }
+  recordClick(id) {
+    const ad = this.ads.get(id);
+    if (!ad) return false;
+    ad.clickCount = (ad.clickCount || 0) + 1;
+    return true;
   }
 
   /**
@@ -246,7 +253,7 @@ class RenewingManager {
       defaultRewardMs: this.defaultRewardMs,
       ads: [...this.ads.values()].map(a => ({
         id: a.id, title: a.title, type: a.type, active: a.active,
-        watchCount: a.watchCount, durationSec: a.durationSec, rewardMs: a.rewardMs,
+        watchCount: a.watchCount, clickCount: a.clickCount || 0, durationSec: a.durationSec, rewardMs: a.rewardMs,
       })),
     };
   }
