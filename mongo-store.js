@@ -76,6 +76,14 @@ class MongoStore {
   async upsertSearchDocument(doc) { if (!doc?.url) return; const safe = { ...doc, termFreq: Object.fromEntries(doc.termFreq instanceof Map ? doc.termFreq.entries() : Object.entries(doc.termFreq || {})) }; delete safe._id; this.stats.writes += 1; void this.withDb(db => db.collection("search_documents").updateOne({ url: safe.url }, { $set: safe }, { upsert: true })); }
   async deleteSearchDocument(url) { if (!url) return; this.stats.writes += 1; void this.withDb(db => db.collection("search_documents").deleteOne({ url })); }
   async saveCrawlSummary(job) { if (!job?.id) return; const doc = { id: String(job.id), root: job.root, createdAt: job.createdAt, startedAt: job.startedAt || null, finishedAt: job.finishedAt || null, status: job.status, statusText: job.statusText, pageAccelerator: !!job.pageAccelerator, counts: job.counts || {}, resourceCount: job.resources?.length || 0, linkCount: job.links?.length || 0, expiresAt: new Date(Date.now() + 14 * 24 * 60 * 60 * 1000) }; this.stats.writes += 1; void this.withDb(db => db.collection("crawl_runs").updateOne({ id: doc.id }, { $set: doc }, { upsert: true })); }
+  async getLatestCrawlSummary(root) {
+    if (!root) return null;
+    this.stats.reads += 1;
+    const doc = await this.withDb(db => db.collection("crawl_runs").findOne({ root, status: { $in: ["done", "stopped"] } }, { projection: { _id: 0 }, sort: { finishedAt: -1 } }));
+    if (!doc || (doc.expiresAt && Date.parse(doc.expiresAt) <= Date.now())) return null;
+    this.stats.hits += 1;
+    return doc;
+  }
 
   // ---- VPN profile persistence ----
   // Stored separately from env-var profiles. Env profiles are always loaded on

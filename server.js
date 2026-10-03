@@ -4608,6 +4608,10 @@ app.post("/api/open", async (req, res) => {
     // accelerator is disabled): a background seed/full-site crawl must never be
     // hijacked by a browsing request, and an exhaustive request gets its own job.
     if (crawlerEnabled && old && !old.done && !old.stopRequested && (!CFG.crawlerPageAccelerator || old.pageAccelerator)) return res.status(202).json({ jobId: old.id, url: root, viewUrl: makeViewUrl(root), engineMode, crawlerEnabled: true });
+    if (crawlerEnabled && !old && mongoStore.enabled && engineMode !== "exhaustive") {
+      const cached = await mongoStore.getLatestCrawlSummary(root);
+      if (cached) return res.status(200).json({ ok: true, jobId: null, url: root, viewUrl: makeViewUrl(root), state: "cached", cached: true, cachedAt: cached.finishedAt || cached.createdAt || null, counts: cached.counts || {}, engineMode, crawlerEnabled: true });
+    }
     const openSid = String(req.body?.sessionId || req.body?.sid || "");
     if (openSid && sessionManager.checkLimit(openSid)) return respondError(res, 410, "This Veyra session reached its time limit and was deleted.", "SESSION_EXPIRED");
     if (!crawlerEnabled) return res.status(200).json({ ok: true, jobId: null, url: root, viewUrl: makeViewUrl(root), state: "disabled", engineMode, crawlerEnabled: false });
