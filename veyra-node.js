@@ -233,6 +233,7 @@ const server = net.createServer(sock => {
 
 // Listen on :: for dual-stack IPv4+IPv6 (ipv6Only defaults to false in Node.js)
 server.listen(PORT, "::", async () => {
+  if (!PRINT_JSON) console.log("Creating temporary Veyra Node code... ### ###");
   // Get local IPs for display (both IPv4 and IPv6)
   const nets = os.networkInterfaces();
   const ips = [];
