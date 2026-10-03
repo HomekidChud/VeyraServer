@@ -88,6 +88,50 @@ function makeNodeCode(config, publicIP) {
   return `VNODE1.${body}.${checksum}`;
 }
 
+function testLocalSocks() {
+  return new Promise(resolve => {
+    const sock = net.connect(PORT, "127.0.0.1");
+    let state = "greeting", buf = Buffer.alloc(0), finished = false;
+    const done = result => { if (finished) return; finished = true; try { sock.destroy(); } catch {} resolve(result); };
+    const timer = setTimeout(() => done({ ok: false, reason: "local SOCKS test timed out" }), 7000);
+    const fail = reason => { clearTimeout(timer); done({ ok: false, reason }); };
+    sock.on("error", e => fail(`local port connection failed: ${e.code || e.message}`));
+    sock.on("data", chunk => {
+      buf = Buffer.concat([buf, chunk]);
+      if (state === "greeting" && buf.length >= 2) {
+        if (buf[0] !== 5 || buf[1] !== 2) return fail("SOCKS5 username/password authentication was not offered");
+        buf = buf.subarray(2); state = "auth";
+        const u = Buffer.from(USER), p = Buffer.from(PASS);
+        sock.write(Buffer.concat([Buffer.from([1, u.length]), u, Buffer.from([p.length]), p]));
+      }
+      if (state === "auth" && buf.length >= 2) {
+        if (buf[1] !== 0) return fail("SOCKS5 credentials were rejected locally");
+        buf = buf.subarray(2); state = "connect";
+        const host = Buffer.from("api64.ipify.org");
+        sock.write(Buffer.concat([Buffer.from([5, 1, 0, 3, host.length]), host, Buffer.from([0, 443])]));
+      }
+      if (state === "connect" && buf.length >= 5) {
+        const atyp = buf[3], need = atyp === 1 ? 10 : atyp === 4 ? 22 : atyp === 3 && buf.length >= 5 ? 7 + buf[4] : 0;
+        if (!need || buf.length < need) return;
+        if (buf[1] !== 0) return fail(`outbound SOCKS connect failed (reply ${buf[1]})`);
+        clearTimeout(timer); done({ ok: true, reason: "authenticated SOCKS5 connection reached api64.ipify.org:443" });
+      }
+    });
+    sock.on("connect", () => sock.write(Buffer.from([5, 1, 2])));
+  });
+}
+
+async function runDiagnostics(publicIP, ips) {
+  const local = await testLocalSocks();
+  const privateLocal = ips.filter(x => /^(10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[0-1])\.|100\.(6[4-9]|[7-9]\d)\.|fe80:)/i.test(x.address));
+  console.log("  Self-test:");
+  console.log(`    ${publicIP ? "PASS" : "WARN"} public IP detection${publicIP ? ` (${publicIP})` : " — use --public-ip=x.x.x.x"}`);
+  console.log(`    ${local.ok ? "PASS" : "FAIL"} ${local.reason}`);
+  if (privateLocal.length && publicIP) console.log("    WARN local interfaces are private/CGNAT; mobile data or router NAT may block Veyra inbound access.");
+  console.log("    INFO external reachability cannot be proven from inside the node; Veyra must reach this public IP and port.");
+  return local;
+}
+
 // ---- SOCKS5 server ----
 const STATES = { AUTH: 0, AUTH2: 1, REQ: 2, CONNECTING: 3, PIPE: 4 };
 
@@ -246,6 +290,7 @@ server.listen(PORT, "::", async () => {
   // Auto-detect public IP
   if (PUBLIC_IP_OVERRIDE && !net.isIP(PUBLIC_IP_OVERRIDE)) throw new Error("--public-ip must be a valid IPv4 or IPv6 address");
   const publicIP = PUBLIC_IP_OVERRIDE || await fetchPublicIP();
+  if (!PRINT_JSON) await runDiagnostics(publicIP, ips);
   const hostAddr = publicIP ? formatHost(publicIP, PORT) : `<your-public-ip>:${PORT}`;
   // Veyra's parseProfile expects a full URL with protocol prefix (socks5://host:port)
   const serverAddr = `socks5://${hostAddr}`;
