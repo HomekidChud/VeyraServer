@@ -494,18 +494,20 @@ class InternetConnectionManager {
   }
 
   setProfile(sessionId, profileId, config = {}) {
-    this.connections.set(sessionId, profileId);
-    this.currentProfile = profileId;
+    const sid = String(sessionId || "").trim();
+    const id = String(profileId || "auto").trim().toLowerCase();
+    const profile = INTERNET_PROFILES.find(p => p.id === id);
+    if (!sid) throw Object.assign(new Error("A session id is required."), { code: "INTERNET_SESSION_REQUIRED" });
+    if (!profile) throw Object.assign(new Error(`Unknown internet profile "${id}".`), { code: "INTERNET_PROFILE_INVALID" });
+    this.connections.set(sid, id);
+    this.currentProfile = id;
     this.stats.totalConnections++;
-
-    const profile = INTERNET_PROFILES.find(p => p.id === profileId);
-    if (!profile) return null;
 
     // Build connection config
     const connectionConfig = {
-      profileId,
+      profileId: id,
       type: profile.type,
-      sessionId,
+      sessionId: sid,
       configured: false,
       status: "disconnected",
       ...config,
@@ -533,23 +535,17 @@ class InternetConnectionManager {
       connectionConfig.sharedFrom = config.sharedFrom || "phone";
     }
 
-    connectionConfig.status = "connecting";
-    this.profiles.set(sessionId, connectionConfig);
-
-    // Simulate connection process
-    setTimeout(() => {
-      const p = this.profiles.get(sessionId);
-      if (p) {
-        p.status = "connected";
-        p.configured = true;
-        p.connectedAt = Date.now();
-      }
-    }, 500);
+    // This manager records a selected integration only. It must not claim to
+    // have changed the host operating system's Wi-Fi, cellular, DNS, or route.
+    connectionConfig.status = "selected";
+    connectionConfig.configured = Object.keys(config || {}).length > 0 || id === "auto";
+    connectionConfig.selectedAt = Date.now();
+    this.profiles.set(sid, connectionConfig);
 
     return connectionConfig;
   }
 
-  getProfile(sessionId) { return this.profiles.get(sessionId); }
+  getProfile(sessionId) { return this.profiles.get(String(sessionId || "").trim()) || null; }
   getCurrentProfile() { return this.currentProfile; }
   getAvailableProfiles() { return INTERNET_PROFILES; }
 
@@ -557,11 +553,12 @@ class InternetConnectionManager {
     const profile = this.profiles.get(sessionId);
     if (!profile) return { ok: false, error: "No connection configured" };
     return {
-      ok: profile.status === "connected",
+      ok: !!profile,
       profile: profile.profileId,
-      latency: Math.floor(Math.random() * 50) + 10,
-      bandwidth: Math.floor(Math.random() * 50) + 20,
-      status: profile.status,
+      latency: null,
+      bandwidth: null,
+      status: profile ? profile.status : "not_selected",
+      note: profile ? "Profile selection is recorded; host network routing is unchanged." : "Select a profile first.",
     };
   }
 

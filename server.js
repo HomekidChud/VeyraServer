@@ -3497,10 +3497,17 @@ app.post('/api/vpn/health', async (req, res) => {
   if (!vpnManager.enabled) return respondError(res, 503, 'Veyra VPN is disabled on this server.', 'VPN_DISABLED');
   res.json({ ok: true, results: await vpnManager.checkAll(), profiles: vpnManager.list() });
 });
-app.post('/api/vpn/connect', (req, res) => {
+app.post('/api/vpn/connect', async (req, res) => {
   try {
     const sid = normalizeSessionId(req.body?.sessionId || req.body?.sid);
-    const result = vpnManager.connect(sid, String(req.body?.profileId || ''), { region: String(req.body?.region || ''), group: String(req.body?.group || '') });
+    const requested = String(req.body?.profileId || '');
+    // Do not mark a session protected until the selected exit has passed a
+    // real gateway probe. Previously connect() attached an untested profile,
+    // then its first page request hit the kill switch with a misleading
+    // generic proxy error.
+    const candidate = vpnManager.get(requested);
+    if (candidate) await vpnManager.test(candidate.id);
+    const result = vpnManager.connect(sid, requested, { region: String(req.body?.region || ''), group: String(req.body?.group || '') });
     const ps = sessionRecord(sid); ps.vpnProfileId = result.profile?.id || null;
     res.json({ ok:true, ...result, note:'Every request from this Veyra session (proxy, crawler and Chromium) now leaves through the VPN exit. If the tunnel drops, the kill switch blocks traffic instead of falling back to the server IP.' });
   } catch (e) { respondError(res, vpnErrStatus(e.code), e.message, e.code || 'VPN_CONNECT_ERROR'); }
@@ -5373,19 +5380,31 @@ app.post("/api/cast/device/push/:deviceId", (req, res) => {
   res.json({ ok: true });
 });
 
-// Internet Connection Manager routes
-app.get("/api/internet/report", (req, res) => res.json(internetManager ? internetManager.report() : { error: "Internet manager not available" }));
-app.get("/api/internet/profile", (req, res) => res.json(internetManager ? internetManager.getProfile(req.query.sessionId) : { error: "Internet manager not available" }));
+// Internet Connection Manager routes. This is a profile/status integration,
+// not a fake host-network switch: it never claims to change server Wi-Fi,
+// cellular, DNS, or routing. Support query and JSON inputs for all clients.
+const internetSessionId = req => String(req.body?.sessionId || req.body?.sid || req.query?.sessionId || req.query?.sid || "ui").trim().slice(0, 128) || "ui";
+app.get("/api/internet", (req, res) => {
+  if (!internetManager) return res.status(503).json({ ok: false, error: "Internet manager not available", code: "INTERNET_UNAVAILABLE" });
+  const sid = internetSessionId(req), selected = internetManager.getProfile(sid);
+  res.json({ ok: true, sessionId: sid, selected, currentProfile: selected?.profileId || internetManager.getCurrentProfile(), profiles: internetManager.getAvailableProfiles(), report: internetManager.report() });
+});
+app.get("/api/internet/report", (req, res) => res.json(internetManager ? { ok: true, ...internetManager.report() } : { ok: false, error: "Internet manager not available", code: "INTERNET_UNAVAILABLE" }));
+app.get("/api/internet/profile", (req, res) => res.json(internetManager ? { ok: true, sessionId: internetSessionId(req), profile: internetManager.getProfile(internetSessionId(req)) } : { ok: false, error: "Internet manager not available", code: "INTERNET_UNAVAILABLE" }));
 app.post("/api/internet/profile", (req, res) => {
-  if (!internetManager) return res.status(503).json({ error: "Internet manager not available" });
-  internetManager.setProfile(req.body.sessionId, req.body.profile, req.body.config);
-  res.json({ ok: true });
+  if (!internetManager) return res.status(503).json({ ok: false, error: "Internet manager not available", code: "INTERNET_UNAVAILABLE" });
+  try {
+    const sid = internetSessionId(req), profile = internetManager.setProfile(sid, req.body?.profile || req.body?.profileId, req.body?.config && typeof req.body.config === "object" ? req.body.config : {});
+    res.json({ ok: true, sessionId: sid, profile, note: "Profile selection saved; host network routing was not changed." });
+  } catch (e) { respondError(res, 400, e.message, e.code || "INTERNET_PROFILE_ERROR"); }
 });
-app.get("/api/internet/test", async (req, res) => {
-  if (!internetManager) return res.status(503).json({ error: "Internet manager not available" });
-  try { const result = await internetManager.testConnection(req.query.sessionId); res.json(result); }
-  catch (e) { res.json({ ok: false, error: e.message, latency: 0, bandwidth: 0 }); }
-});
+const testInternet = (req, res) => {
+  if (!internetManager) return res.status(503).json({ ok: false, error: "Internet manager not available", code: "INTERNET_UNAVAILABLE" });
+  try { res.json({ ok: true, sessionId: internetSessionId(req), ...internetManager.testConnection(internetSessionId(req)) }); }
+  catch (e) { respondError(res, 400, e.message, e.code || "INTERNET_TEST_ERROR"); }
+};
+app.get("/api/internet/test", testInternet);
+app.post("/api/internet/test", testInternet);
 app.get("/status", (req, res, next) => {
   if (!CFG.adminGate || isAdminRequest(req)) return next();
   // Only genuine browser navigations (Accept: text/html) are redirected to the
