@@ -25,7 +25,6 @@
 const https = require("https");
 const http = require("http");
 const { URL } = require("url");
-const vm = require("vm");
 
 class ChallengeSolver {
   constructor(opts = {}) {
@@ -122,29 +121,8 @@ class ChallengeSolver {
    */
   async solve(url, html, statusCode, headers) {
     const challengeType = this.detectChallengeType(html);
-    this.log("info", "CHALLENGE", `Detected ${challengeType} challenge on ${url}`);
-
-    switch (challengeType) {
-      case "cloudflare":
-        return await this.solveCloudflare(url, html, headers);
-      case "ddos-guard":
-        return await this.solveDdosGuard(url, html, headers);
-      case "sucuri":
-        return await this.solveSucuri(url, html, headers);
-      case "meta-refresh":
-        return await this.solveMetaRefresh(url, html, headers);
-      case "js-required":
-        return await this.solveJsRequired(url, html, headers);
-      case "perimeterx":
-      case "blazingfast":
-      case "turnstile":
-      case "hcaptcha":
-      case "recaptcha":
-        return await this.handleCaptcha(url, html, challengeType, headers);
-      default:
-        
-        return await this.solveGeneric(url, html, headers);
-    }
+    this.log("info", "CHALLENGE", `Detected ${challengeType} challenge on ${url}; automatic solving is disabled.`);
+    return this.makeChallengeMessage(url, challengeType);
   }
 
   /**
@@ -274,48 +252,10 @@ class ChallengeSolver {
         }
       }
 
-      
-      const jsMatch = html.match(/<script[^>]*>([\s\S]*?)<\/script>/i);
-      if (jsMatch && jsMatch[1].length > 50 && jsMatch[1].length < 5000) {
-        try {
-          const sandbox = {
-            window: {},
-            document: {
-              cookie: "",
-              location: { href: url, hostname: domain, protocol: u.protocol + "//" },
-              createElement: () => ({ style: {}, setAttribute: () => {}, appendChild: () => {} }),
-              getElementById: () => null,
-            },
-            setTimeout: (fn) => { try { fn(); } catch {} },
-            setInterval: () => {},
-            navigator: { userAgent: this.userAgent, language: "en-US", platform: "Win32" },
-            location: { href: url, hostname: domain, protocol: u.protocol + "//" },
-            atob: (s) => Buffer.from(s, "base64").toString("binary"),
-            btoa: (s) => Buffer.from(s, "binary").toString("base64"),
-            String, Math, Date, parseInt, parseFloat, Array, Object, JSON, RegExp, Error,
-          };
-          vm.createContext(sandbox);
-          vm.runInContext(jsMatch[1], sandbox, { timeout: 3000 });
-
-          
-          if (sandbox.document.cookie) {
-            const cookieName = sandbox.document.cookie.split("=")[0];
-            const cookieValue = sandbox.document.cookie.split("=")[1];
-            if (cookieName && cookieValue) {
-              this.storeCookies(domain, [{ name: cookieName, value: cookieValue, domain }]);
-              this.log("info", "CHALLENGE", `Cloudflare JS challenge solved (cookie: ${cookieName})`);
-              
-              const result = await this.fetchWithHeaders(url);
-              if (result.statusCode === 200 && !this.isChallengePage(result.html, result.statusCode)) {
-                return { html: result.html, statusCode: result.statusCode, headers: result.headers, solved: true, method: "cloudflare-js" };
-              }
-            }
-          }
-        } catch (e) {
-          this.log("warn", "CHALLENGE", `Cloudflare JS challenge failed: ${e.message}`);
-        }
-      }
-
+      // Never execute challenge JavaScript in Node. `vm` is not a security boundary
+      // for attacker-controlled pages, so JavaScript challenges require user-assisted
+      // verification in the isolated browser engine instead.
+      if (/<script[^>]*>/i.test(html)) this.log("info", "CHALLENGE", "JavaScript challenge deferred to user-assisted browser verification.");
       
       return this.makeChallengeMessage(url, "cloudflare");
     } catch (e) {
