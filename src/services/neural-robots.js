@@ -48,6 +48,8 @@ class NeuralRobot {
     this.userAgent = opts.userAgent || "VeyraNeuralBot/1.0 (+https://veyra.app/bot)";
     this.respectRobots = opts.respectRobots !== false;
     this.robotsCache = new Map();
+    this.crawlOrigin = "";
+    this.maxRedirects = Math.max(0, Math.min(5, Number(opts.maxRedirects) || 3));
     this.stats = {
       pagesCrawled: 0,
       linksFound: 0,
@@ -68,6 +70,9 @@ class NeuralRobot {
   fetchRaw(url, opts = {}) {
     return new Promise((resolve, reject) => {
       const u = new URL(url);
+      if (!/^https?:$/.test(u.protocol)) return reject(new Error("Only HTTP(S) crawl URLs are allowed"));
+      if (this.crawlOrigin && u.origin !== this.crawlOrigin) return reject(new Error("Cross-origin crawl destination blocked"));
+      const redirects = Math.max(0, Number(opts.redirects) || 0);
       const lib = u.protocol === "https:" ? https : http;
       const headers = {
         "User-Agent": this.userAgent,
@@ -81,8 +86,9 @@ class NeuralRobot {
       const req = lib.get(url, { headers, timeout: opts.timeoutMs || this.timeoutMs }, (res) => {
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           const redirect = new URL(res.headers.location, url).href;
-          if (this.visited.has(redirect)) return reject(new Error("Redirect loop"));
-          return resolve(this.fetchRaw(redirect, opts));
+          if (redirects >= this.maxRedirects) return reject(new Error("Redirect limit exceeded"));
+          if (this.visited.has(redirect) || new URL(redirect).origin !== this.crawlOrigin) return reject(new Error("Redirect destination blocked"));
+          return resolve(this.fetchRaw(redirect, { ...opts, redirects: redirects + 1 }));
         }
         if (res.statusCode !== 200) {
           res.resume();
@@ -284,7 +290,8 @@ class NeuralRobot {
 
       
       for (const link of parsed.links) {
-        if (!this.visited.has(link) && depth < this.maxDepth) {
+        let sameOrigin = false; try { sameOrigin = new URL(link).origin === this.crawlOrigin; } catch {}
+        if (sameOrigin && !this.visited.has(link) && depth < this.maxDepth && this.queue.length < this.maxPages * this.maxLinksPerPage) {
           this.queue.push({ url: link, depth: depth + 1 });
         }
       }
@@ -305,10 +312,12 @@ class NeuralRobot {
    */
   async startCrawl(seedUrl, query = "", opts = {}) {
     this.visited.clear();
+    this.crawlOrigin = new URL(seedUrl).origin;
     this.queue = [{ url: seedUrl, depth: 0 }];
     this.stats = { pagesCrawled: 0, linksFound: 0, errors: 0, startTime: Date.now(), bytesFetched: 0, avgLatencyMs: 0 };
-    this.maxDepth = opts.maxDepth || this.maxDepth;
-    this.maxPages = opts.maxPages || this.maxPages;
+    this.maxDepth = Math.max(0, Math.min(2, Number(opts.maxDepth) || this.maxDepth));
+    this.maxPages = Math.max(1, Math.min(20, Number(opts.maxPages) || this.maxPages));
+    this.maxLinksPerPage = Math.max(1, Math.min(30, Number(opts.maxLinksPerPage) || this.maxLinksPerPage));
 
     const results = [];
     while (this.queue.length > 0 && results.length < this.maxPages && this.status !== "paused") {

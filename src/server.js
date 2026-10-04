@@ -316,19 +316,28 @@ const DIRECT_HTTP_AGENT = new UndiciAgent({
   pipelining: 1
 });
 
+const isProductionEnvironment = /^(?:production|prod)$/i.test(String(process.env.VEYRA_ENV || process.env.NODE_ENV || ""));
+const trustProxy = /^(?:1|true|yes|on)$/i.test(String(process.env.VEYRA_TRUST_PROXY || ""));
 const shield = createShield(process.env, { lean: CFG.leanMode, log: (level, source, message) => setImmediate(() => serverLog(level, source, message)) });
-app.set("trust proxy", true);
+// Only trust an explicitly configured single reverse proxy. Trusting arbitrary forwarded
+// headers lets direct callers bypass auth and abuse rate limits.
+app.set("trust proxy", trustProxy ? 1 : false);
 app.disable("x-powered-by");
 app.use(shield.middleware);
 installBrandRoutes(app, { frontendUrl: () => CFG.frontendUrl, version: VEYRA_VERSION, isPreviewBot: ua => shield.isPreviewBot(ua), hasProxiedReferer: req => !!proxiedPageFromReferer(req, { allowCookie: false }) });
-const allowedOrigins = CFG.frontendOrigins.includes("*") ? true : CFG.frontendOrigins;
+const configuredOrigins = Array.isArray(CFG.frontendOrigins) ? CFG.frontendOrigins : [];
+if (isProductionEnvironment && configuredOrigins.includes("*")) {
+  console.warn("[Veyra CORS] Wildcard frontend origin is disabled in production. Configure explicit VEYRA_FRONTEND_ORIGINS values.");
+}
+const allowedOrigins = configuredOrigins.includes("*") && !isProductionEnvironment ? true : configuredOrigins.filter(origin => origin !== "*");
 app.use(cors({
-  origin: allowedOrigins,
+  origin(origin, callback) {
+    // Non-browser requests do not need an Origin header. Browser callers must match
+    // the deployment allowlist; wildcard reflection is intentionally development-only.
+    if (!origin || allowedOrigins === true) return callback(null, true);
+    return callback(null, allowedOrigins.includes(origin));
+  },
   methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  
-  
-  
-  
   exposedHeaders: ["X-Veyra-Request-ID", "X-Veyra-Canonical-URL", "X-Veyra-Challenge", "X-Veyra-Content-Type", "X-Veyra-Session-ID", "X-Veyra-Session-Expires"]
 }));
 
@@ -369,10 +378,12 @@ const neuralTrainer = new NeuralLearningWorker({
   maxQueue: numberEnv("NEURAL_TRAIN_QUEUE_MAX", 5000, 100, 100000),
   log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
 });
+if (isProductionEnvironment && !CFG.authSecret) {
+  throw new Error("VEYRA_AUTH_SECRET is required in production. Generate a long random secret and configure durable account storage before deploying.");
+}
 const authStore = new AuthStore({
   dataDir: CFG.authDataDir, secret: CFG.authSecret, tokenTtlMs: CFG.authTokenTtlMs,
   adminEmails: CFG.adminEmails, allowSignup: CFG.authAllowSignup, persistence: mongoStore, testMode: CFG.testMode,
-  
   log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
 });
 
@@ -1034,8 +1045,29 @@ function normalizeSessionId(value) {
   return /^[A-Za-z0-9_-]{16,80}$/.test(sid) ? sid : crypto.randomUUID().replaceAll("-", "");
 }
 function sessionRecord(sid) {
-  
   return sessionManager.touch(sid);
+}
+function sessionCapability(req) {
+  return String(req.get("X-Veyra-Session-Token") || req.query?.sessionToken || req.query?.cap || req.body?.sessionToken || req.body?.sessionCapability || "");
+}
+function constantTimeMatch(a, b) {
+  const left = Buffer.from(String(a || ""));
+  const right = Buffer.from(String(b || ""));
+  return left.length === right.length && left.length > 0 && crypto.timingSafeEqual(left, right);
+}
+function sessionAccessAllowed(req, sid, rec = sessionManager.peek(sid)) {
+  if (!rec) return false;
+  const user = authStore.userFromRequest(req);
+  if (rec.userId && rec.userId !== user?.id) return false;
+  return constantTimeMatch(sessionCapability(req), rec.accessToken);
+}
+function requireSessionAccess(req, res, next) {
+  const sid = String(req.params?.sid || req.body?.sessionId || req.body?.sid || req.query?.sid || req.query?.sessionId || "");
+  const rec = sessionManager.peek(sid);
+  if (!rec || !sessionAccessAllowed(req, sid, rec)) return respondError(res, 403, "This browsing session is not available to this request.", "SESSION_ACCESS_DENIED");
+  req.veyraSession = rec;
+  req.veyraSessionId = sid;
+  next();
 }
 function cookieDomainMatches(host, domain) {
   const h = String(host || "").toLowerCase();
@@ -1643,7 +1675,7 @@ function makeGetFormProxyAction(url, sid) {
   return `/api/form-get/${token}/${safeSid}`;
 }
 
-function challengeFallbackHtml(url, info, sid = "") {
+function challengeFallbackHtml(url, info, sid = "", bridgeToken = "") {
   const safe = escapeHtml(url);
   let query = "";
   try { const u = new URL(url); const cont = u.searchParams.get("continue"); const src = cont ? new URL(cont) : u; query = src.searchParams.get("q") || src.searchParams.get("query") || ""; } catch {}
@@ -1657,7 +1689,7 @@ function challengeFallbackHtml(url, info, sid = "") {
     ["Brave Search", `https://search.brave.com/search?q=${encodeURIComponent(query)}`],
     ["DuckDuckGo", `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`]
   ].map(([n, h]) => `<a class="secondary" href="${escapeHtml(h)}" target="_blank" rel="noopener noreferrer">Open “${escapeHtml(query)}” on ${n}</a>`).join("") : "";
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#10151d;color:#eaf0f6;font:15px/1.5 system-ui,sans-serif}.card{max-width:650px;margin:24px;padding:32px;background:#171e28;border:1px solid #303a48;border-radius:18px;box-shadow:0 20px 60px #0008}.ey{font-size:11px;letter-spacing:.15em;text-transform:uppercase;color:#86a9d5}.card h1{font-size:26px;margin:10px 0}.card p{color:#aab5c4}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px}.actions a{display:inline-block;padding:10px 15px;border-radius:9px;text-decoration:none}.primary{background:#4b82c9;color:#fff}.secondary{border:1px solid #3a4657;color:#dce5ef}.secondary:hover{background:#1f2835}</style></head><body><main class="card"><div class="ey">Veyra Browser</div><h1>${escapeHtml(title)}</h1><p>${why}</p><div class="actions"><a class="primary" href="#" id="veyraChromium">Verify in real Chromium</a>${alt}<a class="secondary" href="${safe}" target="_blank" rel="noopener noreferrer">Open directly in a new tab</a><a class="secondary" href="${escapeHtml(makeViewUrl(url, sid))}">Retry through Veyra</a></div><p style="font-size:13px;margin-top:18px">Chromium shows the site's own check so <b>you</b> can complete it. Veyra does not solve, evade, or weaken CAPTCHA/anti-bot checks.</p></main><script>(function(){var m={type:"veyra:challenge",url:${JSON.stringify(String(url)).replace(/</g, "\\u003c")},kind:${JSON.stringify(String(info?.type || "verification"))},auto:${process.env.CHALLENGE_AUTO_HANDOFF == null ? "true" : /^(1|true|yes|on)$/i.test(String(process.env.CHALLENGE_AUTO_HANDOFF)) ? "true" : "false"}};try{if(parent!==window)parent.postMessage(m,"*")}catch(e){}var b=document.getElementById("veyraChromium");if(b)b.onclick=function(e){e.preventDefault();m.auto=false;m.manual=true;try{parent.postMessage(m,"*")}catch(x){}}})();</script></body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#10151d;color:#eaf0f6;font:15px/1.5 system-ui,sans-serif}.card{max-width:650px;margin:24px;padding:32px;background:#171e28;border:1px solid #303a48;border-radius:18px;box-shadow:0 20px 60px #0008}.ey{font-size:11px;letter-spacing:.15em;text-transform:uppercase;color:#86a9d5}.card h1{font-size:26px;margin:10px 0}.card p{color:#aab5c4}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px}.actions a{display:inline-block;padding:10px 15px;border-radius:9px;text-decoration:none}.primary{background:#4b82c9;color:#fff}.secondary{border:1px solid #3a4657;color:#dce5ef}.secondary:hover{background:#1f2835}</style></head><body><main class="card"><div class="ey">Veyra Browser</div><h1>${escapeHtml(title)}</h1><p>${why}</p><div class="actions"><a class="primary" href="#" id="veyraChromium">Verify in real Chromium</a>${alt}<a class="secondary" href="${safe}" target="_blank" rel="noopener noreferrer">Open directly in a new tab</a><a class="secondary" href="${escapeHtml(makeViewUrl(url, sid))}">Retry through Veyra</a></div><p style="font-size:13px;margin-top:18px">Chromium shows the site's own check so <b>you</b> can complete it. Veyra does not solve, evade, or weaken CAPTCHA/anti-bot checks.</p></main><script>(function(){var m={type:"veyra:challenge",url:${JSON.stringify(String(url)).replace(/</g, "\\u003c")},kind:${JSON.stringify(String(info?.type || "verification"))},bridgeToken:${JSON.stringify(String(bridgeToken || ""))},auto:${process.env.CHALLENGE_AUTO_HANDOFF == null ? "true" : /^(1|true|yes|on)$/i.test(String(process.env.CHALLENGE_AUTO_HANDOFF)) ? "true" : "false"}};try{if(parent!==window)parent.postMessage(m,"*")}catch(e){}var b=document.getElementById("veyraChromium");if(b)b.onclick=function(e){e.preventDefault();m.auto=false;m.manual=true;try{parent.postMessage(m,"*")}catch(x){}}})();</script></body></html>`;
 }
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m])); }
 
@@ -1701,10 +1733,11 @@ function rewriteSrcset(raw, base, sid = "") {
     return parts.join(" ");
   }).join(", ");
 }
-function injectRuntime(html, original, sid = "") {
+function injectRuntime(html, original, sid = "", bridgeToken = "") {
   const code = `<script data-veyra-runtime>(function(){
   const CANONICAL=${JSON.stringify(original)};
   const SESSION_ID=${JSON.stringify(sid)};
+  const BRIDGE_TOKEN=${JSON.stringify(String(bridgeToken || ""))};
   const API_ORIGIN=${JSON.stringify(process.env.PUBLIC_API_ORIGIN || "")};
   let virtualUrl=CANONICAL;
   window.__VEYRA_PAGE_URL__=CANONICAL;
@@ -1744,7 +1777,7 @@ function injectRuntime(html, original, sid = "") {
   function resolve(v){try{const raw=unwrap(realUrl(v));return (raw===''?new URL(virtualUrl):toVirtual(raw)).href}catch{return String(v||'')}}
   function shouldProxy(v){try{const u=new URL(unwrap(v));return /^https?:$/.test(u.protocol)}catch{return false}}
   function proxy(kind,u){const prefix=API_ORIGIN || location.origin;const base=prefix+(kind==='view'?'/api/view?url=':'/api/resource?url=')+encodeURIComponent(u);const from=encodeURIComponent(new URL(virtualUrl).href);return kind==='view'?base+'&sid='+encodeURIComponent(SESSION_ID):base+'&from='+from+'&sid='+encodeURIComponent(SESSION_ID)}
-  function topPost(msg){try{window.top.postMessage(msg,'*')}catch{}}
+  function topPost(msg){try{window.top.postMessage({...msg,bridgeToken:BRIDGE_TOKEN},'*')}catch{}}
   function emit(source,url,extra){if(!url)return;topPost({type:'veyra:navigate',url,source,sessionId:SESSION_ID,...extra})}
   let netSeq=0;
   function hdrObj(h){const o={};try{if(!h)return o;if(typeof h.forEach==='function'&&!Array.isArray(h)){h.forEach((v,k)=>{o[k]=String(v).slice(0,2000)});return o}if(Array.isArray(h)){for(const [k,v] of h)o[String(k).toLowerCase()]=String(v).slice(0,2000);return o}for(const k of Object.keys(h))o[k.toLowerCase()]=String(h[k]).slice(0,2000)}catch{}return o}
@@ -1806,10 +1839,10 @@ function injectRuntime(html, original, sid = "") {
   // DevTools bridge: loaded on demand from the Veyra origin the first time the
   // frontend's DevTools / extensions talk to this page.
   let dtLoading=null;const dtQueue=[];
-  function dtReply(msg){try{window.parent.postMessage(msg,'*')}catch{}}
+  function dtReply(msg){try{window.parent.postMessage({...msg,bridgeToken:BRIDGE_TOKEN},'*')}catch{}}
   function dtLoad(){if(window.__veyraDevtools)return Promise.resolve(window.__veyraDevtools);if(dtLoading)return dtLoading;dtLoading=new Promise((resolve,reject)=>{const sc=document.createElement('script');sc.setAttribute('data-veyra-devtools','bridge');sc.src=(API_ORIGIN||location.origin)+'/api/devtools/bridge.js?v=1';sc.onload=()=>{try{resolve(window.installVeyraDevtools(dtReply,{unwrap:x=>{const r=unwrap(x);try{return r?new URL(r,virtualUrl).href:''}catch{return r}},pageUrl:()=>virtualUrl}))}catch(e){reject(e)}};sc.onerror=()=>{dtLoading=null;reject(new Error('Could not load the DevTools bridge.'))};(document.head||document.documentElement).appendChild(sc)});return dtLoading}
   function dtSer(e){return {message:String(e&&e.message||e),stack:String(e&&e.stack||'')}}
-  window.addEventListener('message',function(ev){const d=ev.data||{};if(!d||d.type!=='veyra:dt')return;if(ev.source!==window.parent||window.parent===window)return;if(!rootProxiedFrame())return;
+  window.addEventListener('message',function(ev){const d=ev.data||{};if(!d||d.type!=='veyra:dt'||d.bridgeToken!==BRIDGE_TOKEN)return;if(ev.source!==window.parent||window.parent===window)return;if(!rootProxiedFrame())return;
     dtLoad().then(b=>b.call(String(d.method||''),d.params||{})).then(result=>{let safe=result;try{safe=JSON.parse(JSON.stringify(result===undefined?null:result))}catch{safe=null}dtReply({type:'veyra:dt-result',id:d.id,ok:true,result:safe,pageUrl:virtualUrl})},e=>dtReply({type:'veyra:dt-result',id:d.id,ok:false,error:dtSer(e),pageUrl:virtualUrl}))});
   // Keyboard shortcuts pressed inside the page are forwarded to the Veyra UI
   // (the parent frame never sees keydown events that happen in this iframe).
@@ -1868,7 +1901,7 @@ function restoreInlineScriptBlocks(html, originals) {
   for (const item of originals || []) out = out.split(item.token).join(item.body);
   return out;
 }
-function rewriteHtml(html, base, sid = "") {
+function rewriteHtml(html, base, sid = "", bridgeToken = "") {
   const protectedScripts = protectInlineScriptBlocks(html);
   const $ = cheerio.load(protectedScripts.html, { decodeEntities: false });
   const declaredBase = $("base[href]").first().attr("href");
@@ -1954,7 +1987,7 @@ function rewriteHtml(html, base, sid = "") {
     if (preloadMarkup) $("head").first().prepend(preloadMarkup);
   }
 
-  return injectRuntime(restoreInlineScriptBlocks($.html(), protectedScripts.originals), base, sid);
+  return injectRuntime(restoreInlineScriptBlocks($.html(), protectedScripts.originals), base, sid, bridgeToken);
 }
 
 const SEARCH_STOP_WORDS = new Set([
@@ -3487,17 +3520,17 @@ app.get('/api/vpn/status', (req, res) => {
   res.json({ ok: true, ...vpnManager.status() });
 });
 app.get('/api/vpn/profiles', (req, res) => res.json({ ok: true, profiles: vpnManager.list(), defaultProfile: vpnManager.defaultProfileId || null }));
-app.post('/api/vpn/test', async (req, res) => {
+app.post('/api/vpn/test', requireAdmin, async (req, res) => {
   try {
     const result = await vpnManager.test(String(req.body?.profileId || ''));
     res.json({ ok:true, ...result });
   } catch (e) { respondError(res, vpnErrStatus(e.code), e.message, e.code || 'VPN_TEST_ERROR', { profile: e.profile }); }
 });
-app.post('/api/vpn/health', async (req, res) => {
+app.post('/api/vpn/health', requireAdmin, async (req, res) => {
   if (!vpnManager.enabled) return respondError(res, 503, 'Veyra VPN is disabled on this server.', 'VPN_DISABLED');
   res.json({ ok: true, results: await vpnManager.checkAll(), profiles: vpnManager.list() });
 });
-app.post('/api/vpn/connect', async (req, res) => {
+app.post('/api/vpn/connect', requireSessionAccess, async (req, res) => {
   try {
     const sid = normalizeSessionId(req.body?.sessionId || req.body?.sid);
     const requested = String(req.body?.profileId || '');
@@ -3512,7 +3545,7 @@ app.post('/api/vpn/connect', async (req, res) => {
     res.json({ ok:true, ...result, note:'Every request from this Veyra session (proxy, crawler and Chromium) now leaves through the VPN exit. If the tunnel drops, the kill switch blocks traffic instead of falling back to the server IP.' });
   } catch (e) { respondError(res, vpnErrStatus(e.code), e.message, e.code || 'VPN_CONNECT_ERROR'); }
 });
-app.post('/api/vpn/disconnect', (req, res) => {
+app.post('/api/vpn/disconnect', requireSessionAccess, (req, res) => {
   try {
     const sid = normalizeSessionId(req.body?.sessionId || req.body?.sid);
     vpnManager.disconnect(sid);
@@ -3520,7 +3553,7 @@ app.post('/api/vpn/disconnect', (req, res) => {
     res.json({ ok:true, connected:false });
   } catch (e) { respondError(res, 400, e.message, e.code || 'VPN_DISCONNECT_ERROR'); }
 });
-app.post('/api/vpn/rotate', (req, res) => {
+app.post('/api/vpn/rotate', requireSessionAccess, (req, res) => {
   try {
     const sid = normalizeSessionId(req.body?.sessionId || req.body?.sid);
     const result = vpnManager.rotate(sid);
@@ -3528,11 +3561,11 @@ app.post('/api/vpn/rotate', (req, res) => {
     res.json({ ok: true, ...result });
   } catch (e) { respondError(res, vpnErrStatus(e.code), e.message, e.code || 'VPN_ROTATE_ERROR'); }
 });
-app.get('/api/vpn/session', (req, res) => {
+app.get('/api/vpn/session', requireSessionAccess, (req, res) => {
   const sid = String(req.query.sid || req.query.sessionId || '');
   res.json({ ok: true, ...vpnManager.sessionInfo(sid) });
 });
-app.get('/api/vpn/ip', async (req, res) => {
+app.get('/api/vpn/ip', requireSessionAccess, async (req, res) => {
   const sid = String(req.query.sid || req.query.sessionId || '');
   try { res.json({ ok: true, ...(await vpnManager.exitIpForSession(sid)) }); }
   catch (e) { respondError(res, vpnErrStatus(e.code) === 400 ? 502 : vpnErrStatus(e.code), e.message, e.code || 'VPN_IP_ERROR'); }
@@ -3541,7 +3574,7 @@ app.get('/api/vpn/ip', async (req, res) => {
 
 
 
-app.get('/api/vpn/list', async (req, res) => {
+app.get('/api/vpn/list', requireAdmin, async (req, res) => {
   try {
     const dbProfiles = mongoStore.enabled ? (await mongoStore.loadVpnProfiles()) : [];
     const envProfiles = vpnManager.list().map(p => ({ ...p, source: 'env' }));
@@ -3555,7 +3588,7 @@ app.get('/api/vpn/list', async (req, res) => {
   } catch (e) { respondError(res, 500, e.message, 'VPN_LIST_ERROR'); }
 });
 
-app.post('/api/vpn/custom', async (req, res) => {
+app.post('/api/vpn/custom', requireAdmin, async (req, res) => {
   const { name, type, server, username, password, region, config, id } = req.body || {};
   if (!name) return respondError(res, 400, 'VPN name is required', 'VPN_NAME_REQUIRED');
   const validTypes = ['socks5', 'http', 'https', 'wireguard'];
@@ -3595,7 +3628,7 @@ app.post('/api/vpn/custom', async (req, res) => {
   }
 });
 
-app.delete('/api/vpn/custom/:profileId', async (req, res) => {
+app.delete('/api/vpn/custom/:profileId', requireAdmin, async (req, res) => {
   const pid = String(req.params.profileId || '');
   if (!pid) return respondError(res, 400, 'Profile ID is required', 'VPN_ID_REQUIRED');
   vpnManager.removeProfile(pid);
@@ -3623,11 +3656,13 @@ app.post('/api/session', (req, res) => {
   const rec = sessionManager.create(sid, { timeLimitMs: limit });
   rec.userId = user?.id || null;
   rec.role = isAdmin ? "admin" : "user";
-  
+  // Separate high-entropy capability: session IDs can occur in proxy URLs, while
+  // state-changing/session-inspection APIs require this non-URL credential.
+  rec.accessToken = crypto.randomBytes(32).toString("base64url");
   rec.incognito = req.body?.incognito === true;
-  res.status(201).json({ ok: true, ...sessionInfo(sid, rec), user: user ? authStore.publicUser(user) : null });
+  res.status(201).json({ ok: true, ...sessionInfo(sid, rec), sessionToken: rec.accessToken, user: user ? authStore.publicUser(user) : null });
 });
-app.get('/api/session/:sid', (req, res) => {
+app.get('/api/session/:sid', requireSessionAccess, (req, res) => {
   const sid = String(req.params.sid);
   if (sessionManager.checkLimit(sid)) return res.json({ ok: true, sessionId: sid, active: false, expired: true, reason: "SESSION_EXPIRED" });
   const rec = sessionManager.peek(sid);
@@ -3635,7 +3670,7 @@ app.get('/api/session/:sid', (req, res) => {
   res.json({ ok: true, ...sessionInfo(sid, rec) });
 });
 
-app.get('/api/session/:sid/cookies', (req, res) => {
+app.get('/api/session/:sid/cookies', requireSessionAccess, (req, res) => {
   const sid = String(req.params.sid);
   if (sessionManager.checkLimit(sid)) return respondError(res, 410, "Session expired.", "SESSION_EXPIRED");
   const rec = sessionManager.peek(sid);
@@ -3645,7 +3680,7 @@ app.get('/api/session/:sid/cookies', (req, res) => {
     .map(c => ({ name: c.name, value: c.value, domain: (c.hostOnly ? "" : ".") + c.domain.replace(/^\./, ""), path: c.path, secure: c.secure, expires: c.expiresAt ? new Date(c.expiresAt).toISOString() : "Session", size: c.name.length + String(c.value).length }));
   res.json({ ok: true, cookies });
 });
-app.delete('/api/session/:sid/cookies', (req, res) => {
+app.delete('/api/session/:sid/cookies', requireSessionAccess, (req, res) => {
   const rec = sessionManager.peek(String(req.params.sid));
   if (!rec) return res.json({ ok: true, deleted: 0 });
   const name = String(req.query.name || ""), domain = String(req.query.domain || "").replace(/^\./, "").toLowerCase();
@@ -3653,7 +3688,7 @@ app.delete('/api/session/:sid/cookies', (req, res) => {
   for (const [k, c] of [...rec.cookies]) if ((!name || c.name === name) && (!domain || c.domain.replace(/^\./, "") === domain)) { rec.cookies.delete(k); n += 1; }
   res.json({ ok: true, deleted: n });
 });
-app.post('/api/session/:sid/prefs', (req, res) => {
+app.post('/api/session/:sid/prefs', requireSessionAccess, (req, res) => {
   const sid = String(req.params.sid);
   if (sessionManager.checkLimit(sid)) return respondError(res, 410, "Session expired.", "SESSION_EXPIRED");
   let rec; try { rec = sessionManager.touch(sid); } catch (e) { return respondError(res, e.status || 400, e.message, e.code || "SESSION_ERROR"); }
@@ -3661,8 +3696,8 @@ app.post('/api/session/:sid/prefs', (req, res) => {
   res.json({ ok: true, prefs: rec.prefs, blocked: rec.blocked || 0 });
 });
 const closeSession = (req, res) => { const closed = sessionManager.close(String(req.params.sid)); res.json({ ok: true, closed }); };
-app.delete('/api/session/:sid', closeSession);
-app.post('/api/session/:sid/close', express.text({ type: () => true, limit: '4kb' }), closeSession);
+app.delete('/api/session/:sid', requireSessionAccess, closeSession);
+app.post('/api/session/:sid/close', express.text({ type: () => true, limit: '4kb' }), requireSessionAccess, closeSession);
 
 
 
@@ -3920,8 +3955,16 @@ function browserSessionOrThrow(browserSid) {
   if (s.proxySessionId) requireLiveProxySession(s.proxySessionId);
   return s;
 }
+function requireBrowserSessionAccess(req, res, next) {
+  try {
+    const browser = browserSessionOrThrow(req.params?.sid);
+    if (!sessionAccessAllowed(req, browser.proxySessionId)) return respondError(res, 403, "This Chromium tab is not available to this request.", "SESSION_ACCESS_DENIED");
+    req.veyraBrowserSession = browser;
+    next();
+  } catch (e) { respondError(res, e.status || 404, e.message, e.code || "BROWSER_SESSION_NOT_FOUND"); }
+}
 
-app.post('/api/browser/session', async (req, res) => {
+app.post('/api/browser/session', requireSessionAccess, async (req, res) => {
   if (!CFG.browserEnabled) return respondError(res, 503, "Chromium browsing is disabled on this server.", "BROWSER_ENGINE_UNAVAILABLE");
   try {
     const proxySessionId = String(req.body?.proxySessionId || req.body?.sessionId || "");
@@ -3976,11 +4019,11 @@ app.post('/api/browser/session', async (req, res) => {
   }
 });
 
-app.get('/api/browser/session/:sid', (req, res) => {
+app.get('/api/browser/session/:sid', requireBrowserSessionAccess, (req, res) => {
   try { const s = browserSessionOrThrow(req.params.sid); res.json({ ok: true, session: browserEngine.public(s) }); }
   catch (e) { respondError(res, e.status || 404, e.message, e.code || "BROWSER_SESSION_NOT_FOUND"); }
 });
-app.post('/api/browser/session/:sid/navigate', async (req, res) => {
+app.post('/api/browser/session/:sid/navigate', requireBrowserSessionAccess, async (req, res) => {
   try {
     const s = browserSessionOrThrow(req.params.sid);
     const url = normalizeUrl(String(req.body?.url || ""));
@@ -3999,19 +4042,19 @@ app.post('/api/browser/session/:sid/navigate', async (req, res) => {
     res.json({ ok: true, session: browserEngine.public(s) });
   } catch (e) { respondError(res, e.status || 502, e.message, e.code || "BROWSER_NAVIGATION_ERROR"); }
 });
-app.post('/api/browser/session/:sid/input', async (req, res) => {
+app.post('/api/browser/session/:sid/input', requireBrowserSessionAccess, async (req, res) => {
   try { browserSessionOrThrow(req.params.sid); const session = await browserEngine.input(req.params.sid, req.body || {}); res.json({ ok: true, session }); }
   catch (e) { respondError(res, e.status || 502, e.message, e.code || "BROWSER_INPUT_ERROR"); }
 });
-app.post('/api/browser/session/:sid/history', async (req, res) => {
+app.post('/api/browser/session/:sid/history', requireBrowserSessionAccess, async (req, res) => {
   try { browserSessionOrThrow(req.params.sid); const session = await browserEngine.history(req.params.sid, String(req.body?.direction || "reload")); res.json({ ok: true, session }); }
   catch (e) { respondError(res, e.status || 502, e.message, e.code || "BROWSER_HISTORY_ERROR"); }
 });
-app.post('/api/browser/session/:sid/stop', async (req, res) => {
+app.post('/api/browser/session/:sid/stop', requireBrowserSessionAccess, async (req, res) => {
   try { browserSessionOrThrow(req.params.sid); const session = await browserEngine.stopNavigation(req.params.sid); res.json({ ok: true, session }); }
   catch (e) { respondError(res, e.status || 502, e.message, e.code || "BROWSER_STOP_ERROR"); }
 });
-app.delete('/api/browser/session/:sid', async (req, res) => {
+app.delete('/api/browser/session/:sid', requireBrowserSessionAccess, async (req, res) => {
   try {
     const s = browserSessionOrThrow(req.params.sid);
     const owner = s.proxySessionId;
@@ -4020,7 +4063,7 @@ app.delete('/api/browser/session/:sid', async (req, res) => {
     res.json(result);
   } catch (e) { respondError(res, e.status || 404, e.message, e.code || "BROWSER_STOP_ERROR"); }
 });
-app.get('/api/browser/session/:sid/screenshot', async (req, res) => {
+app.get('/api/browser/session/:sid/screenshot', requireBrowserSessionAccess, async (req, res) => {
   try { browserSessionOrThrow(req.params.sid); const image = await browserEngine.screenshot(req.params.sid); if (!image) return res.status(503).type('text/plain').send('Chromium screenshot unavailable.'); res.setHeader('Cache-Control', 'no-store'); res.type('jpeg').send(image); }
   catch (e) { respondError(res, e.status || 404, e.message, e.code || "BROWSER_SCREENSHOT_ERROR"); }
 });
@@ -4571,6 +4614,7 @@ async function proxyRequest(req, res, mode) {
   const referrer = sourceUrl || "";
   const sourceOrigin = sourceUrl ? new URL(sourceUrl).origin : "";
   const sid = normalizeSessionId(req.query.sid);
+  const bridgeToken = /^[A-Za-z0-9_-]{16,128}$/.test(String(req.query.bridge || "")) ? String(req.query.bridge) : "";
   if (sessionManager.checkLimit(sid)) return sendSessionExpired(req, res, mode, sid);
   
   
@@ -4653,7 +4697,7 @@ async function proxyRequest(req, res, mode) {
   if (challenge) {
     res.setHeader("X-Veyra-Challenge", "true");
     res.setHeader("X-Veyra-Canonical-URL", canonical);
-    return res.status(200).type("html").send(challengeFallbackHtml(canonical, challenge, sid));
+    return res.status(200).type("html").send(challengeFallbackHtml(canonical, challenge, sid, bridgeToken));
   }
   if (mode === "resource" && /javascript|ecmascript/i.test(result.contentType || "")) noteScriptDir(sid, result.finalUrl || canonical);
   let payload = result.body;
@@ -4668,7 +4712,7 @@ async function proxyRequest(req, res, mode) {
       
       const enhanced = fullPage.enhanceFullPage(payload.toString("utf8"), result.finalUrl || canonical);
       if (enhanced.enhanced) { payload = Buffer.from(enhanced.html, "utf8"); fullPageEnhanced = true; }
-      payload = Buffer.from(await rewriteOffThread("rewriteHtml", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteHtml), "utf8");
+      payload = Buffer.from(await rewriteOffThread("rewriteHtml", payload.toString("utf8"), [result.finalUrl || canonical, sid, bridgeToken], rewriteHtml), "utf8");
     }
     else if (!download && mode === "resource" && result.contentType.toLowerCase().includes("text/css")) payload = Buffer.from(await rewriteOffThread("rewriteCss", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteCssText), "utf8");
     else if (!download && mode === "resource" && /javascript|ecmascript/.test(result.contentType.toLowerCase())) payload = Buffer.from(await rewriteOffThread("rewriteJs", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteJsText), "utf8");
@@ -5321,18 +5365,23 @@ app.post("/api/neural/feedback", async (req, res) => {
   if (!accepted) return res.status(400).json({ ok: false, error: "A public http(s) URL is required." });
   res.json({ ok: true, queued: neuralTrainer.report().queueSize, durable: mongoStore.connected });
 });
-app.post("/api/neural/reset", (req, res) => { neuralTrainer.queue.length = 0; neuralModel.reset(); neuralModel.save(); res.json({ ok: true }); });
-app.get("/api/robots/status", (req, res) => res.json(neuralRobotPool.report()));
-app.get("/api/robots/log", (req, res) => res.json(neuralRobotPool.getLog(Math.min(100, Number(req.query.limit) || 50))));
-app.post("/api/robots/crawl", async (req, res) => {
+app.post("/api/neural/reset", requireAdmin, (req, res) => { neuralTrainer.queue.length = 0; neuralModel.reset(); neuralModel.save(); res.json({ ok: true }); });
+app.get("/api/robots/status", requireAdmin, (req, res) => res.json(neuralRobotPool.report()));
+app.get("/api/robots/log", requireAdmin, (req, res) => res.json(neuralRobotPool.getLog(Math.min(100, Number(req.query.limit) || 50))));
+app.post("/api/robots/crawl", requireUser, async (req, res) => {
   try {
-    const seeds = req.body.seeds || (req.body.seed ? [req.body.seed] : []);
+    const seeds = (Array.isArray(req.body?.seeds) ? req.body.seeds : (req.body?.seed ? [req.body.seed] : [])).slice(0, 3);
     if (!seeds.length) return res.status(400).json({ error: "No seed URLs provided" });
-    const query = req.body.query || "";
-    const opts = { maxDepth: req.body.maxDepth || 3, maxPages: req.body.maxPages || 50 };
+    for (const seed of seeds) await assertPublicUrl(String(seed));
+    const query = String(req.body?.query || "").slice(0, 500);
+    const opts = {
+      maxDepth: Math.max(0, Math.min(2, Number(req.body?.maxDepth) || 2)),
+      maxPages: Math.max(1, Math.min(20, Number(req.body?.maxPages) || 20)),
+      maxLinksPerPage: 20
+    };
     const result = await neuralRobotPool.startCrawl(seeds, query, opts);
-    res.json({ ok: true, results: result });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    res.json({ ok: true, results: result, limits: opts });
+  } catch (e) { res.status(400).json({ ok: false, error: e.message, code: "CRAWL_REJECTED" }); }
 });
 app.post("/api/robots/feedback", async (req, res) => {
   try {
@@ -5342,19 +5391,22 @@ app.post("/api/robots/feedback", async (req, res) => {
   }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
-app.post("/api/robots/reset", (req, res) => { neuralRobotPool.resetAll(); res.json({ ok: true }); });
+app.post("/api/robots/reset", requireAdmin, (req, res) => { neuralRobotPool.resetAll(); res.json({ ok: true }); });
 
 
 
 const challengeSolver = new ChallengeSolver({ log: (level, source, msg) => serverLog(level, source, msg) });
 app.get("/api/challenge/status", (req, res) => res.json(challengeSolver.report()));
-app.post("/api/challenge/solve", async (req, res) => {
+app.post("/api/challenge/solve", requireAdmin, async (req, res) => {
   try {
-    const { url, html, statusCode, headers } = req.body;
+    const { url, html, statusCode } = req.body || {};
     if (!url) return res.status(400).json({ error: "URL required" });
-    const result = await challengeSolver.solve(url, html || "", statusCode || 403, headers || {});
-    res.json({ ok: !!result, result });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    await assertPublicUrl(String(url));
+    const type = challengeSolver.detectChallengeType(String(html || ""));
+    // Challenge JavaScript is never evaluated or fetched from this endpoint. It is
+    // deliberately a diagnostic that directs a signed-in administrator to a user-assisted browser flow.
+    res.status(409).json({ ok: false, code: "CHALLENGE_USER_ASSISTED", challengeType: type, error: "Automatic challenge solving is disabled. Open the page in Chromium and complete the site's own verification." });
+  } catch (e) { res.status(400).json({ ok: false, error: e.message, code: "CHALLENGE_REJECTED" }); }
 });
 app.get("/api/challenge/check", (req, res) => {
   const html = req.query.html || "";
