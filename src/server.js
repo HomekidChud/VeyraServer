@@ -5626,28 +5626,38 @@ async function hydrateNeuralFromMongo() {
 
 if (require.main === module && CFG.processRole !== "worker") {
   let shuttingDown = false;
-  const startServer = async () => {
-    await authStore.ready;
-    await mongoStore.connect();
-    await hydrateNeuralFromMongo();
-    neuralTrainer.start();
-    
-    if (mongoStore.enabled) {
-      try {
-        const dbProfiles = await mongoStore.loadVpnProfiles();
-        let loaded = 0;
-        for (const p of dbProfiles) {
-          const candidate = vpnManager.parseProfile(p);
-          if (candidate && !vpnManager.profiles.has(candidate.id)) {
-            vpnManager.addProfile(candidate);
-            loaded++;
+  let httpServer = null;
+  const hydratePersistence = async () => {
+    try {
+      // Keep durable state fail-open: an unavailable or slow MongoDB instance must
+      // never prevent Render from detecting this process's HTTP listener.
+      await authStore.ready;
+      await mongoStore.connect();
+      await hydrateNeuralFromMongo();
+      neuralTrainer.start();
+
+      if (mongoStore.enabled) {
+        try {
+          const dbProfiles = await mongoStore.loadVpnProfiles();
+          let loaded = 0;
+          for (const p of dbProfiles) {
+            const candidate = vpnManager.parseProfile(p);
+            if (candidate && !vpnManager.profiles.has(candidate.id)) {
+              vpnManager.addProfile(candidate);
+              loaded++;
+            }
           }
-        }
-        serverLog('info', 'VPN', `Loaded ${loaded} VPN profile(s) from MongoDB.`);
-      } catch (e) { serverLog('warn', 'VPN', `Failed to load VPN profiles from MongoDB: ${e.message}`); }
+          serverLog('info', 'VPN', `Loaded ${loaded} VPN profile(s) from MongoDB.`);
+        } catch (e) { serverLog('warn', 'VPN', `Failed to load VPN profiles from MongoDB: ${e.message}`); }
+      }
+      await hydrateSearchFromMongo();
+      serverLog("info", "SYSTEM", "Persistence hydration completed.");
+    } catch (err) {
+      serverLog("warn", "SYSTEM", `Persistence hydration skipped: ${err.stack || err}`);
     }
-    await hydrateSearchFromMongo();
-    const httpServer = app.listen(PORT, "0.0.0.0", () => {
+  };
+  const startServer = () => {
+    httpServer = app.listen(PORT, "0.0.0.0", () => {
       serverLog("info", "SYSTEM", `Veyra server listening on ${PORT}`);
       serverLog("info", "CONFIG", `Plan ${VEYRA_CONFIG.plan.label} (${CFG.plan}, ${VEYRA_CONFIG.plan.ramMb}MB / ${VEYRA_CONFIG.plan.cpu} CPU, via ${VEYRA_CONFIG.planSource}) — ${CFG.maxActiveJobs} crawlers × ${CFG.maxActiveFetches} fetches, ${CFG.parseWorkers} parse workers, ${CFG.maxProxySessions} sessions, ${CFG.maxBrowserSessions} browser sessions.`);
       serverLog("info", "MONGO", mongoStore.status().configured ? `MongoDB configured (${CFG.mongoDb}); persistence/cache is fail-open.` : "MongoDB not configured; using local/ephemeral persistence where applicable.");
@@ -5662,11 +5672,13 @@ if (require.main === module && CFG.processRole !== "worker") {
         serverLog("info", "CAST", `Cast server upgraded to ${castServer.useWebSocket ? "WebSocket" : "HTTP polling"} mode`);
       } catch (e) { serverLog("warn", "CAST", `Cast WebSocket upgrade kept polling mode: ${e.message}`); }
     });
+    httpServer.once("error", err => {
+      serverLog("error", "SYSTEM", `HTTP listener failed: ${err.stack || err}`);
+      process.exitCode = 1;
+    });
+    void hydratePersistence();
   };
-  startServer().catch(err => {
-    serverLog("error", "SYSTEM", `Startup failed: ${err.stack || err}`);
-    process.exitCode = 1;
-  });
+  startServer();
   
   const shutdown = async signal => {
     if (shuttingDown) return; shuttingDown = true;
