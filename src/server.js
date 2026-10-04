@@ -187,6 +187,8 @@ const CFG = Object.freeze({
   maxClientLog: numberEnv("MAX_CLIENT_LOG", 500, 50, 5000),
   maxSearchQueryChars: numberEnv("MAX_SEARCH_QUERY_CHARS", 256, 32, 1000),
   maxSearchResults: numberEnv("MAX_SEARCH_RESULTS", 20, 1, 50),
+  apiSearchCostMicros: numberEnv("API_SEARCH_COST_MICROS", 1000, 1, 1000000),
+  apiKeyInitialCreditsMicros: numberEnv("API_KEY_INITIAL_CREDITS_MICROS", 0, 0, 1000000000000),
   maxProxyBodyBytes: numberEnv("MAX_PROXY_BODY_BYTES", 4 * 1024 * 1024, 64 * 1024, 32 * 1024 * 1024),
   maxProxyTextBytes: numberEnv("MAX_PROXY_TEXT_BYTES", 8 * 1024 * 1024, 256 * 1024, 32 * 1024 * 1024),
   maxProxyImageBytes: numberEnv("MAX_PROXY_IMAGE_BYTES", LEAN_MODE ? 2 * MB : 16 * 1024 * 1024, 256 * 1024, 64 * 1024 * 1024),
@@ -1049,6 +1051,37 @@ function sessionRecord(sid) {
 }
 function sessionCapability(req) {
   return String(req.get("X-Veyra-Session-Token") || req.query?.sessionToken || req.query?.cap || req.body?.sessionToken || req.body?.sessionCapability || "");
+}
+function apiKeyFromRequest(req) {
+  const explicit = String(req.get("X-Veyra-API-Key") || req.get("X-API-Key") || "").trim();
+  if (explicit) return explicit;
+  const auth = String(req.get("authorization") || "");
+  const match = /^Bearer\s+(\S+)$/.exec(auth);
+  return match?.[1] || "";
+}
+function apiKeyCredits(found) { return Math.max(0, Math.trunc(Number(found?.key?.creditsMicros) || 0)); }
+function apiKeyPublicCredits(found) {
+  const balanceMicros = apiKeyCredits(found), spentMicros = Math.max(0, Math.trunc(Number(found?.key?.spentMicros) || 0));
+  return { balanceMicros, spentMicros, balanceUsd: Number((balanceMicros / 1e6).toFixed(6)), spentUsd: Number((spentMicros / 1e6).toFixed(6)), searchCostMicros: CFG.apiSearchCostMicros, searchCostUsd: Number((CFG.apiSearchCostMicros / 1e6).toFixed(6)) };
+}
+function requireApiKey(req, res, next) {
+  const found = authStore.findApiKey(apiKeyFromRequest(req));
+  if (!found) return respondError(res, 401, "A valid Veyra API key is required.", "API_KEY_REQUIRED");
+  if (apiKeyCredits(found) < CFG.apiSearchCostMicros) return respondError(res, 402, `Insufficient API credits. Add at least $${(CFG.apiSearchCostMicros / 1e6).toFixed(6)} to this key.`, "API_CREDITS_EXHAUSTED", { credits: apiKeyPublicCredits(found) });
+  req.veyraApiKey = found;
+  next();
+}
+function consumeApiSearchCredit(found) {
+  const cost = CFG.apiSearchCostMicros;
+  if (apiKeyCredits(found) < cost) throw Object.assign(new Error("Insufficient API credits."), { status: 402, code: "API_CREDITS_EXHAUSTED" });
+  found.key.creditsMicros = apiKeyCredits(found) - cost;
+  found.key.spentMicros = Math.max(0, Math.trunc(Number(found.key.spentMicros) || 0)) + cost;
+  found.key.usage ||= { requests: 0, last24h: 0 };
+  found.key.usage.requests = Math.max(0, Number(found.key.usage.requests) || 0) + 1;
+  found.key.usage.lastSearchAt = new Date().toISOString();
+  found.key.lastUsedAt = new Date().toISOString();
+  authStore.persistUser(found.user);
+  return cost;
 }
 function constantTimeMatch(a, b) {
   const left = Buffer.from(String(a || ""));
@@ -3748,14 +3781,14 @@ function platformData(user) {
 }
 function savePlatformData(user, data) { authStore.setData(user, data); return data.platform; }
 function platformOwner(user) { return authStore.roleFor(user.email) === "admin"; }
-function platformPublicKey(k) { return { id: k.id, name: k.name, prefix: k.prefix, createdAt: k.createdAt, lastUsedAt: k.lastUsedAt || null, revokedAt: k.revokedAt || null }; }
+function platformPublicKey(k) { return { id: k.id, name: k.name, prefix: k.prefix, createdAt: k.createdAt, lastUsedAt: k.lastUsedAt || null, revokedAt: k.revokedAt || null, credits: { balanceMicros: Math.max(0, Math.trunc(Number(k.creditsMicros) || 0)), spentMicros: Math.max(0, Math.trunc(Number(k.spentMicros) || 0)) } }; }
 function platformPublicWorkspace(w) { return { id: w.id, name: w.name, slug: w.slug, description: w.description || "", createdAt: w.createdAt, keys: (w.keys || []).filter(k => !k.revokedAt).map(platformPublicKey) }; }
 function platformFindWorkspace(data, id) { return data.platform.workspaces.find(x => x.id === String(id || "")); }
 function platformFindKey(workspace, id) { return workspace?.keys?.find(x => x.id === String(id || "")); }
 function platformNewKey(name) {
   const raw = `vyr_live_${crypto.randomBytes(24).toString("base64url")}`;
   const now = new Date().toISOString();
-  return { raw, key: { id: crypto.randomUUID(), name: String(name || "Default key").trim().slice(0, 80) || "Default key", prefix: raw.slice(0, 16), hash: crypto.createHash("sha256").update(raw).digest("hex"), createdAt: now, lastUsedAt: null, revokedAt: null, usage: { requests: 0, last24h: 0 } } };
+  return { raw, key: { id: crypto.randomUUID(), name: String(name || "Default key").trim().slice(0, 80) || "Default key", prefix: raw.slice(0, 16), hash: crypto.createHash("sha256").update(raw).digest("hex"), createdAt: now, lastUsedAt: null, revokedAt: null, creditsMicros: CFG.apiKeyInitialCreditsMicros, spentMicros: 0, usage: { requests: 0, last24h: 0 } } };
 }
 function platformSlug(name) { return String(name || "workspace").toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "workspace"; }
 const PLATFORM_PRICING = [
@@ -3799,7 +3832,17 @@ app.post('/api/platform/waitlist/:id/accept', requireAdmin, async (req, res) => 
   const result = await sendPlatformEmail({ to: x.email, subject: "Your Veyra platform access is ready", html: `<p>Hi ${escapeHtml(x.name || "there")},</p><p>Your Veyra Developer Platform access is ready.</p><p><a href="${escapeHtml(base)}">Open the Veyra platform</a> and sign in to create your workspace.</p>${x.plan === "early_access" ? `<p>Early access is <strong>$2.99/month</strong>. ${checkout ? `<a href="${escapeHtml(checkout)}">Continue to secure checkout</a>.` : "A checkout link will be added by the Veyra team."}</p>` : ""}<p>Keep your API keys private and rotate them regularly.</p>` });
   x.emailStatus = result.status; writePlatformWaitlist(rows); res.json({ ok: true, entry: publicWaitlistEntry(x), email: result });
 });
-app.get('/api/platform/pricing', (req, res) => res.json({ ok: true, currency: "USD", plans: PLATFORM_PRICING }));
+app.get('/api/platform/pricing', (req, res) => res.json({ ok: true, currency: "USD", plans: PLATFORM_PRICING, api: { searchCostMicros: CFG.apiSearchCostMicros, searchCostUsd: Number((CFG.apiSearchCostMicros / 1e6).toFixed(6)), unit: "per API search" } }));
+app.get('/api/v1/credits', requireApiKey, (req, res) => res.json({ ok: true, ...apiKeyPublicCredits(req.veyraApiKey), key: platformPublicKey(req.veyraApiKey.key) }));
+app.post('/api/v1/credits/grant', requireUser, (req, res) => {
+  if (authStore.roleFor(req.veyraUser.email) !== "admin") return respondError(res, 403, "Only an administrator can grant API credits.", "API_CREDITS_ADMIN_REQUIRED");
+  const raw = String(req.body?.apiKey || "").trim(), found = authStore.findApiKey(raw);
+  if (!found) return respondError(res, 404, "API key not found.", "API_KEY_NOT_FOUND");
+  const micros = Math.trunc(Number(req.body?.micros ?? (Number(req.body?.usd || 0) * 1e6)));
+  if (!Number.isSafeInteger(micros) || micros <= 0 || micros > 1000000000000) return respondError(res, 400, "Grant must be a positive amount of microdollars (maximum $1,000,000).", "API_CREDITS_AMOUNT_INVALID");
+  found.key.creditsMicros = apiKeyCredits(found) + micros; authStore.persistUser(found.user);
+  res.json({ ok: true, credits: apiKeyPublicCredits(found) });
+});
 app.get('/api/platform/overview', requireUser, (req, res) => {
   const d = platformData(req.veyraUser), owner = platformOwner(req.veyraUser);
   const waitlist = owner ? readPlatformWaitlist() : [];
@@ -4069,6 +4112,18 @@ app.get('/api/browser/session/:sid/screenshot', requireBrowserSessionAccess, asy
 });
 
 
+app.get('/api/v1/search', requireApiKey, async (req, res) => {
+  try {
+    const query = String(req.query.q || "").trim().slice(0, CFG.maxSearchQueryChars);
+    if (!query) return respondError(res, 400, "A search query is required.", "SEARCH_QUERY_REQUIRED");
+    consumeApiSearchCredit(req.veyraApiKey);
+    const offset = Math.max(0, Number(req.query.offset || 0) || 0);
+    const engine = String(req.query.engine || "").trim().toLowerCase();
+    const selected = new Set(["google", "brave", "bing", "duckduckgo", ""]).has(engine) ? engine : "";
+    const result = await webSearch.search(query, { offset, engine: selected, lang: String(req.query.lang || "en").slice(0, 16) });
+    res.json({ ok: true, ...result, chargedMicros: CFG.apiSearchCostMicros, chargedUsd: Number((CFG.apiSearchCostMicros / 1e6).toFixed(6)), credits: apiKeyPublicCredits(req.veyraApiKey) });
+  } catch (e) { respondError(res, e.status || 502, e.message, e.code || "API_SEARCH_ERROR"); }
+});
 app.get('/api/search', (req, res) => {
   try {
     const query = String(req.query.q || "").trim().slice(0, CFG.maxSearchQueryChars);

@@ -158,6 +158,27 @@ class AuthStore {
   }
 
   
+  findApiKey(raw) {
+    const value = String(raw || "").trim();
+    if (!/^vyr_live_[A-Za-z0-9_-]{24,128}$/.test(value)) return null;
+    const digest = crypto.createHash("sha256").update(value).digest();
+    for (const user of this.users.values()) {
+      const data = user.data && typeof user.data === "object" ? user.data : {};
+      const workspaces = data.platform?.workspaces;
+      if (!Array.isArray(workspaces)) continue;
+      for (const workspace of workspaces) for (const key of workspace.keys || []) {
+        const stored = Buffer.from(String(key.hash || ""), "hex");
+        if (!key.revokedAt && stored.length === digest.length && crypto.timingSafeEqual(stored, digest)) return { user, workspace, key };
+      }
+    }
+    return null;
+  }
+
+  persistUser(user) {
+    this.save();
+    void this.persistence?.upsertUser(user);
+  }
+
   roleFor(email) { return this.adminEmails.has(email) || email === this.testAdminEmail ? "admin" : "user"; }
   publicUser(u) {
     return { id: u.id, email: u.email, name: u.name, role: this.roleFor(u.email), createdAt: u.createdAt, lastLoginAt: u.lastLoginAt || null };
