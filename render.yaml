@@ -3,7 +3,7 @@ services:
   - type: web
     name: VeyraServer
     runtime: node
-    plan: free
+    plan: pro
     buildCommand: npm install && npx playwright install chromium && node scripts/install-wireproxy.js
     startCommand: npm start
     healthCheckPath: /health
@@ -23,12 +23,11 @@ services:
         value: https://homekidchud.github.io
       - key: NODE_VERSION
         value: "20"
-      # Chromium is intentionally disabled on Free; YouTube uses the fast
-      # proxy and does not depend on a sleeping/evicted browser process.
+      # Pro is sized for the real Chromium fallback and browser sessions.
       - key: BROWSER_ENABLED
-        value: "false"
-      - key: YT_FAST_PROXY_ONLY
         value: "true"
+      - key: YT_FAST_PROXY_ONLY
+        value: "false"
       - key: YT_MAX_HEIGHT
         value: "360"
       # Keep in sync with `plan:` above (npm run config -- plan <name> does both).
@@ -64,7 +63,7 @@ services:
       # Safe warm-up cap: media is never downloaded by the warm phase.
       - key: PROXY_WARM_MAX_BINARY_BYTES
         value: "786432"
-           # 8.17.2 Free-plan compatibility and stability guardrails (keep proxy-first and prevent browser/crawler contention).
+           # 8.17.2 browser stability guardrails (keep browser/crawler contention bounded).
       - key: CRAWLER_PAGE_HARD_MS
         value: "5000"
       - key: PROXY_WARM_HARD_MS
