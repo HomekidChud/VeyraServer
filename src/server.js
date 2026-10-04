@@ -5143,7 +5143,7 @@ function buildStatusReport() {
   for (const e of VEYRA_CONFIG.errors) addIssue("error", `Config: ${e}`);
   for (const w of VEYRA_CONFIG.warnings) addIssue("warn", `Config: ${w}`);
   if (CFG.vpnEnabled && !vpnManager.profiles?.size) addIssue("error", "VPN_ENABLED is on but no valid VPN profile was loaded — check VPN_PROFILES_JSON / VPN_PROXY_SERVER / VPN_WIREGUARD_CONFIG.");
-  if (CFG.vpnEnabled && [...(vpnManager.profiles?.values() || [])].some(p => p.type === "wireguard") && !vpnManager.wireproxyBin) addIssue("error", "A WireGuard VPN profile is configured but the wireproxy binary is missing — add `node install-wireproxy.js` to the Render build command.");
+  if (CFG.vpnEnabled && [...(vpnManager.profiles?.values() || [])].some(p => p.type === "wireguard") && !vpnManager.wireproxyBin) addIssue("error", "A WireGuard VPN profile is configured but the wireproxy binary is missing — add `node scripts/install-wireproxy.js` to the Render build command.");
   if (CFG.vpnEnabled && !CFG.vpnKillSwitch) addIssue("warn", "VPN_KILL_SWITCH is off — if a tunnel fails, traffic falls back to the Render server IP.");
   if (CFG.adminToken && CFG.adminToken.length < 16) addIssue("warn", "VEYRA_ADMIN_TOKEN is shorter than 16 characters.");
   if (rewriteFailures.length) addIssue("warn", `${rewriteFailures.length} page(s) failed HTML/CSS/JS rewriting since boot and were served unrewritten as a fallback (links on those pages may point outside Veyra). Most recent: ${rewriteFailures[rewriteFailures.length - 1].url} — ${rewriteFailures[rewriteFailures.length - 1].message}`);

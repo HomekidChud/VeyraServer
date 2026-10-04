@@ -147,7 +147,7 @@ Per Veyra session: the proxy, the crawler (`VPN_CRAWLER_PROFILE`) and Chromium a
 
 - Profile types:
   - `http`/`https` CONNECT proxies and `socks5` (always remote DNS, so no DNS leaks).
-  - `wireguard`, a real WireGuard tunnel run through the userspace [wireproxy](https://github.com/windtf/wireproxy). No root or TUN device is needed, so it works on Render. `node install-wireproxy.js` downloads it and checks its checksum during the build.
+  - `wireguard`, a real WireGuard tunnel run through the userspace [wireproxy](https://github.com/windtf/wireproxy). No root or TUN device is needed, so it works on Render. `node scripts/install-wireproxy.js` downloads it and checks its checksum during the build.
   - OpenVPN is not supported: it needs a TUN device, which Render does not provide.
 - Kill switch (`VPN_KILL_SWITCH=true`, default): if the tunnel is down, requests fail with 503 `VPN_KILL_SWITCH`. They never silently fall back to the Render IP.
 - Failover (`VPN_FAILOVER=true`): after `VPN_FAILURE_THRESHOLD` failures, the session moves to the next healthy profile in the same `group`/`region`. Health checks run every `VPN_HEALTH_INTERVAL_MS` and report the exit IP and latency.
