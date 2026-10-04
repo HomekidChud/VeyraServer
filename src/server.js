@@ -3715,6 +3715,13 @@ function savePlatformData(user, data) { authStore.setData(user, data); return da
 function platformOwner(user) { return authStore.roleFor(user.email) === "admin"; }
 function platformPublicKey(k) { return { id: k.id, name: k.name, prefix: k.prefix, createdAt: k.createdAt, lastUsedAt: k.lastUsedAt || null, revokedAt: k.revokedAt || null }; }
 function platformPublicWorkspace(w) { return { id: w.id, name: w.name, slug: w.slug, description: w.description || "", createdAt: w.createdAt, keys: (w.keys || []).filter(k => !k.revokedAt).map(platformPublicKey) }; }
+function platformFindWorkspace(data, id) { return data.platform.workspaces.find(x => x.id === String(id || "")); }
+function platformFindKey(workspace, id) { return workspace?.keys?.find(x => x.id === String(id || "")); }
+function platformNewKey(name) {
+  const raw = `vyr_live_${crypto.randomBytes(24).toString("base64url")}`;
+  const now = new Date().toISOString();
+  return { raw, key: { id: crypto.randomUUID(), name: String(name || "Default key").trim().slice(0, 80) || "Default key", prefix: raw.slice(0, 16), hash: crypto.createHash("sha256").update(raw).digest("hex"), createdAt: now, lastUsedAt: null, revokedAt: null, usage: { requests: 0, last24h: 0 } } };
+}
 function platformSlug(name) { return String(name || "workspace").toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "workspace"; }
 const PLATFORM_PRICING = [
   { id: "owner", name: "Owner", price: 0, unit: "forever", description: "Included for Veyra owners and administrators.", features: ["Unlimited workspaces", "API keys", "Platform documentation"] },
@@ -3789,12 +3796,43 @@ app.patch('/api/platform/workspaces/:id', requireUser, (req, res) => {
 app.delete('/api/platform/workspaces/:id', requireUser, (req, res) => {
   const d = platformData(req.veyraUser), before = d.platform.workspaces.length; d.platform.workspaces = d.platform.workspaces.filter(x => x.id !== req.params.id); if (before === d.platform.workspaces.length) return respondError(res, 404, "Workspace not found.", "WORKSPACE_NOT_FOUND"); savePlatformData(req.veyraUser, d); res.json({ ok: true, deleted: true });
 });
+app.get('/api/platform/workspaces/:id', requireUser, (req, res) => {
+  const d = platformData(req.veyraUser), w = platformFindWorkspace(d, req.params.id);
+  if (!w) return respondError(res, 404, "Workspace not found.", "WORKSPACE_NOT_FOUND");
+  res.json({ ok: true, workspace: platformPublicWorkspace(w), limits: { keysPerWorkspace: platformOwner(req.veyraUser) ? 999 : 10 } });
+});
+app.get('/api/platform/workspaces/:id/keys', requireUser, (req, res) => {
+  const d = platformData(req.veyraUser), w = platformFindWorkspace(d, req.params.id);
+  if (!w) return respondError(res, 404, "Workspace not found.", "WORKSPACE_NOT_FOUND");
+  const keys = (w.keys || []).filter(k => !k.revokedAt);
+  res.json({ ok: true, workspaceId: w.id, keys: keys.map(platformPublicKey), total: keys.length });
+});
 app.post('/api/platform/workspaces/:id/keys', requireUser, (req, res) => {
   const d = platformData(req.veyraUser), w = d.platform.workspaces.find(x => x.id === req.params.id); if (!w) return respondError(res, 404, "Workspace not found.", "WORKSPACE_NOT_FOUND");
   const owner = platformOwner(req.veyraUser); if (!owner && d.platform.billing.status !== "configured") return respondError(res, 402, "Set up billing before creating API keys.", "BILLING_REQUIRED");
   if (!owner && w.keys.filter(k => !k.revokedAt).length >= 10) return respondError(res, 402, "This workspace reached its API key limit.", "PLATFORM_KEY_LIMIT");
-  const raw = `vyr_live_${crypto.randomBytes(24).toString("base64url")}`; const now = new Date().toISOString(); const key = { id: crypto.randomUUID(), name: String(req.body?.name || "Default key").trim().slice(0, 80) || "Default key", prefix: raw.slice(0, 16), hash: crypto.createHash("sha256").update(raw).digest("hex"), createdAt: now, lastUsedAt: null, revokedAt: null };
-  w.keys.push(key); savePlatformData(req.veyraUser, d); res.status(201).json({ ok: true, key: raw, keyInfo: platformPublicKey(key), warning: "Copy this key now. Veyra will not show it again." });
+  const created = platformNewKey(req.body?.name); w.keys.push(created.key); savePlatformData(req.veyraUser, d); res.status(201).json({ ok: true, key: created.raw, keyInfo: platformPublicKey(created.key), warning: "Copy this key now. Veyra will not show it again." });
+});
+app.get('/api/platform/workspaces/:workspaceId/keys/:keyId', requireUser, (req, res) => {
+  const d = platformData(req.veyraUser), w = platformFindWorkspace(d, req.params.workspaceId), k = platformFindKey(w, req.params.keyId);
+  if (!w) return respondError(res, 404, "Workspace not found.", "WORKSPACE_NOT_FOUND");
+  if (!k) return respondError(res, 404, "API key not found.", "API_KEY_NOT_FOUND");
+  res.json({ ok: true, key: platformPublicKey(k), usage: k.usage || { requests: 0, last24h: 0 } });
+});
+app.patch('/api/platform/workspaces/:workspaceId/keys/:keyId', requireUser, (req, res) => {
+  const d = platformData(req.veyraUser), w = platformFindWorkspace(d, req.params.workspaceId), k = platformFindKey(w, req.params.keyId);
+  if (!w) return respondError(res, 404, "Workspace not found.", "WORKSPACE_NOT_FOUND");
+  if (!k || k.revokedAt) return respondError(res, 404, "API key not found.", "API_KEY_NOT_FOUND");
+  if (req.body?.name != null) { const name = String(req.body.name).trim().slice(0, 80); if (name.length < 2) return respondError(res, 400, "Key name is too short.", "API_KEY_NAME_INVALID"); k.name = name; }
+  savePlatformData(req.veyraUser, d); res.json({ ok: true, key: platformPublicKey(k) });
+});
+app.post('/api/platform/workspaces/:workspaceId/keys/:keyId/rotate', requireUser, (req, res) => {
+  const d = platformData(req.veyraUser), w = platformFindWorkspace(d, req.params.workspaceId), old = platformFindKey(w, req.params.keyId);
+  if (!w) return respondError(res, 404, "Workspace not found.", "WORKSPACE_NOT_FOUND");
+  if (!old || old.revokedAt) return respondError(res, 404, "API key not found.", "API_KEY_NOT_FOUND");
+  old.revokedAt = new Date().toISOString();
+  const created = platformNewKey(req.body?.name || old.name); w.keys.push(created.key); savePlatformData(req.veyraUser, d);
+  res.status(201).json({ ok: true, key: created.raw, keyInfo: platformPublicKey(created.key), replacedKeyId: old.id, warning: "The previous key was revoked. Copy this replacement now; it will not be shown again." });
 });
 app.delete('/api/platform/workspaces/:workspaceId/keys/:keyId', requireUser, (req, res) => {
   const d = platformData(req.veyraUser), w = d.platform.workspaces.find(x => x.id === req.params.workspaceId), k = w?.keys?.find(x => x.id === req.params.keyId); if (!k) return respondError(res, 404, "API key not found.", "API_KEY_NOT_FOUND"); k.revokedAt = new Date().toISOString(); savePlatformData(req.veyraUser, d); res.json({ ok: true, revoked: true });
