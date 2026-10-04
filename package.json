@@ -3,19 +3,16 @@
   "version": "8.19.0",
   "private": true,
   "description": "Veyra Browser API, adaptive proxy/browser engine, page resource acceleration, search service, and diagnostics.",
-  "main": "server.js",
+  "main": "src/server.js",
   "scripts": {
-    "start": "node server.js",
-    "prestart": "node ensure-browser.js",
-    "build": "node install-wireproxy.js",
-    "dev": "node --watch server.js",
-    "config": "node config.js",
-    "test:static": "node tests/e2e-hardening-static.mjs",
-    "test:youtube-compat": "node tests/youtube-compat-static.mjs",
-    "test:youtube-media-errors": "node tests/youtube-and-media-errors.mjs",
-    "test:v817": "node tests/v817-regressions.mjs",
-    "test": "npm run test:static && npm run test:youtube-compat && npm run test:youtube-media-errors && npm run test:v817 && npm run test:v8171",
-    "test:v8171": "node tests/v8171-compat.mjs"
+    "start": "node src/server.js",
+    "prestart": "node scripts/ensure-browser.js",
+    "build": "node scripts/install-wireproxy.js",
+    "dev": "node --watch src/server.js",
+    "config": "node src/config/index.js",
+    "check": "node scripts/verify-source.js",
+    "test": "npm run check",
+    "test:legacy": "node tests/legacy/fixed-bugs.js && node tests/legacy/vpn-fixes.js"
   },
   "engines": {
     "node": ">=20"
