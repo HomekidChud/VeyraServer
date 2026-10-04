@@ -5624,10 +5624,15 @@ async function hydrateNeuralFromMongo() {
   return { model: modelLoaded, feedback: feedbackLoaded };
 }
 
-if (require.main === module && CFG.processRole !== "worker") {
-  let shuttingDown = false;
-  let httpServer = null;
-  const hydratePersistence = async () => {
+let veyraServerStarted = false;
+function startVeyraServer() {
+  if (veyraServerStarted) return false;
+  veyraServerStarted = true;
+
+  if (CFG.processRole !== "worker") {
+    let shuttingDown = false;
+    let httpServer = null;
+    const hydratePersistence = async () => {
     try {
       // Keep durable state fail-open: an unavailable or slow MongoDB instance must
       // never prevent Render from detecting this process's HTTP listener.
@@ -5655,9 +5660,9 @@ if (require.main === module && CFG.processRole !== "worker") {
     } catch (err) {
       serverLog("warn", "SYSTEM", `Persistence hydration skipped: ${err.stack || err}`);
     }
-  };
-  const startServer = () => {
-    httpServer = app.listen(PORT, "0.0.0.0", () => {
+    };
+    const startServer = () => {
+      httpServer = app.listen(PORT, "0.0.0.0", () => {
       serverLog("info", "SYSTEM", `Veyra server listening on ${PORT}`);
       serverLog("info", "CONFIG", `Plan ${VEYRA_CONFIG.plan.label} (${CFG.plan}, ${VEYRA_CONFIG.plan.ramMb}MB / ${VEYRA_CONFIG.plan.cpu} CPU, via ${VEYRA_CONFIG.planSource}) — ${CFG.maxActiveJobs} crawlers × ${CFG.maxActiveFetches} fetches, ${CFG.parseWorkers} parse workers, ${CFG.maxProxySessions} sessions, ${CFG.maxBrowserSessions} browser sessions.`);
       serverLog("info", "MONGO", mongoStore.status().configured ? `MongoDB configured (${CFG.mongoDb}); persistence/cache is fail-open.` : "MongoDB not configured; using local/ephemeral persistence where applicable.");
@@ -5671,37 +5676,41 @@ if (require.main === module && CFG.processRole !== "worker") {
         castServer = new CastServer(httpServer, (level, source, msg) => serverLog(level, source, msg), { frontendUrl: CFG.frontendUrl });
         serverLog("info", "CAST", `Cast server upgraded to ${castServer.useWebSocket ? "WebSocket" : "HTTP polling"} mode`);
       } catch (e) { serverLog("warn", "CAST", `Cast WebSocket upgrade kept polling mode: ${e.message}`); }
-    });
-    httpServer.once("error", err => {
-      serverLog("error", "SYSTEM", `HTTP listener failed: ${err.stack || err}`);
-      process.exitCode = 1;
-    });
-    void hydratePersistence();
-  };
-  startServer();
+      });
+      httpServer.once("error", err => {
+        serverLog("error", "SYSTEM", `HTTP listener failed: ${err.stack || err}`);
+        process.exitCode = 1;
+      });
+      void hydratePersistence();
+    };
+    startServer();
   
-  const shutdown = async signal => {
-    if (shuttingDown) return; shuttingDown = true;
-    serverLog("info", "SYSTEM", `${signal} received — shutting down.`);
-    await neuralTrainer.stop();
-    for (const j of jobs.values()) if (!j.done) { j.stopRequested = true; j.stopReason = "shutdown"; j.controller?.abort?.(); }
-    const force = setTimeout(() => process.exit(0), 8000); force.unref();
-    await Promise.allSettled([
-      vpnManager.close?.(),
-      workerPool?.close(),
-      browserEngine.shedIdle(0).then(() => browserEngine.browser?.close()),
-      DIRECT_HTTP_AGENT.close(),
-      mongoStore.close()
-    ]);
-    process.exit(0);
-  };
-  process.once("SIGTERM", () => shutdown("SIGTERM"));
-  process.once("SIGINT", () => shutdown("SIGINT"));
-} else if (require.main === module) {
-  pumpIndexSeeds().catch(e => serverLog("warn", "SEARCH", `Seed startup failed: ${e.message}`));
-  if (CFG.indexRefreshMs > 0) setInterval(() => pumpIndexSeeds().catch(e => serverLog("warn", "SEARCH", `Seed scheduler failed: ${e.message}`)), 30000).unref();
-  serverLog("info", "SYSTEM", "PROCESS_ROLE=worker selected; no HTTP listener started.");
+    const shutdown = async signal => {
+      if (shuttingDown) return; shuttingDown = true;
+      serverLog("info", "SYSTEM", `${signal} received — shutting down.`);
+      await neuralTrainer.stop();
+      for (const j of jobs.values()) if (!j.done) { j.stopRequested = true; j.stopReason = "shutdown"; j.controller?.abort?.(); }
+      const force = setTimeout(() => process.exit(0), 8000); force.unref();
+      await Promise.allSettled([
+        vpnManager.close?.(),
+        workerPool?.close(),
+        browserEngine.shedIdle(0).then(() => browserEngine.browser?.close()),
+        DIRECT_HTTP_AGENT.close(),
+        mongoStore.close()
+      ]);
+      process.exit(0);
+    };
+    process.once("SIGTERM", () => shutdown("SIGTERM"));
+    process.once("SIGINT", () => shutdown("SIGINT"));
+  } else {
+    pumpIndexSeeds().catch(e => serverLog("warn", "SEARCH", `Seed startup failed: ${e.message}`));
+    if (CFG.indexRefreshMs > 0) setInterval(() => pumpIndexSeeds().catch(e => serverLog("warn", "SEARCH", `Seed scheduler failed: ${e.message}`)), 30000).unref();
+    serverLog("info", "SYSTEM", "PROCESS_ROLE=worker selected; no HTTP listener started.");
+  }
+  return true;
 }
+
+if (require.main === module) startVeyraServer();
 
 
 const __workerOps = {
@@ -5711,4 +5720,4 @@ const __workerOps = {
   discover: (text, kind, base, contentType) => collectDiscovery(text, kind, base, contentType)
 };
 
-module.exports = { app, mongoStore, mergeStrayProxyParams, detectChallenge, CFG, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions, normalizeOpenEngineMode, shouldStartCrawlerForEngineMode };
+module.exports = { app, mongoStore, mergeStrayProxyParams, detectChallenge, CFG, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions, normalizeOpenEngineMode, shouldStartCrawlerForEngineMode, startVeyraServer };
