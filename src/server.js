@@ -4751,7 +4751,20 @@ app.get("/api/view", async (req, res) => { try { await proxyRequest(req, res, "v
   serverLog("warn", "PROXY", `View failed for ${sanitizeLogUrl(req.query?.url || "")} — ${message}`, { requestId: req.veyraRequestId, code: publicCode, upstreamCode, upstreamPhase: e.upstreamPhase || null, targetHost: e.upstreamHost || hostOf(req.query?.url || "") });
   respondError(res, e.code === "VPN_KILL_SWITCH" ? 503 : 502, `Veyra could not load this page: ${message}`, publicCode, { requestId: req.veyraRequestId, legacyCode: "PROXY_VIEW_ERROR", upstreamCode, upstreamPhase: e.upstreamPhase || null });
 } });
-app.post("/api/view", async (req, res) => { try { await proxyRequest(req, res, "view"); } catch (e) { respondError(res, 502, `Veyra could not submit this form: ${e.message}`, "PROXY_FORM_ERROR", { requestId: req.veyraRequestId }); } });
+// A proxied page can issue any normal HTTP request through fetch/XHR. Keep the
+// view and resource lanes method-complete so direct API callers and browser
+// runtime requests behave identically (including PUT/PATCH/DELETE/HEAD).
+const proxyMethods = ["get", "post", "put", "patch", "delete", "head"];
+for (const method of proxyMethods) {
+  if (method === "get") continue; // GET /api/view has the snapshot fallback above.
+  app[method]("/api/view", async (req, res) => {
+    try { await proxyRequest(req, res, "view"); }
+    catch (e) {
+      const message = method === "post" ? `Veyra could not submit this form: ${e.message}` : `Veyra view ${method.toUpperCase()} request failed: ${e.message}`;
+      respondError(res, 502, message, method === "post" ? "PROXY_FORM_ERROR" : "PROXY_VIEW_METHOD_ERROR", { requestId: req.veyraRequestId });
+    }
+  });
+}
 app.get("/api/resource", async (req, res) => { try { await proxyRequest(req, res, "resource"); } catch (e) {
   const upstreamCode = e.upstreamCode || networkErrorCode(e) || null;
   const code = /^UPSTREAM_[A-Z0-9_]+$/.test(String(e.code || "")) ? e.code : "PROXY_RESOURCE_ERROR";
