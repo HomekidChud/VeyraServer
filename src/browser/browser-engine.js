@@ -440,7 +440,7 @@ class BrowserEngine {
       const url = page.url();
       const title = await page.title().catch(() => '');
       const text = await page.locator('body').innerText({ timeout: 1500 }).catch(() => '');
-      const signal = /captcha|verify you are human|security verification|attention required|just a moment|checking your browser|challenge/i;
+      const signal = /captcha|verify you are human|security verification|attention required|just a moment|checking your browser|challenge|robot check failed|couldn['’]t confirm.{0,80}robot|session wasn['’]t started/i;
       if (signal.test(url) || signal.test(title) || signal.test(text.slice(0, 12000))) return { url, title: String(title).slice(0, 200) };
     } catch {}
     return null;
