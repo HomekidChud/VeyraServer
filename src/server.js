@@ -112,6 +112,9 @@ const CFG = Object.freeze({
   // after every proxied document can starve the foreground request lane,
   // especially when several mobile tabs are opened at once.
   youtubeWarmResources: boolEnv("YT_WARM_RESOURCES", false),
+  // Cookie-free YouTube home HTML is safe to reuse briefly across sessions;
+  // this avoids a full upstream round-trip for every new mobile tab.
+  youtubeDocumentCache: boolEnv("YT_DOCUMENT_CACHE", true),
   processRole: enumEnv("PROCESS_ROLE", "web", ["web", "worker", "all"]),
   
   
@@ -1388,11 +1391,13 @@ async function fetchCached(url, opts = {}) {
     if (!opts.noCache && method === "GET") {
       const noStore = /no-store/i.test(result.cacheControl || "");
       const bodyBytes = Buffer.byteLength(result.body || Buffer.alloc(0));
-      if (!noStore && !result.truncated && !result.tooLarge && bodyBytes <= CFG.maxCacheBodyBytes) cacheSet(proxyCache, key, { response: result, etag: result.etag, lastModified: result.lastModified }, CFG.maxProxyCacheEntries);
+      const youtubeDocument = CFG.youtubeDocumentCache && /text\/html|application\/xhtml/i.test(String(result.contentType || "")) && isYoutubeHost(new URL(normalized).hostname) && !result.setCookieHeader && !cookieHeader(sid, normalized);
+      const cacheableDocument = youtubeDocument && !result.truncated && !result.tooLarge && bodyBytes <= CFG.maxCacheBodyBytes;
+      if ((!noStore || cacheableDocument) && !result.truncated && !result.tooLarge && bodyBytes <= CFG.maxCacheBodyBytes) cacheSet(proxyCache, key, { response: result, etag: result.etag, lastModified: result.lastModified }, CFG.maxProxyCacheEntries);
       const shareableType = /(?:text\/css|javascript|font\/|image\/|image\/svg\+xml)/i.test(String(result.contentType || ""));
       const noSessionCookies = !result.setCookieHeader && (!sid || !cookieHeader(sid, normalized));
       const incognito = isIncognitoSid(sid);
-      const shared = !incognito && CFG.mongoSharedCache && shareableType && noSessionCookies && !noStore && !result.truncated && !result.tooLarge && bodyBytes <= Math.min(CFG.maxCacheBodyBytes, CFG.mongoCacheBodyMaxBytes);
+      const shared = CFG.mongoSharedCache && (shareableType || youtubeDocument) && noSessionCookies && (!noStore || youtubeDocument) && !result.truncated && !result.tooLarge && bodyBytes <= Math.min(CFG.maxCacheBodyBytes, CFG.mongoCacheBodyMaxBytes) && (!incognito || youtubeDocument);
       if (shared) { const sharedResult = { ...result, sessionId: "" }; cacheSet(proxyCache, sharedKey, { response: sharedResult, etag: result.etag, lastModified: result.lastModified }, CFG.maxProxyCacheEntries); void mongoStore.putProxyCache(sharedKey, result, { url: result.finalUrl || normalized, sessionId: "" }); }
       else if (!sid && !incognito && !noStore && !result.truncated && !result.tooLarge && bodyBytes <= Math.min(CFG.maxCacheBodyBytes, CFG.mongoCacheBodyMaxBytes)) void mongoStore.putProxyCache(key, result, { url: result.finalUrl || normalized, sessionId: "" });
     }

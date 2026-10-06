@@ -31,6 +31,8 @@ services:
       # YouTube's speculative asset graph can starve foreground mobile loads.
       - key: YT_WARM_RESOURCES
         value: "false"
+      - key: YT_DOCUMENT_CACHE
+        value: "true"
       - key: YT_MAX_HEIGHT
         value: "360"
       # Five minutes gives the mobile page enough time to initialize and

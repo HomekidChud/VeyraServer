@@ -82,6 +82,7 @@ GET forms are rewritten to `/api/form-get/:target/:sid` so form fields cannot ov
 - `History.prototype` is patched and a watchdog restores the proxied URL if a page escapes it.
 - Relative-path fallback: root-relative requests that bypass the runtime (DOM-inserted `<script>`, audio, CSS) are resolved from the Referer, or from the `veyra_ctx` cookie. Webpack chunks requested as `/api/<chunk>.js` are resolved against recently proxied script directories. `PROXY_RELATIVE_FALLBACK=true` (default).
 - The JS rewriter no longer rewrites partial dynamic-import prefixes such as `import("./" + chunk)`.
+- Cookie-free YouTube HTML can use a short shared cache (`YT_DOCUMENT_CACHE=true`, default), while cookie-bearing or authenticated sessions remain isolated.
 
 ### Known limits
 - YouTube video playback from a datacenter IP (Render, AWS) is blocked by Google's "Sign in to confirm you're not a bot" check. Route the session through a residential `VPN_PROXY_SERVER` profile if you need playback.
