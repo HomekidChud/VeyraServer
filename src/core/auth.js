@@ -28,12 +28,12 @@ class AuthStore {
     this.adminEmails = new Set((opts.adminEmails || []).map(e => String(e).trim().toLowerCase()).filter(Boolean));
     this.allowSignup = opts.allowSignup !== false;
     this.maxUsers = opts.maxUsers || 5000;
-    this.maxDataBytes = opts.maxDataBytes || 64 * 1024;
+    this.maxDataBytes = opts.maxDataBytes || 512 * 1024;
     this.log = opts.log || (() => {});
     this.persistence = opts.persistence || null;
     this.ready = Promise.resolve();
     if (this.persistence?.enabled) {
-      this.ready = this.persistence.loadUsers().then(rows => { for (const u of rows || []) { if (!u?.id || !u?.email) continue; this.users.set(u.id, u); this.byEmail.set(u.email, u.id); } this.log("info", "AUTH", `Loaded ${this.users.size} account(s) including MongoDB persistence.`); }).catch(e => this.log("warn", "AUTH", `MongoDB account hydration skipped: ${e.message}`));
+      this.ready = this.persistence.loadUsers().then(rows => { for (const u of rows || []) { if (!u?.id || !u?.email) continue; this.prepareUser(u); this.users.set(u.id, u); this.byEmail.set(u.email, u.id); } this.log("info", "AUTH", `Loaded ${this.users.size} account(s) including MongoDB persistence.`); }).catch(e => this.log("warn", "AUTH", `MongoDB account hydration skipped: ${e.message}`));
     }
     this.users = new Map();      
     this.byEmail = new Map();    
@@ -66,6 +66,7 @@ class AuthStore {
           data: {},
           isTestAdmin: true,
         };
+        this.prepareUser(user);
         this.users.set(user.id, user);
         this.byEmail.set(this.testAdminEmail, user.id);
         this.save();
@@ -89,11 +90,18 @@ class AuthStore {
   load() {
     try {
       const raw = JSON.parse(fs.readFileSync(this.file, "utf8"));
-      for (const u of raw.users || []) { this.users.set(u.id, u); this.byEmail.set(u.email, u.id); }
+      for (const u of raw.users || []) { this.prepareUser(u); this.users.set(u.id, u); this.byEmail.set(u.email, u.id); }
       this.log("info", "AUTH", `Loaded ${this.users.size} account(s) from ${this.file}.`);
     } catch (e) {
       if (e.code !== "ENOENT") this.log("warn", "AUTH", `Could not read ${this.file}: ${e.message}`);
     }
+  }
+  prepareUser(user) {
+    if (!user?.id) return user;
+    const label = String(user.name || user.email?.split("@")[0] || "user").normalize("NFKC").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "user";
+    user.storagePath ||= `users/${label}-${String(user.id).slice(0, 12)}`;
+    user.data ||= {};
+    return user;
   }
   save() {
     const snapshot = JSON.stringify({ version: 1, users: [...this.users.values()] });
@@ -173,6 +181,7 @@ class AuthStore {
     if (this.users.size >= this.maxUsers) throw authError(503, "This server has reached its account limit.", "AUTH_FULL");
     const now = new Date().toISOString();
     const user = { id: crypto.randomUUID(), email, name: name || email.split("@")[0], password: this.hash(password), tokenVersion: 0, createdAt: now, lastLoginAt: now, data: {} };
+    this.prepareUser(user);
     this.users.set(user.id, user); this.byEmail.set(email, user.id);
     this.save();
     void this.persistence?.upsertUser(user);

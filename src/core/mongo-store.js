@@ -27,6 +27,7 @@ class MongoStore {
         await Promise.all([
           this.db.collection("users").createIndex({ id: 1 }, { unique: true }).catch(() => {}),
           this.db.collection("users").createIndex({ email: 1 }, { unique: true }).catch(() => {}),
+          this.db.collection("users").createIndex({ storagePath: 1 }, { unique: true, sparse: true }).catch(() => {}),
           this.db.collection("proxy_cache").createIndex({ key: 1 }, { unique: true }).catch(() => {}),
           this.db.collection("proxy_cache").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }).catch(() => {}),
           this.db.collection("search_documents").createIndex({ url: 1 }, { unique: true }).catch(() => {}),
@@ -57,7 +58,17 @@ class MongoStore {
     catch (e) { this.stats.failures += 1; this.connected = false; this.disabledReason = e?.message || String(e); this.retryAfter = Date.now() + 30_000; try { await this.client?.close(); } catch {} this.client = null; this.db = null; return null; }
   }
   async loadUsers() { const rows = await this.withDb(db => db.collection("users").find({}, { projection: { _id: 0 } }).limit(5000).toArray()); return Array.isArray(rows) ? rows : []; }
-  async upsertUser(user) { if (!user?.id) return; const doc = JSON.parse(JSON.stringify(user)); this.stats.writes += 1; void this.withDb(db => db.collection("users").updateOne({ id: doc.id }, { $set: doc }, { upsert: true })); }
+  async upsertUser(user) {
+    if (!user?.id) return;
+    const doc = JSON.parse(JSON.stringify(user));
+    // MongoDB has databases, collections, and documents rather than folders.
+    // storagePath gives each account the requested veyra/users/<name> layout
+    // while keeping the account and its complete data in one atomic document.
+    doc.storagePath ||= `users/${String(doc.name || doc.email || "user").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "user"}-${String(doc.id).slice(0, 12)}`;
+    doc.userName = doc.name || doc.email?.split("@")[0] || "user";
+    this.stats.writes += 1;
+    void this.withDb(db => db.collection("users").updateOne({ id: doc.id }, { $set: doc }, { upsert: true }));
+  }
   async deleteUser(id) { if (!id) return; this.stats.writes += 1; void this.withDb(db => db.collection("users").deleteOne({ id: String(id) })); }
   async getProxyCache(key) {
     if (!key) return null; this.stats.reads += 1;
