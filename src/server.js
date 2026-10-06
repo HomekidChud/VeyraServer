@@ -325,9 +325,9 @@ const allowedOrigins = CFG.frontendOrigins.includes("*") ? true : CFG.frontendOr
 app.use(cors({
   origin: allowedOrigins,
   methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  // Keep preflight requests local, but allow the explicit proxy OPTIONS
-  // route below to forward genuine OPTIONS requests to the target site.
-  preflightContinue: true,
+  // Terminate browser preflights here. If these continue to the API fallback,
+  // the browser sees a 404 and reports the request as a generic fetch failure.
+  preflightContinue: false,
   exposedHeaders: ["X-Veyra-Request-ID", "X-Veyra-Canonical-URL", "X-Veyra-Challenge", "X-Veyra-Content-Type", "X-Veyra-Session-ID", "X-Veyra-Session-Expires"]
 }));
 
