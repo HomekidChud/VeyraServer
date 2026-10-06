@@ -181,7 +181,7 @@ These are the `/api/auth/*` endpoints: signup, login, me, logout-all and sync.
 
 ### Session time limit
 
-Every session is hard-deleted after `SESSION_TIME_LIMIT_MS`, which defaults to 120000 (2 minutes). Deletion covers:
+Every session is hard-deleted after `SESSION_TIME_LIMIT_MS`, which defaults to 300000 (5 minutes). Deletion covers:
 
 - cookies
 - the Chromium context
@@ -211,7 +211,7 @@ Expired session IDs are tombstoned, so clients can't reuse them. `POST /api/sess
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `SESSION_TIME_LIMIT_MS` | `120000` | Max session lifetime before auto-delete |
+| `SESSION_TIME_LIMIT_MS` | `300000` | Max session lifetime before auto-delete |
 | `VEYRA_AUTH_SECRET` | random per boot | Token signing key. **Set this**, or everyone is signed out on restart |
 | `VEYRA_DATA_DIR` | `./data` | Where `users.json` is stored. Point it at a Render persistent disk |
 | `VEYRA_ALLOW_SIGNUP` | `true` | Set `false` to close registration |

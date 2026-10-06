@@ -108,6 +108,10 @@ const CFG = Object.freeze({
   
   youtubeFastProxyOnly: boolEnv("YT_FAST_PROXY_ONLY", LEAN_MODE),
   youtubeMaxHeight: numberEnv("YT_MAX_HEIGHT", 360, 144, 1080),
+  // YouTube discovers a large, mostly speculative asset graph. Warming it
+  // after every proxied document can starve the foreground request lane,
+  // especially when several mobile tabs are opened at once.
+  youtubeWarmResources: boolEnv("YT_WARM_RESOURCES", false),
   processRole: enumEnv("PROCESS_ROLE", "web", ["web", "worker", "all"]),
   
   
@@ -276,7 +280,9 @@ const CFG = Object.freeze({
   
   
   adminGate: boolEnv("VEYRA_ADMIN_GATE", true),
-  sessionTimeLimitMs: numberEnv("SESSION_TIME_LIMIT_MS", 2 * 60 * 1000, 0, 7 * 24 * 60 * 60 * 1000),
+  // Two minutes is shorter than a normal mobile browsing interaction and
+  // caused an otherwise healthy YouTube tab to become unusable mid-load.
+  sessionTimeLimitMs: numberEnv("SESSION_TIME_LIMIT_MS", 5 * 60 * 1000, 0, 7 * 24 * 60 * 60 * 1000),
   
   adminSessionTimeLimitMs: 10 * 60 * 1000,
   authSecret: process.env.VEYRA_AUTH_SECRET || "",
@@ -4460,6 +4466,37 @@ function proxyRefererCanonical(req) {
   return normalizeUrl(raw);
 }
 
+function isYoutubeHost(hostname) {
+  const h = String(hostname || "").toLowerCase().replace(/^www\./, "");
+  return h === "youtube.com" || h === "m.youtube.com" || h === "music.youtube.com";
+}
+
+// YouTube commonly redirects m.youtube.com to www.youtube.com at the edge.
+// That redirect is valid upstream, but exposing it as Veyra's virtual URL
+// makes mobile navigation and relative app routes escape the intended view.
+function virtualPageUrl(requestedUrl, finalUrl) {
+  const requested = normalizeUrl(requestedUrl);
+  const final = normalizeUrl(finalUrl || requestedUrl);
+  if (!requested || !final) return final || requested;
+  try {
+    const from = new URL(requested), to = new URL(final);
+    if (from.hostname.toLowerCase() === "m.youtube.com" && isYoutubeHost(to.hostname)) {
+      to.hostname = "m.youtube.com";
+      return to.href;
+    }
+  } catch {}
+  return final;
+}
+
+function shouldWarmPageResources(url) {
+  try {
+    const host = new URL(url).hostname;
+    return !isYoutubeHost(host) || CFG.youtubeWarmResources;
+  } catch {
+    return true;
+  }
+}
+
 function proxyAcceptForResource(req, mode) {
   if (req.get("Accept")) return String(req.get("Accept")).slice(0, 1000);
   return mode === "view"
@@ -4621,7 +4658,10 @@ async function proxyRequest(req, res, mode) {
     const browserPriority = mode === "view" ? 1000 : (looksLikeApiResource(canonical, accept, method) ? 980 : (/css|javascript|font|svg/i.test(accept) ? 900 : /image/i.test(accept) ? 800 : 700));
     const isNextRsc = /text\/x-component|text\/x-react-server-components/i.test(String(accept || "")) || !!req.get("RSC") || !!req.get("Next-Router-State-Tree") || !!req.get("Next-Action") || !!req.get("Next-Url");
     const requestLimit = mediaRequest ? CFG.maxProxyMediaBytes : (looksLikeApiResource(canonical, accept, method) || isNextRsc ? CFG.proxyApiBodyBytes : CFG.maxProxyBodyBytes);
-    const retries = mediaRequest ? 1 : (looksLikeApiResource(canonical, accept, method) || isNextRsc ? CFG.proxyApiRetries : CFG.maxRetries);
+    // googlevideo URLs are signed and commonly IP-bound. Retrying a 403
+    // cannot change that decision and only doubles queue pressure.
+    const signedYoutubeMedia = mediaRequest && /(?:googlevideo\.com|videoplayback)/i.test(canonical);
+    const retries = signedYoutubeMedia ? 0 : (mediaRequest ? 1 : (looksLikeApiResource(canonical, accept, method) || isNextRsc ? CFG.proxyApiRetries : CFG.maxRetries));
     const requestUserAgent = req.get("User-Agent") ? String(req.get("User-Agent")).slice(0, 2000) : "";
     const hasAuthorization = !!req.get("Authorization");
     const result = await browserScheduler.request(browserKey, () => fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, requestId: req.veyraRequestId, userAgent: requestUserAgent || undefined, limit: requestLimit, retries, limitForContentType, noCache: method !== "GET" || mediaRequest || hasAuthorization || isNextRsc, timeout: mediaRequest ? CFG.mediaRequestTimeoutMs : CFG.requestTimeoutMs, bodyTimeoutMs: mediaRequest ? CFG.mediaBodyTimeoutMs : CFG.bodyTimeoutMs, streamOversize: mode === "resource" }), { priority: browserPriority + (mediaRequest ? 30 : 0), host: hostOf(canonical), url: canonical });
@@ -4666,9 +4706,10 @@ async function proxyRequest(req, res, mode) {
       
       
       
-      const enhanced = fullPage.enhanceFullPage(payload.toString("utf8"), result.finalUrl || canonical);
+      const pageUrl = virtualPageUrl(canonical, result.finalUrl || canonical);
+      const enhanced = fullPage.enhanceFullPage(payload.toString("utf8"), pageUrl);
       if (enhanced.enhanced) { payload = Buffer.from(enhanced.html, "utf8"); fullPageEnhanced = true; }
-      payload = Buffer.from(await rewriteOffThread("rewriteHtml", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteHtml), "utf8");
+      payload = Buffer.from(await rewriteOffThread("rewriteHtml", payload.toString("utf8"), [pageUrl, sid], rewriteHtml), "utf8");
     }
     else if (!download && mode === "resource" && result.contentType.toLowerCase().includes("text/css")) payload = Buffer.from(await rewriteOffThread("rewriteCss", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteCssText), "utf8");
     else if (!download && mode === "resource" && /javascript|ecmascript/.test(result.contentType.toLowerCase())) payload = Buffer.from(await rewriteOffThread("rewriteJs", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteJsText), "utf8");
@@ -4682,7 +4723,8 @@ async function proxyRequest(req, res, mode) {
     payload = result.body;
   }
   for (const [k,v] of Object.entries(upstreamHeaders)) if (v) res.setHeader(k, v);
-  res.setHeader("X-Veyra-Canonical-URL", result.finalUrl || canonical);
+  const exposedCanonical = mode === "view" ? virtualPageUrl(canonical, result.finalUrl || canonical) : (result.finalUrl || canonical);
+  res.setHeader("X-Veyra-Canonical-URL", exposedCanonical);
   res.setHeader("X-Veyra-Session-ID", sid);
   res.setHeader("X-Veyra-Content-Type", result.contentType || "application/octet-stream");
   res.setHeader("X-Veyra-Proxy-Mode", mode);
@@ -4699,7 +4741,9 @@ async function proxyRequest(req, res, mode) {
   }
   res.status(outputStatus).send(payload);
   if (mode === "view" && !result.truncated && !result.tooLarge && /html|xhtml|^$/i.test(result.contentType || "")) {
-    void warmPageResources(result.body.toString("utf8"), result.finalUrl || canonical, sid);
+    if (shouldWarmPageResources(result.finalUrl || canonical)) {
+      void warmPageResources(result.body.toString("utf8"), result.finalUrl || canonical, sid);
+    }
   }
   } finally {
     

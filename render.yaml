@@ -28,8 +28,15 @@ services:
         value: "true"
       - key: YT_FAST_PROXY_ONLY
         value: "false"
+      # YouTube's speculative asset graph can starve foreground mobile loads.
+      - key: YT_WARM_RESOURCES
+        value: "false"
       - key: YT_MAX_HEIGHT
         value: "360"
+      # Five minutes gives the mobile page enough time to initialize and
+      # prevents the old two-minute hard expiry during normal browsing.
+      - key: SESSION_TIME_LIMIT_MS
+        value: "300000"
       # Keep in sync with `plan:` above (npm run config -- plan <name> does both).
       # "auto" also works: Veyra detects the instance's RAM/CPU from cgroups.
       - key: VEYRA_ENV
