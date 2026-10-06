@@ -325,10 +325,9 @@ const allowedOrigins = CFG.frontendOrigins.includes("*") ? true : CFG.frontendOr
 app.use(cors({
   origin: allowedOrigins,
   methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  
-  
-  
-  
+  // Keep preflight requests local, but allow the explicit proxy OPTIONS
+  // route below to forward genuine OPTIONS requests to the target site.
+  preflightContinue: true,
   exposedHeaders: ["X-Veyra-Request-ID", "X-Veyra-Canonical-URL", "X-Veyra-Challenge", "X-Veyra-Content-Type", "X-Veyra-Session-ID", "X-Veyra-Session-Expires"]
 }));
 
@@ -4773,7 +4772,17 @@ app.get("/api/resource", async (req, res) => { try { await proxyRequest(req, res
 } });
 app.get("/api/download", async (req, res) => { try { req.query.download = "1"; await proxyRequest(req, res, "resource"); } catch (e) { respondError(res, 502, `Veyra download error: ${e.message}`, "DOWNLOAD_ERROR", { requestId: req.veyraRequestId }); } });
 app.post("/api/resource", async (req, res) => { try { await proxyRequest(req, res, "resource"); } catch (e) { respondError(res, 502, `Veyra resource request failed: ${e.message}`, "PROXY_RESOURCE_POST_ERROR", { requestId: req.veyraRequestId }); } });
-for (const method of ["put","patch","delete","head","options"]) app[method]("/api/resource", async (req,res)=>{ try { await proxyRequest(req,res,"resource"); } catch(e) { respondError(res,502,`Veyra resource ${method.toUpperCase()} request failed: ${e.message}`,"PROXY_RESOURCE_METHOD_ERROR",{requestId:req.veyraRequestId}); } });
+for (const method of ["put","patch","delete","head"]) app[method]("/api/resource", async (req,res)=>{ try { await proxyRequest(req,res,"resource"); } catch(e) { respondError(res,502,`Veyra resource ${method.toUpperCase()} request failed: ${e.message}`,"PROXY_RESOURCE_METHOD_ERROR",{requestId:req.veyraRequestId}); } });
+app.options(["/api/view", "/api/resource"], async (req, res) => {
+  // Browser CORS preflight is for Veyra itself; do not send its
+  // Access-Control-* headers to the target site. A bare OPTIONS request is
+  // an actual upstream request and should follow the same proxy contract as
+  // GET/POST/PUT/PATCH/DELETE.
+  if (req.get("Access-Control-Request-Method") || req.get("Access-Control-Request-Headers")) return res.status(204).end();
+  const mode = req.path === "/api/view" ? "view" : "resource";
+  try { await proxyRequest(req, res, mode); }
+  catch (e) { respondError(res, 502, `Veyra ${mode} OPTIONS request failed: ${e.message}`, "PROXY_OPTIONS_ERROR", { requestId: req.veyraRequestId }); }
+});
 
 const OPEN_ENGINE_MODES = new Set(["auto", "proxy", "crawler", "exhaustive", "browser", "combined"]);
 function normalizeOpenEngineMode(value) {
