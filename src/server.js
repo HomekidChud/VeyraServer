@@ -4528,6 +4528,16 @@ function shouldDirectYoutubeStaticAsset(url, contentType) {
   }
 }
 
+function isDirectYoutubeStaticUrl(url) {
+  if (!CFG.youtubeDirectStaticAssets) return false;
+  try {
+    const u = new URL(url);
+    return isYoutubeHost(u.hostname) && (/^\/s\//i.test(u.pathname) || /^\/player\//i.test(u.pathname));
+  } catch {
+    return false;
+  }
+}
+
 function proxyAcceptForResource(req, mode) {
   if (req.get("Accept")) return String(req.get("Accept")).slice(0, 1000);
   return mode === "view"
@@ -4628,6 +4638,12 @@ async function proxyRequest(req, res, mode) {
     !!req.get("Range") || /video|audio/i.test(accept) || /googlevideo\.com/i.test(canonical) || /videoplayback/i.test(canonical)
   );
   if (!safeMethod(method)) return respondError(res, 405, "Unsupported proxy method.", "PROXY_METHOD_NOT_ALLOWED");
+  if (mode === "resource" && !download && (method === "GET" || method === "HEAD") && isDirectYoutubeStaticUrl(canonical)) {
+    res.setHeader("location", canonical);
+    res.setHeader("cache-control", "public, max-age=300");
+    res.setHeader("x-veyra-direct-asset", "youtube-cdn");
+    return res.status(302).end();
+  }
   const body = method === "GET" || method === "HEAD" ? undefined : (() => {
     if (Buffer.isBuffer(req.body)) return req.body.length ? req.body : undefined;
     if (req.is("application/x-www-form-urlencoded")) return new URLSearchParams(req.body || {}).toString();
