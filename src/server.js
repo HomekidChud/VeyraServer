@@ -1812,8 +1812,33 @@ function injectRuntime(html, original, sid = "") {
   function fmtArg(x,d){d=d||0;if(typeof x==='string')return x;if(x instanceof Error)return (x.name||'Error')+': '+x.message+(x.stack?'\\n'+String(x.stack).split('\\n').slice(1,6).join('\\n'):'');if(typeof Node!=='undefined'&&x instanceof Node)return x.nodeType===1?'<'+x.tagName.toLowerCase()+(x.id?'#'+x.id:'')+(x.className&&typeof x.className==='string'?'.'+x.className.trim().split(/\\s+/).slice(0,3).join('.'):'')+'>':x.nodeName;if(typeof x==='function')return 'ƒ '+(x.name||'anonymous')+'()';try{const seen=new WeakSet();return JSON.stringify(x,(k,v)=>{if(typeof v==='object'&&v){if(seen.has(v))return '[Circular]';seen.add(v)}if(typeof v==='function')return 'ƒ';if(typeof v==='bigint')return String(v)+'n';return v})||String(x)}catch{return String(x)}}
   let consoleBudget=400,consoleWindow=Date.now();
   try{['log','info','debug','warn','error','trace','dir','table','assert','group','groupCollapsed','groupEnd','count','timeEnd'].forEach(level=>{if(typeof console[level]!=='function')return;const native=console[level].bind(console);console[level]=(...args)=>{native(...args);if(level==='assert'){if(args[0])return;args=['Assertion failed:',...args.slice(1)]}const now=Date.now();if(now-consoleWindow>2000){consoleWindow=now;consoleBudget=400}if(--consoleBudget<0)return;let stack='';if(level==='trace'||level==='error'){try{stack=String(new Error().stack||'').split('\\n').slice(2,9).join('\\n')}catch{}}let msg='';try{msg=args.map(x=>fmtArg(x)).join(' ')}catch{}topPost({type:'veyra:page-console',level:level==='assert'?'error':level,sessionId:SESSION_ID,message:msg.slice(0,20000),stack,time:now,pageUrl:virtualUrl})}})}catch{}
-  window.addEventListener('error',e=>topPost({type:'veyra:page-error',level:'error',sessionId:SESSION_ID,message:e.message||'Resource error',url:e.filename||'',line:e.lineno||null,column:e.colno||null,stack:e.error&&e.error.stack||'',pageUrl:virtualUrl}),true);
-  window.addEventListener('unhandledrejection',e=>topPost({type:'veyra:page-error',level:'error',sessionId:SESSION_ID,message:e.reason&&e.reason.message||String(e.reason||'Unhandled rejection'),stack:e.reason&&e.reason.stack||'',pageUrl:virtualUrl}),true);
+  function failedResource(target){
+    if(!target||target===window||target.nodeType!==1)return null;
+    const tag=String(target.tagName||'').toLowerCase();
+    if(!tag)return null;
+    const raw=target.currentSrc||target.src||target.href||target.poster||target.data||target.getAttribute('src')||target.getAttribute('href')||target.getAttribute('poster')||'';
+    let url='';
+    try{const parsed=new URL(unwrap(raw),virtualUrl);if(/^https?:$/.test(parsed.protocol))url=parsed.href}catch{}
+    let type=tag;
+    if(tag==='link')type=String(target.rel||'').toLowerCase().includes('stylesheet')?'stylesheet':'link';
+    else if(tag==='img'||tag==='image')type='image';
+    else if(tag==='video'||tag==='audio'||tag==='source')type='media';
+    const id=String(target.id||'').slice(0,120);
+    const selector=tag+(id?'#'+id:'');
+    let status=Number(target.status||target.statusCode||target.responseStatus);
+    if(!Number.isFinite(status)||status<100||status>599)status=null;
+    return {tag,type,url,selector,status};
+  }
+  window.addEventListener('error',function(e){
+    const resource=failedResource(e.target);
+    const rawMessage=String(e.message||'');
+    const opaque=!resource&&!e.filename&&/^Script error[.]?$/i.test(rawMessage)&&!e.error;
+    const resourceUrl=resource&&resource.url||'';
+    const message=resource?'Failed to load <'+resource.tag+'> resource.':rawMessage||'Resource error';
+    const note=opaque?'The browser provided only a generic Script error with no source location or stack. Cross-origin error details may be hidden unless the script and its server opt in to error sharing.':resource?(resource.status?'The page reports a failed resource; HTTP status '+resource.status+'.':'The failed element is identified, but its error event does not include an HTTP status or network failure reason. Check Network for the request.') : '';
+    topPost({type:'veyra:page-error',level:'error',sessionId:SESSION_ID,message,errorName:e.error&&e.error.name||'',errorDescription:e.error&&e.error.message||'',diagnosis:opaque?'cross-origin-script':resource?'resource-load':'',browserNote:note,context:resource?'Failed resource element: <'+resource.tag+'>.':opaque?'Browser-sanitized cross-origin script error.':'',url:e.filename||resourceUrl,resourceUrl,resourceTag:resource&&resource.tag||'',resourceType:resource&&resource.type||'',resourceStatus:resource&&resource.status,pageUrl:virtualUrl,line:e.lineno||null,column:e.colno||null,stack:e.error&&e.error.stack||'',time:Date.now(),resourceSelector:resource&&resource.selector||''});
+  },true);
+  window.addEventListener('unhandledrejection',e=>topPost({type:'veyra:page-error',level:'error',sessionId:SESSION_ID,message:e.reason&&e.reason.message||String(e.reason||'Unhandled rejection'),errorName:e.reason&&e.reason.name||'',errorDescription:e.reason&&e.reason.message||'',context:'Unhandled promise rejection.',stack:e.reason&&e.reason.stack||'',pageUrl:virtualUrl,time:Date.now()}),true);
   let inspectMode=false, inspectLast=0, inspectSelected=null;
   function inspectPath(el){const parts=[];let n=el;while(n&&n.nodeType===1&&parts.length<7){let s=n.tagName.toLowerCase();if(n.id)s+='#'+n.id.replace(/[^a-zA-Z0-9_-]/g,'-');else{let c=0,p=n;while((p=p.previousElementSibling))if(p.tagName===n.tagName)c++;if(c)s += ':nth-of-type(' + String(c+1) + ')'}parts.unshift(s);n=n.parentElement}return parts.join(' > ')}
   function inspectData(el){if(!el||el.nodeType!==1)return null;const rect=el.getBoundingClientRect();const attrs={};for(const a of [...el.attributes].slice(0,40))attrs[a.name]=a.value;let styles={};let computed={};try{const cs=getComputedStyle(el);for(const k of ['display','position','width','height','margin','padding','color','background','font','font-size','line-height','opacity','z-index','overflow','border','grid-template-columns','grid-template-rows','flex-direction','justify-content','align-items']){styles[k]=cs.getPropertyValue(k)||''}}catch{}try{const cs=getComputedStyle(el);for(let i=0;i<cs.length&&i<140;i++){const k=cs[i];if(/^(margin|padding|font|color|background|display|position|width|height|border|grid|flex|overflow|opacity|z-index)/i.test(k))computed[k]=cs.getPropertyValue(k)}}catch{}const outer=String(el.outerHTML||'').slice(0,16000);const children=[...el.children].slice(0,60).map((c,i)=>({index:i,tag:c.tagName.toLowerCase(),id:c.id||'',classes:String(c.className||'').slice(0,300),path:inspectPath(c)}));const parent=el.parentElement?{tag:el.parentElement.tagName.toLowerCase(),id:el.parentElement.id||'',path:inspectPath(el.parentElement)}:null;return {tag:el.tagName.toLowerCase(),id:el.id||'',classes:String(el.className||'').slice(0,500),attrs,path:inspectPath(el),outerHTML:outer,rect:{x:rect.x,y:rect.y,width:rect.width,height:rect.height},scrollWidth:el.scrollWidth||0,scrollHeight:el.scrollHeight||0,styles,computed,inlineStyle:el.getAttribute('style')||'',parent,children,tree:inspectPath(el)} }
