@@ -118,6 +118,9 @@ const CFG = Object.freeze({
   // YouTube's own bundles do not need Veyra URL rewriting: the injected
   // runtime already intercepts fetch/XHR and handles relative-resource fallback.
   youtubeSkipStaticJsRewrite: boolEnv("YT_SKIP_STATIC_JS_REWRITE", true),
+  // Public static bundles can be loaded from YouTube's CDN directly instead
+  // of waiting for Render to download and re-serve multi-megabyte assets.
+  youtubeDirectStaticAssets: boolEnv("YT_DIRECT_STATIC_ASSETS", true),
   processRole: enumEnv("PROCESS_ROLE", "web", ["web", "worker", "all"]),
   
   
@@ -4515,6 +4518,16 @@ function shouldSkipYoutubeStaticJsRewrite(url, contentType) {
   }
 }
 
+function shouldDirectYoutubeStaticAsset(url, contentType) {
+  if (!CFG.youtubeDirectStaticAssets || !/javascript|ecmascript|text\/css/i.test(String(contentType || ""))) return false;
+  try {
+    const u = new URL(url);
+    return isYoutubeHost(u.hostname) && (/^\/s\//i.test(u.pathname) || /^\/player\//i.test(u.pathname));
+  } catch {
+    return false;
+  }
+}
+
 function proxyAcceptForResource(req, mode) {
   if (req.get("Accept")) return String(req.get("Accept")).slice(0, 1000);
   return mode === "view"
@@ -4712,6 +4725,12 @@ async function proxyRequest(req, res, mode) {
     res.setHeader("X-Veyra-Challenge", "true");
     res.setHeader("X-Veyra-Canonical-URL", canonical);
     return res.status(200).type("html").send(challengeFallbackHtml(canonical, challenge, sid));
+  }
+  if (mode === "resource" && !download && result.status >= 200 && result.status < 300 && shouldDirectYoutubeStaticAsset(result.finalUrl || canonical, result.contentType)) {
+    res.setHeader("location", result.finalUrl || canonical);
+    res.setHeader("cache-control", "public, max-age=300");
+    res.setHeader("x-veyra-direct-asset", "youtube-cdn");
+    return res.status(302).end();
   }
   if (mode === "resource" && /javascript|ecmascript/i.test(result.contentType || "")) noteScriptDir(sid, result.finalUrl || canonical);
   let payload = result.body;
