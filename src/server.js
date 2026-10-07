@@ -115,6 +115,9 @@ const CFG = Object.freeze({
   // Cookie-free YouTube home HTML is safe to reuse briefly across sessions;
   // this avoids a full upstream round-trip for every new mobile tab.
   youtubeDocumentCache: boolEnv("YT_DOCUMENT_CACHE", true),
+  // YouTube's own bundles do not need Veyra URL rewriting: the injected
+  // runtime already intercepts fetch/XHR and handles relative-resource fallback.
+  youtubeSkipStaticJsRewrite: boolEnv("YT_SKIP_STATIC_JS_REWRITE", true),
   processRole: enumEnv("PROCESS_ROLE", "web", ["web", "worker", "all"]),
   
   
@@ -4502,6 +4505,16 @@ function shouldWarmPageResources(url) {
   }
 }
 
+function shouldSkipYoutubeStaticJsRewrite(url, contentType) {
+  if (!CFG.youtubeSkipStaticJsRewrite || !/javascript|ecmascript/i.test(String(contentType || ""))) return false;
+  try {
+    const u = new URL(url);
+    return isYoutubeHost(u.hostname) && (/^\/s\//i.test(u.pathname) || /^\/player\//i.test(u.pathname));
+  } catch {
+    return false;
+  }
+}
+
 function proxyAcceptForResource(req, mode) {
   if (req.get("Accept")) return String(req.get("Accept")).slice(0, 1000);
   return mode === "view"
@@ -4717,7 +4730,7 @@ async function proxyRequest(req, res, mode) {
       payload = Buffer.from(await rewriteOffThread("rewriteHtml", payload.toString("utf8"), [pageUrl, sid], rewriteHtml), "utf8");
     }
     else if (!download && mode === "resource" && result.contentType.toLowerCase().includes("text/css")) payload = Buffer.from(await rewriteOffThread("rewriteCss", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteCssText), "utf8");
-    else if (!download && mode === "resource" && /javascript|ecmascript/.test(result.contentType.toLowerCase())) payload = Buffer.from(await rewriteOffThread("rewriteJs", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteJsText), "utf8");
+    else if (!download && mode === "resource" && /javascript|ecmascript/.test(result.contentType.toLowerCase()) && !shouldSkipYoutubeStaticJsRewrite(result.finalUrl || canonical, result.contentType)) payload = Buffer.from(await rewriteOffThread("rewriteJs", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteJsText), "utf8");
     else if (!download && mode === "resource" && /mpegurl|dash\+xml/i.test(result.contentType.toLowerCase())) payload = Buffer.from(rewriteMediaManifest(payload.toString("utf8"), result.finalUrl || canonical, sid), "utf8");
   } catch (rewriteErr) {
     

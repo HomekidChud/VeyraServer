@@ -33,6 +33,8 @@ services:
         value: "false"
       - key: YT_DOCUMENT_CACHE
         value: "true"
+      - key: YT_SKIP_STATIC_JS_REWRITE
+        value: "true"
       - key: YT_MAX_HEIGHT
         value: "360"
       # Five minutes gives the mobile page enough time to initialize and
