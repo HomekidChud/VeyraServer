@@ -25,6 +25,7 @@ const http = require("http");
 const https = require("https");
 const { URL } = require("url");
 const path = require("path");
+const zlib = require("zlib");
 
 
 let cheerio = null;
@@ -43,7 +44,8 @@ class NeuralRobot {
     this.depth = 0;
     this.maxDepth = opts.maxDepth || 3;
     this.maxPages = opts.maxPages || 50;
-    this.maxLinksPerPage = opts.maxLinksPerPage || 30;
+    this.maxLinksPerPage = opts.maxLinksPerPage || 80;
+    this.concurrency = Math.max(1, Math.min(8, Number(opts.concurrency) || 3));
     this.timeoutMs = opts.timeoutMs || 10000;
     this.userAgent = opts.userAgent || "VeyraNeuralBot/1.0 (+https://veyra.app/bot)";
     this.respectRobots = opts.respectRobots !== false;
@@ -55,6 +57,9 @@ class NeuralRobot {
       startTime: 0,
       bytesFetched: 0,
       avgLatencyMs: 0,
+      compressedResponses: 0,
+      duplicateUrls: 0,
+      skippedNonHtml: 0,
     };
     this.neuralModel = opts.neuralModel || null;  
     this.onPageFound = opts.onPageFound || (() => {});
@@ -73,7 +78,7 @@ class NeuralRobot {
         "User-Agent": this.userAgent,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en;q=0.9",
-        "Accept-Encoding": "identity",  
+        "Accept-Encoding": "gzip, br, deflate",
         "Connection": "close",
         ...opts.headers,
       };
@@ -93,21 +98,29 @@ class NeuralRobot {
           res.resume();
           return reject(new Error(`Not HTML: ${contentType}`));
         }
-        let data = "";
+        const chunks = [];
         let bytes = 0;
-        const maxBytes = 5 * 1024 * 1024; 
+        const maxBytes = opts.maxBytes || 8 * 1024 * 1024;
         res.on("data", (chunk) => {
           bytes += chunk.length;
           if (bytes > maxBytes) { res.destroy(); reject(new Error("Page too large")); return; }
-          data += chunk;
+          chunks.push(chunk);
         });
         res.on("end", () => {
+          let data = Buffer.concat(chunks);
+          const encoding = String(res.headers["content-encoding"] || "").toLowerCase();
+          try {
+            if (encoding.includes("br")) data = zlib.brotliDecompressSync(data);
+            else if (encoding.includes("gzip")) data = zlib.gunzipSync(data);
+            else if (encoding.includes("deflate")) data = zlib.inflateSync(data);
+            if (encoding) this.stats.compressedResponses++;
+          } catch { reject(new Error("Compressed response could not be decoded")); return; }
           resolve({
             url: url,
-            html: data,
+            html: data.toString("utf8"),
             statusCode: res.statusCode,
             headers: res.headers,
-            bytes: bytes,
+            bytes: data.length,
             contentType: contentType,
           });
         });
@@ -164,7 +177,20 @@ class NeuralRobot {
       if (i < 20) headings.push($(el).text().trim());
     });
 
-    return { title, links, text, metadata, headings };
+    const canonical = $("link[rel='canonical']").attr("href") || "";
+    const language = $("html").attr("lang") || "";
+    const jsonLd = [];
+    $("script[type='application/ld+json']").each((i, el) => {
+      if (i >= 4) return false;
+      try { jsonLd.push(JSON.parse($(el).text())); } catch {}
+    });
+    const passages = [];
+    $("main,article,section,p,li").each((i, el) => {
+      if (i >= 80) return false;
+      const value = $(el).text().replace(/\s+/g, " ").trim();
+      if (value.length >= 45) passages.push(value.slice(0, 500));
+    });
+    return { title, links, text, metadata, headings, canonical, language, jsonLd, passages };
   }
 
   /**
@@ -200,6 +226,18 @@ class NeuralRobot {
     return Math.min(hits / terms.length, 1.0);
   }
 
+  canonicalUrl(raw, base = "") {
+    try {
+      const u = new URL(raw, base);
+      if (!/^https?:$/.test(u.protocol)) return "";
+      u.hash = ""; u.hostname = u.hostname.toLowerCase();
+      for (const key of [...u.searchParams.keys()]) if (/^(utm_|gclid|fbclid|mc_|ref|source|session|click)/i.test(key)) u.searchParams.delete(key);
+      if ((u.protocol === "https:" && u.port === "443") || (u.protocol === "http:" && u.port === "80")) u.port = "";
+      if (u.pathname.length > 1) u.pathname = u.pathname.replace(/\/{2,}/g, "/").replace(/\/$/, "");
+      return u.href;
+    } catch { return ""; }
+  }
+
   /**
    * Check robots.txt for a domain.
    */
@@ -224,24 +262,21 @@ class NeuralRobot {
   }
 
   parseRobots(txt) {
-    const rules = { allowed: [], disallowed: [] };
-    const lines = txt.split("\n");
-    for (const line of lines) {
-      const m = line.match(/^\s*(Allow|Disallow):\s*(.*)/i);
-      if (m) {
-        if (m[1].toLowerCase() === "allow") rules.allowed.push(m[2].trim());
-        else rules.disallowed.push(m[2].trim());
-      }
+    const groups = []; let group = null;
+    for (const raw of String(txt || "").split(/\r?\n/)) {
+      const line = raw.replace(/#.*/, "").trim(); if (!line) continue;
+      const m = line.match(/^([^:]+):\s*(.*)$/); if (!m) continue;
+      const key = m[1].toLowerCase(), value = m[2].trim();
+      if (key === "user-agent") { if (!group || group.rules.length) { group = { agents: [], rules: [] }; groups.push(group); } group.agents.push(value.toLowerCase()); }
+      else if ((key === "allow" || key === "disallow") && group) group.rules.push({ type: key, path: value });
     }
+    const bot = this.userAgent.toLowerCase();
+    const selected = groups.find(g => g.agents.some(a => a !== "*" && bot.includes(a))) || groups.find(g => g.agents.includes("*"));
     return {
       isAllowed(path) {
-        for (const d of rules.disallowed) {
-          if (d === "/" || path.startsWith(d)) {
-            for (const a of rules.allowed) { if (path.startsWith(a)) return true; }
-            return false;
-          }
-        }
-        return true;
+        if (!selected) return true;
+        const matching = selected.rules.filter(r => r.path && path.startsWith(r.path)).sort((a, b) => b.path.length - a.path.length);
+        return !matching.length || matching[0].type === "allow";
       },
     };
   }
@@ -263,7 +298,7 @@ class NeuralRobot {
 
     try {
       const res = await this.fetchRaw(url);
-      const parsed = this.parseHtml(res.html, url);
+      const parsed = this.parseHtml(res.html, res.url || url);
       const score = this.scorePage(parsed, query, depth);
       const latency = Date.now() - start;
 
@@ -273,21 +308,23 @@ class NeuralRobot {
       this.stats.avgLatencyMs = (this.stats.avgLatencyMs * (this.stats.pagesCrawled - 1) + latency) / this.stats.pagesCrawled;
 
       const page = {
-        url, title: parsed.title, text: parsed.text, links: parsed.links,
-        metadata: parsed.metadata, headings: parsed.headings,
+        url: this.canonicalUrl(parsed.canonical || res.url || url), title: parsed.title, text: parsed.text, links: parsed.links.map(link => this.canonicalUrl(link, res.url || url)).filter(Boolean),
+        metadata: parsed.metadata, headings: parsed.headings, passages: parsed.passages || [], language: parsed.language || "", jsonLd: parsed.jsonLd || [],
         score, depth, latency, bytes: res.bytes,
         timestamp: Date.now(),
       };
 
       this.onPageFound(page);
-      parsed.links.forEach(link => this.onLinkFound(link, url, score));
+      page.links.forEach(link => this.onLinkFound(link, page.url, score));
 
       
-      for (const link of parsed.links) {
+      for (const link of page.links) {
         if (!this.visited.has(link) && depth < this.maxDepth) {
-          this.queue.push({ url: link, depth: depth + 1 });
+          const priority = this.neuralModel?.scoreUrl ? this.neuralModel.scoreUrl(link, { type: "html", internal: new URL(link).hostname === new URL(page.url).hostname }) : score;
+          this.queue.push({ url: link, depth: depth + 1, priority });
         }
       }
+      this.queue.sort((a, b) => (b.priority || 0) - (a.priority || 0));
 
       this.status = "idle";
       this.currentUrl = null;
@@ -305,20 +342,26 @@ class NeuralRobot {
    */
   async startCrawl(seedUrl, query = "", opts = {}) {
     this.visited.clear();
-    this.queue = [{ url: seedUrl, depth: 0 }];
-    this.stats = { pagesCrawled: 0, linksFound: 0, errors: 0, startTime: Date.now(), bytesFetched: 0, avgLatencyMs: 0 };
+    this.queue = [{ url: this.canonicalUrl(seedUrl), depth: 0, priority: 1 }];
+    this.stats = { pagesCrawled: 0, linksFound: 0, errors: 0, startTime: Date.now(), bytesFetched: 0, avgLatencyMs: 0, compressedResponses: 0, duplicateUrls: 0, skippedNonHtml: 0 };
     this.maxDepth = opts.maxDepth || this.maxDepth;
     this.maxPages = opts.maxPages || this.maxPages;
 
-    const results = [];
-    while (this.queue.length > 0 && results.length < this.maxPages && this.status !== "paused") {
-      const { url, depth } = this.queue.shift();
-      if (this.visited.has(url)) continue;
-      this.visited.add(url);
-
-      const page = await this.crawlPage(url, query, depth);
-      if (page) results.push(page);
-    }
+    const results = [], active = new Set();
+    this.status = "crawling";
+    const pump = async () => {
+      while (this.queue.length && results.length + active.size < this.maxPages && this.status !== "paused") {
+        const item = this.queue.shift();
+        if (!item?.url || this.visited.has(item.url)) { this.stats.duplicateUrls++; continue; }
+        this.visited.add(item.url);
+        const task = this.crawlPage(item.url, query, item.depth).then(page => { if (page) results.push(page); }).finally(() => active.delete(task));
+        active.add(task);
+        if (active.size >= this.concurrency) await Promise.race(active);
+      }
+      await Promise.all(active);
+    };
+    await pump();
+    this.status = "idle";
 
     return {
       pages: results,
@@ -352,6 +395,9 @@ class NeuralRobot {
       errors: this.stats.errors,
       bytesFetched: this.stats.bytesFetched,
       avgLatencyMs: Math.round(this.stats.avgLatencyMs),
+      compressedResponses: this.stats.compressedResponses,
+      duplicateUrls: this.stats.duplicateUrls,
+      skippedNonHtml: this.stats.skippedNonHtml,
       queueSize: this.queue.length,
       visitedCount: this.visited.size,
       uptime: this.stats.startTime ? Date.now() - this.stats.startTime : 0,
@@ -361,7 +407,7 @@ class NeuralRobot {
   reset() {
     this.visited.clear();
     this.queue = [];
-    this.stats = { pagesCrawled: 0, linksFound: 0, errors: 0, startTime: 0, bytesFetched: 0, avgLatencyMs: 0 };
+    this.stats = { pagesCrawled: 0, linksFound: 0, errors: 0, startTime: 0, bytesFetched: 0, avgLatencyMs: 0, compressedResponses: 0, duplicateUrls: 0, skippedNonHtml: 0 };
     this.status = "idle";
     this.currentUrl = null;
   }

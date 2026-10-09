@@ -192,6 +192,7 @@ const CFG = Object.freeze({
   maxSitemapUrls: numberEnv("MAX_SITEMAP_URLS", 50000, 100, 500000),
   maxJobAgeMs: numberEnv("MAX_JOB_AGE_MS", 60 * 60 * 1000, 60 * 1000, 24 * 60 * 60 * 1000),
   proxyCacheMs: numberEnv("CACHE_TTL_MS", 10000, 0, 300000),
+  proxyStaleWhileRevalidateMs: numberEnv("CACHE_STALE_WHILE_REVALIDATE_MS", 120000, 0, 900000),
   maxProxyCacheEntries: numberEnv("MAX_CACHE_ENTRIES", LEAN_MODE ? 60 : 200, 10, 5000),
   searchCacheMs: numberEnv("SEARCH_CACHE_TTL_MS", 30000, 0, 600000),
   maxSearchCacheEntries: numberEnv("MAX_SEARCH_CACHE_ENTRIES", 100, 10, 5000),
@@ -363,6 +364,7 @@ const jobs = new Map();
 const activeByRoot = new Map();
 const proxyCache = new Map();
 const fetchInflight = new Map();
+const revalidateInflight = new Map();
 const searchCache = new Map();
 const sessionManager = new SessionManager({
   maxSessions: CFG.maxProxySessions, idleTtlMs: CFG.sessionIdleTtlMs, hardTtlMs: CFG.sessionMaxAgeMs, timeLimitMs: CFG.sessionTimeLimitMs,
@@ -1392,7 +1394,15 @@ async function fetchCached(url, opts = {}) {
       const persisted = await mongoStore.getProxyCache(sharedKey);
       if (persisted) { cacheSet(proxyCache, sharedKey, persisted, CFG.maxProxyCacheEntries); cachedEntry = persisted; }
     }
-    if (cachedEntry && Date.now() - cachedEntry.time <= CFG.proxyCacheMs && !opts.revalidate) return { ...cachedEntry.response, cacheHit: true };
+    const cacheAge = cachedEntry ? Date.now() - cachedEntry.time : Infinity;
+    if (cachedEntry && cacheAge <= CFG.proxyCacheMs && !opts.revalidate) return { ...cachedEntry.response, cacheHit: true, cacheAgeMs: cacheAge };
+    if (cachedEntry && !opts.revalidate && CFG.proxyStaleWhileRevalidateMs > 0 && cacheAge <= CFG.proxyCacheMs + CFG.proxyStaleWhileRevalidateMs) {
+      if (!revalidateInflight.has(key)) {
+        const refresh = fetchCached(url, { ...opts, revalidate: true, noCache: false }).catch(() => null).finally(() => revalidateInflight.delete(key));
+        revalidateInflight.set(key, refresh);
+      }
+      return { ...cachedEntry.response, cacheHit: true, stale: true, cacheAgeMs: cacheAge };
+    }
     const result = await fetchBuffer(url, { ...opts, cached: cachedEntry && method === "GET" ? cachedEntry : null });
     if (!opts.noCache && method === "GET") {
       const noStore = /no-store/i.test(result.cacheControl || "");
@@ -1706,6 +1716,10 @@ function rewriteJsText(text, base, sid = "") {
       return u ? `${prefix}${quote}${makeResourceUrl(u, base, sid)}${quote}` : m;
     });
   }
+  out = out.replace(/(["'`])(https?:\/\/[^"'`\s]+)\1/g, (m, quote, value) => {
+    const u = resolveResource(value, base);
+    try { return u && new URL(u).origin === new URL(base).origin ? `${quote}${makeResourceUrl(u, base, sid)}${quote}` : m; } catch { return m; }
+  });
   return out;
 }
 function rewriteSrcset(raw, base, sid = "") {
@@ -1918,6 +1932,9 @@ function rewriteHtml(html, base, sid = "") {
   $("base").remove();
   $("meta[http-equiv]").filter((_, el) => String($(el).attr("http-equiv") || "").toLowerCase() === "content-security-policy").remove();
   $("a[href],area[href]").each((_, el) => { const u = resolveNavigation($(el).attr("href"), effectiveBase); if (u) $(el).attr("href", makeViewUrl(u, sid)); });
+  for (const attr of ["data-href", "data-url", "data-action", "data-endpoint", "ping"]) {
+    $(`[${attr}]`).each((_, el) => { const raw = $(el).attr(attr); const u = resolveNavigation(raw, effectiveBase) || resolveResource(raw, effectiveBase); if (u) $(el).attr(attr, makeResourceUrl(u, effectiveBase, sid)); });
+  }
   $("form[action]").each((_, el) => {
     const raw = $(el).attr("action");
     const u = resolveNavigation(raw, effectiveBase);
