@@ -1979,6 +1979,18 @@ function rewriteHtml(html, base, sid = "") {
   for (const tag of ["img", "source", "audio", "input", "embed"]) {
     $(`${tag}[src]`).each((_, el) => { const u = resolveResource($(el).attr("src"), effectiveBase); if (u) $(el).attr("src", makeResourceUrl(u, effectiveBase, sid)); });
   }
+  // Several large sites (including GeoFS) defer script loading through
+  // data-deferredsrc or a loader-specific dest attribute. Those URLs bypass
+  // the normal script[src] rewrite and otherwise resolve against Veyra's own
+  // /api/view document instead of the website.
+  $("script[data-deferredsrc]").each((_, el) => {
+    const raw = $(el).attr("data-deferredsrc"); const u = resolveResource(raw, effectiveBase);
+    if (u) $(el).attr("data-deferredsrc", makeResourceUrl(u, effectiveBase, sid));
+  });
+  $("script[dest]").each((_, el) => {
+    const raw = $(el).attr("dest"); const u = resolveResource(raw, effectiveBase);
+    if (u) $(el).attr("dest", makeResourceUrl(u, effectiveBase, sid));
+  });
   $("video[poster]").each((_, el) => { const u = resolveResource($(el).attr("poster"), effectiveBase); if (u) $(el).attr("poster", makeResourceUrl(u, effectiveBase, sid)); });
   $("track[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), effectiveBase); if (u) $(el).attr("src", makeResourceUrl(u, effectiveBase, sid)); });
   
