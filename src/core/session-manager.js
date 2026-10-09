@@ -301,7 +301,7 @@ class SessionManager {
       active: this.sessions.size, max: this.maxSessions, timeLimitMs: this.timeLimitMs, tombstones: this.tombstones.size, idleTtlMs: this.idleTtlMs, hardTtlMs: this.hardTtlMs,
       cookies, browserSessions: browsers, oldestSessionAgeMs: oldest,
       sleeping: this.sleeping, serverIdleMs: this.serverIdleMs, idleForMs: t - this.lastActivity, stats: { ...this.stats },
-      sessions: [...this.sessions.entries()].slice(-100).reverse().map(([id, rec]) => ({ id: id.slice(0, 8) + "…", ageMs: t - rec.createdAt, remainingMs: this.remainingMs(rec), timeLimitMs: rec.timeLimitMs ?? this.timeLimitMs, requests: rec.requests || 0, cookies: rec.cookies.size, browserSessions: rec.browserSessions.size, userId: rec.userId ? String(rec.userId).slice(0, 8) : null, paused: this.isPaused(id) })),
+      sessions: [...this.sessions.entries()].slice(-100).reverse().map(([id, rec]) => ({ id: id.slice(0, 8) + "…", sessionId: id, role: rec.role || "user", ageMs: t - rec.createdAt, remainingMs: this.remainingMs(rec), timeLimitMs: rec.timeLimitMs ?? this.timeLimitMs, requests: rec.requests || 0, cookies: rec.cookies.size, browserSessions: rec.browserSessions.size, userId: rec.userId ? String(rec.userId).slice(0, 8) : null, paused: this.isPaused(id) })),
       pausedSessions: this.pausedSessions.size
     };
   }

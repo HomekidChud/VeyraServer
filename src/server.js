@@ -3758,6 +3758,8 @@ app.put('/api/admin/session-policy', requireAdmin, (req, res) => {
         rec.renewedMs = 0;
         applied += 1;
       }
+      // Do not leave sessions usable until the next sweep after shortening a policy.
+      void sessionManager.sweep();
     }
     serverLog('info', 'SESSION', `Admin updated session policy: guest=${guest}ms admin=${admin}ms idle=${idle}ms age=${age}ms max=${max}${body.applyExisting === true ? `; applied to ${applied} active session(s)` : ''}.`);
     res.json({ ok: true, policy: sessionPolicySummary(), appliedExisting: applied });
@@ -3836,7 +3838,7 @@ app.post('/api/auth/login', (req, res) => { try { res.json({ ok: true, ...authSt
 app.get('/api/auth/me', requireUser, (req, res) => {
   const user = req.veyraUser;
   const admin = authStore.roleFor(user.email) === "admin";
-  res.json({ ok: true, user: authStore.publicUser(user), sessionTimeLimitMs: admin ? CFG.adminSessionTimeLimitMs : CFG.sessionTimeLimitMs });
+  res.json({ ok: true, user: authStore.publicUser(user), sessionTimeLimitMs: admin ? runtimeSessionPolicy.adminTimeLimitMs : runtimeSessionPolicy.guestTimeLimitMs });
 });
 app.patch('/api/auth/me', requireUser, (req, res) => { try { res.json({ ok: true, ...authStore.update(req.veyraUser, req.body || {}) }); } catch (e) { authFail(res, e); } });
 app.delete('/api/auth/me', requireUser, (req, res) => { try { authStore.remove(req.veyraUser, req.body?.password); res.json({ ok: true }); } catch (e) { authFail(res, e); } });
@@ -3846,7 +3848,7 @@ app.put('/api/auth/data', requireUser, (req, res) => { try { res.json({ ok: true
 app.get('/api/auth/config', (req, res) => {
   const user = authStore.userFromRequest(req);
   const admin = !!(user && authStore.roleFor(user.email) === "admin");
-  res.json({ ok: true, signupEnabled: CFG.authAllowSignup, sessionTimeLimitMs: admin ? CFG.adminSessionTimeLimitMs : CFG.sessionTimeLimitMs, admin: admin || configEditAllowed(req), testMode: CFG.testMode, testAdmin: CFG.testMode ? authStore.getTestAdminCredentials() : null });
+  res.json({ ok: true, signupEnabled: CFG.authAllowSignup, sessionTimeLimitMs: admin ? runtimeSessionPolicy.adminTimeLimitMs : runtimeSessionPolicy.guestTimeLimitMs, admin: admin || configEditAllowed(req), testMode: CFG.testMode, testAdmin: CFG.testMode ? authStore.getTestAdminCredentials() : null });
 });
 
 
