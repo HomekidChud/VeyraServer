@@ -4188,11 +4188,26 @@ function queueNeuralIndexFindings(query, sources = []) {
   while (aiIndexRuns.size > 1000) aiIndexRuns.delete(aiIndexRuns.keys().next().value);
 }
 const aiAnswerEngine = new AIAnswerEngine();
+async function persistAIObservation(query, results, answer) {
+  if (!mongoStore.enabled) return;
+  const id = `ai_${Date.now().toString(36)}_${crypto.randomBytes(6).toString("hex")}`;
+  const rows = Array.isArray(results) ? results.slice(0, 24) : [];
+  const used = new Set((answer?.sources || []).map(s => normalizeUrl(s?.url || s)).filter(Boolean));
+  await mongoStore.recordAIObservation({ id, query, answer: answer?.answer || "", hasAnswer: !!answer?.hasAnswer, generatedBy: answer?.generatedBy || "", sources: answer?.sources || [], results: rows, pipeline: answer?.pipeline || {}, grounding: answer?.grounding || {} });
+  await Promise.all(rows.map((row, index) => {
+    const url = normalizeUrl(row?.url); if (!url) return null;
+    return neuralTrainer.enqueuePersistent({
+      id: `${id}_${index}`, url, positive: used.has(url), weight: used.has(url) ? 1.5 : Math.max(0.1, 1 - index / Math.max(1, rows.length)),
+      context: { type: "ai-result", query: String(query || "").slice(0, 600), rank: index + 1, selectedByAnswer: used.has(url), sourceCount: rows.length }
+    });
+  }));
+}
 app.post('/api/search/answer', async (req, res) => {
   try {
     const { query, results } = req.body;
     if (!query) return res.json({ hasAnswer: false, reason: 'No query provided' });
     const answer = await aiAnswerEngine.answer(query, results || []);
+    void persistAIObservation(query, results || [], answer).catch(e => serverLog("warn", "AI", `AI observation persistence failed: ${e.message}`));
     if (answer.hasAnswer) queueNeuralIndexFindings(query, answer.sources || []);
     res.json(answer);
   } catch (e) { res.json({ hasAnswer: false, reason: e.message }); }

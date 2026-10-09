@@ -42,7 +42,12 @@ class MongoStore {
           this.db.collection("neural_feedback").createIndex({ id: 1 }, { unique: true }).catch(() => {}),
           this.db.collection("neural_feedback").createIndex({ status: 1, createdAt: 1 }).catch(() => {}),
           this.db.collection("neural_feedback").createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }).catch(() => {}),
-          this.db.collection("neural_models").createIndex({ id: 1 }, { unique: true }).catch(() => {})
+          this.db.collection("neural_models").createIndex({ id: 1 }, { unique: true }).catch(() => {}),
+          this.db.collection("ai_observations").createIndex({ id: 1 }, { unique: true }).catch(() => {}),
+          this.db.collection("ai_observations").createIndex({ createdAt: -1 }).catch(() => {}),
+          this.db.collection("ai_feedback").createIndex({ id: 1 }, { unique: true }).catch(() => {}),
+          this.db.collection("ai_feedback").createIndex({ status: 1, createdAt: 1 }).catch(() => {}),
+          this.db.collection("ai_neural_models").createIndex({ id: 1 }, { unique: true }).catch(() => {})
         ]);
         this.connected = true; this.disabledReason = ""; this.retryAfter = 0; return true;
       } catch (e) {
@@ -109,7 +114,11 @@ class MongoStore {
       createdAt: new Date(feedback.createdAt || Date.now()), updatedAt: new Date(),
       expiresAt: new Date(Date.now() + 90 * 24 * 60 * 60 * 1000)
     };
-    const result = await this.withDb(db => db.collection("neural_feedback").updateOne({ id: doc.id }, { $setOnInsert: doc }, { upsert: true }));
+    const result = await this.withDb(async db => {
+      await db.collection("neural_feedback").updateOne({ id: doc.id }, { $setOnInsert: doc }, { upsert: true });
+      await db.collection("ai_feedback").updateOne({ id: doc.id }, { $setOnInsert: { ...doc, storagePath: `ai/feedback/${doc.id}` } }, { upsert: true });
+      return true;
+    });
     if (result == null) return false;
     this.stats.writes += 1;
     return true;
@@ -122,19 +131,57 @@ class MongoStore {
   async markNeuralFeedbackProcessed(id, error = "") {
     if (!id) return;
     this.stats.writes += 1;
-    void this.withDb(db => db.collection("neural_feedback").updateOne({ id: String(id) }, { $set: { status: error ? "error" : "processed", error: error || null, processedAt: new Date(), updatedAt: new Date() } }));
+    void this.withDb(async db => {
+      const update = { $set: { status: error ? "error" : "processed", error: error || null, processedAt: new Date(), updatedAt: new Date() } };
+      await db.collection("neural_feedback").updateOne({ id: String(id) }, update);
+      await db.collection("ai_feedback").updateOne({ id: String(id) }, update);
+    });
   }
   async saveNeuralModel(id, data) {
     if (!id || !data) return;
     const doc = { id: String(id), ...data, updatedAt: new Date() };
     this.stats.writes += 1;
-    return this.withDb(db => db.collection("neural_models").updateOne({ id: doc.id }, { $set: doc }, { upsert: true }));
+    return this.withDb(async db => {
+      await db.collection("neural_models").updateOne({ id: doc.id }, { $set: doc }, { upsert: true });
+      await db.collection("ai_neural_models").updateOne({ id: doc.id }, { $set: { ...doc, storagePath: `ai/neural/${doc.id}` } }, { upsert: true });
+      return true;
+    });
   }
   async loadNeuralModel(id) {
     if (!id) return null;
     this.stats.reads += 1;
-    const doc = await this.withDb(db => db.collection("neural_models").findOne({ id: String(id) }, { projection: { _id: 0, id: 0 } }));
+    const doc = await this.withDb(async db => (await db.collection("ai_neural_models").findOne({ id: String(id) }, { projection: { _id: 0, id: 0 } })) || (await db.collection("neural_models").findOne({ id: String(id) }, { projection: { _id: 0, id: 0 } })));
     return doc || null;
+  }
+
+  async recordAIObservation(observation) {
+    if (!observation?.id) return false;
+    const safe = JSON.parse(JSON.stringify({
+      id: String(observation.id), storagePath: `ai/observations/${String(observation.id)}`,
+      query: String(observation.query || "").slice(0, 1000), answer: String(observation.answer || "").slice(0, 6000),
+      hasAnswer: !!observation.hasAnswer, generatedBy: String(observation.generatedBy || ""),
+      sources: Array.isArray(observation.sources) ? observation.sources.slice(0, 24) : [],
+      results: Array.isArray(observation.results) ? observation.results.slice(0, 24) : [],
+      pipeline: observation.pipeline || {}, grounding: observation.grounding || {},
+      createdAt: new Date(observation.createdAt || Date.now())
+    }));
+    this.stats.writes += 1;
+    const result = await this.withDb(db => db.collection("ai_observations").updateOne({ id: safe.id }, { $set: safe }, { upsert: true }));
+    return result != null;
+  }
+  async enqueueAITraining(feedback) {
+    if (!feedback?.id || !feedback?.url) return false;
+    const doc = { ...feedback, id: String(feedback.id), storagePath: `ai/feedback/${String(feedback.id)}`, url: String(feedback.url), status: "queued", createdAt: new Date(feedback.createdAt || Date.now()), updatedAt: new Date(), expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000) };
+    const result = await this.withDb(db => db.collection("ai_feedback").updateOne({ id: doc.id }, { $setOnInsert: doc }, { upsert: true }));
+    if (result == null) return false;
+    this.stats.writes += 1;
+    return true;
+  }
+  async saveAINeuralModel(id, data) {
+    if (!id || !data) return;
+    const doc = { id: String(id), storagePath: `ai/neural/${String(id)}`, ...data, updatedAt: new Date() };
+    this.stats.writes += 1;
+    return this.withDb(db => db.collection("ai_neural_models").updateOne({ id: doc.id }, { $set: doc }, { upsert: true }));
   }
 
   
