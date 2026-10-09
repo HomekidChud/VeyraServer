@@ -4930,6 +4930,16 @@ app.get("/api/form-get/:target/:sid", async (req, res) => {
   }
 });
 app.get("/api/view", async (req, res) => { try { await proxyRequest(req, res, "view"); } catch (e) {
+  // Render/browser cold starts can occasionally lose the first upstream
+  // connection even though the target is healthy a moment later. fetchCached
+  // already retries individual upstream attempts; this outer retry covers a
+  // scheduler/connect failure before a response is produced, without turning
+  // persistent failures into an unbounded loop.
+  if (!res.headersSent && req._veyraViewRetries !== 1 && isRetryableNetworkError(e)) {
+    req._veyraViewRetries = 1;
+    await new Promise(resolve => setTimeout(resolve, 350));
+    try { return await proxyRequest(req, res, "view"); } catch (retryError) { e = retryError; }
+  }
   
   
   const snapSid = normalizeSessionId(req.query.sid);
