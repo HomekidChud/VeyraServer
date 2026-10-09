@@ -16,6 +16,12 @@
 - The browser AI card now shows the evidence-quality label rather than an uncalibrated percentage.
 - Added deterministic regression coverage for raw webpage contamination, duplicate evidence, URL normalization and citation verification.
 
+## Neural index crawler extension
+
+The existing neural robot pool now feeds the Veyra Index instead of only logging discovered pages. AI-selected answer sources automatically become bounded crawl seeds when `INDEX_AI_FINDINGS=true` (the default), with a configurable page budget and depth. A manual `POST /api/neural/index` route is also available for administrators or controlled indexing jobs. Each indexed page stores normalized metadata, cleaned text, a content hash, query relevance and neural score; raw pages are never returned as an answer dump. Link scheduling combines the existing neural URL score with query-term relevance, respects robots rules and keeps crawl budgets bounded.
+
+The previous absolute-seed canonicalization bug was fixed, and indexed crawler text now removes navigation, cookie, advertisement, social, audio and dictionary UI boilerplate before it enters the search index.
+
 ## Deliberate limitations
 
 The score is explicitly not a calibrated probability. A statistically calibrated confidence model requires a reviewed, labeled evaluation set and repeated measurement. Claim verification is transparent citation/coverage checking; it is not a semantic entailment model. No external model was substituted for Veyra’s configured native model.

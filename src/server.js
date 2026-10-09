@@ -246,6 +246,9 @@ const CFG = Object.freeze({
   indexSeeds: csvEnv("INDEX_SEEDS", []),
   indexSeedCrawl: boolEnv("INDEX_SEED_CRAWL", true),
   indexRefreshMs: numberEnv("INDEX_REFRESH_MS", 6 * 60 * 60 * 1000, 0, 30 * 24 * 60 * 60 * 1000),
+  indexAiFindings: boolEnv("INDEX_AI_FINDINGS", true),
+  indexAiMaxPages: numberEnv("INDEX_AI_MAX_PAGES", 24, 1, 100),
+  indexAiMaxDepth: numberEnv("INDEX_AI_MAX_DEPTH", 2, 0, 5),
   indexSnapshotEnabled: boolEnv("INDEX_SNAPSHOT_ENABLED", false),
   indexSnapshotPath: process.env.INDEX_SNAPSHOT_PATH || "/tmp/veyra-search-index.json",
   processBrowserFallback: boolEnv("BROWSER_RENDER_FALLBACK", false),
@@ -2128,6 +2131,32 @@ function indexDocument(url, text, precomputedMeta = null) {
     serverLog("warn", "SEARCH", `Indexing failed for ${url}: ${e.message}`);
     return null;
   }
+}
+function indexNeuralPage(page, query = "") {
+  const url = normalizeUrl(page?.url);
+  if (!url || !page?.text || page.text.length < 80) return null;
+  const title = String(page.title || hostOf(url)).replace(/\s+/g, " ").trim().slice(0, 300);
+  const headings = Array.isArray(page.headings) ? page.headings.join(" | ").replace(/\s+/g, " ").trim().slice(0, 1200) : "";
+  const description = String(page.metadata?.description || page.metadata?.["og:description"] || "").replace(/\s+/g, " ").trim().slice(0, 600);
+  const text = String(page.text)
+    .replace(/\b(?:jump to content|main menu|move to sidebar|hide navigation|search search|appearance|donate|contribute|help learn to edit|community portal|recent changes|upload file|special pages|add to word list|audio player|play pronunciation|cookie settings)\b/gi, " ")
+    .replace(/\s+/g, " ").trim().slice(0, CFG.maxIndexTextChars);
+  const termFreq = new Map();
+  for (const term of tokenizeSearch(`${title} ${headings} ${description} ${text} ${url}`)) termFreq.set(term, (termFreq.get(term) || 0) + 1);
+  const doc = indexDocument(url, text, {
+    title, description, headings, snippet: description || text.slice(0, 600), text,
+    favicon: "", canonical: url, lang: page.language || "", host: hostOf(url), path: pathOf(url),
+    wordCount: Math.max(1, tokenizeSearch(text).length), termFreq
+  });
+  if (doc) {
+    doc.indexedBy = "neural-crawler";
+    doc.sourceQuery = String(query || "").slice(0, CFG.maxSearchQueryChars);
+    doc.neuralScore = Number(page.score || 0);
+    doc.queryRelevance = Number(page.queryRelevance || 0);
+    doc.contentHash = crypto.createHash("sha1").update(text).digest("hex");
+    void mongoStore.upsertSearchDocument(doc);
+  }
+  return doc;
 }
 function invalidateSearchCaches() { searchCache.clear(); }
 function makeSearchSnippet(doc, parsed) {
@@ -4143,12 +4172,28 @@ app.post('/api/browser/resume-verification', async (req, res) => {
 });
 
 
+const aiIndexRuns = new Map();
+function queueNeuralIndexFindings(query, sources = []) {
+  if (!CFG.indexAiFindings || typeof neuralRobotPool?.startCrawl !== "function") return;
+  const seeds = [...new Set((Array.isArray(sources) ? sources : []).map(s => normalizeUrl(s?.url || s)).filter(Boolean))].slice(0, 6);
+  if (!seeds.length) return;
+  const key = `${String(query || "").toLowerCase().trim()}|${seeds.join(",")}`;
+  const previous = aiIndexRuns.get(key) || 0;
+  if (previous && Date.now() - previous < Math.max(60000, CFG.indexRefreshMs || 60000)) return;
+  aiIndexRuns.set(key, Date.now());
+  const perSeed = Math.max(1, Math.ceil(CFG.indexAiMaxPages / seeds.length));
+  void neuralRobotPool.startCrawl(seeds, String(query || "").slice(0, CFG.maxSearchQueryChars), {
+    maxDepth: CFG.indexAiMaxDepth, maxPages: perSeed
+  }).catch(e => serverLog("warn", "SEARCH", `AI finding index crawl failed: ${e.message}`));
+  while (aiIndexRuns.size > 1000) aiIndexRuns.delete(aiIndexRuns.keys().next().value);
+}
 const aiAnswerEngine = new AIAnswerEngine();
 app.post('/api/search/answer', async (req, res) => {
   try {
     const { query, results } = req.body;
     if (!query) return res.json({ hasAnswer: false, reason: 'No query provided' });
     const answer = await aiAnswerEngine.answer(query, results || []);
+    if (answer.hasAnswer) queueNeuralIndexFindings(query, answer.sources || []);
     res.json(answer);
   } catch (e) { res.json({ hasAnswer: false, reason: e.message }); }
 });
@@ -5182,6 +5227,9 @@ const STATUS_VAR_DEFS = [
   { group: "Search index", key: "maxSearchQueryTerms", label: "Max search query terms", kind: "number", names: ["MAX_SEARCH_QUERY_TERMS"], fallback: 20, min: 1, max: 64 },
   { group: "Search index", key: "indexSeeds", label: "Index seed URLs", kind: "csv", names: ["INDEX_SEEDS"], fallback: [] },
   { group: "Search index", key: "indexSeedCrawl", label: "Auto-crawl index seeds", kind: "bool", names: ["INDEX_SEED_CRAWL"], fallback: true },
+  { group: "Search index", key: "indexAiFindings", label: "Index AI-selected findings", kind: "bool", names: ["INDEX_AI_FINDINGS"], fallback: true },
+  { group: "Search index", key: "indexAiMaxPages", label: "AI finding crawl page budget", kind: "number", names: ["INDEX_AI_MAX_PAGES"], fallback: 24, min: 1, max: 100 },
+  { group: "Search index", key: "indexAiMaxDepth", label: "AI finding crawl depth", kind: "number", names: ["INDEX_AI_MAX_DEPTH"], fallback: 2, min: 0, max: 5 },
   { group: "Search index", key: "indexRefreshMs", label: "Index refresh interval (ms)", kind: "number", names: ["INDEX_REFRESH_MS"], fallback: 6 * 60 * 60 * 1000, min: 0, max: 30 * 24 * 60 * 60 * 1000 },
   { group: "Search index", key: "indexSnapshotEnabled", label: "Index snapshot enabled", kind: "bool", names: ["INDEX_SNAPSHOT_ENABLED"], fallback: false },
   { group: "Search index", key: "indexSnapshotPath", label: "Index snapshot path", kind: "string", names: ["INDEX_SNAPSHOT_PATH"], fallback: "/tmp/veyra-search-index.json" },
@@ -5470,7 +5518,12 @@ app.get("/api/debug/system", requireAdmin, (req, res) => {
 
 
 
-const neuralRobotPool = new NeuralRobotPool({ maxWorkers: 8, neuralModel, log: (level, source, msg) => serverLog(level, source, msg) });
+const neuralRobotPool = new NeuralRobotPool({
+  maxWorkers: 8,
+  neuralModel,
+  log: (level, source, msg) => serverLog(level, source, msg),
+  onPageFound: page => indexNeuralPage(page, page?.query || "")
+});
 app.get("/api/neural/stats", (req, res) => res.json({ ok: true, mongo: mongoStore.status(), model: neuralModel.report(), trainer: neuralTrainer.report() }));
 app.post("/api/neural/feedback", async (req, res) => {
   const accepted = await neuralTrainer.enqueuePersistent({
@@ -5495,6 +5548,19 @@ app.post("/api/robots/crawl", async (req, res) => {
     const result = await neuralRobotPool.startCrawl(seeds, query, opts);
     res.json({ ok: true, results: result });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post("/api/neural/index", async (req, res) => {
+  try {
+    const seeds = req.body?.seeds || (req.body?.seed ? [req.body.seed] : []);
+    if (!Array.isArray(seeds) || !seeds.length) return res.status(400).json({ ok: false, error: "No seed URLs provided" });
+    const query = String(req.body?.query || "").slice(0, CFG.maxSearchQueryChars);
+    const maxPages = Math.min(CFG.indexAiMaxPages, Math.max(1, Number(req.body?.maxPages) || CFG.indexAiMaxPages));
+    const maxDepth = Math.min(CFG.indexAiMaxDepth, Math.max(0, Number(req.body?.maxDepth) || CFG.indexAiMaxDepth));
+    const normalized = [...new Set(seeds.map(seed => normalizeUrl(seed)).filter(Boolean))].slice(0, 8);
+    if (!normalized.length) return res.status(400).json({ ok: false, error: "No public HTTP(S) seed URLs provided" });
+    const result = await neuralRobotPool.startCrawl(normalized, query, { maxPages: Math.ceil(maxPages / normalized.length), maxDepth });
+    res.json({ ok: true, indexed: true, provider: "veyra-index", seeds: normalized.length, results: result.map(x => ({ seed: x.seed, status: x.status, stats: x.result?.stats || null, error: x.error || null })), index: searchIndexStats() });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 app.post("/api/robots/feedback", async (req, res) => {
   try {

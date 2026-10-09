@@ -168,8 +168,8 @@ class NeuralRobot {
     });
 
     
-    $("script, style, noscript").remove();
-    const text = $("body").text().replace(/\s+/g, " ").trim().slice(0, 5000);
+    $("script, style, noscript, svg, template, nav, header, footer, aside, form, [role='navigation'], [aria-hidden='true'], [class*='cookie'], [id*='cookie'], [class*='advert'], [id*='advert'], [class*='social'], [class*='share']").remove();
+    const text = String($("main, article").first().text() || $("body").text()).replace(/\s+/g, " ").trim().slice(0, 5000);
 
     
     const headings = [];
@@ -205,12 +205,15 @@ class NeuralRobot {
       if (pageInfo.metadata["og:title"]) score += 0.05;
       if (depth === 0) score += 0.15;
       if (pageInfo.links && pageInfo.links.length > 10) score += 0.1;
-      return Math.min(score, 1.0);
+      const lexical = this.textRelevance(pageInfo.text + " " + pageInfo.title, query);
+      return Math.min(1, score * 0.55 + lexical * 0.45);
     }
 
     const features = [0.5, 0.5, 1.0, Math.max(0, 1 - depth * 0.2), 0.5,
       this.textRelevance(pageInfo.text + " " + pageInfo.title, query), 0.5, 0.8, 0.5, 0.5];
-    return this.neuralModel.score(features);
+    const neural = this.neuralModel.score(features);
+    const lexical = features[5];
+    return Math.max(0, Math.min(1, neural * 0.55 + lexical * 0.45));
   }
 
   /**
@@ -228,7 +231,7 @@ class NeuralRobot {
 
   canonicalUrl(raw, base = "") {
     try {
-      const u = new URL(raw, base);
+      const u = new URL(raw, base || undefined);
       if (!/^https?:$/.test(u.protocol)) return "";
       u.hash = ""; u.hostname = u.hostname.toLowerCase();
       for (const key of [...u.searchParams.keys()]) if (/^(utm_|gclid|fbclid|mc_|ref|source|session|click)/i.test(key)) u.searchParams.delete(key);
@@ -310,7 +313,7 @@ class NeuralRobot {
       const page = {
         url: this.canonicalUrl(parsed.canonical || res.url || url), title: parsed.title, text: parsed.text, links: parsed.links.map(link => this.canonicalUrl(link, res.url || url)).filter(Boolean),
         metadata: parsed.metadata, headings: parsed.headings, passages: parsed.passages || [], language: parsed.language || "", jsonLd: parsed.jsonLd || [],
-        score, depth, latency, bytes: res.bytes,
+        score, query, queryRelevance: this.textRelevance(`${parsed.title} ${parsed.text} ${(parsed.headings || []).join(" ")}`, query), depth, latency, bytes: res.bytes,
         timestamp: Date.now(),
       };
 
@@ -320,7 +323,9 @@ class NeuralRobot {
       
       for (const link of page.links) {
         if (!this.visited.has(link) && depth < this.maxDepth) {
-          const priority = this.neuralModel?.scoreUrl ? this.neuralModel.scoreUrl(link, { type: "html", internal: new URL(link).hostname === new URL(page.url).hostname }) : score;
+          const lexical = this.textRelevance(link, query);
+          const neural = this.neuralModel?.scoreUrl ? this.neuralModel.scoreUrl(link, { type: "html", internal: new URL(link).hostname === new URL(page.url).hostname }) : score;
+          const priority = neural + lexical * 2;
           this.queue.push({ url: link, depth: depth + 1, priority });
         }
       }
@@ -348,12 +353,14 @@ class NeuralRobot {
     this.maxPages = opts.maxPages || this.maxPages;
 
     const results = [], active = new Set();
+    let started = 0;
     this.status = "crawling";
     const pump = async () => {
-      while (this.queue.length && results.length + active.size < this.maxPages && this.status !== "paused") {
+      while (this.queue.length && started < this.maxPages && this.status !== "paused") {
         const item = this.queue.shift();
         if (!item?.url || this.visited.has(item.url)) { this.stats.duplicateUrls++; continue; }
         this.visited.add(item.url);
+        started++;
         const task = this.crawlPage(item.url, query, item.depth).then(page => { if (page) results.push(page); }).finally(() => active.delete(task));
         active.add(task);
         if (active.size >= this.concurrency) await Promise.race(active);
@@ -426,11 +433,11 @@ class NeuralRobotPool {
 
     for (let i = 0; i < this.maxWorkers; i++) {
       this.workers.push(new NeuralRobot(i, {
+        ...opts,
         neuralModel: this.neuralModel,
-        onPageFound: (page) => this.logPage(page),
+        onPageFound: (page) => { this.logPage(page); opts.onPageFound?.(page); },
         onLinkFound: (url, fromUrl, score) => this.logLink(url, fromUrl, score),
         onFeedback: (url, clicked, relevance) => this.logFeedback(url, clicked, relevance),
-        ...opts,
       }));
     }
   }
