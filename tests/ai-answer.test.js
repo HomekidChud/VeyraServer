@@ -20,6 +20,7 @@ const evidence = engine.buildEvidence("What is hi?", engine.detectIntent("What i
 assert.equal(evidence.length, 2, "near-identical evidence must not count as independent");
 assert.equal(evidence[0].id, "S1");
 const local = engine.localSynthesis("What is hi?", engine.detectIntent("What is hi?"), evidence);
+assert.ok(local.sourceIds.length >= 2, "local synthesis should combine independent evidence when available");
 const verified = engine.verifyAnswer(local.answer, evidence);
 assert.equal(verified.unsupported, 0);
 const quality = engine.evidenceQuality(evidence, evidence.slice(0, 1), verified, engine.detectIntent("What is hi?"));

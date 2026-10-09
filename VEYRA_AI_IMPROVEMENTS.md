@@ -22,6 +22,8 @@ The existing neural robot pool now feeds the Veyra Index instead of only logging
 
 The previous absolute-seed canonicalization bug was fixed, and indexed crawler text now removes navigation, cookie, advertisement, social, audio and dictionary UI boilerplate before it enters the search index.
 
+Neural synthesis now requires cited multi-source output when independent evidence exists. If the native model is unavailable or fails those checks, Veyra abstains instead of displaying copied raw snippets. The old extractive fallback remains opt-in through `AI_ANSWER_ALLOW_EXTRACTIVE_FALLBACK=true` for controlled diagnostics only.
+
 ## Deliberate limitations
 
 The score is explicitly not a calibrated probability. A statistically calibrated confidence model requires a reviewed, labeled evaluation set and repeated measurement. Claim verification is transparent citation/coverage checking; it is not a semantic entailment model. No external model was substituted for Veyra’s configured native model.

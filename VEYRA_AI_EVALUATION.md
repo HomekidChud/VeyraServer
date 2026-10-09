@@ -41,6 +41,8 @@ No claim is made here about a production accuracy uplift because a labeled bench
 
 A bounded crawl of the public Wikipedia photosynthesis page completed successfully and inserted one normalized document into the local Veyra Index. A subsequent Veyra Index query returned the indexed document with a cleaned content snippet rather than the page's navigation dump. The crawler uses configurable budgets (`INDEX_AI_MAX_PAGES`, default 24, and `INDEX_AI_MAX_DEPTH`, default 2); production scale depends on configured seeds, crawl capacity, robots permissions and persistence availability.
 
+The answer endpoint now abstains when native neural synthesis cannot produce cited multi-source output. This prevents an irrelevant Bing response from being exposed as a copied extractive “AI answer.” Extractive fallback is available only when explicitly enabled for diagnostics.
+
 ## Recommended next evaluation stage
 
 Add reviewed fixtures for definitions, conflicts, current facts, insufficient evidence, malicious source instructions and provider failures. Compare the same fixtures before and after this pipeline using citation correctness, unsupported-claim rate, extraction quality and latency.
