@@ -410,12 +410,16 @@ function installVeyraDevtools(emitFn, opts) {
       if (source.length > 200000) throw new Error("Userscript exceeds the 200 KB safety limit.");
       const old = ext.scripts.get(key); if (old === source) return true;
       if (!source.trim()) { ext.scripts.delete(key); extStyle("script-" + key, ""); return true; }
+      if (!p.localOnly) throw new Error("Developer scripts are local-only and may not be restored or delivered through account sync.");
+      if (/\b(?:fetch|XMLHttpRequest|WebSocket|EventSource|navigator\.sendBeacon|importScripts|eval|Function|Worker|SharedWorker)\b|\bdocument\s*(?:\.\s*cookie|\[\s*["']cookie)/i.test(source)) {
+        throw new Error("Developer scripts may not access network, cookies, workers, or dynamic code.");
+      }
       const values = ext.scriptValues.get(key) || Object.create(null); ext.scriptValues.set(key, values);
       const gmGet = name => values[String(name)] ?? null;
       const gmSet = (name, value) => { values[String(name)] = value; return value; };
       const gmDelete = name => { delete values[String(name)]; return true; };
       const gmList = () => Object.keys(values).slice(0, 200);
-      const gmStyle = css => { if (String(css).length > 120000) throw new Error("GM_addStyle CSS is too large."); extStyle("script-" + key, String(css)); };
+      const gmStyle = css => { const value = String(css); if (value.length > 120000) throw new Error("GM_addStyle CSS is too large."); if (/@import\b|url\s*\(|javascript\s*:|expression\s*\(|-moz-binding|behavior\s*:|@font-face|@namespace\b/i.test(value)) throw new Error("GM_addStyle may not import, fetch, or load remote resources."); extStyle("script-" + key, value); };
       const run = new Function("GM_getValue", "GM_setValue", "GM_deleteValue", "GM_listValues", "GM_addStyle", `${source}\n//# sourceURL=veyra-userscript-${key}.user.js`);
       run(gmGet, gmSet, gmDelete, gmList, gmStyle);
       ext.scripts.set(key, source); return true;

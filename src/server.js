@@ -27,6 +27,8 @@ const { NeuralLearningWorker } = require("./services/neural-learning");
 const { ChallengeSolver } = require("./browser/challenge-solver");
 const { CastServer, InternetConnectionManager } = require("./network/cast-server");
 const { AIAnswerEngine } = require("./services/ai-answer");
+const { ExtensionStoreSecurity, ExtensionSecurityError } = require("./services/extension-security");
+const { VeyraAssistant, AssistantFeedbackStore, AssistantError } = require("./services/veyra-assistant");
 const { RenewingManager } = require("./services/renewing-system");
 const fullPage = require("./browser/full-page.js");
 const { FailoverController } = require("./browser/browser-failover.js");
@@ -67,6 +69,14 @@ function csvEnv(name, fallback = []) {
 function enumEnv(name, fallback, allowed) {
   const raw = String(process.env[name] ?? "").trim().toLowerCase();
   return allowed.includes(raw) ? raw : fallback;
+}
+function jsonObjectEnv(name) {
+  const raw = String(process.env[name] ?? "").trim();
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch { return {}; }
 }
 
 
@@ -398,10 +408,28 @@ const neuralTrainer = new NeuralLearningWorker({
 const authStore = new AuthStore({
   dataDir: CFG.authDataDir, secret: CFG.authSecret, tokenTtlMs: CFG.authTokenTtlMs,
   adminEmails: CFG.adminEmails, allowSignup: CFG.authAllowSignup, persistence: mongoStore, testMode: CFG.testMode,
-  
   log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
 });
-
+const extensionStoreSecurity = new ExtensionStoreSecurity({
+  dataDir: process.env.VEYRA_EXTENSION_DATA_DIR || path.join(CFG.authDataDir, "extensions"),
+  builtInStoreFile: path.join(__dirname, "..", "extension-store.json"),
+  requireSignature: boolEnv("VEYRA_EXTENSION_REQUIRE_SIGNATURE", false),
+  trustedSigningKeys: jsonObjectEnv("VEYRA_EXTENSION_TRUSTED_KEYS_JSON"),
+  log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
+});
+const assistantFeedbackStore = new AssistantFeedbackStore({
+  dataDir: process.env.VEYRA_ASSISTANT_DATA_DIR || path.join(CFG.authDataDir, "assistant"),
+  retentionMs: numberEnv("VEYRA_ASSISTANT_FEEDBACK_RETENTION_MS", 30 * 24 * 60 * 60 * 1000, 24 * 60 * 60 * 1000, 365 * 24 * 60 * 60 * 1000)
+});
+const veyraAssistant = new VeyraAssistant({
+  apiKey: process.env.OPENAI_API_KEY || "",
+  apiBase: process.env.OPENAI_API_BASE || "",
+  model: process.env.VEYRA_ASSISTANT_MODEL || "",
+  timeoutMs: numberEnv("VEYRA_ASSISTANT_TIMEOUT_MS", 20000, 1000, 60000),
+  maxRequests: numberEnv("VEYRA_ASSISTANT_REQUESTS_PER_WINDOW", 8, 1, 100),
+  rateWindowMs: numberEnv("VEYRA_ASSISTANT_RATE_WINDOW_MS", 10 * 60 * 1000, 60000, 24 * 60 * 60 * 1000),
+  log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
+});
 class Semaphore {
   constructor(limit) { this.limit = Math.max(1, limit); this.active = 0; this.waiters = []; }
   get available() { return Math.max(0, this.limit - this.active); }
@@ -3553,37 +3581,42 @@ app.post('/api/youtube/resolve', async (req, res) => {
 
 
 
-const EXT_STORE_FILE = path.join(__dirname, "..", "extension-store.json");
-function safeExtensionCss(css) {
-  const v = String(css || "");
-  if (!v.trim() || v.length > 120000) throw new Error("Extension CSS is empty or exceeds 120 KB.");
-  if (/@import\b|url\s*\(|javascript\s*:|expression\s*\(|-moz-binding|behavior\s*:|@font-face|@namespace\b/i.test(v)) throw new Error("Extension CSS may not import, fetch, execute scripts, or load external resources.");
-  if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(v)) throw new Error("Extension CSS contains control characters.");
-  let depth = 0; for (let i = 0; i < v.length; i++) { if (v[i] === "{") depth++; else if (v[i] === "}") { depth--; if (depth < 0) throw new Error("Extension CSS braces are unbalanced."); } }
-  if (depth !== 0) throw new Error("Extension CSS braces are unbalanced.");
-  return v;
+function extensionActor(req, role = "publisher") {
+  const user = req.veyraUser || authStore.userFromRequest(req);
+  return user ? { id: user.id, name: user.name || user.email, email: user.email, role } : null;
 }
-function validateExtensionPackage(pkg) {
-  if (!pkg || typeof pkg !== "object" || Array.isArray(pkg)) throw new Error("Extension package must be an object.");
-  const id = String(pkg.id || "").trim(); if (!/^[a-z0-9][a-z0-9-_.]{1,63}$/i.test(id)) throw new Error("Invalid extension id.");
-  const name = String(pkg.name || "").trim(); if (!name || name.length > 80) throw new Error("Invalid extension name.");
-  const perms = Array.isArray(pkg.permissions) ? pkg.permissions.map(String) : []; if (perms.some(x => x !== "styles")) throw new Error("Only the styles permission is supported.");
-  for (const k of ["js","script","scripts","content_scripts","background","service_worker","web_accessible_resources","externally_connectable"]) if (pkg[k]) throw new Error(`Unsupported extension capability: ${k}`);
-  const files = pkg.files && typeof pkg.files === "object" ? pkg.files : {}; const css = safeExtensionCss(pkg.css ?? files["style.css"] ?? "");
-  const matches = pkg.matches == null ? [] : Array.isArray(pkg.matches) ? pkg.matches.map(String).slice(0, 30) : [];
-  if (matches.some(x => x.length > 120 || /[\r\n]/.test(x))) throw new Error("Invalid extension match pattern.");
-  const integrity = crypto.createHash("sha256").update(JSON.stringify({ id, version: String(pkg.version || "1.0.0"), matches, css })).digest("hex");
-  return { schema: "veyra-extension/v1", id, name, version: String(pkg.version || "1.0.0").slice(0, 20), description: String(pkg.description || "").slice(0, 300), author: String(pkg.author || "").slice(0, 100), publisher: String(pkg.publisher || "").slice(0, 100), permissions: ["styles"], matches, files: { "style.css": css }, published: !!pkg.published, verified: true, integrity };
+function extensionFailure(res, error) {
+  const known = error instanceof ExtensionSecurityError;
+  return respondError(res, known ? error.status : 400, known ? error.message : "Extension security validation failed.", known ? error.code : "EXTENSION_SECURITY_REJECTED");
 }
-function readExtensionStore() {
-  let raw = []; try { raw = JSON.parse(fs.readFileSync(EXT_STORE_FILE, "utf8")); } catch { raw = []; }
-  const out = []; for (const pkg of Array.isArray(raw) ? raw : []) { try { out.push(validateExtensionPackage(pkg)); } catch (e) { serverLog("warn", "STORE", `Rejected invalid published extension ${String(pkg?.id || "unknown")}: ${e.message}`); } }
-  return out;
-}
-app.get("/api/extensions/store", (req, res) => res.json({ ok: true, extensions: readExtensionStore() }));
-app.get("/api/extensions/store/:id", (req, res) => { const ext = readExtensionStore().find(x => x.id === req.params.id); if (!ext) return respondError(res, 404, "Extension not found.", "EXTENSION_NOT_FOUND"); res.json({ ok: true, extension: ext }); });
-app.post("/api/extensions/verify", (req, res) => { try { const extension = validateExtensionPackage(req.body || {}); res.json({ ok: true, safe: true, extension, policy: { scripts: false, cookieAccess: false, networkImports: false, permissions: ["styles"] } }); } catch (e) { res.status(400).json({ ok: false, safe: false, reason: e.message, code: "EXTENSION_SECURITY_REJECTED" }); } });
-
+app.get("/api/extensions/policy", (req, res) => res.json({ ok: true, policy: extensionStoreSecurity.policy() }));
+app.get("/api/extensions/store", (req, res) => res.json({ ok: true, extensions: extensionStoreSecurity.listPublished(), policy: extensionStoreSecurity.policy() }));
+app.get("/api/extensions/store/:id", (req, res) => {
+  const extension = extensionStoreSecurity.listPublished().find(item => item.id === req.params.id);
+  if (!extension) return respondError(res, 404, "Extension not found.", "EXTENSION_NOT_FOUND");
+  res.json({ ok: true, extension });
+});
+app.post("/api/extensions/verify", (req, res) => {
+  try { res.json({ ok: true, safe: true, extension: extensionStoreSecurity.verify(req.body || {}), policy: extensionStoreSecurity.policy() }); }
+  catch (error) { extensionFailure(res, error); }
+});
+app.post("/api/extensions/upload", requireUser, (req, res) => respondError(res, 415, "Archive and binary uploads are not supported. Submit a JSON CSS-only manifest to /api/extensions/submissions; Veyra never extracts untrusted archives.", "EXTENSION_ARCHIVE_UNSUPPORTED"));
+app.post("/api/extensions/submissions", requireUser, (req, res) => {
+  const submission = extensionStoreSecurity.submit(req.body || {}, extensionActor(req));
+  if (submission.state === "REJECTED") return res.status(400).json({ ok: false, submission, error: submission.error });
+  res.status(202).json({ ok: true, submission });
+});
+app.get("/api/extensions/submissions/mine", requireUser, (req, res) => res.json({ ok: true, submissions: extensionStoreSecurity.listMine(req.veyraUser.id) }));
+app.get("/api/extensions/reviews", requireAdmin, (req, res) => res.json({ ok: true, submissions: extensionStoreSecurity.listForReview() }));
+app.post("/api/extensions/reviews/:id/decision", requireAdmin, (req, res) => {
+  try { res.json({ ok: true, submission: extensionStoreSecurity.decide(req.params.id, req.body?.decision, extensionActor(req, "admin"), req.body?.note) }); }
+  catch (error) { extensionFailure(res, error); }
+});
+app.post("/api/extensions/reviews/:id/publish", requireAdmin, (req, res) => {
+  try { res.status(201).json({ ok: true, extension: extensionStoreSecurity.publish(req.params.id, extensionActor(req, "admin")) }); }
+  catch (error) { extensionFailure(res, error); }
+});
+app.get("/api/extensions/audit", requireAdmin, (req, res) => res.json({ ok: true, events: extensionStoreSecurity.auditEvents(req.query.limit) }));
 const vpnErrStatus = code => ({ VPN_DISABLED: 503, VPN_NOT_CONFIGURED: 404, VPN_ALL_DOWN: 503, VPN_KILL_SWITCH: 503, VPN_TEST_FAILED: 502, VPN_NOT_CONNECTED: 409 })[code] || 400;
 
 
@@ -4281,6 +4314,33 @@ app.post('/api/search/answer', async (req, res) => {
   } catch (e) { res.json({ hasAnswer: false, reason: e.message }); }
 });
 app.get('/api/answer/status', (req, res) => res.json(aiAnswerEngine.report()));
+
+app.get('/api/assistant/status', (req, res) => res.json({ ok: true, ...veyraAssistant.status(), feedback: assistantFeedbackStore.status() }));
+app.post('/api/assistant/ask', requireUser, async (req, res) => {
+  try {
+    const result = await veyraAssistant.ask(req.body || {}, req.veyraUser);
+    res.json({ ok: true, ...result });
+  } catch (error) {
+    const known = error instanceof AssistantError;
+    respondError(res, known ? error.status : 502, known ? error.message : "Veyra Assistant could not complete this request.", known ? error.code : "ASSISTANT_FAILED");
+  }
+});
+app.post('/api/assistant/feedback', requireUser, (req, res) => {
+  try {
+    const feedback = assistantFeedbackStore.record({
+      user: req.veyraUser,
+      taskId: req.body?.taskId,
+      question: req.body?.question,
+      rating: req.body?.rating,
+      note: req.body?.note,
+      trainingConsent: req.body?.trainingConsent === true
+    });
+    res.status(feedback.stored ? 202 : 200).json({ ok: true, feedback });
+  } catch (error) {
+    const known = error instanceof AssistantError;
+    respondError(res, known ? error.status : 400, known ? error.message : "Veyra Assistant feedback could not be recorded.", known ? error.code : "ASSISTANT_FEEDBACK_FAILED");
+  }
+});
 
 
 
@@ -5618,7 +5678,7 @@ const neuralRobotPool = new NeuralRobotPool({
   onPageFound: page => indexNeuralPage(page, page?.query || "")
 });
 app.get("/api/neural/stats", (req, res) => res.json({ ok: true, mongo: mongoStore.status(), model: neuralModel.report(), trainer: neuralTrainer.report() }));
-app.post("/api/neural/feedback", async (req, res) => {
+app.post("/api/neural/feedback", requireUser, async (req, res) => {
   const accepted = await neuralTrainer.enqueuePersistent({
     url: req.body?.url,
     positive: req.body?.positive,
@@ -5629,10 +5689,10 @@ app.post("/api/neural/feedback", async (req, res) => {
   if (!accepted) return res.status(400).json({ ok: false, error: "A public http(s) URL is required." });
   res.json({ ok: true, queued: neuralTrainer.report().queueSize, durable: mongoStore.connected });
 });
-app.post("/api/neural/reset", (req, res) => { neuralTrainer.queue.length = 0; neuralModel.reset(); neuralModel.save(); res.json({ ok: true }); });
+app.post("/api/neural/reset", requireAdmin, (req, res) => { neuralTrainer.queue.length = 0; neuralModel.reset(); neuralModel.save(); res.json({ ok: true }); });
 app.get("/api/robots/status", (req, res) => res.json(neuralRobotPool.report()));
 app.get("/api/robots/log", (req, res) => res.json(neuralRobotPool.getLog(Math.min(100, Number(req.query.limit) || 50))));
-app.post("/api/robots/crawl", async (req, res) => {
+app.post("/api/robots/crawl", requireUser, async (req, res) => {
   try {
     const seeds = req.body.seeds || (req.body.seed ? [req.body.seed] : []);
     if (!seeds.length) return res.status(400).json({ error: "No seed URLs provided" });
@@ -5642,7 +5702,7 @@ app.post("/api/robots/crawl", async (req, res) => {
     res.json({ ok: true, results: result });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
-app.post("/api/neural/index", async (req, res) => {
+app.post("/api/neural/index", requireUser, async (req, res) => {
   try {
     const seeds = req.body?.seeds || (req.body?.seed ? [req.body.seed] : []);
     if (!Array.isArray(seeds) || !seeds.length) return res.status(400).json({ ok: false, error: "No seed URLs provided" });
@@ -5655,7 +5715,7 @@ app.post("/api/neural/index", async (req, res) => {
     res.json({ ok: true, indexed: true, provider: "veyra-index", seeds: normalized.length, results: result.map(x => ({ seed: x.seed, status: x.status, stats: x.result?.stats || null, error: x.error || null })), index: searchIndexStats() });
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
-app.post("/api/robots/feedback", async (req, res) => {
+app.post("/api/robots/feedback", requireUser, async (req, res) => {
   try {
     const accepted = await neuralTrainer.enqueuePersistent({ url: req.body.url, positive: !!req.body.clicked, weight: req.body.relevance || 0.5, context: { type: "html", source: "robot" } });
     if (!accepted) return res.status(400).json({ ok: false, error: "A public http(s) URL is required." });
@@ -5663,13 +5723,10 @@ app.post("/api/robots/feedback", async (req, res) => {
   }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
-app.post("/api/robots/reset", (req, res) => { neuralRobotPool.resetAll(); res.json({ ok: true }); });
-
-
-
+app.post("/api/robots/reset", requireAdmin, (req, res) => { neuralRobotPool.resetAll(); res.json({ ok: true }); });
 const challengeSolver = new ChallengeSolver({ log: (level, source, msg) => serverLog(level, source, msg) });
 app.get("/api/challenge/status", (req, res) => res.json(challengeSolver.report()));
-app.post("/api/challenge/solve", async (req, res) => {
+app.post("/api/challenge/solve", requireUser, async (req, res) => {
   try {
     const { url, html, statusCode, headers } = req.body;
     if (!url) return res.status(400).json({ error: "URL required" });
