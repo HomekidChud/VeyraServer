@@ -4,8 +4,9 @@
 - API proxy accepts `OPTIONS` in addition to the existing browser methods.
 - Explicit target `Authorization` headers are forwarded for API compatibility and force no-cache behavior.
 - Redirects remain hop-by-hop validated through the public-destination/SSRF checks.
-- The custom extension store serves only verified CSS-only packages.
-- Extension verification rejects scripts, background/service-worker capabilities, external CSS imports/resources and unsupported permissions.
+- The extension store supports legacy CSS-only v1 and signed, human-reviewed v2 bundles with content scripts and an opaque-origin background sandbox.
+- Executable packages require a trusted Ed25519 signature, specific HTTPS host matches, a separate administrator review, and per-device installation consent. Signatures and static heuristics do not guarantee benign behavior.
+- Archive/binary extraction, service workers, WebAssembly, remote code, and unreviewed executable packages remain unsupported.
 
 ## Veyra 8.17.1
 

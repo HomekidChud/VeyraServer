@@ -3600,7 +3600,7 @@ app.post("/api/extensions/verify", (req, res) => {
   try { res.json({ ok: true, safe: true, extension: extensionStoreSecurity.verify(req.body || {}), policy: extensionStoreSecurity.policy() }); }
   catch (error) { extensionFailure(res, error); }
 });
-app.post("/api/extensions/upload", requireUser, (req, res) => respondError(res, 415, "Archive and binary uploads are not supported. Submit a JSON CSS-only manifest to /api/extensions/submissions; Veyra never extracts untrusted archives.", "EXTENSION_ARCHIVE_UNSUPPORTED"));
+app.post("/api/extensions/upload", requireUser, (req, res) => respondError(res, 415, "Archive and binary uploads are not supported. Submit a validated v1 CSS package or signed v2 JSON bundle to /api/extensions/submissions; Veyra never extracts untrusted archives.", "EXTENSION_ARCHIVE_UNSUPPORTED"));
 app.post("/api/extensions/submissions", requireUser, (req, res) => {
   const submission = extensionStoreSecurity.submit(req.body || {}, extensionActor(req));
   if (submission.state === "REJECTED") return res.status(400).json({ ok: false, submission, error: submission.error });

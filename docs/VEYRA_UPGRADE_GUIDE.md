@@ -6,7 +6,7 @@
 
 Veyra is a browser client backed by a Node/Express service for proxy browsing, search, account data, Veyra AI search answers, and platform operations. This upgrade adds two deliberately bounded subsystems:
 
-1. **Veyra Extension Store Security** — a CSS-only extension format, server-side validation and static scanning, quarantine, human review, auditable publication, integrity metadata, and optional publisher-signature enforcement.
+1. **Veyra Extension Store Security** — legacy CSS-only `v1` packages plus signed, human-reviewed executable `v2` packages, server-side static checks, quarantine, auditable publication, and explicit per-device permission consent.
 2. **Veyra Assistant** — a consent-aware, multi-agent assistance service. Two analysts work independently in parallel; a verifier receives their structured findings and produces the user-facing answer.
 
 Neither subsystem grants an extension arbitrary code execution or gives Assistant automatic access to the user’s browser, tabs, cookies, account data, or page contents.
@@ -18,9 +18,9 @@ Neither subsystem grants an extension arbitrary code execution or gives Assistan
 1. Open **Extensions → Store**.
 2. Review the publisher, site matches, `PASS` scan state, signing state, and shortened SHA-256 integrity value.
 3. Select **Review & install**.
-4. Confirm the displayed CSS-only permissions and website scope.
+4. Confirm the exact requested permissions and site scope. For JavaScript packages, read the residual-risk warning before approving.
 
-Store listings intentionally do **not** display invented ratings or download totals. A store extension can only modify CSS on its declared matching sites. It cannot use JavaScript, network requests, cookies, background workers, WebAssembly, browser permissions, or remote imports.
+Store listings intentionally do **not** display invented ratings or download totals. CSS-only `v1` packages can only modify page styling. Signed `v2` packages may include content scripts and an opaque-origin background iframe. Content scripts run in the matching page context and can read or alter page content; background scripts have a stricter CSP sandbox and only receive the extension-local storage API. Executable Store packages require a trusted Ed25519 signature, completed static checks, a distinct administrator review, HTTPS host matches, and explicit install consent on each device.
 
 ### Use Veyra Assistant
 
@@ -38,9 +38,9 @@ Developer mode is for local experimentation, not the public Store. It can import
 
 ## 3. Developer guide
 
-### CSS-only package format
+### Package formats
 
-The public Store accepts `veyra-extension/v1` JSON packages. The only supported package file is `style.css`.
+The public Store accepts legacy `veyra-extension/v1` CSS packages and the `veyra-extension/v2` executable bundle format. Archives and binary files remain unsupported; packages are JSON with allowlisted virtual file names only.
 
 ```json
 {
@@ -59,20 +59,47 @@ The public Store accepts `veyra-extension/v1` JSON packages. The only supported 
 }
 ```
 
+Executable v2 example:
+
+```json
+{
+  "schema": "veyra-extension/v2",
+  "id": "reading-helper",
+  "name": "Reading Helper",
+  "version": "1.0.0",
+  "description": "Adds a small reading aid on the documentation site.",
+  "author": "Example publisher",
+  "publisher": "Example publisher",
+  "permissions": ["content_scripts", "background", "storage"],
+  "matches": ["https://docs.example.com/*"],
+  "files": {
+    "content/reading.js": "document.documentElement.dataset.readingHelper = 'on';",
+    "background.js": "Veyra.storage.set('installed', true);"
+  },
+  "privacyPolicy": "https://example.com/privacy",
+  "dataDisclosure": "Stores a local installed flag.",
+  "networkDisclosure": "No network access in the background sandbox."
+}
+```
+
+Sign the normalized package locally with the publisher's Ed25519 private key using exported `signExtensionPackage` from `src/services/extension-security.js`. Keep the private key out of the Veyra server, repository, CI logs, and client. Configure only the matching public PEM key in `VEYRA_EXTENSION_TRUSTED_KEYS_JSON`; every package containing JavaScript requires a trusted signature, even when `VEYRA_EXTENSION_REQUIRE_SIGNATURE=false`.
+
 ### Rules enforced by the server
 
 | Area | Constraint |
 |---|---|
 | Transport | JSON only; archive and binary upload endpoints return `415 EXTENSION_ARCHIVE_UNSUPPORTED` |
-| Files | Exactly one virtual file: `style.css` |
+| Files | v1: `style.css`; v2: optional `style.css`, `background.js`, and `content/*.js`; no arbitrary paths |
 | CSS | Maximum 120 KB; blocks `@import`, `url()`, `javascript:`, CSS expressions, bindings, behaviors, remote fonts, and namespaces |
-| Runtime | `permissions` may be empty or contain `styles` only |
-| Scope | Up to 30 validated web match patterns |
-| Manifest | Unknown fields and all script, worker, binary, WebAssembly, host-permission, and native-messaging capabilities are rejected |
-| Integrity | Canonical manifest plus CSS is SHA-256 hashed server-side |
-| Publisher signing | Ed25519 verification is available; release policy can require trusted signatures |
+| Runtime | v2 supports CSS, content scripts, an opaque-origin background iframe, and extension-local storage |
+| Declared permissions | `styles`, `content_scripts`, `background`, `storage`, `cookies`, `network`, `tabs`; `tabs` is disclosure-only and has no callable API yet |
+| Scope | Up to 30 validated web match patterns; executable packages require explicit HTTPS hosts and may not use wildcard hosts or all-site access |
+| Manifest | Worker/service-worker imports, native messaging, WebAssembly, binaries, archives, remote assets, and unknown fields are rejected |
+| Limits | CSS 120 KB; each JS file 64 KB; total JavaScript 80 KB |
+| Integrity | Canonical manifest and every virtual file are included in the SHA-256 integrity record and publisher signature |
+| Publisher signing | Executable packages must verify against a configured trusted Ed25519 key; all releases also require separate human approval |
 
-Do not add JavaScript, remote assets, or an archive extractor to this path. That would change the threat model and requires a separate sandboxed analysis service, malware pipeline, content-disarm policy, and security review.
+Static scanner findings are heuristic; they are **not malware detection** and cannot prove code harmless. Signatures prove package provenance/integrity, not benign intent. Content scripts run in the visited page's JavaScript context and can access page DOM; the install prompt states this risk. `cookies` and `network` are package disclosures plus detectable-pattern checks, not an unbypassable API membrane for page-context scripts. Background code runs in an iframe with an opaque origin, network/resource CSP restrictions, and only the `Veyra.storage` bridge, but it shares the browser renderer thread and can still consume CPU or freeze the Veyra tab. Do not add archive extraction, remote code loading, or additional privileged APIs without a new threat-model review.
 
 ### Submission and review lifecycle
 
@@ -98,7 +125,7 @@ All write endpoints use bearer authentication. Reviewer and audit endpoints requ
 | Method | Endpoint | Auth | Purpose |
 |---|---|---:|---|
 | `GET` | `/api/extensions/policy` | No | Read the active package policy and limits |
-| `GET` | `/api/extensions/store` | No | List published CSS-only packages with security metadata |
+| `GET` | `/api/extensions/store` | No | List published v1/v2 packages with security metadata |
 | `GET` | `/api/extensions/store/:id` | No | Read a published package |
 | `POST` | `/api/extensions/verify` | No | Validate and statically scan a package without storing it |
 | `POST` | `/api/extensions/upload` | User | Always rejects archive/binary transport (`415`) |
@@ -145,10 +172,10 @@ The response contains a verified answer, caveats, suggested next steps, evidence
 | Variable | Default | Meaning |
 |---|---|---|
 | `VEYRA_EXTENSION_DATA_DIR` | `${VEYRA_DATA_DIR}/extensions` | Quarantine, release, and audit data location |
-| `VEYRA_EXTENSION_REQUIRE_SIGNATURE` | `false` | Require a valid Ed25519 publisher signature for submitted packages |
+| `VEYRA_EXTENSION_REQUIRE_SIGNATURE` | `false` | Require signatures for all submissions; executable v2 packages always require trusted signatures |
 | `VEYRA_EXTENSION_TRUSTED_KEYS_JSON` | `{}` | JSON object mapping trusted `keyId` values to PEM public keys |
 
-Enable signature enforcement only after the key registry is provisioned and tested in staging. Built-in catalog items are maintained source artifacts and are statically validated on read.
+Configure and test trusted publisher public keys in staging. Executable packages are rejected when no matching trusted key exists. Built-in catalog items are maintained source artifacts and are statically validated on read.
 
 ### Veyra Assistant configuration
 
@@ -167,13 +194,13 @@ Configure an OpenAI-compatible model that supports JSON-schema structured output
 
 ### Rollout checklist
 
-1. Deploy to staging with `VEYRA_EXTENSION_REQUIRE_SIGNATURE=false`; test a harmless CSS package through all lifecycle states.
-2. Verify no archive or script reaches storage, and test a blocked `url()` CSS declaration.
-3. Configure a non-production Assistant provider and verify the consent rejection path, rate limit, timeout, and unavailable-provider path.
-4. Enable monitoring for `STORE` and `ASSISTANT` log components.
-5. Back up the protected data directory and rehearse restore procedures.
-6. Promote with feature availability communicated as **CSS-only Store** and **opt-in Assistant**.
-7. After trusted publisher keys are distributed, set `VEYRA_EXTENSION_REQUIRE_SIGNATURE=true` in staging before production.
+1. Deploy to staging with trusted signing keys configured; test a CSS package and a signed executable package through all lifecycle states.
+2. Verify archives, unsigned code, wildcard executable scopes, and blocked remote CSS are rejected.
+3. Confirm reviewers inspect every JS file and scanner warning, and that the publisher cannot review their own submission.
+4. Configure a non-production Assistant provider and verify the consent rejection path, rate limit, timeout, and unavailable-provider path.
+5. Enable monitoring for `STORE` and `ASSISTANT` log components.
+6. Back up the protected data directory and rehearse restore procedures.
+7. Promote as a **reviewed executable Store with explicit per-device install consent** and **opt-in Assistant**.
 
 ## 6. Security design
 
@@ -181,13 +208,15 @@ Configure an OpenAI-compatible model that supports JSON-schema structured output
 
 | Threat | Control |
 |---|---|
-| Malicious executable extension | CSS-only schema, denylisted capabilities, virtual-file allowlist, no archive extraction, no executable runtime |
+| Malicious executable extension | Signature/provenance gate, explicit HTTPS scope, JSON virtual-file allowlist, static heuristic findings, independent human review, explicit per-device install consent; background code uses a restrictive opaque-origin iframe |
 | Remote style exfiltration | Blocks imports, `url()`, script URIs, expressions, bindings, behaviors, namespaces, and remote font declarations |
 | Path traversal / decompression attacks | No filesystem package paths and no archive parser |
 | Store publication abuse | Quarantine, static scan, reviewer separation, approval requirement, publication state gate, audit events |
-| Supply-chain tampering | Server-issued SHA-256 canonical integrity metadata; optional Ed25519 trusted-key gate |
+| Supply-chain tampering | Server-issued SHA-256 canonical integrity metadata; trusted Ed25519 signature is mandatory for executable packages |
 | Client-side bypass | Browser asks server to re-verify before store install and installs the server-returned normalized package |
-| Script propagation | Developer scripts are explicitly local-only and excluded from account sync |
+| Script propagation | Developer scripts and executable Store bundles are excluded from account sync; each device requires review/consent installation |
+
+Content scripts still execute in the visited page's JavaScript context. Review their complete source and permissions; signatures and heuristic checks cannot guarantee safety. Do not use high-value sessions with extensions you do not trust.
 
 ### Assistant privacy model
 
@@ -205,7 +234,8 @@ Maintain semantic versioning for each repository. This upgrade should be recorde
 ### Unreleased — secure Store and Veyra Assistant
 
 **Added**
-- Quarantined CSS-only extension package lifecycle with audit history.
+- Quarantined CSS and signed executable v2 package lifecycle with audit history and per-device consent.
+- HTTPS-scoped content scripts plus a restrictive background iframe with extension-local storage.
 - SHA-256 integrity metadata, static security scan metadata, and optional Ed25519 trusted-publisher verification.
 - Consent-aware Veyra Assistant with parallel independent analysts and verifier.
 - Explicit opt-in feedback queue with retention and human-review-only policy.

@@ -1,5 +1,7 @@
 # Veyra Security Audit — 2026-10-09
 
+> **Follow-up note:** The initial audit below described the CSS-only release candidate. A later user-approved change adds a signed and human-reviewed executable v2 tier; see the addendum at the end for its changed controls and residual risks.
+
 > **Scope:** `HomekidChud/VeyraBrowser` and `HomekidChud/VeyraServer`, with emphasis on extension intake, browser extension execution, API authorization, AI assistance boundaries, and dependency health.
 >
 > **Assessment type:** targeted source review plus automated regression and local API integration testing. This is not a penetration test, compliance certification, or a claim that a running deployment is secure without its production configuration.
@@ -8,7 +10,7 @@
 
 The prior extension store already attempted a CSS-only policy, but it had no submission lifecycle, no reviewer separation, limited manifest validation, no authoritative store audit record, and the browser installed the pre-verification object instead of the server-normalized object. Developer scripts could also be included in account synchronization, which made script propagation possible across a user’s devices.
 
-This upgrade implements a fail-closed CSS-only public Store pipeline, separates locally risky developer scripts from Store functionality, and introduces consent boundaries around the new Assistant service.
+The initial upgrade implemented a fail-closed CSS-only public Store pipeline, separated locally risky developer scripts from Store functionality, and introduced consent boundaries around the Assistant service.
 
 ## Findings and remediation
 
@@ -60,8 +62,8 @@ This upgrade implements a fail-closed CSS-only public Store pipeline, separates 
 | Risk | Current disposition | Required operational action |
 |---|---|---|
 | Developer mode executes local code in the page realm | Intentional advanced feature; not part of Store trust model | Keep developer mode off by default; use a non-sensitive test profile; consider removing the capability entirely for high-assurance deployments |
-| Static CSS analysis cannot evaluate an arbitrary executable package | Avoided by rejecting executable and archive packages | Do not broaden Store acceptance without sandboxing, CDR, malware analysis, and an independent security review |
-| Publisher signing is optional by default | CSS-only design and review gate still apply | Provision trusted Ed25519 keys and enforce signatures before accepting third-party publishers at scale |
+| Content scripts can execute in page context | Accepted only for signed, reviewed, explicitly consented packages; residual risk remains material | Review every source file; do not install into sensitive sessions unless the publisher and code are trusted |
+| Publisher signing is optional by default for CSS-only packages | Executable package validation always requires a trusted Ed25519 signature | Provision/revoke trusted Ed25519 keys; require separate human review and meaningful review notes |
 | Account/admin security depends on deployment secrets | Code has gates but cannot secure empty/weak production variables | Configure strong `VEYRA_AUTH_SECRET`, `VEYRA_ADMIN_TOKEN`, TLS, backups, and restricted data-directory permissions |
 | AI provider may retain data under its own contractual terms | User-approved content is sent to configured provider only | Select provider and data-processing terms deliberately; disclose them to users; do not enable Assistant until approved |
 | Rate limit is in-process | Suitable for a single process only | Use a shared rate-limit store when horizontally scaling the API |
@@ -79,3 +81,28 @@ This upgrade implements a fail-closed CSS-only public Store pipeline, separates 
 ## Verification caveat
 
 The integration test used an isolated local data directory and test accounts. It proves the code path and fail-closed behavior; it does not validate production reverse-proxy rules, cloud IAM, backup access, DNS, TLS termination, model-provider data policies, or administrative operating procedures.
+
+## Addendum — signed executable v2 tier
+
+The user explicitly approved allowing reviewed/signed Store scripts with an install warning and acknowledged residual risk. The package server and browser client were then extended to support `veyra-extension/v2` while retaining v1 CSS packages.
+
+### Controls added
+
+- Only JSON virtual files are accepted: optional `style.css`, `background.js`, and `content/*.js`. Archives, arbitrary paths, worker imports, WASM, native messaging, and remote code remain rejected.
+- Executable bundles are always required to verify as Ed25519-signed by a configured trusted publisher key, regardless of the global CSS-package signature setting.
+- Script bundle scope must name exact HTTPS hosts; wildcard hosts, wildcard schemes, and all-site matches are rejected.
+- Each JS file is limited to 64 KB and total JS to 80 KB. CSS remains limited to 120 KB.
+- Content/network/cookie/storage patterns are surfaced to human reviewers; basic detectable network, cookie, and browser-storage accesses require corresponding declared permissions. These are heuristic checks, not an enforcement membrane.
+- Every Store listing identifies CSS vs executable content, requested permissions, signature state, scan state, publisher, scope, and digest. The user sees an install confirmation that explains executable permissions and residual risk.
+- Executable packages do not propagate through automatic account sync. Each device must install and consent separately.
+- Background JS runs in an iframe sandboxed with `allow-scripts` only, an opaque origin, restrictive CSP, and a small parent-mediated extension-local storage API.
+
+### Residual risk — material
+
+Content scripts execute in the visited page's JavaScript context to interact with the DOM. Once installed, they can read and modify matching page content and may make requests in that page context. Permissions and source-pattern checks provide disclosure and reviewer signals; they are **not a hard security boundary** against obfuscated code. A malicious but validly signed or incorrectly approved publisher can still harm users. Signature means the exact package was signed by a trusted key; it does not mean Veyra guarantees that the code is safe. The sandboxed background iframe is more restricted but shares the browser renderer thread, so pathological code can still consume CPU or freeze the Veyra tab; it is not a substitute for independent browser-process isolation or adversarial testing.
+
+Do not describe this as malware-proof, and do not use content-script extensions on sensitive authenticated websites unless the user trusts the publisher and source review. Production rollout requires trusted publisher-key provisioning, independent reviewers, a key revocation procedure, and user-facing policy disclosure.
+
+### Additional verification
+
+Regression tests generate an Ed25519 keypair, verify a signed v2 background bundle, reject unsigned executable code, reject wildcard executable hosts, reject permission/file mismatches, and verify the manual-review/publish lifecycle. Browser source checks cover the new background sandbox module and explicit install flow. These are code-path tests, not adversarial sandbox escapes or penetration tests.

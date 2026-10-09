@@ -410,9 +410,11 @@ function installVeyraDevtools(emitFn, opts) {
       if (source.length > 200000) throw new Error("Userscript exceeds the 200 KB safety limit.");
       const old = ext.scripts.get(key); if (old === source) return true;
       if (!source.trim()) { ext.scripts.delete(key); extStyle("script-" + key, ""); return true; }
-      if (!p.localOnly) throw new Error("Developer scripts are local-only and may not be restored or delivered through account sync.");
-      if (/\b(?:fetch|XMLHttpRequest|WebSocket|EventSource|navigator\.sendBeacon|importScripts|eval|Function|Worker|SharedWorker)\b|\bdocument\s*(?:\.\s*cookie|\[\s*["']cookie)/i.test(source)) {
-        throw new Error("Developer scripts may not access network, cookies, workers, or dynamic code.");
+      if (!p.localOnly && !(p.storeApproved === true && Array.isArray(p.permissions) && p.permissions.includes("content_scripts"))) {
+        throw new Error("Only explicitly local developer scripts or reviewed Store content scripts may run.");
+      }
+      if (p.storeApproved !== true && /\b(?:fetch|XMLHttpRequest|WebSocket|EventSource|navigator\.sendBeacon|importScripts|eval|Function|Worker|SharedWorker)\b|\bdocument\s*(?:\.\s*cookie|\[\s*["']cookie)/i.test(source)) {
+        throw new Error("Unreviewed developer scripts may not access network, cookies, workers, or dynamic code.");
       }
       const values = ext.scriptValues.get(key) || Object.create(null); ext.scriptValues.set(key, values);
       const gmGet = name => values[String(name)] ?? null;
