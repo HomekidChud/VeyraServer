@@ -369,6 +369,13 @@ const proxyCache = new Map();
 const fetchInflight = new Map();
 const revalidateInflight = new Map();
 const searchCache = new Map();
+const runtimeSessionPolicy = {
+  guestTimeLimitMs: CFG.sessionTimeLimitMs,
+  adminTimeLimitMs: CFG.adminSessionTimeLimitMs,
+  idleTtlMs: CFG.sessionIdleTtlMs,
+  maxAgeMs: CFG.sessionMaxAgeMs,
+  maxSessions: CFG.maxProxySessions
+};
 const sessionManager = new SessionManager({
   maxSessions: CFG.maxProxySessions, idleTtlMs: CFG.sessionIdleTtlMs, hardTtlMs: CFG.sessionMaxAgeMs, timeLimitMs: CFG.sessionTimeLimitMs,
   maxCookieBytes: CFG.sessionMaxCookieBytes, serverIdleMs: CFG.serverIdleSleepMs,
@@ -3712,16 +3719,55 @@ function sessionInfo(sid, rec) {
   const expiresAt = sessionManager.expiresAt(rec);
   return { sessionId: sid, active: true, createdAt: new Date(rec.createdAt).toISOString(), lastUsed: new Date(rec.lastUsed).toISOString(),
     timeLimitMs: (rec.timeLimitMs ?? sessionManager.timeLimitMs) || null, expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null, remainingMs: sessionManager.remainingMs(rec),
-    idleExpiresInMs: Math.max(0, CFG.sessionIdleTtlMs - (Date.now() - rec.lastUsed)), cookies: rec.cookies.size, requests: rec.requests,
+    idleExpiresInMs: Math.max(0, sessionManager.idleTtlMs - (Date.now() - rec.lastUsed)), cookies: rec.cookies.size, requests: rec.requests,
     serverTime: new Date().toISOString(), incognito: !!rec.incognito, vpn: vpnManager.sessionInfo?.(sid) || null };
 }
 app.get('/api/sessions', requireAdmin, (req, res) => res.json({ ok: true, ...sessionManager.report(), vpnConnections: vpnManager.status().connections, browser: { sessions: browserEngine.sessions.size, running: !!browserEngine.browser }, failover: failoverController ? failoverController.report() : null, snapshots: snapshotStore ? snapshotStore.report() : null }));
-
+function sessionPolicySummary() {
+  return {
+    ...runtimeSessionPolicy,
+    activeSessions: sessionManager.size,
+    note: 'Changes apply immediately to new sessions. Active-session duration changes require applyExisting=true.'
+  };
+}
+app.get('/api/admin/session-policy', requireAdmin, (req, res) => res.json({ ok: true, policy: sessionPolicySummary() }));
+app.put('/api/admin/session-policy', requireAdmin, (req, res) => {
+  const body = req.body || {};
+  const clamp = (value, min, max, label) => {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n < min || n > max) throw Object.assign(new Error(`${label} must be between ${min} and ${max}.`), { code: 'SESSION_POLICY_INVALID', status: 400 });
+    return Math.round(n);
+  };
+  try {
+    // Inputs are milliseconds so the API remains unambiguous; the panel uses minutes.
+    const guest = clamp(body.guestTimeLimitMs, 0, 7 * 24 * 60 * 60 * 1000, 'Guest session limit');
+    const admin = clamp(body.adminTimeLimitMs, 0, 7 * 24 * 60 * 60 * 1000, 'Admin session limit');
+    const idle = clamp(body.idleTtlMs, 60 * 1000, 24 * 60 * 60 * 1000, 'Idle timeout');
+    const age = clamp(body.maxAgeMs, 10 * 60 * 1000, 7 * 24 * 60 * 60 * 1000, 'Maximum age');
+    const max = clamp(body.maxSessions, 10, 5000, 'Maximum sessions');
+    Object.assign(runtimeSessionPolicy, { guestTimeLimitMs: guest, adminTimeLimitMs: admin, idleTtlMs: idle, maxAgeMs: age, maxSessions: max });
+    sessionManager.timeLimitMs = guest;
+    sessionManager.idleTtlMs = idle;
+    sessionManager.hardTtlMs = age;
+    sessionManager.maxSessions = max;
+    sessionManager.enforceCap();
+    let applied = 0;
+    if (body.applyExisting === true) {
+      for (const rec of sessionManager.sessions.values()) {
+        rec.timeLimitMs = rec.role === 'admin' ? admin : guest;
+        rec.renewedMs = 0;
+        applied += 1;
+      }
+    }
+    serverLog('info', 'SESSION', `Admin updated session policy: guest=${guest}ms admin=${admin}ms idle=${idle}ms age=${age}ms max=${max}${body.applyExisting === true ? `; applied to ${applied} active session(s)` : ''}.`);
+    res.json({ ok: true, policy: sessionPolicySummary(), appliedExisting: applied });
+  } catch (e) { respondError(res, e.status || 400, e.message, e.code || 'SESSION_POLICY_INVALID'); }
+});
 app.post('/api/session', (req, res) => {
   const user = authStore.userFromRequest(req);
   const sid = crypto.randomUUID().replaceAll("-", "");
   const isAdmin = !!(user && authStore.roleFor(user.email) === "admin");
-  const limit = isAdmin ? CFG.adminSessionTimeLimitMs : CFG.sessionTimeLimitMs;
+  const limit = isAdmin ? runtimeSessionPolicy.adminTimeLimitMs : runtimeSessionPolicy.guestTimeLimitMs;
   const rec = sessionManager.create(sid, { timeLimitMs: limit });
   rec.userId = user?.id || null;
   rec.role = isAdmin ? "admin" : "user";
