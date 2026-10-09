@@ -14,7 +14,7 @@
 class SessionManager {
   constructor(opts = {}) {
     this.maxSessions = opts.maxSessions || 500;
-    this.idleTtlMs = opts.idleTtlMs || 30 * 60 * 1000;
+    this.idleTtlMs = opts.idleTtlMs || 60 * 1000;
     this.hardTtlMs = opts.hardTtlMs || 24 * 60 * 60 * 1000;
     this.maxCookieBytes = opts.maxCookieBytes || 128 * 1024;
     
@@ -134,6 +134,7 @@ class SessionManager {
     const rec = this.sessions.get(sid);
     const limit = rec?.timeLimitMs ?? this.timeLimitMs;
     if (rec && limit && this.now() - rec.createdAt >= limit + (rec.renewedMs || 0)) { this.expire(sid, "limit"); return true; }
+    if (rec && (this.now() - rec.lastUsed > this.idleTtlMs || this.now() - rec.createdAt > this.hardTtlMs)) { this.expire(sid, "idle"); return true; }
     return false;
   }
   tombstone(sid) {
@@ -267,7 +268,7 @@ class SessionManager {
     
     for (const [sid, rec] of this.sessions) {
       if (this.isPaused(sid)) continue; 
-      if (t - rec.lastUsed <= this.idleTtlMs && t - rec.createdAt <= this.hardTtlMs) break;
+      if (t - rec.lastUsed <= this.idleTtlMs && t - rec.createdAt <= this.hardTtlMs) continue;
       this.expire(sid, "idle"); n += 1;
     }
     if (!this.sleeping && this.serverIdleMs > 0 && t - this.lastActivity > this.serverIdleMs) {

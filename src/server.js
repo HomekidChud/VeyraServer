@@ -287,7 +287,7 @@ const CFG = Object.freeze({
   parseWorkerTimeoutMs: numberEnv("PARSE_WORKER_TIMEOUT_MS", 20000, 1000, 120000),
   parseWorkerHeapMb: numberEnv("PARSE_WORKER_HEAP_MB", MEMORY_LIMIT_MB && MEMORY_LIMIT_MB <= 2048 ? 160 : 384, 64, 4096),
   
-  sessionIdleTtlMs: numberEnv("SESSION_IDLE_TTL_MS", numberEnv("PROXY_SESSION_TTL_MS", P.sessionIdleMs, 60 * 1000, 24 * 60 * 60 * 1000), 60 * 1000, 24 * 60 * 60 * 1000),
+  sessionIdleTtlMs: numberEnv("SESSION_IDLE_TTL_MS", 60 * 1000, 60 * 1000, 24 * 60 * 60 * 1000),
   sessionMaxAgeMs: numberEnv("SESSION_MAX_AGE_MS", 24 * 60 * 60 * 1000, 10 * 60 * 1000, 7 * 24 * 60 * 60 * 1000),
   
   
@@ -3782,6 +3782,12 @@ app.get('/api/session/:sid', (req, res) => {
   if (sessionManager.checkLimit(sid)) return res.json({ ok: true, sessionId: sid, active: false, expired: true, reason: "SESSION_EXPIRED" });
   const rec = sessionManager.peek(sid);
   if (!rec) return res.json({ ok: true, sessionId: sid, active: false });
+  res.json({ ok: true, ...sessionInfo(sid, rec) });
+});
+app.post('/api/session/:sid/heartbeat', (req, res) => {
+  const sid = String(req.params.sid);
+  if (sessionManager.checkLimit(sid)) return respondError(res, 410, "Session expired due to inactivity or its time limit.", "SESSION_EXPIRED");
+  let rec; try { rec = sessionManager.touch(sid); } catch (e) { return respondError(res, e.status || 400, e.message, e.code || "SESSION_ERROR"); }
   res.json({ ok: true, ...sessionInfo(sid, rec) });
 });
 
