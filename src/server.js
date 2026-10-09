@@ -1971,9 +1971,9 @@ function rewriteHtml(html, base, sid = "") {
   $("link[href]").each((_, el) => {
     const rel = String($(el).attr("rel") || "").toLowerCase();
     if (rel.includes("canonical")) return;
-    const raw = $(el).attr("href"); const u = resolveResource(raw, effectiveBase); if (u) { $(el).attr("href", makeResourceUrl(u, effectiveBase, sid)); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); }
+    const raw = $(el).attr("href"); const u = resolveResource(raw, effectiveBase); if (u) { $(el).attr("href", makeResourceUrl(u, effectiveBase, sid)); $(el).removeAttr("crossorigin"); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); }
   });
-  $("script[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), effectiveBase); if (u) { $(el).attr("src", makeResourceUrl(u, effectiveBase, sid)); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); } });
+  $("script[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), effectiveBase); if (u) { $(el).attr("src", makeResourceUrl(u, effectiveBase, sid)); $(el).removeAttr("crossorigin"); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); } });
   for (const tag of ["img", "source", "audio", "input", "embed"]) {
     $(`${tag}[src]`).each((_, el) => { const u = resolveResource($(el).attr("src"), effectiveBase); if (u) $(el).attr("src", makeResourceUrl(u, effectiveBase, sid)); });
   }
