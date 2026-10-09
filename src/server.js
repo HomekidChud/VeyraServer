@@ -1766,8 +1766,10 @@ function injectRuntime(html, original, sid = "") {
     // URLs from it yields "/api/view/<rest>"; map that onto the real page path.
     const vp=new URL(virtualUrl);
     if(/^[/]api[/]view[/]/.test(u.pathname))return new URL(vp.pathname.replace(/[/]$/,'')+u.pathname.slice(9)+u.search+u.hash,vp);
-    // Other non-Veyra /api/... paths are page-relative specifiers resolved against /api/view.
-    if(!VEYRA_ROUTES.test(u.pathname))return new URL(u.pathname.slice(5)+u.search+u.hash,virtualUrl);
+    // Other non-Veyra /api/... paths belong to the website, not Veyra. Keep
+    // the leading slash so /api/... remains rooted on the website when the
+    // current page is /watch/... or another nested route.
+    if(!VEYRA_ROUTES.test(u.pathname))return new URL(u.pathname.slice(4)+u.search+u.hash,virtualUrl);
   }catch{}return u}
   // Read a Request's real URL via the native getter: some apps (YouTube) hand fetch()
   // a data: Request with a spoofed own 'url' getter to replay a cached response.
