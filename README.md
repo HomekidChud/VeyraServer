@@ -9,6 +9,12 @@ VEYRA_CHROMIUM_ENABLED=false
 
 Set `VEYRA_CHROMIUM_ENABLED=true` only when browser rendering is explicitly required and Chromium is installed in the runtime image. The normal crawler, search, and answer paths do not launch or download Chromium. Operational status is available at `GET /api/acquisition/status`.
 
+## Google search
+
+Google's public HTML search often challenges cloud datacenter IPs. Veyra does not bypass that challenge or rotate IPs to evade it. The preferred solution is the official Google Programmable Search JSON API: set `GOOGLE_SEARCH_API_KEY` and `GOOGLE_SEARCH_CX` as secret Render environment variables. No residential IP is needed for that API path. If those variables are absent, an explicit `engine=google` request reports `not-configured` instead of silently returning another provider's results; ordinary search may still use the configured Bing, Brave, or other permitted provider.
+
+If direct Google pages are required, use a legitimate residential or mobile egress service that you control or are authorized to use, configure it as a Veyra VPN profile, and respect Google's terms and rate limits. Do not use rotating proxies to evade CAPTCHA, bans, authentication, or access controls.
+
 ## 8.17.1 compatibility hardening
 
 - API proxy accepts `OPTIONS` in addition to the existing browser methods.

@@ -152,7 +152,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
   async function search(query, { offset = 0, engine = "", lang = "" } = {}) {
     const q = cleanText(query, 600);
     if (!q) return { provider: "none", results: [], attempts: [] };
-    const want = engine && providers[engine] ? [engine, ...order.filter(p => p !== engine)] : order;
+    const want = engine && providers[engine] ? [engine] : order;
     const key = `${want.join(",")}|${offset}|${lang}|${q.toLowerCase()}`;
     const hit = cache.get(key);
     if (hit && Date.now() - hit.time < TTL) return { ...hit.value, cached: true };

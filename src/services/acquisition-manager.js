@@ -1,13 +1,13 @@
 "use strict";
 
 const crypto = require("crypto");
+const net = require("net");
 const dns = require("dns").promises;
 const { URL } = require("url");
 const { fetch: undiciFetch, Agent } = require("undici");
 const cheerio = require("cheerio");
 
 const PRIVATE_V4 = /^(?:0|10|127|169\.254|192\.0\.2|198\.51\.100|203\.0\.113|224|240)(?:\.|$)|^172\.(?:1[6-9]|2\d|3[01])\.|^192\.168\./;
-const PRIVATE_V6 = /^(?:0*:)?(?:0*:)?(?:0*:)?(?:0*:)?(?:0*:)?(?:0*:)?(?:0*:)?(?:1|::1|fc|fd|fe8|fe9|fea|feb)/i;
 const TRACKING = /^(utm_[^=]+|fbclid|gclid|mc_cid|mc_eid|ref|source)$/i;
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
@@ -25,7 +25,12 @@ function canonicalUrl(raw) {
 function hostOf(url) { try { return new URL(url).hostname.toLowerCase(); } catch { return ""; } }
 function isPrivateAddress(address) {
   const value = String(address || "").replace(/^::ffff:/i, "");
-  return PRIVATE_V4.test(value) || PRIVATE_V6.test(value) || value === "localhost";
+  if (value === "localhost" || PRIVATE_V4.test(value)) return true;
+  if (net.isIP(value) === 6) {
+    const normalized = value.toLowerCase();
+    return normalized === "::" || normalized === "::1" || normalized.startsWith("fc") || normalized.startsWith("fd") || /^(?:fe[89ab]):/i.test(normalized) || normalized.startsWith("2001:db8:");
+  }
+  return false;
 }
 function retryable(status) { return status === 408 || status === 425 || status === 429 || status >= 500; }
 
@@ -101,7 +106,7 @@ class AcquisitionManager {
       if (visited.has(url)) throw new Error("Redirect loop detected."); visited.add(url);
       await this.assertPublicUrl(url);
       const host = hostOf(url);
-      return this._limiter(host).run(async () => {
+      const outcome = await this._limiter(host).run(async () => {
         let lastError;
         for (let attempt = 0; attempt <= (opts.retries ?? this.maxRetries); attempt += 1) {
           const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), opts.timeoutMs || this.timeoutMs);
@@ -111,7 +116,10 @@ class AcquisitionManager {
             clearTimeout(timer);
             if (response.status >= 300 && response.status < 400 && response.headers.get("location")) {
               const next = canonicalUrl(new URL(response.headers.get("location"), url).href); if (!next) throw new Error("Invalid redirect target.");
-              redirectChain.push(url); url = next; break;
+              return { redirect: next };
+            }
+            if (response.status === 304) {
+              return { ok: true, status: 304, url, finalUrl: url, redirectChain, body: Buffer.alloc(0), contentType: String(response.headers.get("content-type") || ""), etag: response.headers.get("etag") || "", lastModified: response.headers.get("last-modified") || "", cacheControl: response.headers.get("cache-control") || "", headers: response.headers, engine: opts.engine || "direct-http" };
             }
             const type = String(response.headers.get("content-type") || "").toLowerCase();
             if (response.status < 200 || response.status >= 300) { if (!retryable(response.status) || attempt >= (opts.retries ?? this.maxRetries)) throw Object.assign(new Error(`HTTP ${response.status}`), { status: response.status }); await sleep(150 * 2 ** attempt + Math.random() * 100); continue; }
@@ -121,8 +129,10 @@ class AcquisitionManager {
             return { ok: true, status: response.status, url, finalUrl: url, redirectChain, body, contentType: type, etag: response.headers.get("etag") || "", lastModified: response.headers.get("last-modified") || "", cacheControl: response.headers.get("cache-control") || "", headers: response.headers, engine: opts.engine || "direct-http" };
           } catch (error) { clearTimeout(timer); lastError = error; if (attempt >= (opts.retries ?? this.maxRetries) || error.code === "SSRF_BLOCKED" || error.code === "CONTENT_TYPE_UNSUPPORTED") break; await sleep(150 * 2 ** attempt + Math.random() * 100); }
         }
-        this.stats.errors += 1; throw lastError || new Error("Acquisition failed.");
+        if (lastError) { this.stats.errors += 1; throw lastError; }
       });
+      if (outcome?.redirect) { redirectChain.push(url); url = outcome.redirect; continue; }
+      return outcome;
     }
     throw new Error("Too many redirects.");
   }
