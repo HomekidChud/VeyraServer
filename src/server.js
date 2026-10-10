@@ -428,6 +428,8 @@ const agentTraining = new AgentTrainingService({
   tickMs: numberEnv("VEYRA_AGENT_TRAINING_TICK_MS", 350, 100, 5000),
   checkpointEverySteps: numberEnv("VEYRA_AGENT_TRAINING_CHECKPOINT_STEPS", 20, 1, 1000),
   maxMazeSize: numberEnv("VEYRA_AGENT_TRAINING_MAX_MAZE", 21, 9, 31),
+  maxSamplesPerEpisode: numberEnv("VEYRA_AGENT_TRAINING_SAMPLES_PER_EPISODE", 256, 0, 10000),
+  localEpisodeLimit: numberEnv("VEYRA_AGENT_TRAINING_LOCAL_EPISODES", 500, 1, 10000),
   requireMongo: boolEnv("VEYRA_AGENT_TRAINING_REQUIRE_MONGO", String(process.env.VEYRA_ENV || "").toLowerCase() === "production"),
   enabled: boolEnv("VEYRA_AGENT_TRAINING_ENABLED", true),
   log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
