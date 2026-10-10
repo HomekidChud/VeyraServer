@@ -196,6 +196,10 @@ assert.ok(Math.abs(restoredQualityLearner.predict(goodAnswerFeatures) - qualityL
   assert.deepEqual(sparseResult.sourceIds, ["S1", "S2", "S3"], "citations can supply source IDs when a compatible model omits optional JSON fields");
   assert.deepEqual(sparseResult.keyPoints, []);
   assert.equal(sparseEngine.verifyAnswer(sparseResult.answer, sparseEvidence).unsupported, 0, "the accepted short summary must still pass the factual grounding verifier");
+  const crossSourceClaim = "Roblox is a large global community built around virtual worlds and games for many types of players, from racing to other experiences [S1][S2][S3].";
+  assert.equal(sparseEngine.verifyAnswer(crossSourceClaim, sparseEvidence).unsupported, 0, "a paraphrased claim supported collectively by its cited sources should not be rejected just because no single source repeats the full sentence");
+  const unsupportedClaim = "Roblox guarantees weekly income for every player [S1][S2][S3].";
+  assert.equal(sparseEngine.verifyAnswer(unsupportedClaim, sparseEvidence).unsupported, 1, "multi-source aggregation must still reject claims with insufficient evidence overlap");
   clearAIEnv();
   process.env.GROQ_API_KEY = "offline-groq-unauthorized-key";
   global.fetch = async url => String(url) === "https://api.groq.com/openai/v1/models"
@@ -208,6 +212,18 @@ assert.ok(Math.abs(restoredQualityLearner.predict(goodAnswerFeatures) - qualityL
   assert.doesNotMatch(JSON.stringify(rejectedGroq), /offline-groq-unauthorized-key/, "failure diagnostics must never expose API-key values");
   global.fetch = savedFetch;
   restoreAIEnv();
+
+  const previousDiagnosticEnv = Object.fromEntries(aiEnvNames.map(name => [name, process.env[name]]));
+  clearAIEnv();
+  process.env.GROQ_API_KEY = "offline-grounding-diagnostic-key";
+  const groundingRejected = new AIAnswerEngine({ allowExtractiveFallback: false });
+  groundingRejected.synthesizeWithLLM = async () => ({ answer: "Roblox guarantees weekly income for every player [S1].", keyPoints: [], caveats: [], sourceIds: ["S1"] });
+  const groundingFailure = await groundingRejected.answer("Roblox", [{ url: sparseEvidence[0].url, title: sparseEvidence[0].title, contentText: sparseEvidence[0].documentText }]);
+  aiEnvNames.forEach(name => previousDiagnosticEnv[name] == null ? delete process.env[name] : process.env[name] = previousDiagnosticEnv[name]);
+  assert.equal(groundingFailure.diagnosticCode, "grounding_rejected");
+  assert.equal(groundingFailure.groundingDiagnostic.unsupportedClaims, 1);
+  assert.deepEqual(groundingFailure.groundingDiagnostic.claims[0], { id: "C1", sourceIds: ["S1"], status: "unsupported-or-uncited" }, "grounding diagnostics should return safe claim IDs/statuses without claim text");
+  assert.doesNotMatch(JSON.stringify(groundingFailure), /weekly income/i, "rejected model text must not be included in public diagnostics");
 
   const grounded = new AIAnswerEngine({ allowExtractiveFallback: true });
   grounded.synthesizeWithLLM = async () => null;
