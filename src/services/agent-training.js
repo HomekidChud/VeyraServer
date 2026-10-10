@@ -70,14 +70,18 @@ class AgentTrainingService {
     this.log = options.log || (() => {});
     this.dataDir = options.dataDir || path.join(process.cwd(), "data", "agent-training");
     this.stateFile = path.join(this.dataDir, "checkpoint.json");
+    this.episodeHistoryFile = path.join(this.dataDir, "episodes.jsonl");
     this.tickMs = boundedInt(options.tickMs, 100, 5000, 350);
     this.checkpointEverySteps = boundedInt(options.checkpointEverySteps, 1, 1000, 20);
     this.maxMazeSize = boundedInt(options.maxMazeSize, 9, 31, 21);
+    this.maxSamplesPerEpisode = boundedInt(options.maxSamplesPerEpisode, 0, 10000, 256);
+    this.localEpisodeLimit = boundedInt(options.localEpisodeLimit, 1, 10000, 500);
     this.requireMongo = options.requireMongo === true;
     this.enabled = options.enabled !== false;
     this.timer = null; this.persistBusy = false; this.waitLogged = false;
     this.startedAt = null;
     this.askRequests = new Map();
+    this.localEpisodeCount = this._countLocalEpisodes();
     this.state = {
       modelId: MODEL_ID, status: "idle", createdAt: new Date().toISOString(), episodes: 0,
       successfulEpisodes: 0, totalSteps: 0, totalSanctions: 0, bestScore: 0, lastScore: 0,
@@ -93,6 +97,20 @@ class AgentTrainingService {
       const saved = JSON.parse(fs.readFileSync(this.stateFile, "utf8"));
       if (saved?.modelId === MODEL_ID && saved.policy) this.state = { ...this.state, ...saved, events: Array.isArray(saved.events) ? saved.events.slice(-100) : [], currentEpisode: null };
     } catch {}
+  }
+
+  _countLocalEpisodes() {
+    if (this.requireMongo) return 0;
+    try {
+      return fs.readFileSync(this.episodeHistoryFile, "utf8").split(/\r?\n/).filter(Boolean).length;
+    } catch { return 0; }
+  }
+
+  _recordSample(episode, sample) {
+    if (this.maxSamplesPerEpisode <= 0) return;
+    episode.samples ||= [];
+    if (episode.samples.length >= this.maxSamplesPerEpisode) { episode.samplesTruncated = true; return; }
+    episode.samples.push(sample);
   }
 
   _emit(type, message, details = {}) {
@@ -144,7 +162,7 @@ class AgentTrainingService {
     const maze = createMaze(size);
     const observation = Array.from({ length: size }, () => Array(size).fill("?"));
     const agents = ROLES.map(role => ({ ...role, x: maze.start.x, y: maze.start.y, sanctions: 0, cooldown: 0, messages: 0 }));
-    const episode = { id: crypto.randomUUID(), startedAt: new Date().toISOString(), size, maze, observation, agents, foundKeys: [], step: 0, score: 0, status: "running", messages: [], turns: 0 };
+    const episode = { id: crypto.randomUUID(), startedAt: new Date().toISOString(), size, maze, observation, agents, foundKeys: [], step: 0, score: 0, status: "running", messages: [], turns: 0, samples: [], samplesTruncated: false };
     this._reveal(episode, maze.start.x, maze.start.y);
     this._emit("episode", `Episode ${this.state.episodes + 1} started: ${size}×${size} cooperative maze; three keys and an exit.`, { episodeId: episode.id, size });
     return episode;
@@ -222,6 +240,9 @@ class AgentTrainingService {
     for (const agent of ep.agents) {
       if (!this.enabled || ep.status !== "running") break;
       if (agent.cooldown > 0) { agent.cooldown -= 1; continue; }
+      const collectSample = this.maxSamplesPerEpisode > 0 && ep.samples.length < this.maxSamplesPerEpisode;
+      const inputObservation = collectSample ? ep.observation.map(row => row.join("")).join("") : "";
+      const inputPosition = { x: agent.x, y: agent.y };
       const proposal = this._chooseMove(ep, agent);
       if (!proposal) continue;
       const dx = Math.abs(proposal.x - agent.x), dy = Math.abs(proposal.y - agent.y);
@@ -229,10 +250,12 @@ class AgentTrainingService {
       if (ep.maze.grid[proposal.y][proposal.x] === "#") { this._sanction(ep, agent, "attempted move through a wall"); continue; }
       const previous = { x: agent.x, y: agent.y };
       agent.x = proposal.x; agent.y = proposal.y; ep.score += 1;
+      let sampleReward = 1;
       this._reveal(ep, agent.x, agent.y);
       const physical = ep.maze.grid[agent.y][agent.x];
       if (physical === "k" && !ep.foundKeys.some(key => key.x === agent.x && key.y === agent.y)) {
         ep.foundKeys.push({ x: agent.x, y: agent.y }); ep.score += 30;
+        sampleReward += 30;
         this._message(ep, agent.id, "key-found", `Found a key at ${agent.x},${agent.y}; shared the verified location.`);
         // The world marks a collected key as ordinary floor for other agents.
         ep.maze.grid[agent.y][agent.x] = "."; ep.observation[agent.y][agent.x] = ".";
@@ -241,14 +264,25 @@ class AgentTrainingService {
       } else if (agent.id === "coordinator" && ep.step % 7 === 0) {
         this._message(ep, agent.id, "plan", `${ep.foundKeys.length}/${ep.maze.keys.length} keys found; agents are coordinating toward shared objectives.`);
       }
-      if (physical === "E" && ep.foundKeys.length === ep.maze.keys.length) {
-        ep.status = "solved"; ep.score += 100;
+      const solved = physical === "E" && ep.foundKeys.length === ep.maze.keys.length;
+      if (solved) { ep.status = "solved"; ep.score += 100; sampleReward += 100; }
+      if (collectSample) this._recordSample(ep, {
+        step: ep.step, agent: agent.id, size: ep.size, position: inputPosition,
+        observation: inputObservation, action: proposal.name, reward: sampleReward,
+        nextPosition: { x: agent.x, y: agent.y }, done: solved
+      });
+      if (solved) {
         this._finishEpisode(ep, true); break;
       }
       // Training action validator: no hidden-state reports, external I/O, or privileged operations exist.
       if (agent.x === previous.x && agent.y === previous.y) this._sanction(ep, agent, "unverifiable movement report");
     }
-    if (ep.step >= ep.size * ep.size * 8 && ep.status === "running") { ep.status = "timeout"; ep.score -= 20; this._finishEpisode(ep, false); }
+    if (ep.step >= ep.size * ep.size * 8 && ep.status === "running") {
+      ep.status = "timeout"; ep.score -= 20;
+      const lastSample = ep.samples?.[ep.samples.length - 1];
+      if (lastSample?.step === ep.step) lastSample.done = true;
+      this._finishEpisode(ep, false);
+    }
     this.state.status = this.enabled ? "running" : "paused";
     if (ep.step % this.checkpointEverySteps === 0 || ep.status !== "running") void this._persist(false);
   }
@@ -284,7 +318,7 @@ class AgentTrainingService {
     this.persistBusy = true;
     const snapshot = JSON.parse(JSON.stringify({ ...this.state, currentEpisode: this.state.currentEpisode && {
       ...this.state.currentEpisode,
-      maze: undefined // Never persist hidden maze truth in a checkpoint; only the visible team observation is saved.
+      maze: undefined, samples: undefined // Never persist hidden maze truth or a bulky active sample buffer in the checkpoint.
     } }));
     try {
       if (this.requireMongo) {
@@ -312,15 +346,40 @@ class AgentTrainingService {
   }
 
   async _persistEpisode(ep) {
+    const record = {
+      id: ep.id, modelId: MODEL_ID, startedAt: ep.startedAt, completedAt: ep.completedAt, size: ep.size,
+      score: ep.score, turns: ep.step, status: ep.status, keyCount: ep.foundKeys.length,
+      agentStats: ep.agents.map(({ id, sanctions, messages }) => ({ id, sanctions, messages })),
+      events: ep.messages.slice(-30).map(({ id, from, kind, text, step, at }) => ({ id, from, kind, text, step, at })),
+      sampleCount: Array.isArray(ep.samples) ? ep.samples.length : 0,
+      samplesTruncated: ep.samplesTruncated === true,
+      samples: Array.isArray(ep.samples) ? ep.samples : []
+    };
+    if (!this.requireMongo) this._persistLocalEpisode(record);
     if (!this.mongo?.enabled) return;
     try {
+      const mongoRecord = { ...record };
+      delete mongoRecord.samples;
       await this.mongo.withDb(db => db.collection("agent_training_episodes").updateOne({ id: ep.id }, { $set: {
-        id: ep.id, modelId: MODEL_ID, startedAt: ep.startedAt, completedAt: ep.completedAt, size: ep.size,
-        score: ep.score, turns: ep.step, status: ep.status, keyCount: ep.foundKeys.length,
-        agentStats: ep.agents.map(({ id, sanctions, messages }) => ({ id, sanctions, messages })),
-        events: ep.messages.slice(-30)
+        ...mongoRecord
       } }, { upsert: true }));
     } catch (error) { this.log("warn", "AGENT_TRAINING", `Episode persistence failed: ${error.message}`); }
+  }
+
+  _persistLocalEpisode(record) {
+    try {
+      fs.mkdirSync(this.dataDir, { recursive: true, mode: 0o700 });
+      fs.appendFileSync(this.episodeHistoryFile, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
+      fs.chmodSync(this.episodeHistoryFile, 0o600);
+      this.localEpisodeCount += 1;
+      if (this.localEpisodeCount > this.localEpisodeLimit) {
+        const retained = fs.readFileSync(this.episodeHistoryFile, "utf8").split(/\r?\n/).filter(Boolean).slice(-this.localEpisodeLimit);
+        const temp = `${this.episodeHistoryFile}.${process.pid}.tmp`;
+        fs.writeFileSync(temp, `${retained.join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
+        fs.renameSync(temp, this.episodeHistoryFile);
+        this.localEpisodeCount = retained.length;
+      }
+    } catch (error) { this.log("warn", "AGENT_TRAINING", `Local episode archive failed: ${error.message}`); }
   }
 
   report() {
@@ -329,7 +388,13 @@ class AgentTrainingService {
       available: true, mode: "server-cooperative-training", modelId: MODEL_ID,
       externalApiKeyRequired: false, foundationModelTraining: false,
       status: this.state.status, startedAt: this.startedAt, tickMs: this.tickMs, checkpointEverySteps: this.checkpointEverySteps,
-      persistence: { mongodbConfigured: !!this.mongo?.enabled, mongodbRequired: this.requireMongo, mongodbConnected: !!this.mongo?.connected, checkpointSavedToMongo: !!this.state.savedToMongo, localCheckpoint: this.requireMongo ? false : this.stateFile },
+      persistence: {
+        mongodbConfigured: !!this.mongo?.enabled, mongodbRequired: this.requireMongo, mongodbConnected: !!this.mongo?.connected,
+        checkpointSavedToMongo: !!this.state.savedToMongo, localCheckpoint: this.requireMongo ? false : this.stateFile,
+        localEpisodeHistory: this.requireMongo ? false : this.episodeHistoryFile,
+        localEpisodesRetained: this.requireMongo ? 0 : this.localEpisodeCount,
+        localEpisodeLimit: this.requireMongo ? 0 : this.localEpisodeLimit
+      },
       curriculum: { challenge: "cooperative-maze", difficulty: ep ? ep.size : Math.min(this.maxMazeSize, 9 + 2 * Math.min(6, Math.floor(this.state.episodes / 4))), maxDifficulty: this.maxMazeSize, agents: ROLES.map(({ id, name, task }) => ({ id, name, task })), coordination: "shared verified map messages; scout, mapper, coordinator" },
       counters: { episodes: this.state.episodes, successfulEpisodes: this.state.successfulEpisodes, successRate: this.state.episodes ? Math.round(this.state.successfulEpisodes / this.state.episodes * 1000) / 10 : 0, totalSteps: this.state.totalSteps, sanctions: this.state.totalSanctions, lastScore: this.state.lastScore, bestScore: this.state.bestScore },
       policy: this.state.policy,
