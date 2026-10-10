@@ -97,13 +97,26 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       const u = new URL("https://api.search.brave.com/res/v1/web/search"); u.searchParams.set("q", q); u.searchParams.set("count", "20"); if (offset) u.searchParams.set("offset", String(Math.min(9, Math.floor(offset / 20)))); if (lang) u.searchParams.set("search_lang", lang);
       const r = await fetchText(u.href, { accept: "application/json", headers: { "X-Subscription-Token": braveKey }, signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Brave Search API request failed"), { status: r.status, retryAfterMs: r.retryAfterMs }); const json = JSON.parse(r.text); return { results: parseBraveApi(json), total: null, more: !!json?.query?.more_results_available };
     } },
-    bing: { available: () => true, async run(q, { offset, lang, signal }) {
+    bing: { available: () => true, async run(q, { offset, lang, signal, limit }) {
       const u = new URL(bingKey ? "https://api.bing.microsoft.com/v7.0/search" : "https://www.bing.com/search"); u.searchParams.set("q", q);
-      if (bingKey) { u.searchParams.set("count", "20"); u.searchParams.set("offset", String(offset || 0)); if (lang) u.searchParams.set("setLang", lang); }
-      else { if (offset) u.searchParams.set("first", String(offset + 1)); if (lang) u.searchParams.set("setlang", lang); }
+      const requestedLimit = Math.max(1, Math.min(50, Number(limit) || 20));
+      if (bingKey) { u.searchParams.set("count", String(requestedLimit)); u.searchParams.set("offset", String(offset || 0)); if (lang) u.searchParams.set("setLang", lang); }
+      else {
+        if (lang) u.searchParams.set("setlang", lang);
+        const pageSize = 10, starts = Array.from({ length: Math.ceil(requestedLimit / pageSize) }, (_, i) => Math.max(0, Number(offset) || 0) + 1 + i * pageSize);
+        const pages = await Promise.allSettled(starts.map(async first => {
+          const pageUrl = new URL(u.href); pageUrl.searchParams.set("first", String(first)); pageUrl.searchParams.set("count", String(pageSize));
+          const response = await fetchText(pageUrl.href, { accept: "text/html", signal, timeoutMs });
+          if (!response.ok) throw Object.assign(new Error("Bing search request failed"), { status: response.status, retryAfterMs: response.retryAfterMs });
+          return parseBingHtml(response.text);
+        }));
+        const successful = pages.filter(page => page.status === "fulfilled").flatMap(page => page.value);
+        if (!successful.length) throw pages.find(page => page.status === "rejected")?.reason || new Error("Bing returned no result pages");
+        const results = dedupe(successful).slice(0, requestedLimit);
+        return { results, total: null, more: results.length >= requestedLimit, pagesFetched: pages.filter(page => page.status === "fulfilled").length };
+      }
       const r = await fetchText(u.href, { accept: bingKey ? "application/json" : "text/html", headers: bingKey ? { "Ocp-Apim-Subscription-Key": bingKey } : {}, signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Bing search request failed"), { status: r.status, retryAfterMs: r.retryAfterMs });
-      if (bingKey) { const json = JSON.parse(r.text); return { results: parseBingApi(json), total: json?.webPages?.totalEstimatedMatches ?? null }; }
-      return { results: parseBingHtml(r.text), total: null };
+      const json = JSON.parse(r.text); return { results: parseBingApi(json), total: json?.webPages?.totalEstimatedMatches ?? null };
     } },
     duckduckgo: { available: () => true, async run(q, { offset, lang, signal }) {
       const u = new URL("https://html.duckduckgo.com/html/"); u.searchParams.set("q", q); if (offset) u.searchParams.set("s", String(offset)); if (lang) u.searchParams.set("kl", lang === "en" ? "wt-wt" : `${lang}-${lang}`);
@@ -162,11 +175,12 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       return { name, results: [], ms, error: info.code, classification: info.classification };
     } finally { clearTimeout(timer); if (abortListener) controller.signal.removeEventListener("abort", abortListener); params.signal?.removeEventListener("abort", abortUpstream); }
   }
-  async function search(query, { offset = 0, engine = "", lang = "", signal } = {}) {
+  async function search(query, { offset = 0, engine = "", lang = "", signal, limit = 20 } = {}) {
     const requestStartedAt = Date.now(); let firstResultAt = null;
+    const requestedLimit = Math.max(1, Math.min(50, Number(limit) || 20));
     const q = cleanText(query, 600); if (!q) return { provider: "none", results: [], attempts: [], responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: null };
     const requested = engine && providers[engine] ? [engine] : order.filter(name => providers[name]);
-    const key = `${requested.join(",")}|${offset}|${lang}|${q.toLowerCase()}`; const hit = cache.get(key);
+    const key = `${requested.join(",")}|${offset}|${requestedLimit}|${lang}|${q.toLowerCase()}`; const hit = cache.get(key);
     if (hit && Date.now() - hit.time < cacheTtlMs) return { ...hit.value, cached: true, responseTimeMs: Date.now() - requestStartedAt };
     const attempts = []; let eligible = [];
     for (const name of requested) {
@@ -189,7 +203,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
     if (signal?.aborted) abortForCaller(); else signal?.addEventListener("abort", abortForCaller, { once: true });
     const deadlineTimer = setTimeout(() => { deadlineExpired = true; requestController.abort(); }, overallDeadlineMs);
     const settled = new Array(eligible.length); let cursor = 0;
-    async function worker() { while (cursor < eligible.length && !requestController.signal.aborted) { const index = cursor++; const item = await runProvider(eligible[index], q, { offset, lang, signal: requestController.signal, isCancelled: () => callerCancelled, isDeadlineExpired: () => deadlineExpired, isEarlyCancel: () => earlyCancelled, onResults: at => { if (firstResultAt == null) firstResultAt = at; } }); settled[index] = item; for (const result of item.results) { const key = canonicalKey(result.url); if (key) observedResultKeys.add(key); } if (!callerCancelled && !deadlineExpired && !earlyCancelled && observedResultKeys.size >= earlyResultThreshold && deadlineAt - Date.now() <= earlyCancelWindowMs) { earlyCancelled = true; requestController.abort(); } } }
+    async function worker() { while (cursor < eligible.length && !requestController.signal.aborted) { const index = cursor++; const item = await runProvider(eligible[index], q, { offset, limit: requestedLimit, lang, signal: requestController.signal, isCancelled: () => callerCancelled, isDeadlineExpired: () => deadlineExpired, isEarlyCancel: () => earlyCancelled, onResults: at => { if (firstResultAt == null) firstResultAt = at; } }); settled[index] = item; for (const result of item.results) { const key = canonicalKey(result.url); if (key) observedResultKeys.add(key); } if (!callerCancelled && !deadlineExpired && !earlyCancelled && observedResultKeys.size >= earlyResultThreshold && deadlineAt - Date.now() <= earlyCancelWindowMs) { earlyCancelled = true; requestController.abort(); } } }
     try { await Promise.all(Array.from({ length: Math.min(parallelism, eligible.length) }, worker)); }
     finally { clearTimeout(deadlineTimer); signal?.removeEventListener("abort", abortForCaller); }
     const successful = settled.filter(Boolean);
@@ -200,9 +214,9 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       if (!existing) merged.set(id, { ...result, providers: [item.name], source: item.name });
       else { if (!existing.providers.includes(item.name)) existing.providers.push(item.name); if (result.snippet.length > existing.snippet.length) existing.snippet = result.snippet; }
     }
-    const results = [...merged.values()].slice(0, 20);
+    const results = [...merged.values()].slice(0, requestedLimit);
     const source = successful.find(x => x.results.length)?.name || "none";
-    const value = { provider: source, results, total: successful.reduce((n, x) => n + (x.total || x.results.length), 0) || null, more: successful.some(x => x.more), attempts, googleConfigured: configured("google"), braveConfigured: configured("brave"), bingConfigured: !!bingKey, providersUsed: successful.filter(x => x.results.length).map(x => x.name), cancelled: callerCancelled, earlyCancelled, deadlineExceeded: deadlineExpired, responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: firstResultAt == null ? null : firstResultAt - requestStartedAt, diagnostics: { providerCount: eligible.length, parallelism: Math.min(parallelism, eligible.length), overallDeadlineMs, earlyCancelWindowMs, earlyResultThreshold, providers: Object.fromEntries(Object.keys(providers).map(name => [name, healthSummary(name)])), google: healthSummary("google") } };
+    const value = { provider: source, results, total: successful.reduce((n, x) => n + (x.total || x.results.length), 0) || null, more: successful.some(x => x.more), attempts, googleConfigured: configured("google"), braveConfigured: configured("brave"), bingConfigured: configured("bing"), providersUsed: successful.filter(x => x.results.length).map(x => x.name), cancelled: callerCancelled, earlyCancelled, deadlineExceeded: deadlineExpired, responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: firstResultAt == null ? null : firstResultAt - requestStartedAt, diagnostics: { providerCount: eligible.length, parallelism: Math.min(parallelism, eligible.length), overallDeadlineMs, earlyCancelWindowMs, earlyResultThreshold, providers: Object.fromEntries(Object.keys(providers).map(name => [name, healthSummary(name)])), google: healthSummary("google") } };
     if (results.length && cacheTtlMs) { cache.set(key, { time: Date.now(), value }); while (cache.size > MAX_CACHE) cache.delete(cache.keys().next().value); }
     return value;
   }

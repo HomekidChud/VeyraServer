@@ -82,3 +82,8 @@ At the time of this report, the separate Render environment update was still pro
 - Persistent queue records are represented by the manager’s record map in this first integration. Mongo persistence remains available for the existing search/crawl stores and can be extended with durable acquisition-job records in a subsequent change.
 - No before/after production benchmark is claimed because no representative workload or baseline run was supplied. The manager reports request, cache, byte, error, block, and per-engine counters for honest measurements.
 - Browser rendering remains available only when explicitly enabled and the runtime image contains Chromium.
+
+
+## Search-index and source-view follow-up (2026-10-10)
+
+The source-view route now opens in the Veyra fast-proxy browser while retaining its `veyra://` title; its inert HTML viewer only permits configured frontend origins to embed it. Bing can page to 20 HTML results. Search-to-answer returns the full discovery list separately and caps source-page acquisition at eight documents. Relevant external search results enter a bounded background crawl using AcquisitionManager's socket-level address validation, redirect rechecks, robots policy, and size/concurrency limits; crawler workers without the injected safe fetcher fail closed. The console reports AI readiness without secrets, and an API key uses the official OpenAI URL when no custom base is configured. Full current and legacy test suites pass locally; deployment status is not asserted.

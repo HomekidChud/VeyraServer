@@ -71,3 +71,12 @@ A final single live Veyra route smoke on `/api/search/web` with Bing HTML mode r
 - Regression coverage asserts full-document context reaches the model, a grounded paraphrase is accepted, unsupported claims are rejected, fallback abstains by default, and complementary same-topic sources are retained.
 
 See `AUDIT_SEARCH_CRAWLER_UPGRADE.md`, `CRAWLER_AUDIT.md`, `CRAWLER_TEST_MATRIX.md`, `GOOGLE_DIAGNOSTICS.md`, `YOUTUBE_TEST_REPORT.md` and `NETWORK_DIAGNOSTICS.md` for scope and details.
+
+
+## Follow-up: live source-view routing, AI readiness, 20-result search and safe indexing (2026-10-10)
+
+- Fixed View Source to navigate through the active fast-proxy browser event to Veyra's same-origin inert source document, preserving the `veyra://view_source/...` address as the visible title. The old Chromium-only route is not used. The viewer CSP now permits only the configured frontend origin(s) as frame ancestors while keeping scripts, network connections, images and plugins restricted.
+- The console now reports AI-answer readiness and model name without exposing API keys. AI requests use the official OpenAI API base by default when `OPENAI_API_KEY` is present; Render declares the key as an optional unsynced secret. No key was available/added by this code change, so production AI remains dependent on Render secret configuration.
+- Bing HTML retrieval paginates two ten-result pages for a 20-result request; API-key retrieval receives the requested count. The web endpoint and local index endpoint default to 20, with configurable server cap. Search-to-answer retains all discovered external results separately from the at-most-eight pages fetched for grounding.
+- Relevant external search candidates are scheduled for bounded background indexing. Neural crawler workers now fail closed without an injected safe fetcher; production wires them through AcquisitionManager, which validates DNS/IP at socket connection, rechecks redirects and enforces robots/body/concurrency controls.
+- Verification: full `npm test`, `npm run test:legacy`, and `git diff --check` passed. Focused tests include offline two-page Bing HTML fixtures, API-base readiness, source-view CSP, 20-result propagation, separate search-results payload, indexing queue scheduling, robots rules and fail-closed crawler fetching. No production deployment is claimed by these local results.

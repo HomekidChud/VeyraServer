@@ -449,11 +449,11 @@ class AcquisitionManager {
     if (opts.signal?.aborted) abortForCaller(); else opts.signal?.addEventListener("abort", abortForCaller, { once: true });
     const deadlineTimer = setTimeout(() => { deadlineExpired = true; controller.abort(); }, deadlineMs);
     try {
-    const result = await search(query, { lang: opts.lang || "en", signal: controller.signal });
+    const result = await search(query, { lang: opts.lang || "en", offset: Math.max(0, Number(opts.offset) || 0), limit: Math.max(1, Math.min(50, Number(opts.limit) || 20)), signal: controller.signal });
     const rows = Array.isArray(result?.results) ? result.results : [];
     const uniqueCount = new Set(rows.map(row => canonicalUrl(row?.canonicalUrl || row?.url)).filter(Boolean)).size;
     this.stats.duplicates += Math.max(0, rows.length - uniqueCount);
-    const candidates = rankSearchCandidates(query, rows, opts.limit || 8).map(row => [row.url, row]);
+    const candidates = rankSearchCandidates(query, rows, opts.fetchLimit || opts.limit || 8).map(row => [row.url, row]);
     const settled = await Promise.allSettled(candidates.map(async ([url, source]) => {
       const fetchStartedAt = Date.now();
       const page = await this.fetch(url, { engine: "search-first", signal: controller.signal });

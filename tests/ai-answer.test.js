@@ -15,8 +15,7 @@ assert.equal(structured.jsonLd[0].headline, "Hi");
 assert.equal(normalizeUrl("https://example.com/a/?utm_source=x#part"), "https://example.com/a/");
 assert.equal(evidenceText("window.__CONFIG__ = {}; Add to word list"), "");
 assert.equal(normalizeAnswerFormat("## Answer\n- **A useful result** [S1].\n\n2. More detail [S2]."), "A useful result [S1]. More detail [S2].");
-assert.equal(normalizeAnswerFormat("Answering questions [S1]."), "Answering questions [S1].");
-
+  assert.equal(normalizeAnswerFormat("Answering questions [S1]."), "Answering questions [S1].");
 const engine = new AIAnswerEngine();
 assert.equal(engine.allowExtractiveFallback, false, "verbatim source excerpts must not silently be presented as the default AI answer");
 const evidence = engine.buildEvidence("What is hi?", engine.detectIntent("What is hi?"), [
@@ -47,6 +46,21 @@ assert.ok(quality.score >= 0 && quality.score <= 1);
 assert.match(quality.label, /evidence|verify/i);
 
 (async () => {
+  const savedApiKey = process.env.OPENAI_API_KEY, savedApiBase = process.env.OPENAI_API_BASE, savedFetch = global.fetch;
+  process.env.OPENAI_API_KEY = "offline-readiness-test-key";
+  delete process.env.OPENAI_API_BASE;
+  const configuredEngine = new AIAnswerEngine();
+  assert.equal(configuredEngine.report().llmConfigured, true, "an API key alone should enable the default official OpenAI endpoint");
+  let calledUrl = "";
+  global.fetch = async url => { calledUrl = String(url); return { ok: true, json: async () => ({ choices: [{ message: { content: "{}" } }] }) }; };
+  try { await configuredEngine.synthesizeWithLLM("test", { type: "definition" }, []); }
+  finally {
+    global.fetch = savedFetch;
+    if (savedApiKey == null) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = savedApiKey;
+    if (savedApiBase == null) delete process.env.OPENAI_API_BASE; else process.env.OPENAI_API_BASE = savedApiBase;
+  }
+  assert.equal(calledUrl, "https://api.openai.com/v1/chat/completions");
+
   const grounded = new AIAnswerEngine({ allowExtractiveFallback: true });
   grounded.synthesizeWithLLM = async () => null;
   const answer = await grounded.answer("What does the Veyra index store?", [

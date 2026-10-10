@@ -33,6 +33,21 @@ const { createWebSearch, classifyGoogleResponse } = require("../src/services/web
   assert.equal(result.results[0].snippet, "A longer snippet from Bing.");
   assert.equal(result.attempts.length, 3);
 
+  const bingPageStarts = [];
+  const bingTwenty = createWebSearch({ env: { WEB_SEARCH_ORDER: "bing", WEB_SEARCH_CACHE_TTL_MS: "0" }, fetchText: async url => {
+    const parsed = new URL(url); const first = Number(parsed.searchParams.get("first")); bingPageStarts.push(first);
+    const rows = Array.from({ length: 10 }, (_, i) => {
+      const number = first + i;
+      return `<li class="b_algo"><h2><a href="https://bing-fixture.example/result/${number}">Veyra result ${number}</a></h2><div class="b_caption"><p>Controlled Bing page ${number}.</p></div></li>`;
+    }).join("");
+    return { ok: true, status: 200, text: rows };
+  } });
+  const twenty = await bingTwenty.search("Veyra results", { engine: "bing", limit: 20 });
+  assert.equal(twenty.results.length, 20, "Bing HTML should fetch and return two result pages when the caller requests 20");
+  assert.deepEqual(bingPageStarts.sort((a, b) => a - b), [1, 11], "Bing HTML pagination should request result offsets 1 and 11");
+  assert.equal(twenty.attempts[0].count, 20);
+  assert.equal(twenty.bingConfigured, true, "HTML search availability should be reflected independently of API-key configuration");
+
   const identities = createWebSearch({ env: { WEB_SEARCH_ORDER: "duckduckgo" }, fetchText: async () => ({ ok: true, status: 200, text: [
     '<div class="result"><a class="result__a" href="https://example.com/Case">Upper path</a></div>',
     '<div class="result"><a class="result__a" href="https://example.com/case">Lower path</a></div>',

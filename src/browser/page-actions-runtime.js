@@ -23,10 +23,10 @@ function pageActionsRuntime() {
       const capture=await nativeFetch(captureUrl,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url:virtualUrl})});
       let payload={};try{payload=await capture.json()}catch{}
       if(!capture.ok||!payload.ok)throw new Error(payload.error||'Source capture failed.');
-      const navigateUrl=new URL('/api/browser/session/'+encodeURIComponent(SESSION_ID)+'/navigate',origin).href;
-      const navigation=await nativeFetch(navigateUrl,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url:payload.schemeUrl})});
-      let state={};try{state=await navigation.json()}catch{}
-      if(!navigation.ok||!state.ok)throw new Error(state.error||'Veyra could not open the captured source view.');
+      const viewerUrl=new URL(String(payload.webUrl||''),origin);
+      if(viewerUrl.origin!==new URL(origin).origin||!/^\/view_source\/[A-Za-z0-9_-]{20,40}\/[A-Za-z0-9_-]{8,4096}$/.test(viewerUrl.pathname))throw new Error('Veyra returned an invalid source-view route.');
+      if(!/^veyra:\/\/view_source\/[A-Za-z0-9_-]{20,40}\/[A-Za-z0-9_-]{8,4096}$/.test(String(payload.schemeUrl||'')))throw new Error('Veyra returned an invalid source address.');
+      emit('document-navigation',viewerUrl.href,{title:payload.schemeUrl,veyraSourceUri:payload.schemeUrl});
     }catch(error){veyraToast('View source failed: '+String(error&&error.message||error).slice(0,180))}
   }
   async function veyraOpenDeveloperTools(el,x,y){

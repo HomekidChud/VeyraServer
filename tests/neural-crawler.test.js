@@ -34,4 +34,14 @@ const legacy = new NeuralCrawlerModel();
 assert.equal(legacy.loadData({ version: 1, weights: Array(NUM_FEATURES).fill(0.2), bias: 0.1 }), true, "legacy v1 checkpoints remain loadable");
 assert.equal(legacy.optimizerStep, 0);
 assert.equal(model.report().optimizer.name, "AdamW");
-console.log("Neural crawler regression tests passed");
+(async () => {
+  await assert.rejects(() => robot.fetchRaw("https://127.0.0.1/private"), error => error.code === "SAFE_FETCH_REQUIRED", "crawler workers without the socket-validated adapter must fail closed");
+  const safeRobot = new NeuralRobot(1, { fetchPage: async url => ({
+    status: 200, finalUrl: url, contentType: url.endsWith("/robots.txt") ? "text/plain" : "text/html; charset=utf-8",
+    body: Buffer.from(url.endsWith("/robots.txt") ? "User-agent: *\nDisallow: /private" : "<html><head><title>Fixture</title></head><body><main><p>Safe fixture page content for the neural crawler.</p></main></body></html>")
+  }) });
+  assert.equal(await safeRobot.checkRobots("https://crawler-fixture.example/private/page"), false, "plain-text robots.txt must be parsed instead of silently treated as unavailable");
+  const page = await safeRobot.fetchRaw("https://crawler-fixture.example/public/page");
+  assert.match(page.html, /Safe fixture page content/);
+  console.log("Neural crawler regression tests passed, including fail-closed safe fetching and robots.txt policy");
+})().catch(error => { console.error(error); process.exitCode = 1; });

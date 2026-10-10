@@ -5,7 +5,7 @@ const assert = require("assert");
 for (const name of ["OPENAI_API_KEY", "OPENAI_API_BASE", "GOOGLE_SEARCH_API_KEY", "GOOGLE_API_KEY", "GOOGLE_SEARCH_CX", "GOOGLE_CSE_ID", "BRAVE_SEARCH_API_KEY", "BING_SEARCH_API_KEY"]) delete process.env[name];
 process.env.WEB_SEARCH_ORDER = "google";
 process.env.VEYRA_CHROMIUM_ENABLED = "false";
-process.env.INDEX_AI_FINDINGS = "false";
+process.env.INDEX_AI_FINDINGS = "true";
 process.env.AI_ANSWER_ALLOW_EXTRACTIVE_FALLBACK = "true";
 
 const { app, indexDocument, mongoStore, CFG } = require("../src/server");
@@ -19,11 +19,21 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
       webSearchCalls += 1;
       if (query === "mock web route query") {
         assert.equal(options.engine, "bing");
+        assert.equal(options.limit, 20, "Veyra web search should request 20 results by default");
         return { provider: "mock-provider", results: [{ url: "https://search-fixture.example/result", title: "Mock result", snippet: "Controlled route fixture", provider: "mock-provider" }], attempts: [{ provider: "mock-provider", count: 1 }] };
       }
-      return { provider: "none", results: [], attempts: [{ provider: "none", skipped: "test-fixture" }] };
+      assert.equal(options.limit, 20, "answer discovery should request 20 provider results");
+      return { provider: "mock-provider", results: [
+        { url: "https://search-fixture.example/result", title: "Mock web result", snippet: "Controlled external discovery result", provider: "mock-provider" },
+        { url: "https://second-search-fixture.example/result", title: "Second web result", snippet: "Another independently indexed candidate", provider: "mock-provider" }
+      ], candidates: [
+        { url: "https://search-fixture.example/result", title: "Mock web result", snippet: "Controlled external discovery result", provider: "mock-provider" },
+        { url: "https://second-search-fixture.example/result", title: "Second web result", snippet: "Another independently indexed candidate", provider: "mock-provider" }
+      ], attempts: [{ provider: "mock-provider", count: 2 }] };
     }
   };
+  let crawlCalls = 0, crawlArgs = null;
+  app.locals.veyraNeuralRobotPool = { async startCrawl(seeds, query, options) { crawlCalls += 1; crawlArgs = { seeds, query, options }; return [{ status: "fulfilled" }]; } };
 
   const url = "https://fixture-search-route.test/veyra-local-answer";
   const article = `<!doctype html><html><head><title>Veyra local route fixture</title><meta name="description" content="Local route integration fixture"></head><body><main><h1>Veyra local route fixture</h1><p>The Veyra local route fixture confirms the answer endpoint can reuse indexed article text without another page fetch.</p><p>Stored source text retains its canonical URL, provider attribution, extraction status and exact passage offsets for citation checks.</p></main></body></html>`;
@@ -40,6 +50,11 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     assert.equal(webPayload.provider, "mock-provider");
     assert.equal(webPayload.results[0].url, "https://search-fixture.example/result");
     assert.equal(webPayload.source, "web");
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(crawlCalls, 1, "relevant external search results should be sent to the bounded background index crawler");
+    assert.deepEqual(crawlArgs.seeds, ["https://search-fixture.example/result"]);
+    assert.equal(crawlArgs.query, "mock web route query");
+    assert.ok(crawlArgs.options.maxPages <= CFG.indexAiMaxPages);
     assert.equal(webSearchCalls, 1);
 
     const answerResponse = await fetch(`${base}/api/search/answer`, {
@@ -52,6 +67,8 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     assert.equal(answer.hasAnswer, true);
     assert.equal(answer.generatedBy, "local-grounded-fallback");
     assert.equal(answer.sources.some(source => source.provider === "veyra-index"), true);
+    assert.equal(answer.searchResults.some(source => source.provider === "mock-provider"), true, "web search results should remain available separately when answer generation has no configured model");
+    assert.equal(answer.searchResults.length, 2, "external result discovery should not be truncated to only the top few answer-crawl candidates");
     assert.equal(answer.pipeline.sourceRetrieval.localCandidates > 0, true);
     assert.equal(answer.pipeline.sourceRetrieval.external.fetched, 0, "controlled provider mock must not fetch external pages");
     assert.equal(Number.isFinite(answer.pipeline.responseTimeMs), true);
@@ -94,6 +111,7 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     console.log("Search, answer and YouTube Express routes passed controlled local integration tests");
   } finally {
     delete app.locals.veyraWebSearch;
+    delete app.locals.veyraNeuralRobotPool;
     delete app.locals.veyraYoutubeFetch;
     await new Promise(resolve => server.close(resolve));
   }

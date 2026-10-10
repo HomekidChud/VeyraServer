@@ -93,6 +93,10 @@ services:
         value: "10000"
       - key: MAX_BROWSER_PAGES
         value: "1"
+      # Optional model access is supplied in the Render dashboard; the official
+      # OpenAI API base is used automatically unless OPENAI_API_BASE is set.
+      - key: OPENAI_API_KEY
+        sync: false
       - key: BROWSER_MAX_ACTIVE_FETCHES
         value: "4"
       - key: MONGODB_CACHE_BODY_MAX_BYTES

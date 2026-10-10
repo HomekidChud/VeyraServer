@@ -21,11 +21,7 @@
  *   app.post('/api/robots/crawl', (req, res) => robotPool.startCrawl(req.body.seed, req.body));
  */
 
-const http = require("http");
-const https = require("https");
 const { URL } = require("url");
-const path = require("path");
-const zlib = require("zlib");
 
 
 let cheerio = null;
@@ -65,70 +61,24 @@ class NeuralRobot {
     this.onPageFound = opts.onPageFound || (() => {});
     this.onLinkFound = opts.onLinkFound || (() => {});
     this.onFeedback = opts.onFeedback || (() => {});
+    this.fetchPage = typeof opts.fetchPage === "function" ? opts.fetchPage : null;
   }
 
   /**
    * Fetch a URL as raw HTML — no Chromium needed. 10-50x faster.
    */
-  fetchRaw(url, opts = {}) {
-    return new Promise((resolve, reject) => {
-      const u = new URL(url);
-      const lib = u.protocol === "https:" ? https : http;
-      const headers = {
-        "User-Agent": this.userAgent,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en;q=0.9",
-        "Accept-Encoding": "gzip, br, deflate",
-        "Connection": "close",
-        ...opts.headers,
-      };
-
-      const req = lib.get(url, { headers, timeout: opts.timeoutMs || this.timeoutMs }, (res) => {
-        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          const redirect = new URL(res.headers.location, url).href;
-          if (this.visited.has(redirect)) return reject(new Error("Redirect loop"));
-          return resolve(this.fetchRaw(redirect, opts));
-        }
-        if (res.statusCode !== 200) {
-          res.resume();
-          return reject(new Error(`HTTP ${res.statusCode}`));
-        }
-        const contentType = res.headers["content-type"] || "";
-        if (!contentType.includes("text/html") && !contentType.includes("application/xhtml")) {
-          res.resume();
-          return reject(new Error(`Not HTML: ${contentType}`));
-        }
-        const chunks = [];
-        let bytes = 0;
-        const maxBytes = opts.maxBytes || 8 * 1024 * 1024;
-        res.on("data", (chunk) => {
-          bytes += chunk.length;
-          if (bytes > maxBytes) { res.destroy(); reject(new Error("Page too large")); return; }
-          chunks.push(chunk);
-        });
-        res.on("end", () => {
-          let data = Buffer.concat(chunks);
-          const encoding = String(res.headers["content-encoding"] || "").toLowerCase();
-          try {
-            if (encoding.includes("br")) data = zlib.brotliDecompressSync(data);
-            else if (encoding.includes("gzip")) data = zlib.gunzipSync(data);
-            else if (encoding.includes("deflate")) data = zlib.inflateSync(data);
-            if (encoding) this.stats.compressedResponses++;
-          } catch { reject(new Error("Compressed response could not be decoded")); return; }
-          resolve({
-            url: url,
-            html: data.toString("utf8"),
-            statusCode: res.statusCode,
-            headers: res.headers,
-            bytes: data.length,
-            contentType: contentType,
-          });
-        });
-        res.on("error", reject);
-      });
-      req.on("error", reject);
-      req.on("timeout", () => { req.destroy(); reject(new Error("Timeout")); });
-    });
+  async fetchRaw(url, opts = {}) {
+    if (!this.fetchPage) throw Object.assign(new Error("Crawler fetch is unavailable until a socket-validated fetcher is configured."), { code: "SAFE_FETCH_REQUIRED" });
+    const response = await this.fetchPage(url, opts);
+    const statusCode = Number(response?.statusCode || response?.status || 0);
+    if (!response || statusCode < 200 || statusCode >= 300) throw Object.assign(new Error(`HTTP ${statusCode || "fetch failed"}`), { status: statusCode || 502 });
+    const finalUrl = String(response.finalUrl || response.url || url);
+    const contentType = String(response.contentType || response.headers?.get?.("content-type") || "").toLowerCase();
+    const isRobots = new URL(finalUrl).pathname.toLowerCase() === "/robots.txt";
+    if (!/(?:text\/html|application\/xhtml\+xml)/i.test(contentType) && !isRobots) throw Object.assign(new Error(`Not HTML: ${contentType || "unknown content type"}`), { code: "CONTENT_TYPE_UNSUPPORTED" });
+    const body = Buffer.isBuffer(response.body) ? response.body : Buffer.from(String(response.html || response.body || ""), "utf8");
+    if (body.length > (opts.maxBytes || 8 * 1024 * 1024)) throw Object.assign(new Error("Page too large"), { code: "RESPONSE_TOO_LARGE" });
+    return { url: finalUrl, html: body.toString("utf8"), statusCode, headers: response.headers || {}, bytes: body.length, contentType };
   }
 
   /**

@@ -28,7 +28,7 @@ const { NeuralLearningWorker } = require("./services/neural-learning");
 const { ChallengeSolver } = require("./browser/challenge-solver");
 const { CastServer, InternetConnectionManager } = require("./network/cast-server");
 const { AIAnswerEngine } = require("./services/ai-answer");
-const { AcquisitionManager } = require("./services/acquisition-manager");
+const { AcquisitionManager, rankSearchCandidates } = require("./services/acquisition-manager");
 const { RenewingManager } = require("./services/renewing-system");
 const fullPage = require("./browser/full-page.js");
 const { FailoverController } = require("./browser/browser-failover.js");
@@ -1415,6 +1415,16 @@ function viewSourceUrlHasSecrets(value) {
   try { return [...new URL(value).searchParams.keys()].some(name => /(?:token|secret|password|session|signature|credential|authorization|accesskey|api[_-]?key|(?:^|[_-])key(?:$|[_-])|(?:^|[_-])sig(?:$|[_-])|^(?:auth|code|jwt)$)/i.test(name)); }
   catch { return true; }
 }
+function sourceViewerFrameAncestors() {
+  const allowed = new Set(["'self'"]);
+  for (const candidate of Array.isArray(CFG.frontendOrigins) ? CFG.frontendOrigins : []) {
+    try {
+      const origin = new URL(String(candidate)).origin;
+      if (/^https?:$/.test(new URL(origin).protocol)) allowed.add(origin);
+    } catch {}
+  }
+  return [...allowed].join(" ");
+}
 app.post("/api/view-source", async (req, res) => {
   try {
     const target = normalizeUrl(String(req.body?.url || ""));
@@ -1451,7 +1461,7 @@ app.get("/view_source/:sourceId/:link", (req, res) => {
   if (!entry) return res.status(404).type("text").send("Source view not found or expired.");
   res.set({
     "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
-    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    "Content-Security-Policy": `default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors ${sourceViewerFrameAncestors()}`
   }).type("html").send(sourcePage(entry));
 });
 
@@ -4335,7 +4345,7 @@ app.get('/api/search', (req, res) => {
   try {
     const query = String(req.query.q || "").trim().slice(0, CFG.maxSearchQueryChars);
     const offset = Math.max(0, Number(req.query.offset || 0) || 0);
-    const limit = Math.min(CFG.maxSearchResults, Math.max(1, Number(req.query.limit || 10) || 10));
+    const limit = Math.min(CFG.maxSearchResults, Math.max(1, Number(req.query.limit || 20) || 20));
     const started = Date.now();
     const result = localSearch(query, offset, limit);
     res.json({ ok: true, ...result, provider: "veyra-index", responseTimeMs: Date.now() - started });
@@ -4371,8 +4381,10 @@ app.get('/api/search/web', async (req, res) => {
     const selected = validEngine.has(engine) ? engine : "";
     const offset = Math.max(0, Number(req.query.offset || 0) || 0);
     const lang = String(req.query.lang || "en").slice(0, 16);
+    const limit = Math.min(CFG.maxSearchResults, Math.max(1, Number(req.query.limit || 20) || 20));
     const started = Date.now();
-    const result = await (app.locals.veyraWebSearch || webSearch).search(q, { offset, engine: selected, lang, signal: request.signal });
+    const result = await (app.locals.veyraWebSearch || webSearch).search(q, { offset, limit, engine: selected, lang, signal: request.signal });
+    queueNeuralIndexFindings(q, result.results || []);
     res.json({ ok: true, ...result, source: "web", responseTimeMs: Date.now() - started });
   } catch (e) {
     respondError(res, 502, "Veyra web search is temporarily unavailable.", "SEARCH_WEB_ERROR");
@@ -4405,17 +4417,28 @@ app.post('/api/browser/resume-verification', async (req, res) => {
 
 const aiIndexRuns = new Map();
 function queueNeuralIndexFindings(query, sources = []) {
-  if (!CFG.indexAiFindings || typeof neuralRobotPool?.startCrawl !== "function") return;
-  const seeds = [...new Set((Array.isArray(sources) ? sources : []).map(s => normalizeUrl(s?.url || s)).filter(Boolean))].slice(0, 6);
+  const crawler = app.locals.veyraNeuralRobotPool || neuralRobotPool;
+  if (!CFG.indexAiFindings || typeof crawler?.startCrawl !== "function") return;
+  const stop = new Set("a an and are as at be but by for from how in is it of on or the to was were what when where which who why with does do did can could should would".split(" "));
+  const queryTokens = [...new Set(String(query || "").toLowerCase().match(/[a-z0-9]{2,}/g) || [])].filter(token => !stop.has(token));
+  if (!queryTokens.length) return;
+  const external = (Array.isArray(sources) ? sources : []).filter(source => source && source.extractionStatus !== "local-index" && !["veyra-index", "local-index"].includes(String(source.provider || source.source || "").toLowerCase()));
+  const ranked = rankSearchCandidates(query, external, 20);
+  const relevant = ranked.filter(source => {
+    const words = new Set(`${source.title || ""} ${source.snippet || source.description || ""} ${source.url || ""}`.toLowerCase().match(/[a-z0-9]{2,}/g) || []);
+    return queryTokens.some(token => words.has(token));
+  });
+  const seeds = [...new Set(relevant.map(source => normalizeUrl(source.url || source.canonicalUrl)).filter(Boolean))].slice(0, 6);
   if (!seeds.length) return;
   const key = `${String(query || "").toLowerCase().trim()}|${seeds.join(",")}`;
   const previous = aiIndexRuns.get(key) || 0;
   if (previous && Date.now() - previous < Math.max(60000, CFG.indexRefreshMs || 60000)) return;
   aiIndexRuns.set(key, Date.now());
   const perSeed = Math.max(1, Math.ceil(CFG.indexAiMaxPages / seeds.length));
-  void neuralRobotPool.startCrawl(seeds, String(query || "").slice(0, CFG.maxSearchQueryChars), {
+  void Promise.resolve().then(() => crawler.startCrawl(seeds, String(query || "").slice(0, CFG.maxSearchQueryChars), {
     maxDepth: CFG.indexAiMaxDepth, maxPages: perSeed
-  }).catch(e => serverLog("warn", "SEARCH", `AI finding index crawl failed: ${e.message}`));
+  })).then(results => { if (!Array.isArray(results) || !results.length) aiIndexRuns.delete(key); })
+    .catch(e => { aiIndexRuns.delete(key); serverLog("warn", "SEARCH", `Search-result index crawl failed: ${e.message}`); });
   while (aiIndexRuns.size > 1000) aiIndexRuns.delete(aiIndexRuns.keys().next().value);
 }
 const aiAnswerEngine = new AIAnswerEngine({ acquisitionManager });
@@ -4448,8 +4471,10 @@ app.post('/api/search/answer', async (req, res) => {
       const localSearchMs = Date.now() - localSearchStartedAt;
       const externalDiscoveryStartedAt = Date.now();
       let discovered = { pages: [], metrics: { candidates: 0, fetched: 0, extracted: 0, failed: 0 }, provider: "none", attempts: [] };
-      try { discovered = await acquisitionManager.searchFirst(normalizedQuery, (q, opts) => (app.locals.veyraWebSearch || webSearch).search(q, opts), { limit: CFG.maxSearchResults, signal: request.signal }); }
+      try { discovered = await acquisitionManager.searchFirst(normalizedQuery, (q, opts) => (app.locals.veyraWebSearch || webSearch).search(q, opts), { limit: CFG.maxSearchResults, fetchLimit: Math.min(8, CFG.maxSearchResults), signal: request.signal }); }
       catch { serverLog("warn", "SEARCH", "Search-to-answer external discovery failed; continuing with local-index candidates."); }
+      const externalDiscoveries = discovered.candidates || [];
+      queueNeuralIndexFindings(normalizedQuery, externalDiscoveries);
       const combined = new Map();
       const add = candidate => {
         const key = normalizeUrl(candidate.canonicalUrl || candidate.url); if (!key) return;
@@ -4464,14 +4489,14 @@ app.post('/api/search/answer', async (req, res) => {
         add({ url: page.url, canonicalUrl: page.canonical, title: page.title, snippet: page.description || page.text.slice(0, 600), contentText: page.text, provider: page.source?.provider || page.source?.source, providers: page.source?.providers || [], source: page.source, sourceIdentity: new URL(page.url).hostname.replace(/^www\./, ""), retrievedAt: page.fetchedAt, publishedAt: page.publishedAt, fetchStatus: "fetched", extractionStatus: page.extractionStatus });
       }
       results = [...combined.values()];
-      retrievalDiagnostics = { localCandidates: local.results.length, localSearchMs, externalDiscoveryMs: Date.now() - externalDiscoveryStartedAt, external: discovered.metrics, providers: discovered.attempts || [], mergedCandidates: results.length };
+      retrievalDiagnostics = { localCandidates: local.results.length, localSearchMs, externalDiscoveryMs: Date.now() - externalDiscoveryStartedAt, external: discovered.metrics, providers: discovered.attempts || [], mergedCandidates: results.length, webSearchResults: externalDiscoveries.slice(0, CFG.maxSearchResults).map(row => ({ url: row.url, title: row.title || "", snippet: String(row.snippet || row.description || "").slice(0, 700), provider: row.provider || "", providers: row.providers || [] })).filter(row => row.url) };
     }
     const answer = await aiAnswerEngine.answer(query, results || [], { signal: request.signal, retrievalDiagnostics });
+    if (retrievalDiagnostics) answer.searchResults = retrievalDiagnostics.webSearchResults || [];
     const routeResponseTimeMs = Date.now() - routeStartedAt;
     answer.responseTimeMs = routeResponseTimeMs;
     answer.pipeline = { ...(answer.pipeline || {}), answerGenerationMs: answer.pipeline?.latencyMs ?? null, responseTimeMs: routeResponseTimeMs };
     void persistAIObservation(query, results || [], answer).catch(e => serverLog("warn", "AI", `AI observation persistence failed: ${e.message}`));
-    if (answer.hasAnswer) queueNeuralIndexFindings(query, answer.sources || []);
     res.json(answer);
   } catch (e) { res.json({ hasAnswer: false, reason: "Answer retrieval or synthesis failed.", code: /^[A-Z0-9_:-]{1,64}$/i.test(String(e?.code || "")) ? String(e.code) : "ANSWER_PIPELINE_ERROR" }); }
   finally { request.dispose(); }
@@ -5810,6 +5835,11 @@ app.get("/api/debug/system", requireAdmin, (req, res) => {
 const neuralRobotPool = new NeuralRobotPool({
   maxWorkers: 8,
   neuralModel,
+  fetchPage: async (url, opts = {}) => acquisitionManager.fetch(url, {
+    engine: "neural-crawler", timeoutMs: Math.min(CFG.requestTimeoutMs, Math.max(1000, Number(opts.timeoutMs) || CFG.requestTimeoutMs)),
+    maxBytes: Math.min(CFG.maxProxyTextBytes, Math.max(65536, Number(opts.maxBytes) || CFG.maxProxyTextBytes)), retries: 0,
+    skipRobots: new URL(url).pathname.toLowerCase() === "/robots.txt"
+  }),
   log: (level, source, msg) => serverLog(level, source, msg),
   onPageFound: page => indexNeuralPage(page, page?.query || "")
 });

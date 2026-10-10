@@ -65,3 +65,8 @@
 - `neural-search.js` remains disconnected from the live web-search provider path intentionally; there is one active live provider orchestration path.
 
 See `CRAWLER_TEST_MATRIX.md`, `GOOGLE_DIAGNOSTICS.md`, `YOUTUBE_TEST_REPORT.md`, `NETWORK_DIAGNOSTICS.md` and `REGRESSION_REPORT.md` for exact commands and scopes.
+
+
+## Search-result indexing follow-up (2026-10-10)
+
+Bing HTML requests now fetch two pages when 20 results are requested, while answer grounding fetches no more than eight full pages and preserves the complete external result list separately for the UI. Relevant results can seed a bounded background index crawl. Neural workers no longer use raw `http.get`: production injects AcquisitionManager's DNS/IP-validated and redirect-rechecked fetch path, and standalone workers without that adapter fail closed. The operations console exposes AI readiness; an API key alone selects the official OpenAI endpoint unless a custom base is set. Full current and legacy tests passed locally; a production deploy was not verified.

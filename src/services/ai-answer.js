@@ -93,6 +93,11 @@ function normalizeUrl(raw) {
     return u.pathname === "/" && !u.search ? u.origin : u.href;
   } catch { return ""; }
 }
+function openAiApiBase() {
+  const configured = String(process.env.OPENAI_API_BASE || "").trim();
+  if (configured) return configured.replace(/\/+$/, "");
+  return String(process.env.OPENAI_API_KEY || "").trim() ? "https://api.openai.com/v1" : "";
+}
 function similarity(a, b) {
   const aa = new Set(terms(a)), bb = new Set(terms(b));
   if (!aa.size || !bb.size) return 0;
@@ -249,7 +254,7 @@ class AIAnswerEngine {
   evidenceQuality(evidence, used, verified, intent) { const independent = new Set(used.map(e => e.sourceIdentity)).size, coverage = verified.supported / Math.max(1, verified.supported + verified.unsupported), relevance = used.reduce((s, e) => s + Math.min(1, e.score), 0) / Math.max(1, used.length), extraction = used.reduce((s, e) => s + (e.extractionQuality || 0.5), 0) / Math.max(1, used.length); let score = Math.max(0, Math.min(1, 0.35 * coverage + 0.25 * relevance + 0.2 * extraction + 0.2 * Math.min(1, independent / (intent.type === "definition" ? 1 : 2)))); if (verified.unsupported) score *= 0.8; const label = score >= 0.78 ? "Strong supporting evidence" : score >= 0.55 ? "Moderate supporting evidence" : score >= 0.3 ? "Limited evidence" : "Unable to verify"; return { score: Math.round(score * 100) / 100, label, basis: { evidenceCoverage: Math.round(coverage * 100) / 100, independentSources: independent, relevance: Math.round(relevance * 100) / 100, extractionQuality: Math.round(extraction * 100) / 100, verifiedClaims: verified.supported, unsupportedClaims: verified.unsupported } }; }
   followUps(query, intent) { const subject = intent.subject || query; const out = intent.type === "definition" ? [`How is ${subject} used today?`, `Why is ${subject} important?`] : intent.type === "howto" ? [`What are common mistakes with ${subject}?`, `What tools are needed for ${subject}?`] : [`What are the latest developments about ${subject}?`, `What are the main sources for ${subject}?`]; return out.filter(x => x.toLowerCase() !== String(query).toLowerCase()).slice(0, 2); }
   async synthesizeWithLLM(query, intent, evidence) {
-    const key = String(process.env.OPENAI_API_KEY || "").trim(), base = String(process.env.OPENAI_API_BASE || "").replace(/\/$/, "");
+    const key = String(process.env.OPENAI_API_KEY || "").trim(), base = openAiApiBase();
     if (!key || !base) return null;
     const explore = intent.type === "explore";
     const simple = !explore && terms(query).length <= 5 && !["howto", "why"].includes(intent.type);
@@ -298,6 +303,6 @@ class AIAnswerEngine {
       return evidence.some(source => (source.verificationSentences || source.matched || []).some(line => similarity(claim, line) >= 0.88));
     });
   }
-  report() { return { maxPages: this.maxPagesToRead, model: this.model, llmConfigured: !!(process.env.OPENAI_API_KEY && process.env.OPENAI_API_BASE), extractiveFallback: this.allowExtractiveFallback, mode: "multi-source-grounded-synthesis", confidence: "evidence-quality score, not calibrated probability" }; }
+  report() { return { maxPages: this.maxPagesToRead, model: this.model, llmConfigured: !!(String(process.env.OPENAI_API_KEY || "").trim() && openAiApiBase()), extractiveFallback: this.allowExtractiveFallback, mode: "multi-source-grounded-synthesis", confidence: "evidence-quality score, not calibrated probability" }; }
 }
 module.exports = { AIAnswerEngine, cleanText, normalizeAnswerFormat, evidenceText, extractReadable, normalizeUrl, similarity };
