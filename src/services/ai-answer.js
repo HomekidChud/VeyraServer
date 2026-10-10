@@ -36,6 +36,14 @@ function normalizeAnswerFormat(value, max = 2200) {
 function terms(text) {
   return [...new Set(String(text || "").toLowerCase().replace(/[^a-z0-9\s-]/g, " ").split(/\s+/).filter(x => x.length > 2 && !STOP.has(x)))];
 }
+function groundingTerms(text) {
+  return [...new Set((String(text || "").toLowerCase().match(/[a-z0-9]{2,}/g) || []).filter(token => !STOP.has(token)).map(token => {
+    if (/^(series|species|news)$/.test(token)) return token;
+    if (token.length > 5 && token.endsWith("ies")) return `${token.slice(0, -3)}y`;
+    if (token.length > 4 && token.endsWith("s") && !/(?:ss|us|is|ous|ics)$/.test(token)) return token.slice(0, -1);
+    return token;
+  }).filter(token => token.length > 2 && !STOP.has(token)))];
+}
 function safeUrl(raw) {
   try { const u = new URL(String(raw || "")); return /^https?:$/.test(u.protocol) && !u.username && !u.password ? u.href : ""; } catch { return ""; }
 }
@@ -213,14 +221,27 @@ function similarity(a, b) {
 }
 function claimSupported(claimTokens, source) {
   if (!claimTokens?.length || !source) return false;
-  const candidates = source.verificationSentences?.length ? source.verificationSentences : source.matched || [];
+  const candidates = [...new Set([...(source.verificationSentences || []), ...(source.matched || [])])];
   const minAnchors = claimTokens.length < 5 ? 2 : claimTokens.length < 12 ? 3 : 4;
   const minRatio = claimTokens.length < 5 ? 0.5 : claimTokens.length < 12 ? 0.35 : 0.28;
   return candidates.some(sentence => {
-    const sourceTokens = new Set(String(sentence).toLowerCase().match(/[a-z0-9]{2,}/g) || []);
+    const sourceTokens = new Set(groundingTerms(sentence));
     const overlap = claimTokens.filter(token => sourceTokens.has(token)).length;
     return overlap >= minAnchors && overlap / claimTokens.length >= minRatio;
   });
+}
+function claimSupportedAcrossSources(claimTokens, sources) {
+  if (!claimTokens?.length || !Array.isArray(sources)) return false;
+  const uniqueSources = [...new Map(sources.filter(Boolean).map(source => [String(source.sourceIdentity || host(source.url || source.canonicalUrl) || source.id || ""), source])).values()];
+  if (uniqueSources.length < 2) return false;
+  const sourceTokens = uniqueSources.map(source => new Set(groundingTerms((source.matched?.length ? source.matched : source.verificationSentences || []).join(" "))));
+  const minAnchors = claimTokens.length < 5 ? 2 : claimTokens.length < 12 ? 3 : 4;
+  const minRatio = claimTokens.length < 5 ? 0.5 : claimTokens.length < 12 ? 0.45 : 0.4;
+  const minContribution = claimTokens.length < 8 ? 1 : 2;
+  const combined = new Set(sourceTokens.flatMap(tokens => [...tokens]));
+  const contributingSources = sourceTokens.filter(tokens => claimTokens.filter(token => tokens.has(token)).length >= minContribution).length;
+  const overlap = claimTokens.filter(token => combined.has(token)).length;
+  return contributingSources >= 2 && overlap >= minAnchors && overlap / claimTokens.length >= minRatio;
 }
 const ANSWER_QUALITY_FEATURES = Object.freeze(["bias", "grounding", "citationCoverage", "sourceDiversity", "lengthCoverage", "originalWording", "formatConsistency"]);
 function sigmoid(value) { const x = Math.max(-30, Math.min(30, Number(value) || 0)); return 1 / (1 + Math.exp(-x)); }
@@ -317,7 +338,8 @@ class AIAnswerEngine {
     if (!llmVerified && !this.allowExtractiveFallback) {
       const configured = providerConfig(process.env, this.model).configured;
       const diagnosticCode = llm ? "grounding_rejected" : synthesisDiagnostics.failureCode || "provider_error";
-      return { hasAnswer: false, reason: configured ? synthesisFailureMessage(diagnosticCode) : "AI summary generation is not configured on this server. Configure a compatible model API key, endpoint, and model; copied excerpts remain disabled.", code: configured ? "SYNTHESIS_UNVERIFIED" : "AI_MODEL_NOT_CONFIGURED", ...(configured ? { diagnosticCode } : {}), llmConfigured: configured, query: q, intent: intent.type, sourcesAvailable: evidence.length, pipeline: { retrieved: results.length, fetched: contents.length, selected: evidence.length, independent: new Set(evidence.map(e => e.sourceIdentity)).size, sourceRetrieval: retrievalDiagnostics, responseTimeMs: Date.now() - started } };
+      const groundingDiagnostic = llm ? { supportedClaims: draftVerification.supported, unsupportedClaims: draftVerification.unsupported, claims: draftVerification.claims.map(({ id, sourceIds, status }) => ({ id, sourceIds, status })) } : undefined;
+      return { hasAnswer: false, reason: configured ? synthesisFailureMessage(diagnosticCode) : "AI summary generation is not configured on this server. Configure a compatible model API key, endpoint, and model; copied excerpts remain disabled.", code: configured ? "SYNTHESIS_UNVERIFIED" : "AI_MODEL_NOT_CONFIGURED", ...(configured ? { diagnosticCode } : {}), ...(groundingDiagnostic ? { groundingDiagnostic } : {}), llmConfigured: configured, query: q, intent: intent.type, sourcesAvailable: evidence.length, pipeline: { retrieved: results.length, fetched: contents.length, selected: evidence.length, independent: new Set(evidence.map(e => e.sourceIdentity)).size, sourceRetrieval: retrievalDiagnostics, responseTimeMs: Date.now() - started } };
     }
     const selectedDraft = llmVerified ? llm : local;
     const answer = selectedDraft === draft ? draftVerification.answer : local.answer;
@@ -413,12 +435,10 @@ class AIAnswerEngine {
     let supported = 0, unsupported = invalid.length;
     for (const statement of statements) {
       const ids = [...statement.matchAll(/\[(S\d+)\]/g)].map(match => match[1]).filter(id => byId.has(id));
-      const claimTokens = [...new Set((statement.replace(/\[S\d+\]/g, " ").toLowerCase().match(/[a-z0-9]{2,}/g) || []).filter(token => !STOP.has(token)))];
-      let matches = false;
-      for (const id of ids) {
-        const source = byId.get(id);
-        if (claimSupported(claimTokens, source)) { matches = true; break; }
-      }
+      const claimTokens = groundingTerms(statement.replace(/\[S\d+\]/g, " "));
+      const citedSources = ids.map(id => byId.get(id)).filter(Boolean);
+      let matches = citedSources.some(source => claimSupported(claimTokens, source));
+      if (!matches && citedSources.length > 1) matches = claimSupportedAcrossSources(claimTokens, citedSources);
       if (matches) supported += 1; else unsupported += 1;
     }
     const caveats = [];
@@ -427,8 +447,9 @@ class AIAnswerEngine {
     const claims = statements.map((statement, index) => {
       const sourceIds = [...new Set([...statement.matchAll(/\[(S\d+)\]/g)].map(match => match[1]).filter(id => byId.has(id)))];
       const body = statement.replace(/\[(S\d+)\]/g, "").trim();
-      const tokenSet = new Set((body.toLowerCase().match(/[a-z0-9]{2,}/g) || []).filter(token => !STOP.has(token)));
-      const isSupported = sourceIds.some(id => claimSupported([...tokenSet], byId.get(id)));
+      const tokenSet = new Set(groundingTerms(body));
+      const citedSources = sourceIds.map(id => byId.get(id)).filter(Boolean);
+      const isSupported = citedSources.some(source => claimSupported([...tokenSet], source)) || claimSupportedAcrossSources([...tokenSet], citedSources);
       return { id: `C${index + 1}`, text: body, sourceIds, status: isSupported ? "supported-by-overlap" : "unsupported-or-uncited" };
     });
     return { answer: clean, supported, unsupported, claims, caveats };
