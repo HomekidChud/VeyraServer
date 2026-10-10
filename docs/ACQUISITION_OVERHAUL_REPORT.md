@@ -41,6 +41,8 @@ The latest follow-up makes View Page Source call the active browser-session navi
 
 AI answer strings are normalized to a consistent plain-text paragraph while citations are retained. The local neural URL relevance model now uses AdamW with saved optimizer moments and backward-compatible v1 checkpoint loading. This updates the locally trainable search ranker only; it does not fine-tune the hosted generative answer model, whose weights are not available to this service.
 
+Following a copy-paste regression report, synthesis now receives up to 90,000 characters of full extracted document text within a shared context budget (rather than only five selected sentences per page). Claim verification compares against relevant full-document sentences so supported rewording is not automatically downgraded to extraction. Near-duplicate source suppression now compares full page text. If grounded paraphrase synthesis fails, the default endpoint abstains; raw extracted sentences are available only through the explicit diagnostic fallback flag.
+
 The `tests/source-view.test.js`, AI-answer and neural-crawler suites cover route validation/tampering, inert source rendering, custom-URI navigation hooks, Developer Tools selection dispatch, deterministic answer formatting, AdamW ranking updates and checkpoint compatibility. The full suites are rerun for this follow-up; Chromium remains disabled by default and no live browser UI interaction is claimed.
 
 ## Validation

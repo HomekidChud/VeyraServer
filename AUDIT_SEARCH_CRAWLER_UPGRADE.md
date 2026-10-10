@@ -6,7 +6,7 @@
 
 Implemented code changes in the existing live application. `/api/search/web` retains one bounded concurrent provider orchestration path, now with learned provider ordering, safe health metrics, cooldowns, per-provider/overall deadlines, caller cancellation, and configured early cancellation when enough results are available near the deadline. `/api/search/answer` merges local-index and external results, ranks answer-retrieval candidates using relevance and quality/diversity/cost/freshness signals, reuses acquired text, and enforces a total search-first deadline. The acquisition layer has global/per-host gates, DNS socket-time validation, destination/redirect checks, safe persistent-cache integration and extraction-quality classification/metrics. YouTube resolution explicitly distinguishes metadata from playback. Chromium remains disabled unless explicitly configured and installed in the deployment image.
 
-The answer response includes evidence IDs, exact stored-passage offsets, provider/extraction provenance, claim/source overlap results, conflict caveats, evidence-quality basis, and timing for answer generation and total HTTP route handling. Challenge/consent pages are not used as evidence. When synthesis is unavailable, a clearly quoted/cited local fallback can be disabled with `AI_ANSWER_ALLOW_EXTRACTIVE_FALLBACK=false`. Citation overlap remains a heuristic rather than semantic proof.
+The answer response includes evidence IDs, exact stored-passage offsets, provider/extraction provenance, claim/source overlap results, conflict caveats, evidence-quality basis, and timing for answer generation and total HTTP route handling. Challenge/consent pages are not used as evidence. Current behavior abstains when grounded paraphrase synthesis is unavailable; a verbatim extractive diagnostic fallback is opt-in with `AI_ANSWER_ALLOW_EXTRACTIVE_FALLBACK=true`. Citation overlap remains a heuristic rather than semantic proof.
 
 ## Verification and measured observations
 
@@ -33,6 +33,12 @@ No dependency was added; `package-lock.json` is unchanged. No commit, push, PR o
 ## Configuration
 
 Existing provider settings remain supported. Web search adds `WEB_SEARCH_DEADLINE_MS` (default 12 seconds), `WEB_SEARCH_EARLY_RESULT_THRESHOLD` (default 20) and `WEB_SEARCH_EARLY_CANCEL_WINDOW_MS` (default 1 second). Acquisition search-first discovery uses `SEARCH_FIRST_DEADLINE_MS` (default 20 seconds). Provider-order, concurrency, timeouts, credentials, cache TTL, and Chromium opt-in are documented in `README.md`. No API secret was added to source or `.env.example`.
+
+## AI copy-paste follow-up (2026-10-10)
+
+The user-reported extractive answer was traced to an always-enabled local fallback combined with a synthesis packet containing only a few ranked sentences per document and a citation gate that rejected paraphrases. The current path passes bounded full extracted page text (up to a 90,000-character aggregate) to the model, asks for a source-grounded original overview, validates claims against full-document sentences, and rejects sentences that are nearly verbatim. Similarity-based source deduplication now compares full page content, preserving pages with complementary details. If synthesis is unavailable or unverified, the endpoint abstains by default; extractive fallback requires explicit diagnostic opt-in.
+
+Current verification after this change: `npm test` passed with 54 JavaScript source files validated; `npm run test:legacy` passed (27 passed, 0 failed); `git diff --check` passed. The suite mocks model calls and proves prompt coverage, paraphrase acceptance, unsupported-claim rejection, source-retention and abstention; it does not constitute a live model quality evaluation.
 
 ## Not completed / not verified
 

@@ -22,6 +22,10 @@ The deterministic test covers:
 - Removal of script/configuration contamination.
 - Near-identical evidence suppression.
 - Citation support validation and bounded evidence-quality scoring.
+- Full extracted page text is passed to synthesis within a bounded aggregate; answer formatting is normalized, paraphrases are citation-checked against document sentences, and copied sentences are rejected.
+- Model failure or unsupported paraphrases abstain by default rather than displaying verbatim passages; extractive fallback is explicit diagnostic opt-in.
+- Complementary source pages remain separate even when their opening sentence is similar.
+- A simulated original-wording answer grounded in the page is accepted; an unsupported claim and the default verbatim fallback are rejected.
 - Query-aware neural crawler scoring, absolute seed canonicalization and removal of navigation/cookie boilerplate before indexing.
 
 ## Baseline versus updated behavior
@@ -41,7 +45,7 @@ No claim is made here about a production accuracy uplift because a labeled bench
 
 A bounded crawl of the public Wikipedia photosynthesis page completed successfully and inserted one normalized document into the local Veyra Index. A subsequent Veyra Index query returned the indexed document with a cleaned content snippet rather than the page's navigation dump. The crawler uses configurable budgets (`INDEX_AI_MAX_PAGES`, default 24, and `INDEX_AI_MAX_DEPTH`, default 2); production scale depends on configured seeds, crawl capacity, robots permissions and persistence availability.
 
-The answer endpoint now abstains when native neural synthesis cannot produce cited multi-source output. This prevents an irrelevant Bing response from being exposed as a copied extractive “AI answer.” Extractive fallback is available only when explicitly enabled for diagnostics.
+The answer endpoint abstains when native neural synthesis cannot produce a cited, grounded paraphrase. Full extracted text from the selected pages is sent within a bounded context budget; exploratory queries request a longer overview. Verbatim extracts are never silently presented as the default Veyra AI answer. Extractive fallback is available only when explicitly enabled for diagnostics.
 
 ## Recommended next evaluation stage
 
