@@ -52,7 +52,7 @@ function pageActionsRuntime() {
     if(media){item('Play / pause media',()=>{const node=el.closest('video,audio');if(node){if(node.paused)void node.play();else node.pause()}});item('Copy media address',async()=>veyraToast(await veyraCopyText(media)?'Media address copied':'Could not copy media address'));divider()}
     item('View page source  ·  Ctrl+U',veyraViewPageSource);
     item('Inspect element',()=>veyraInspectPanel(el));
-    item('Select all',()=>{try{const selection=window.getSelection(),range=document.createRange();range.selectNodeContents(document.body);selection.removeAllRanges();selection.addRange(range)}catch{try{document.execCommand('selectAll')}catch{}}});item('Reload page',()=>emit('document-navigation',virtualUrl,{reload:true}));item('Back',()=>history.back());item('Forward',()=>history.forward());item('Print',()=>window.print());
+    item('Select all',()=>{try{const selection=window.getSelection(),range=document.createRange();range.selectNodeContents(document.body);selection.removeAllRanges();selection.addRange(range)}catch{try{document.execCommand('selectAll')}catch{}}});item('Reload page',()=>location.reload());item('Back',()=>history.back());item('Forward',()=>history.forward());item('Print',()=>window.print());
     root.appendChild(menu);veyraActionMenu=menu;requestAnimationFrame(()=>{const rect=menu.getBoundingClientRect();menu.style.left=Math.max(8,Math.min(Number(x)||8,innerWidth-rect.width-8))+'px';menu.style.top=Math.max(8,Math.min(Number(y)||8,innerHeight-rect.height-8))+'px'});
   }
   document.addEventListener('contextmenu',function(event){if(!rootProxiedFrame()||veyraEditingTarget(event.target))return;event.preventDefault();event.stopPropagation();veyraContextMenu(event.clientX,event.clientY,event.target)},true);

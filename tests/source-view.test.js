@@ -47,7 +47,7 @@ const { pageActionsRuntime } = require("../src/browser/page-actions-runtime");
   assert.ok(pageRuntime.includes("key!=='u'"), "Ctrl+U should be handled locally inside the page frame");
   assert.ok(pageRuntime.includes("emit('document-navigation',payload.schemeUrl"), "source view should navigate with the custom Veyra URI");
   assert.ok(pageRuntime.includes("emit('document-navigation',link)"), "open-link should use the browser's recognized navigation event");
-  assert.ok(pageRuntime.includes("emit('document-navigation',virtualUrl,{reload:true})"), "reload should use the recognized navigation event");
+  assert.ok(pageRuntime.includes("item('Reload page',()=>location.reload())"), "reload should refresh the proxied document directly");
   assert.ok(pageRuntime.includes("veyraInspectPanel(el)"), "Inspect Element should open the built-in inspector instead of relying only on an external listener");
   assert.equal(pageActionsRuntime().includes("contextmenu.open-link"), false, "menu must not emit unsupported custom action events");
   let fetches = 0;
