@@ -29,9 +29,15 @@ const { createSourceViewerStore, parseSourceScheme, sourcePage } = require("../s
   for (const name of ["OPENAI_API_KEY", "OPENAI_API_BASE", "GOOGLE_SEARCH_API_KEY", "GOOGLE_API_KEY", "GOOGLE_SEARCH_CX", "GOOGLE_CSE_ID", "BRAVE_SEARCH_API_KEY", "BING_SEARCH_API_KEY"]) delete process.env[name];
   process.env.VEYRA_CHROMIUM_ENABLED = "false";
   process.env.INDEX_AI_FINDINGS = "false";
-  const { app, mongoStore } = require("../src/server");
+  const { app, mongoStore, rewriteHtml } = require("../src/server");
   mongoStore.enabled = false;
   mongoStore.uri = "";
+  const proxiedHtml = rewriteHtml("<!doctype html><html><head></head><body><p>Shortcut fixture</p></body></html>", "https://fixture-source.test/page", "source-view-test-session");
+  const pageRuntime = proxiedHtml.match(/<script data-veyra-runtime>([\s\S]*?)<\/script>/)?.[1];
+  assert.ok(pageRuntime, "proxied pages should receive the Veyra page-action runtime");
+  new Script(pageRuntime);
+  for (const capability of ["contextmenu", "touchstart", "View page source  ·  Ctrl+U", "Inspect element"]) assert.ok(pageRuntime.includes(capability), `missing page action: ${capability}`);
+  assert.ok(pageRuntime.includes("key!=='u'"), "Ctrl+U should be handled locally inside the page frame");
   let fetches = 0;
   let nextResponse = { ok: true, status: 200, contentType: "text/html; charset=utf-8", body: Buffer.from("<!doctype html><html><body><script>alert('owned')</script><h1>Fixture</h1></body></html>"), finalUrl: "https://fixture-source.test/page" };
   app.locals.veyraSourceAssertPublic = async url => {

@@ -28,7 +28,8 @@
 - `/console` now has Overview, Logs and View Source workflows. The overview polls `/api/search/diagnostics` and `/api/acquisition/status` for provider circuit/latency, fetch queues, throughput, cache, extraction and resource information; provider secrets are not exposed. The logs API's existing admin gate remains in force.
 - The source viewer reuses the existing `AcquisitionManager`, including public-address/DNS and redirect protections and robots handling. It limits captures to 1 MiB, text media types and a 15-second request timeout, and rejects credential/signature query URLs.
 - Source snapshots are temporary in-memory capabilities: five-minute TTL, 100 entries and 8 MiB aggregate maximum. `veyra://view_source/<generated-id>/<base64url-link>` is resolved internally by the browser navigation route. The view is inert text under a restrictive CSP; expiry or token mismatch returns 404. No persistence or new dependency is introduced.
-- Local route coverage is in `tests/source-view.test.js`; the full `npm test` passes with 53 JavaScript source files validated. No live browser interaction was attempted because Chromium remains disabled by default.
+- Proxied pages support `Ctrl+U`/`Cmd+U` for current-page source. Right-click on desktop or a long-press on touch displays a Veyra page-actions menu with selection/link/media actions, source, inspect element, select all, reload, back/forward and print. This page-content menu does not reproduce native browser chrome or the full DevTools UI; inspection reuses Veyra's existing metadata bridge.
+- Local route and injected-runtime coverage is in `tests/source-view.test.js`. No live desktop/mobile browser interaction was attempted because Chromium remains disabled by default.
 
 ## Existing components reused
 
@@ -36,7 +37,7 @@
 
 ## Changed files
 
-- Source: `src/server.js`, `src/services/console-ui.js`, `src/services/websearch.js`, `src/services/acquisition-manager.js`, `src/services/ai-answer.js`, `src/core/mongo-store.js`, `src/browser/youtube.js`.
+- Source: `src/server.js`, `src/services/console-ui.js`, `src/browser/page-actions-runtime.js`, `src/services/websearch.js`, `src/services/acquisition-manager.js`, `src/services/ai-answer.js`, `src/core/mongo-store.js`, `src/browser/youtube.js`.
 - Tests/tools/config: `tests/websearch.test.js`, `tests/acquisition-manager.test.js`, `tests/ai-answer.test.js`, `tests/proxy-rewrite.test.js`, `tests/search-route.test.js`, `tests/source-view.test.js`, `tests/youtube.test.js`, `tests/network-diagnostics.test.js`, `scripts/network-diagnostics.js`, `scripts/bench-search-orchestration.js`, `package.json`.
 - Documentation: `README.md`, `CRAWLER_AUDIT.md`, `CRAWLER_TEST_MATRIX.md`, `GOOGLE_DIAGNOSTICS.md`, `YOUTUBE_TEST_REPORT.md`, `NETWORK_DIAGNOSTICS.md`, `REGRESSION_REPORT.md`, `AUDIT_SEARCH_CRAWLER_UPGRADE.md`.
 

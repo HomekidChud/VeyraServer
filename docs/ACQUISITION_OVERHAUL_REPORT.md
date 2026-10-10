@@ -35,7 +35,9 @@ The existing architecture was preserved. The change adds a shared acquisition la
 
 The operations console now displays provider health and acquisition metrics through read-only diagnostics endpoints. Its source-inspector flow uses the same acquisition boundary rather than a separate fetch implementation. Captures are limited to public HTTP(S) text documents, subject to robots and redirect/DNS checks, 15 seconds and 1 MiB. Sensitive query-parameter URLs are rejected before a shareable link is issued. In-memory source snapshots expire after five minutes and are bounded to 100 entries/8 MiB total. Source text is escaped into an inert viewer; generated `veyra://view_source/<id>/<base64url-link>` values resolve only while their random-ID snapshot remains live. This follow-up does not change Chromium's opt-in default or add dependencies.
 
-The new `tests/source-view.test.js` covers route validation, tampering, content type, private-host rejection, source escaping and UI script parsing. The full suite passed on 2026-10-10 with 53 JavaScript files validated.
+The proxied-page runtime now maps `Ctrl+U`/`Cmd+U` to capture and open the current page source. Desktop right-click and mobile long-press show a Veyra page-actions menu (selection/link/media, source, inspect, select-all, reload/history and print). It is a page-level Veyra menu rather than a replica of browser-native chrome or full DevTools; the inspect action uses existing Veyra element metadata.
+
+The new `tests/source-view.test.js` covers route validation, tampering, content type, private-host rejection, source escaping, console UI scripts and the injected keyboard/touch runtime. The full suite passed on 2026-10-10 with 54 JavaScript files validated.
 
 ## Validation
 
