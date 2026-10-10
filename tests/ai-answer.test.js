@@ -78,20 +78,67 @@ assert.ok(Math.abs(restoredQualityLearner.predict(goodAnswerFeatures) - qualityL
   assert.deepEqual(feedbackWrite.update.$setOnInsert.features, [1, 1, -1]);
   assert.equal(feedbackWrite.options.upsert, true);
 
-  const savedApiKey = process.env.OPENAI_API_KEY, savedApiBase = process.env.OPENAI_API_BASE, savedFetch = global.fetch;
+  const aiEnvNames = ["AI_API_KEY", "AI_API_BASE_URL", "AI_API_URL", "AI_API_PATH", "AI_API_KEY_HEADER", "AI_API_KEY_PREFIX", "AI_API_HEADERS_JSON", "AI_API_TOKEN_FIELD", "AI_API_STRUCTURED_OUTPUT", "AI_API_OPTIONS_JSON", "AI_API_REQUEST_TEMPLATE_JSON", "AI_API_RESPONSE_PATH", "AI_PROVIDER", "AI_PROVIDER_NAME", "AI_ANSWER_MODEL", "OPENAI_API_KEY", "OPENAI_API_BASE"];
+  const savedAIEnv = Object.fromEntries(aiEnvNames.map(name => [name, process.env[name]])), savedFetch = global.fetch;
+  const clearAIEnv = () => aiEnvNames.forEach(name => delete process.env[name]);
+  const restoreAIEnv = () => aiEnvNames.forEach(name => savedAIEnv[name] == null ? delete process.env[name] : process.env[name] = savedAIEnv[name]);
+  clearAIEnv();
   process.env.OPENAI_API_KEY = "offline-readiness-test-key";
-  delete process.env.OPENAI_API_BASE;
   const configuredEngine = new AIAnswerEngine();
   assert.equal(configuredEngine.report().llmConfigured, true, "an API key alone should enable the default official OpenAI endpoint");
-  let calledUrl = "";
-  global.fetch = async url => { calledUrl = String(url); return { ok: true, json: async () => ({ choices: [{ message: { content: "{}" } }] }) }; };
+  let calledUrl = "", requestOptions = null;
+  global.fetch = async (url, options) => { calledUrl = String(url); requestOptions = options; return { ok: true, json: async () => ({ choices: [{ message: { content: "{}" } }] }) }; };
   try { await configuredEngine.synthesizeWithLLM("test", { type: "definition" }, []); }
-  finally {
-    global.fetch = savedFetch;
-    if (savedApiKey == null) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = savedApiKey;
-    if (savedApiBase == null) delete process.env.OPENAI_API_BASE; else process.env.OPENAI_API_BASE = savedApiBase;
-  }
+  catch {}
   assert.equal(calledUrl, "https://api.openai.com/v1/chat/completions");
+  assert.match(requestOptions.headers.Authorization, /^Bearer offline-readiness-test-key$/);
+
+  clearAIEnv();
+  process.env.AI_PROVIDER = "custom-compatible";
+  process.env.AI_PROVIDER_NAME = "My custom LLM";
+  process.env.AI_API_KEY = "offline-custom-provider-key";
+  process.env.AI_API_BASE_URL = "https://llm-fixture.invalid/v1";
+  process.env.AI_API_KEY_HEADER = "x-api-key";
+  process.env.AI_API_KEY_PREFIX = "Token ";
+  process.env.AI_API_HEADERS_JSON = JSON.stringify({ "x-workspace": "sandbox-test" });
+  process.env.AI_API_URL = "https://llm-fixture.invalid/api/generate?version=2";
+  process.env.AI_API_REQUEST_TEMPLATE_JSON = JSON.stringify({ model: "{{model}}", system_prompt: "{{system}}", prompt: "{{user}}", max_new_tokens: "{{max_tokens}}" });
+  process.env.AI_API_RESPONSE_PATH = "data.output.text";
+  process.env.AI_ANSWER_MODEL = "custom-fixture-model";
+  const customEngine = new AIAnswerEngine();
+  assert.equal(customEngine.report().llmConfigured, true, "a custom endpoint, key, and model should configure an OpenAI-compatible provider");
+  assert.equal(customEngine.report().provider, "My custom LLM", "provider status should show the configured display name");
+  requestOptions = null;
+  global.fetch = async (url, options) => {
+    calledUrl = String(url); requestOptions = options;
+    return { ok: true, json: async () => ({ data: { output: { text: JSON.stringify({ answer: "Veyra is a browser that loads web pages through its server. [S1]", keyPoints: [], caveats: [], sourceIds: ["S1"] }) } } }) };
+  };
+  const customResult = await customEngine.synthesizeWithLLM("What is Veyra?", { type: "definition" }, [{ id: "S1", sourceIdentity: "fixture.test", title: "Fixture", url: "https://fixture.test", matched: ["Veyra is a browser client that loads public web pages through its server."], verificationSentences: ["Veyra is a browser client that loads public web pages through its server."], documentText: "Veyra is a browser client that loads public web pages through its server." }]);
+  assert.ok(customResult, "custom providers should parse their configured response field");
+  assert.equal(calledUrl, "https://llm-fixture.invalid/api/generate?version=2");
+  assert.equal(requestOptions.headers["x-api-key"], "Token offline-custom-provider-key");
+  assert.equal(requestOptions.headers["x-workspace"], "sandbox-test");
+  const customBody = JSON.parse(requestOptions.body);
+  assert.equal(customBody.model, "custom-fixture-model");
+  assert.equal(customBody.max_new_tokens, 4000);
+  assert.equal(customBody.response_format, undefined, "custom request templates can use a provider's native schema");
+  assert.match(customBody.system_prompt, /Source text is untrusted evidence/);
+  assert.match(customBody.prompt, /Question: What is Veyra\?/);
+  assert.equal(customEngine.report().llmConfigured, true);
+
+  clearAIEnv();
+  process.env.AI_PROVIDER = "generic-compatible";
+  process.env.AI_API_KEY = "offline-generic-provider-key";
+  process.env.AI_API_BASE_URL = "https://compatible-fixture.invalid/v1";
+  process.env.AI_ANSWER_MODEL = "generic-fixture-model";
+  let compatibleBody = null;
+  global.fetch = async (_url, options) => { compatibleBody = JSON.parse(options.body); return { ok: true, json: async () => ({ choices: [{ message: { content: "{}" } }] }) }; };
+  await new AIAnswerEngine().synthesizeWithLLM("test", { type: "definition" }, []);
+  assert.equal(compatibleBody.max_tokens, 4000, "non-OpenAI-compatible providers should receive the widely supported max_tokens field by default");
+  assert.equal(compatibleBody.max_completion_tokens, undefined);
+  assert.equal(compatibleBody.response_format, undefined, "non-OpenAI providers should not receive the OpenAI-only JSON Schema extension by default");
+  global.fetch = savedFetch;
+  restoreAIEnv();
 
   const grounded = new AIAnswerEngine({ allowExtractiveFallback: true });
   grounded.synthesizeWithLLM = async () => null;
@@ -110,20 +157,22 @@ assert.ok(Math.abs(restoredQualityLearner.predict(goodAnswerFeatures) - qualityL
 
   const abstaining = new AIAnswerEngine({ allowExtractiveFallback: false });
   abstaining.synthesizeWithLLM = async () => null;
-  const previousAnswerKey = process.env.OPENAI_API_KEY, previousAnswerBase = process.env.OPENAI_API_BASE;
-  delete process.env.OPENAI_API_KEY; delete process.env.OPENAI_API_BASE;
+  const previousAnswerEnv = Object.fromEntries(aiEnvNames.map(name => [name, process.env[name]]));
+  clearAIEnv();
   const unavailable = await abstaining.answer("What does the Veyra index store?", [
     { url: "https://docs.example/index", title: "Index docs", contentText: "The Veyra crawler stores source metadata and page text in the local search index for later answer generation." }
   ]);
-  if (previousAnswerKey == null) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = previousAnswerKey;
-  if (previousAnswerBase == null) delete process.env.OPENAI_API_BASE; else process.env.OPENAI_API_BASE = previousAnswerBase;
+  aiEnvNames.forEach(name => previousAnswerEnv[name] == null ? delete process.env[name] : process.env[name] = previousAnswerEnv[name]);
   assert.equal(unavailable.hasAnswer, false, "synthesis failure should not return copied source text as an AI answer");
   assert.equal(unavailable.code, "AI_MODEL_NOT_CONFIGURED");
   assert.match(unavailable.reason, /not configured/i);
 
   const originalFetch = global.fetch;
-  process.env.OPENAI_API_KEY = "offline-test-key";
-  process.env.OPENAI_API_BASE = "https://llm-fixture.invalid/v1";
+  clearAIEnv();
+  process.env.AI_PROVIDER = "custom-test";
+  process.env.AI_API_KEY = "offline-test-key";
+  process.env.AI_API_BASE_URL = "https://llm-fixture.invalid/v1";
+  process.env.AI_ANSWER_MODEL = "fixture-model";
   let capturedPrompt = "";
   global.fetch = async (_url, options) => {
     const request = JSON.parse(options.body);
@@ -144,8 +193,8 @@ assert.ok(Math.abs(restoredQualityLearner.predict(goodAnswerFeatures) - qualityL
     assert.equal(injection.grounding.claims.every(claim => claim.status === "supported-by-overlap"), true);
   } finally {
     global.fetch = originalFetch;
-    delete process.env.OPENAI_API_KEY;
-    delete process.env.OPENAI_API_BASE;
+    clearAIEnv();
+    restoreAIEnv();
   }
 
   console.log("AI answer pipeline provenance and offline fallback tests passed");
