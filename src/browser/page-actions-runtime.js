@@ -18,22 +18,29 @@ function pageActionsRuntime() {
   async function veyraCopyText(text){const value=String(text||'');if(!value)return false;try{if(navigator.clipboard&&navigator.clipboard.writeText){await navigator.clipboard.writeText(value);return true}}catch{}try{const area=document.createElement('textarea');area.value=value;area.setAttribute('readonly','');area.style.cssText='position:fixed;left:-9999px;top:0;opacity:0';document.body.appendChild(area);area.select();const ok=document.execCommand('copy');area.remove();return !!ok}catch{return false}}
   async function veyraViewPageSource(){
     try{
-      const origin=API_ORIGIN||location.origin;const endpoint=new URL('/api/view-source',origin).href;
-      const response=await nativeFetch(endpoint,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url:virtualUrl})});
-      let payload={};try{payload=await response.json()}catch{}
-      if(!response.ok||!payload.ok)throw new Error(payload.error||'Source capture failed.');
-      emit('document-navigation',payload.schemeUrl,{sourceUri:payload.schemeUrl,sourceTarget:virtualUrl});
+      const origin=API_ORIGIN||location.origin;
+      const captureUrl=new URL('/api/view-source',origin).href;
+      const capture=await nativeFetch(captureUrl,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url:virtualUrl})});
+      let payload={};try{payload=await capture.json()}catch{}
+      if(!capture.ok||!payload.ok)throw new Error(payload.error||'Source capture failed.');
+      const navigateUrl=new URL('/api/browser/session/'+encodeURIComponent(SESSION_ID)+'/navigate',origin).href;
+      const navigation=await nativeFetch(navigateUrl,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url:payload.schemeUrl})});
+      let state={};try{state=await navigation.json()}catch{}
+      if(!navigation.ok||!state.ok)throw new Error(state.error||'Veyra could not open the captured source view.');
     }catch(error){veyraToast('View source failed: '+String(error&&error.message||error).slice(0,180))}
   }
-  function veyraInspectPanel(el){
+  async function veyraOpenDeveloperTools(el,x,y){
+    const selected=el&&el!==document.body&&el!==document.documentElement;
+    topPost({type:'veyra:shortcut',key:'I',code:'KeyI',ctrlKey:true,metaKey:false,shiftKey:true,altKey:false,sessionId:SESSION_ID});
+    if(!selected)return;
     try{
-      const root=veyraEnsureActionHost();const previous=root.querySelector('.inspect-panel');if(previous)previous.remove();
-      const panel=document.createElement('section');panel.className='menu inspect-panel';panel.setAttribute('role','dialog');panel.setAttribute('aria-label','Veyra element inspector');panel.style.cssText='position:fixed;left:auto;right:12px;top:12px;width:min(440px,calc(100vw - 24px));max-height:calc(100vh - 24px);';
-      const heading=document.createElement('div');heading.style.cssText='font-weight:700;padding:8px 10px';heading.textContent='Veyra element inspector';panel.appendChild(heading);
-      const details=inspectData(el)||{};for(const [label,value] of [['Element',details.path||details.tag||'unknown'],['Text',String(el.innerText||el.textContent||'').trim().slice(0,1200)],['Outer HTML',String(details.outerHTML||el.outerHTML||'').slice(0,5000)],['Computed styles',JSON.stringify(details.styles||{},null,2)]]){const title=document.createElement('div');title.style.cssText='padding:6px 10px 2px;color:#9eb2ce;font-size:12px';title.textContent=label;const pre=document.createElement('pre');pre.style.cssText='white-space:pre-wrap;overflow-wrap:anywhere;max-height:180px;overflow:auto;margin:0 10px 6px;padding:8px;background:#0b1119;border-radius:6px;font:11px/1.45 ui-monospace,monospace';pre.textContent=value;panel.append(title,pre)}
-      const actions=document.createElement('div');actions.style.cssText='display:flex;gap:6px;padding:8px;flex-wrap:wrap';const add=(label,fn)=>{const button=document.createElement('button');button.type='button';button.textContent=label;button.addEventListener('click',fn);actions.appendChild(button)};add('Copy HTML',async()=>veyraToast(await veyraCopyText(details.outerHTML||el.outerHTML)?'Element HTML copied':'Could not copy HTML'));add('Copy selector',async()=>veyraToast(await veyraCopyText(details.path||'')?'Element selector copied':'Could not copy selector'));add('Close',()=>panel.remove());panel.appendChild(actions);root.appendChild(panel);el.scrollIntoView({block:'nearest',inline:'nearest'});try{el.style.outline='2px solid #77aaff';setTimeout(()=>el.style.removeProperty('outline'),3500)}catch{};
-      inspectSelected=el;inspectEmit('veyra:inspect-select',el);topPost({type:'veyra:inspect-state',enabled:false,sessionId:SESSION_ID,pageUrl:virtualUrl});
-    }catch(error){veyraToast('Inspect element failed: '+String(error&&error.message||error))}
+      const bridge=await dtLoad();
+      const result=await bridge.call('dom.nodeAt',{x:Number(x)||0,y:Number(y)||0});
+      if(!result)return;
+      const detail=await bridge.call('dom.select',{id:result.id});
+      await bridge.call('dom.highlight',{id:result.id});
+      bridge.emit('dom.select',{...result,...detail});
+    }catch(error){topPost({type:'veyra:dt-event',event:'dom.selectFailed',data:{message:String(error&&error.message||error),pageUrl:virtualUrl,sessionId:SESSION_ID}})}
   }
   function veyraActionElement(target){if(target&&target.nodeType===3)target=target.parentElement;return target instanceof Element?target:null}
   function veyraElementUrl(el,selector,attrs){try{const node=el&&el.closest?el.closest(selector):null;if(!node)return '';let raw='';for(const attr of attrs){raw=node[attr]||node.getAttribute(attr)||'';if(raw)break}return raw?canonicalizeMaybeProxy(raw):''}catch{return ''}}
@@ -51,7 +58,7 @@ function pageActionsRuntime() {
     if(image){item('Open image in new tab',()=>topPost({type:'veyra:open',url:image,sessionId:SESSION_ID}));item('Copy image address',async()=>veyraToast(await veyraCopyText(image)?'Image address copied':'Could not copy image address'));divider()}
     if(media){item('Play / pause media',()=>{const node=el.closest('video,audio');if(node){if(node.paused)void node.play();else node.pause()}});item('Copy media address',async()=>veyraToast(await veyraCopyText(media)?'Media address copied':'Could not copy media address'));divider()}
     item('View page source  ·  Ctrl+U',veyraViewPageSource);
-    item('Inspect element',()=>veyraInspectPanel(el));
+    item('Inspect element',()=>veyraOpenDeveloperTools(el,x,y));
     item('Select all',()=>{try{const selection=window.getSelection(),range=document.createRange();range.selectNodeContents(document.body);selection.removeAllRanges();selection.addRange(range)}catch{try{document.execCommand('selectAll')}catch{}}});item('Reload page',()=>location.reload());item('Back',()=>history.back());item('Forward',()=>history.forward());item('Print',()=>window.print());
     root.appendChild(menu);veyraActionMenu=menu;requestAnimationFrame(()=>{const rect=menu.getBoundingClientRect();menu.style.left=Math.max(8,Math.min(Number(x)||8,innerWidth-rect.width-8))+'px';menu.style.top=Math.max(8,Math.min(Number(y)||8,innerHeight-rect.height-8))+'px'});
   }

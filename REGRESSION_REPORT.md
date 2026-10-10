@@ -54,4 +54,12 @@ A final single live Veyra route smoke on `/api/search/web` with Bing HTML mode r
 - No real YouTube playback, transcript, caption or private/age/region-restricted playback validation. oEmbed remains metadata/embeddability only.
 - `src/services/neural-search.js` remains a separate implementation; the production answer path now combines the existing local Veyra index with the one live `websearch.js` orchestration path rather than importing the duplicate implementation.
 
+## Follow-up repair: source navigation, DevTools and answer consistency (2026-10-10)
+
+- View Page Source now captures the current proxied URL and POSTs the resulting `veyra://view_source/...` URI directly to the active browser-session navigation endpoint. The session's canonical/display URL remains the custom URI; the UI no longer depends on a host shell to interpret a repeated URL or send the user to a Render hostname.
+- Inspect Element now opens the existing Developer Tools interface through Veyra's Ctrl+Shift+I shortcut bridge. When invoked on a page element, the bridge resolves the target at the context-menu pointer location, calls the existing DOM select/highlight methods, and emits the normal `dom.select` event. Invoked without a page target, it opens DevTools without a selection. The prior in-page details popup is removed.
+- AI answer output is normalized to a consistent single plain-text paragraph (no headings, Markdown emphasis, bullets or numbering) while preserving source citations. The extractive fallback follows the same format.
+- The lightweight, locally trainable neural URL relevance ranker now uses AdamW with persisted first/second moments and decoupled weight decay. Checkpoint version 2 stores optimizer state; version 1 checkpoints still load. This is not fine-tuning of the hosted generative model: Veyra's answer LLM remains an inference API, and its weights are not available to this repository's trainer.
+- Focused source-view, answer-format and AdamW convergence/restore tests passed. Full current and legacy suites plus `git diff --check` are run before the follow-up is pushed. Live browser-UI interaction and production answer-quality evaluation remain unverified; Chromium stays opt-in.
+
 See `AUDIT_SEARCH_CRAWLER_UPGRADE.md`, `CRAWLER_AUDIT.md`, `CRAWLER_TEST_MATRIX.md`, `GOOGLE_DIAGNOSTICS.md`, `YOUTUBE_TEST_REPORT.md` and `NETWORK_DIAGNOSTICS.md` for scope and details.

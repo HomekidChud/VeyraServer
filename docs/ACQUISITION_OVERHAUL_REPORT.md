@@ -37,9 +37,11 @@ The operations console now displays provider health and acquisition metrics thro
 
 The proxied-page runtime now maps `Ctrl+U`/`Cmd+U` to capture and open the current page source. Desktop right-click and mobile long-press show a Veyra page-actions menu (selection/link/media, source, inspect, select-all, reload/history and print). It is a page-level Veyra menu rather than a replica of browser-native chrome or full DevTools; the inspect action uses existing Veyra element metadata.
 
-The follow-up repair routes menu navigation through the existing Veyra browser message path and opens source with its `veyra://view_source/...` URI instead of displaying a Render hostname. Inspect Element opens an in-page details panel. The source viewer and console now display inline Veyra marks with a verified badge.
+The latest follow-up makes View Page Source call the active browser-session navigation route directly with its `veyra://view_source/...` URI, so the custom scheme remains the displayed session address instead of showing a Render hostname. Inspect Element opens the existing Developer Tools UI through the Ctrl+Shift+I bridge and selects/highlights the element under the context-menu pointer using the DevTools DOM bridge; without a target it opens DevTools without selecting. The previous page-injected details popup is removed. The source viewer and console display inline Veyra marks with a verified badge.
 
-The new `tests/source-view.test.js` covers route validation, tampering, content type, private-host rejection, source escaping, console UI scripts and the injected keyboard/touch runtime. The full suite passed on 2026-10-10 with 54 JavaScript files validated.
+AI answer strings are normalized to a consistent plain-text paragraph while citations are retained. The local neural URL relevance model now uses AdamW with saved optimizer moments and backward-compatible v1 checkpoint loading. This updates the locally trainable search ranker only; it does not fine-tune the hosted generative answer model, whose weights are not available to this service.
+
+The `tests/source-view.test.js`, AI-answer and neural-crawler suites cover route validation/tampering, inert source rendering, custom-URI navigation hooks, Developer Tools selection dispatch, deterministic answer formatting, AdamW ranking updates and checkpoint compatibility. The full suites are rerun for this follow-up; Chromium remains disabled by default and no live browser UI interaction is claimed.
 
 ## Validation
 

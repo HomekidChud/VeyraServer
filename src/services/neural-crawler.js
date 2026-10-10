@@ -7,8 +7,8 @@
  *   - Feature extraction: each discovered URL is converted to a feature vector
  *     (domain authority, link context, content type, depth, freshness, etc.)
  *   - Weight vector: a simple single-layer neural model (logistic regression
- *     with a learned bias). Weights are updated via gradient descent on
- *     user feedback signals.
+ *     with a learned bias). Weights are updated with AdamW from ranking
+ *     feedback signals; this is local URL-ranker training, not LLM fine-tuning.
  *   - Feedback signals: clicks on search results, bookmarks, time spent on
  *     a page, tab opens, reloads, and explicit "useful" / "not useful" votes.
  *   - Priority queue: the crawler's frontier is re-ranked by the neural
@@ -70,7 +70,15 @@ class NeuralCrawlerModel {
     this.weights = new Float64Array(NUM_FEATURES);
     this.bias = 0;
     this.learningRate = opts.learningRate || 0.01;
-    this.l2Regularization = opts.l2Regularization || 0.001;
+    this.weightDecay = Number(opts.weightDecay ?? opts.l2Regularization ?? 0.001);
+    this.adamBeta1 = Number(opts.adamBeta1 ?? 0.9);
+    this.adamBeta2 = Number(opts.adamBeta2 ?? 0.999);
+    this.adamEpsilon = Number(opts.adamEpsilon ?? 1e-8);
+    this.optimizerStep = 0;
+    this.firstMoment = new Float64Array(NUM_FEATURES);
+    this.secondMoment = new Float64Array(NUM_FEATURES);
+    this.biasFirstMoment = 0;
+    this.biasSecondMoment = 0;
     this.trainingExamples = 0;
     this.feedbackHistory = [];
     this.maxHistory = opts.maxHistory || 10000;
@@ -198,12 +206,21 @@ class NeuralCrawlerModel {
 
     
     const gradient = error * weight;
+    this.optimizerStep += 1;
+    const correction1 = 1 - Math.pow(this.adamBeta1, this.optimizerStep);
+    const correction2 = 1 - Math.pow(this.adamBeta2, this.optimizerStep);
     for (let i = 0; i < NUM_FEATURES; i++) {
-      
-      const reg = this.l2Regularization * this.weights[i];
-      this.weights[i] -= this.learningRate * (gradient * features[i] + reg);
+      const grad = gradient * features[i];
+      this.firstMoment[i] = this.adamBeta1 * this.firstMoment[i] + (1 - this.adamBeta1) * grad;
+      this.secondMoment[i] = this.adamBeta2 * this.secondMoment[i] + (1 - this.adamBeta2) * grad * grad;
+      const mHat = this.firstMoment[i] / correction1;
+      const vHat = this.secondMoment[i] / correction2;
+      const adaptiveStep = mHat / (Math.sqrt(vHat) + this.adamEpsilon);
+      this.weights[i] = this.weights[i] * (1 - this.learningRate * this.weightDecay) - this.learningRate * adaptiveStep;
     }
-    this.bias -= this.learningRate * gradient;
+    this.biasFirstMoment = this.adamBeta1 * this.biasFirstMoment + (1 - this.adamBeta1) * gradient;
+    this.biasSecondMoment = this.adamBeta2 * this.biasSecondMoment + (1 - this.adamBeta2) * gradient * gradient;
+    this.bias -= this.learningRate * (this.biasFirstMoment / correction1) / (Math.sqrt(this.biasSecondMoment / correction2) + this.adamEpsilon);
 
     
     const host = safeHost(url);
@@ -259,9 +276,10 @@ class NeuralCrawlerModel {
 
   serialize() {
     return {
-        version: 1,
+        version: 2,
         weights: Array.from(this.weights),
         bias: this.bias,
+        optimizer: { name: "AdamW", step: this.optimizerStep, firstMoment: Array.from(this.firstMoment), secondMoment: Array.from(this.secondMoment), biasFirstMoment: this.biasFirstMoment, biasSecondMoment: this.biasSecondMoment },
         trainingExamples: this.trainingExamples,
         stats: { ...this.stats },
         domainClickCounts: Object.fromEntries(this.domainClickCounts),
@@ -271,10 +289,19 @@ class NeuralCrawlerModel {
   }
 
   loadData(data) {
-    if (!data || data.version !== 1) return false;
+    if (!data || ![1, 2].includes(data.version)) return false;
     const w = data.weights || [];
     for (let i = 0; i < NUM_FEATURES && i < w.length; i++) this.weights[i] = Number(w[i]) || 0;
     this.bias = Number(data.bias) || 0;
+    const optimizer = data.optimizer && data.optimizer.name === "AdamW" ? data.optimizer : null;
+    this.optimizerStep = Math.max(0, Number(optimizer?.step) || 0);
+    this.firstMoment.fill(0); this.secondMoment.fill(0);
+    for (let i = 0; i < NUM_FEATURES; i++) {
+      this.firstMoment[i] = Number(optimizer?.firstMoment?.[i]) || 0;
+      this.secondMoment[i] = Number(optimizer?.secondMoment?.[i]) || 0;
+    }
+    this.biasFirstMoment = Number(optimizer?.biasFirstMoment) || 0;
+    this.biasSecondMoment = Number(optimizer?.biasSecondMoment) || 0;
     this.trainingExamples = Number(data.trainingExamples) || 0;
     if (data.stats) Object.assign(this.stats, data.stats);
     this.domainClickCounts.clear();
@@ -303,6 +330,7 @@ class NeuralCrawlerModel {
       .map(([domain, clicks]) => ({ domain, clicks }));
     return {
       enabled: true,
+      optimizer: { name: "AdamW", step: this.optimizerStep, learningRate: this.learningRate, weightDecay: this.weightDecay },
       features: FEATURE_NAMES,
       weights: Array.from(this.weights),
       bias: this.bias,
@@ -320,6 +348,7 @@ class NeuralCrawlerModel {
     this.weights = new Float64Array(NUM_FEATURES);
     this.bias = 0;
     this.trainingExamples = 0;
+    this.optimizerStep = 0; this.firstMoment.fill(0); this.secondMoment.fill(0); this.biasFirstMoment = 0; this.biasSecondMoment = 0;
     this.feedbackHistory = [];
     this.domainClickCounts.clear();
     this.domainVisitCounts.clear();

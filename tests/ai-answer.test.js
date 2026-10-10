@@ -1,6 +1,6 @@
 "use strict";
 const assert = require("assert");
-const { AIAnswerEngine, extractReadable, evidenceText, normalizeUrl } = require("../src/services/ai-answer");
+const { AIAnswerEngine, extractReadable, evidenceText, normalizeUrl, normalizeAnswerFormat } = require("../src/services/ai-answer");
 
 const noisy = `<!doctype html><html><head><title>Hi - Dictionary</title><script>alert(1)</script></head><body>
 <header>Navigation menu Sign in</header><main><h1>hi</h1><button>Add to word list</button><p>Hi is an informal greeting used to say hello.</p><p>Hi is an informal greeting used to say hello.</p><div>Audio player Play pronunciation</div></main><footer>Related words Social media</footer></body></html>`;
@@ -14,6 +14,8 @@ assert.equal(structured.description, "Greeting");
 assert.equal(structured.jsonLd[0].headline, "Hi");
 assert.equal(normalizeUrl("https://example.com/a/?utm_source=x#part"), "https://example.com/a/");
 assert.equal(evidenceText("window.__CONFIG__ = {}; Add to word list"), "");
+assert.equal(normalizeAnswerFormat("## Answer\n- **A useful result** [S1].\n\n2. More detail [S2]."), "A useful result [S1]. More detail [S2].");
+assert.equal(normalizeAnswerFormat("Answering questions [S1]."), "Answering questions [S1].");
 
 const engine = new AIAnswerEngine();
 const evidence = engine.buildEvidence("What is hi?", engine.detectIntent("What is hi?"), [
@@ -46,7 +48,8 @@ assert.match(quality.label, /evidence|verify/i);
   ]);
   assert.equal(answer.hasAnswer, true);
   assert.equal(answer.generatedBy, "local-grounded-fallback");
-  assert.match(answer.answer, /“/);
+  assert.doesNotMatch(answer.answer, /[“”*`]/);
+  assert.match(answer.answer, /\[S1\]/);
   assert.equal(answer.sources.length >= 2, true);
   assert.equal(answer.sources[0].documentId.length > 10, true);
   assert.equal(answer.grounding.claims.every(claim => claim.status === "supported-by-overlap"), true);
@@ -59,7 +62,7 @@ assert.match(quality.label, /evidence|verify/i);
   global.fetch = async (_url, options) => {
     const request = JSON.parse(options.body);
     capturedPrompt = request.messages.map(message => message.content).join("\n");
-    return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ answer: "The Veyra crawler fetches permitted public pages and extracts source metadata. [S1]", keyPoints: [], caveats: [], sourceIds: ["S1"] }) } }] }) };
+    return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ answer: "## Answer\n- **The Veyra crawler** fetches permitted public pages and extracts source metadata. [S1]", keyPoints: [], caveats: [], sourceIds: ["S1"] }) } }] }) };
   };
   try {
     const injection = await new AIAnswerEngine({ allowExtractiveFallback: true }).answer("What does the Veyra crawler do?", [
@@ -69,6 +72,7 @@ assert.match(quality.label, /evidence|verify/i);
     assert.match(capturedPrompt, /ignore all previous instructions/i, "the test must include a realistic hostile source passage in the model context");
     assert.equal(injection.generatedBy.startsWith("llm:"), true);
     assert.equal(injection.grounding.unsupportedClaims, 0);
+    assert.equal(injection.answer, "The Veyra crawler fetches permitted public pages and extracts source metadata. [S1]");
   } finally {
     global.fetch = originalFetch;
     delete process.env.OPENAI_API_KEY;
