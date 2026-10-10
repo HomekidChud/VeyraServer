@@ -11,7 +11,7 @@
     "dev": "node --watch src/server.js",
     "config": "node src/config/index.js",
     "check": "node scripts/verify-source.js",
-    "test": "npm run check && node tests/ai-answer.test.js && node tests/neural-crawler.test.js && node tests/proxy-rewrite.test.js && node tests/extension-security.test.js && node tests/veyra-assistant.test.js",
+    "test": "npm run check && node tests/ai-answer.test.js && node tests/neural-crawler.test.js && node tests/proxy-rewrite.test.js && node tests/extension-security.test.js && node tests/veyra-assistant.test.js && node tests/agent-training.test.js",
     "test:legacy": "node tests/legacy/fixed-bugs.js && node tests/legacy/vpn-fixes.js"
   },
   "engines": {

@@ -47,7 +47,10 @@ class MongoStore {
           this.db.collection("ai_observations").createIndex({ createdAt: -1 }).catch(() => {}),
           this.db.collection("ai_feedback").createIndex({ id: 1 }, { unique: true }).catch(() => {}),
           this.db.collection("ai_feedback").createIndex({ status: 1, createdAt: 1 }).catch(() => {}),
-          this.db.collection("ai_neural_models").createIndex({ id: 1 }, { unique: true }).catch(() => {})
+          this.db.collection("ai_neural_models").createIndex({ id: 1 }, { unique: true }).catch(() => {}),
+          this.db.collection("agent_training_models").createIndex({ id: 1 }, { unique: true }).catch(() => {}),
+          this.db.collection("agent_training_episodes").createIndex({ id: 1 }, { unique: true }).catch(() => {}),
+          this.db.collection("agent_training_episodes").createIndex({ completedAt: -1 }).catch(() => {})
         ]);
         this.connected = true; this.disabledReason = ""; this.retryAfter = 0; return true;
       } catch (e) {

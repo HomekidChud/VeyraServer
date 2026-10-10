@@ -24,13 +24,12 @@ Store listings intentionally do **not** display invented ratings or download tot
 
 ### Use Veyra Assistant
 
-1. Sign in and open **Veyra Assistant** from the browser menu or ` /assistant ` route.
-2. Enter a question. This is submitted to the configured model provider only after selecting **Ask Veyra Assistant**.
-3. Optionally paste a page URL, title, or selected text. The UI requires an explicit consent switch before any pasted context is sent.
-4. Read the verified answer, caveats, and next steps. The UI shows workflow completion states, not private chain-of-thought or agent prompts.
-5. Optional feedback is not retained for training unless the separate training-consent switch is enabled.
+1. Sign in and open **Veyra Assistance** from the browser menu or `/assistant` route.
+2. Ask about the local agent-training system. Questions are processed locally; the Assistant endpoint does not call an external model provider or require an API key.
+3. Review the answer and caveats. The bounded roles report from training state; this prototype is not a general-purpose language model or AGI.
+4. Optional feedback is not retained for human review unless the separate training-consent switch is enabled.
 
-The Assistant does not automatically browse, inspect tabs, read cookies, capture selection, or execute browser actions.
+The Assistant does not automatically browse, inspect tabs, read cookies, capture selection, execute browser actions, or send page context to an external provider.
 
 ### Developer mode warning
 
@@ -135,27 +134,21 @@ All write endpoints use bearer authentication. Reviewer and audit endpoints requ
 | `POST` | `/api/extensions/reviews/:id/decision` | Admin | Approve or reject; reviewer must differ from publisher |
 | `POST` | `/api/extensions/reviews/:id/publish` | Admin | Publish an approved, passing package |
 | `GET` | `/api/extensions/audit` | Admin | Read audit events |
-| `GET` | `/api/assistant/status` | No | Check whether Assistant is configured; exposes no secret |
-| `POST` | `/api/assistant/ask` | User | Run the consent-aware two-analyst-plus-verifier workflow |
+| `GET` | `/api/assistant/status` | No | Report the active local, keyless Assistant mode |
+| `POST` | `/api/assistant/ask` | User | Ask the bounded local Veyra Assistance prototype; no external AI call |
 | `POST` | `/api/assistant/feedback` | User | Submit optional feedback; content is retained only with explicit training consent |
+| `GET` | `/api/admin/agent-training` | Admin | Read sanitized live maze observations, counters, and events |
+| `POST` | `/api/admin/agent-training/control` | Admin | Pause or resume the bounded training worker |
 
 ### Assistant request contract
 
 ```json
-{
-  "question": "Help me turn this requirement into a release plan.",
-  "context": {
-    "url": "https://example.com/spec",
-    "title": "Example specification",
-    "selectedText": "Only text the user explicitly chose to share."
-  },
-  "consent": { "sendPageContext": true }
-}
+{ "question": "How are the maze agents progressing?" }
 ```
 
-If any page context is present without `sendPageContext: true`, the service returns `400 ASSISTANT_CONTEXT_CONSENT_REQUIRED`. The server rate-limits each user and fails closed when no model provider is configured.
+The active local endpoint reads only `question`, ignores any supplied page context, applies a per-user in-process rate limit, and does not call the legacy provider-backed Assistant implementation. The browser UI does not offer page-context sharing in this mode.
 
-The response contains a verified answer, caveats, suggested next steps, evidence status, and non-sensitive workflow status. It does not return hidden reasoning, system prompts, or full intermediate agent messages.
+The response contains a local status answer, limitations, suggested next steps, evidence status, and role labels—not hidden reasoning, system prompts, or fabricated model-training claims.
 
 ## 5. Deployment and operations
 
@@ -177,30 +170,32 @@ The response contains a verified answer, caveats, suggested next steps, evidence
 
 Configure and test trusted publisher public keys in staging. Executable packages are rejected when no matching trusted key exists. Built-in catalog items are maintained source artifacts and are statically validated on read.
 
-### Veyra Assistant configuration
+### Veyra Assistance and local agent training
+
+The active Assistant path is local and keyless. The public ask endpoint does not call the legacy provider-backed class and ignores page context; model API credentials are not required or used by this path. The training worker is a bounded cooperative maze simulation with reward-statistic updates, not foundation-model training or AGI. See [`AGENT_TRAINING.md`](AGENT_TRAINING.md) for the full operational and safety contract.
 
 | Variable | Default | Meaning |
-|---|---|---|
-| `OPENAI_API_KEY` | unset | Model-provider credential; never expose to the client |
-| `OPENAI_API_BASE` | unset | OpenAI-compatible provider base URL |
-| `VEYRA_ASSISTANT_MODEL` | unset | Model identifier; Assistant remains disabled until set |
-| `VEYRA_ASSISTANT_TIMEOUT_MS` | `20000` | Per-provider-call timeout (1–60 seconds) |
-| `VEYRA_ASSISTANT_REQUESTS_PER_WINDOW` | `8` | Per-user request budget |
-| `VEYRA_ASSISTANT_RATE_WINDOW_MS` | `600000` | Rate-limit window |
-| `VEYRA_ASSISTANT_DATA_DIR` | `${VEYRA_DATA_DIR}/assistant` | Feedback review queue location |
-| `VEYRA_ASSISTANT_FEEDBACK_RETENTION_MS` | 30 days | Opt-in feedback retention, bounded to 1–365 days |
+|---|---:|---|
+| `VEYRA_AGENT_TRAINING_ENABLED` | `true` | Start the training worker with the main server process |
+| `VEYRA_AGENT_TRAINING_TICK_MS` | `350` | Simulation tick delay, clamped to 100–5000 ms |
+| `VEYRA_AGENT_TRAINING_MAX_MAZE` | `21` | Maximum maze side length, clamped to 9–31 |
+| `VEYRA_AGENT_TRAINING_DIR` | `${VEYRA_DATA_DIR}/agent-training` | Local checkpoint fallback |
+| `MONGODB_URI` / `MONGODB_DB` | unset / `veyra` | Existing Mongo connection; stores model counters and completed episode summaries when configured |
+| `VEYRA_ASSISTANT_DATA_DIR` | `${VEYRA_DATA_DIR}/assistant` | Opt-in feedback review queue location |
+| `VEYRA_ASSISTANT_FEEDBACK_RETENTION_MS` | 30 days | Feedback retention, bounded to 1–365 days |
 
-Configure an OpenAI-compatible model that supports JSON-schema structured output. Veyra Assistant submits three bounded model calls per successful request: two independent analysts in parallel and one verifier. Tune per-user limits and provider spend controls before enabling it in production.
+For continuous production training, keep the server process running on an always-on service/worker. Local checkpoints are written even when MongoDB is unavailable; set a durable `MONGODB_URI` to persist the training policy and episode summaries to MongoDB. This process-level loop does not prevent a host from suspending or terminating the deployment.
 
 ### Rollout checklist
 
 1. Deploy to staging with trusted signing keys configured; test a CSS package and a signed executable package through all lifecycle states.
 2. Verify archives, unsigned code, wildcard executable scopes, and blocked remote CSS are rejected.
 3. Confirm reviewers inspect every JS file and scanner warning, and that the publisher cannot review their own submission.
-4. Configure a non-production Assistant provider and verify the consent rejection path, rate limit, timeout, and unavailable-provider path.
-5. Enable monitoring for `STORE` and `ASSISTANT` log components.
-6. Back up the protected data directory and rehearse restore procedures.
-7. Promote as a **reviewed executable Store with explicit per-device install consent** and **opt-in Assistant**.
+4. Verify the local Assistant status/ask routes and administrator authorization for live-training and pause/resume endpoints.
+5. Confirm whether MongoDB is configured; exercise the local checkpoint fallback and, in staging, the Mongo training collections.
+6. Enable monitoring for `STORE`, `ASSISTANT`, and `AGENT_TRAINING` log components.
+7. Back up the protected data directory and rehearse restore procedures.
+8. Promote as a **reviewed executable Store with explicit per-device install consent** and **local keyless Assistant prototype**.
 
 ## 6. Security design
 
@@ -222,9 +217,9 @@ Content scripts still execute in the visited page's JavaScript context. Review t
 
 - User question is submitted only when the user presses the request button.
 - Page-derived context is not collected automatically. Context must be pasted and explicitly approved.
-- Analyst prompts instruct models to treat user context as untrusted reference data, not executable instructions.
+- The active endpoint reads only the question field; it ignores page-context fields and contacts no external model.
 - No browser automation, browser-session access, credentials, cookies, or account data is made available to agents.
-- Rate limits and request-size limits reduce abuse and unexpected provider spend.
+- Per-user request and input-size limits reduce abuse. The bounded local training loop is independent from open-ended Assistant prompts.
 - Opt-in feedback is stored for time-limited **human review** only. It does **not** automatically train, fine-tune, or modify a model.
 
 ## 7. Versioning and release notes
@@ -237,10 +232,11 @@ Maintain semantic versioning for each repository. This upgrade should be recorde
 - Quarantined CSS and signed executable v2 package lifecycle with audit history and per-device consent.
 - HTTPS-scoped content scripts plus a restrictive background iframe with extension-local storage.
 - SHA-256 integrity metadata, static security scan metadata, and optional Ed25519 trusted-publisher verification.
-- Consent-aware Veyra Assistant with parallel independent analysts and verifier.
+- Keyless local Veyra Assistance prototype and a bounded cooperative maze training loop with live administrator monitoring.
 - Explicit opt-in feedback queue with retention and human-review-only policy.
 
 **Changed**
+- User-facing Assistant no longer depends on an external model provider and explicitly discloses its limited, non-AGI capability.
 - Store UI removes unauditable popularity claims and requires permission review before installation.
 - Account sync excludes developer scripts and unverified/local extension content.
 - Neural crawler mutations and challenge solving require authenticated users; destructive neural resets require administrators.

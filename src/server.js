@@ -29,6 +29,7 @@ const { CastServer, InternetConnectionManager } = require("./network/cast-server
 const { AIAnswerEngine } = require("./services/ai-answer");
 const { ExtensionStoreSecurity, ExtensionSecurityError } = require("./services/extension-security");
 const { VeyraAssistant, AssistantFeedbackStore, AssistantError } = require("./services/veyra-assistant");
+const { AgentTrainingService } = require("./services/agent-training");
 const { RenewingManager } = require("./services/renewing-system");
 const fullPage = require("./browser/full-page.js");
 const { FailoverController } = require("./browser/browser-failover.js");
@@ -420,6 +421,14 @@ const extensionStoreSecurity = new ExtensionStoreSecurity({
 const assistantFeedbackStore = new AssistantFeedbackStore({
   dataDir: process.env.VEYRA_ASSISTANT_DATA_DIR || path.join(CFG.authDataDir, "assistant"),
   retentionMs: numberEnv("VEYRA_ASSISTANT_FEEDBACK_RETENTION_MS", 30 * 24 * 60 * 60 * 1000, 24 * 60 * 60 * 1000, 365 * 24 * 60 * 60 * 1000)
+});
+const agentTraining = new AgentTrainingService({
+  mongo: mongoStore,
+  dataDir: process.env.VEYRA_AGENT_TRAINING_DIR || path.join(CFG.authDataDir, "agent-training"),
+  tickMs: numberEnv("VEYRA_AGENT_TRAINING_TICK_MS", 350, 100, 5000),
+  maxMazeSize: numberEnv("VEYRA_AGENT_TRAINING_MAX_MAZE", 21, 9, 31),
+  enabled: boolEnv("VEYRA_AGENT_TRAINING_ENABLED", true),
+  log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
 });
 const veyraAssistant = new VeyraAssistant({
   apiKey: process.env.OPENAI_API_KEY || "",
@@ -4315,13 +4324,13 @@ app.post('/api/search/answer', async (req, res) => {
 });
 app.get('/api/answer/status', (req, res) => res.json(aiAnswerEngine.report()));
 
-app.get('/api/assistant/status', (req, res) => res.json({ ok: true, ...veyraAssistant.status(), feedback: assistantFeedbackStore.status() }));
+app.get('/api/assistant/status', (req, res) => res.json({ ok: true, available: true, mode: "local-keyless-prototype", externalApiKeyRequired: false, externalProviderUsed: false, execution: "local cooperative maze-training agents; bounded rule-based responses", contextPolicy: "Questions are processed locally; no external AI provider or page context is used.", training: "A cooperative simulation adapts bounded reward statistics; it does not train a foundation model and is not AGI.", feedback: assistantFeedbackStore.status() }));
 app.post('/api/assistant/ask', requireUser, async (req, res) => {
   try {
-    const result = await veyraAssistant.ask(req.body || {}, req.veyraUser);
+    const result = agentTraining.answerLocal(req.body?.question, req.veyraUser);
     res.json({ ok: true, ...result });
   } catch (error) {
-    const known = error instanceof AssistantError;
+    const known = error instanceof AssistantError || !!error?.status;
     respondError(res, known ? error.status : 502, known ? error.message : "Veyra Assistant could not complete this request.", known ? error.code : "ASSISTANT_FAILED");
   }
 });
@@ -4340,6 +4349,14 @@ app.post('/api/assistant/feedback', requireUser, (req, res) => {
     const known = error instanceof AssistantError;
     respondError(res, known ? error.status : 400, known ? error.message : "Veyra Assistant feedback could not be recorded.", known ? error.code : "ASSISTANT_FEEDBACK_FAILED");
   }
+});
+
+app.get("/api/admin/agent-training", requireAdmin, (req, res) => res.json({ ok: true, training: agentTraining.report() }));
+app.post("/api/admin/agent-training/control", requireAdmin, async (req, res) => {
+  const action = String(req.body?.action || "").toLowerCase();
+  if (action === "pause") return res.json({ ok: true, training: agentTraining.pause() });
+  if (action === "resume") return res.json({ ok: true, training: await agentTraining.start() });
+  respondError(res, 400, "action must be pause or resume.", "AGENT_TRAINING_INVALID_ACTION");
 });
 
 
@@ -6018,6 +6035,7 @@ function startVeyraServer() {
       await mongoStore.connect();
       await hydrateNeuralFromMongo();
       neuralTrainer.start();
+      if (agentTraining.enabled) await agentTraining.start();
 
       if (mongoStore.enabled) {
         try {
@@ -6066,6 +6084,7 @@ function startVeyraServer() {
     const shutdown = async signal => {
       if (shuttingDown) return; shuttingDown = true;
       serverLog("info", "SYSTEM", `${signal} received — shutting down.`);
+      agentTraining.close();
       await neuralTrainer.stop();
       for (const j of jobs.values()) if (!j.done) { j.stopRequested = true; j.stopReason = "shutdown"; j.controller?.abort?.(); }
       const force = setTimeout(() => process.exit(0), 8000); force.unref();
@@ -6098,4 +6117,4 @@ const __workerOps = {
   discover: (text, kind, base, contentType) => collectDiscovery(text, kind, base, contentType)
 };
 
-module.exports = { app, mongoStore, mergeStrayProxyParams, detectChallenge, CFG, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions, normalizeOpenEngineMode, shouldStartCrawlerForEngineMode, startVeyraServer };
+module.exports = { app, mongoStore, agentTraining, mergeStrayProxyParams, detectChallenge, CFG, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions, normalizeOpenEngineMode, shouldStartCrawlerForEngineMode, startVeyraServer };

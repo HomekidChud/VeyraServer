@@ -1,4 +1,11 @@
 
+## Veyra Assistance — local agent-training prototype
+
+- Runs a keyless cooperative maze simulation with Scout, Mapper, and Coordinator roles; admin panel exposes live maps, messages, rewards, sanctions, and pause/resume controls.
+- The local user-facing Assistant is intentionally limited to training status and related questions. No external model API is called. The policy reward updates are not foundation-model training; this prototype is not AGI.
+- MongoDB persistence uses the existing `MONGODB_URI` configuration; protected local checkpoints are the fallback. Configure an always-on server process and Mongo URI for continuous durable production training.
+- See [`docs/AGENT_TRAINING.md`](docs/AGENT_TRAINING.md) for safety boundaries, configuration, persistence, admin endpoints, and known limitations.
+
 ## 8.17.1 compatibility hardening
 
 - API proxy accepts `OPTIONS` in addition to the existing browser methods.

@@ -106,3 +106,15 @@ Do not describe this as malware-proof, and do not use content-script extensions 
 ### Additional verification
 
 Regression tests generate an Ed25519 keypair, verify a signed v2 background bundle, reject unsigned executable code, reject wildcard executable hosts, reject permission/file mismatches, and verify the manual-review/publish lifecycle. Browser source checks cover the new background sandbox module and explicit install flow. These are code-path tests, not adversarial sandbox escapes or penetration tests.
+
+## Addendum — 2026-10-10 local Veyra Assistance training
+
+The earlier provider-backed Assistant description and its provider-retention risk row describe a superseded route, not the active user-facing endpoint. The current `/api/assistant/ask` path uses a local keyless prototype and does not call the provider-backed implementation or forward page context, even if provider credentials happen to be present in the server environment.
+
+- The main server process starts a bounded cooperative maze simulation by default. Three rule-driven roles share observed map cells/messages and update bounded reward statistics. This is not foundation-model training or AGI.
+- The maze is a sandbox; generated objectives and transitions are validated server-side. Invalid/non-adjacent/wall moves are blocked and receive a reward deduction and short cooldown. These are simulated penalties only; the agents have no arbitrary code execution, network tool, account access, or host controls.
+- Training status, maze observations, messages, and pause/resume controls use administrator-gated endpoints. Browser voice events are opt-in and use local browser speech synthesis only.
+- Policy counters and completed summaries persist to MongoDB when `MONGODB_URI` is configured and the connection is available. Development validation had no Mongo URI, so live Mongo persistence was not verified; a protected local checkpoint fallback is used.
+- The continuous loop exists only while the Veyra Server process is alive. Hosting-provider uptime/restart behavior is outside this code change.
+
+See `AGENT_TRAINING.md`. Server regression tests cover the local no-key response, generated-maze reachability, sanction/cooldown behavior, and omission of hidden maze truth from checkpoints. This is functional test coverage, not evidence of general intelligence or a complete adversarial safety evaluation.
