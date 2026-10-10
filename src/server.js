@@ -4357,7 +4357,9 @@ app.post('/api/assistant/feedback', requireUser, (req, res) => {
   }
 });
 
-app.get("/admin/agent-training", requireAdmin, (req, res) => res.type("html").set("Cache-Control", "no-store").send(agentTrainingPage()));
+// The page shell contains no training data; its login form authenticates to the
+// existing API and sends a Bearer token to the still-admin-protected endpoints.
+app.get("/admin/agent-training", (req, res) => res.type("html").set("Cache-Control", "no-store").send(agentTrainingPage()));
 app.get("/api/admin/agent-training/live-log", requireAdmin, (req, res) => {
   if (agentTraining.report().persistence.localLiveTrace === false) return respondError(res, 404, "Local live trace is disabled when MongoDB persistence is required.", "AGENT_TRAINING_TRACE_DISABLED");
   try {
