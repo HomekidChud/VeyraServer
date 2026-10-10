@@ -174,6 +174,26 @@ assert.ok(Math.abs(restoredQualityLearner.predict(goodAnswerFeatures) - qualityL
   assert.equal(groqBody.max_tokens, undefined);
   assert.equal(groqBody.response_format, undefined);
   assert.equal(groqEngine.report().model, "openai/gpt-oss-20b");
+  const sparseEvidence = [
+    { id: "S1", sourceIdentity: "roblox.com", title: "Roblox", url: "https://www.roblox.com/", matched: ["Roblox is the ultimate virtual universe that lets you create, share experiences with friends, and be anything you can imagine."], verificationSentences: ["Roblox is the ultimate virtual universe that lets you create, share experiences with friends, and be anything you can imagine."], documentText: "Roblox is the ultimate virtual universe that lets you create, share experiences with friends, and be anything you can imagine. Join a global community." },
+    { id: "S2", sourceIdentity: "about.roblox.com", title: "About Roblox", url: "https://about.roblox.com/", matched: ["Roblox is a global platform where millions of people gather together every day to imagine, create, and be anything they can imagine.", "Join a vibrant community."], verificationSentences: ["Roblox is a global platform where millions of people gather together every day to imagine, create, and be anything they can imagine.", "Join a vibrant community."], documentText: "Roblox is a global platform where millions of people gather together every day to imagine, create, and be anything they can imagine. Join a vibrant community." },
+    { id: "S3", sourceIdentity: "play.google.com", title: "Roblox on Google Play", url: "https://play.google.com/store/apps/details?id=com.roblox.client", matched: ["Roblox is home to every kind of game, for every kind of player.", "Compete in high-octane racing games, battle it out in hardcore experiences."], verificationSentences: ["Roblox is home to every kind of game, for every kind of player.", "Compete in high-octane racing games, battle it out in hardcore experiences."], documentText: "Roblox is home to every kind of game, for every kind of player. Compete in high-octane racing games, battle it out in hardcore experiences." }
+  ];
+  const sparseSummary = "Roblox is a virtual platform where people create, share, and experience user-made worlds with friends [S1][S2]. Roblox describes itself as a global platform where millions of people gather [S2]. The Google Play listing mentions racing games and other experiences [S3].";
+  let sparseRequest = null;
+  global.fetch = async (url, options = {}) => {
+    if (String(url) === "https://api.groq.com/openai/v1/models") return { ok: true, json: async () => ({ data: [{ id: "openai/gpt-oss-20b", active: true }] }) };
+    sparseRequest = JSON.parse(options.body);
+    return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ answer: sparseSummary }) } }] }) };
+  };
+  const sparseEngine = new AIAnswerEngine();
+  const sparseResult = await sparseEngine.synthesizeWithLLM("Roblox", { type: "explore" }, sparseEvidence);
+  assert.ok(sparseResult, "short grounded summaries should be accepted when evidence consists of search snippets");
+  assert.match(sparseRequest.messages[0].content, /1-3 sentences and 20-80 words/i, "sparse evidence should not be forced into a long overview");
+  assert.match(sparseRequest.messages[0].content, /at least 2 independent sources/i, "sparse summaries should still use independent evidence");
+  assert.deepEqual(sparseResult.sourceIds, ["S1", "S2", "S3"], "citations can supply source IDs when a compatible model omits optional JSON fields");
+  assert.deepEqual(sparseResult.keyPoints, []);
+  assert.equal(sparseEngine.verifyAnswer(sparseResult.answer, sparseEvidence).unsupported, 0, "the accepted short summary must still pass the factual grounding verifier");
   global.fetch = savedFetch;
   restoreAIEnv();
 
