@@ -71,17 +71,21 @@ class AgentTrainingService {
     this.dataDir = options.dataDir || path.join(process.cwd(), "data", "agent-training");
     this.stateFile = path.join(this.dataDir, "checkpoint.json");
     this.episodeHistoryFile = path.join(this.dataDir, "episodes.jsonl");
+    this.liveTraceFile = path.join(this.dataDir, "live-training.jsonl");
     this.tickMs = boundedInt(options.tickMs, 100, 5000, 350);
     this.checkpointEverySteps = boundedInt(options.checkpointEverySteps, 1, 1000, 20);
     this.maxMazeSize = boundedInt(options.maxMazeSize, 9, 31, 21);
     this.maxSamplesPerEpisode = boundedInt(options.maxSamplesPerEpisode, 0, 10000, 256);
     this.localEpisodeLimit = boundedInt(options.localEpisodeLimit, 1, 10000, 500);
+    this.localLiveLogLimit = boundedInt(options.localLiveLogLimit, 1, 100000, 5000);
+    this.localLiveLogTrimBatch = Math.min(200, Math.max(1, Math.floor(this.localLiveLogLimit / 4)));
     this.requireMongo = options.requireMongo === true;
     this.enabled = options.enabled !== false;
     this.timer = null; this.persistBusy = false; this.waitLogged = false;
     this.startedAt = null;
     this.askRequests = new Map();
     this.localEpisodeCount = this._countLocalEpisodes();
+    this.localLiveLogCount = this._countLiveRecords();
     this.state = {
       modelId: MODEL_ID, status: "idle", createdAt: new Date().toISOString(), episodes: 0,
       successfulEpisodes: 0, totalSteps: 0, totalSanctions: 0, bestScore: 0, lastScore: 0,
@@ -104,6 +108,29 @@ class AgentTrainingService {
     try {
       return fs.readFileSync(this.episodeHistoryFile, "utf8").split(/\r?\n/).filter(Boolean).length;
     } catch { return 0; }
+  }
+
+  _countLiveRecords() {
+    if (this.requireMongo) return 0;
+    try { return fs.readFileSync(this.liveTraceFile, "utf8").split(/\r?\n/).filter(Boolean).length; }
+    catch { return 0; }
+  }
+
+  _appendLiveTrace(record) {
+    if (this.requireMongo) return;
+    try {
+      fs.mkdirSync(this.dataDir, { recursive: true, mode: 0o700 });
+      fs.appendFileSync(this.liveTraceFile, `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
+      fs.chmodSync(this.liveTraceFile, 0o600);
+      this.localLiveLogCount += 1;
+      if (this.localLiveLogCount > this.localLiveLogLimit + this.localLiveLogTrimBatch) {
+        const retained = fs.readFileSync(this.liveTraceFile, "utf8").split(/\r?\n/).filter(Boolean).slice(-this.localLiveLogLimit);
+        const temp = `${this.liveTraceFile}.${process.pid}.tmp`;
+        fs.writeFileSync(temp, `${retained.join("\n")}\n`, { encoding: "utf8", mode: 0o600 });
+        fs.renameSync(temp, this.liveTraceFile);
+        this.localLiveLogCount = retained.length;
+      }
+    } catch (error) { this.log("warn", "AGENT_TRAINING", `Local live trace write failed: ${error.message}`); }
   }
 
   _recordSample(episode, sample) {
@@ -200,7 +227,19 @@ class AgentTrainingService {
     const target = knownKeys[0] || (episode.foundKeys.length >= 3 ? knownExit : null);
     if (target) {
       const path = shortestPath(map, agent, target, episode.size);
-      if (path.length) return neighbors.find(n => n.name === path[0]);
+      if (path.length) {
+        const proposal = neighbors.find(n => n.name === path[0]);
+        if (proposal) {
+          const hasKey = knownKeys.length > 0;
+          const targetType = hasKey ? "known key" : "known exit";
+          agent.lastDecision = {
+            rule: hasKey ? "navigate-to-known-key" : "navigate-to-exit",
+            target, pathLength: path.length,
+            explanation: `The shared map shows a ${targetType} at (${target.x},${target.y}); follow the shortest known safe route (${path.length} steps).`
+          };
+          return proposal;
+        }
+      }
     }
     const frontiers = [];
     for (let y = 1; y < episode.size - 1; y++) for (let x = 1; x < episode.size - 1; x++) {
@@ -215,8 +254,28 @@ class AgentTrainingService {
       const bScore = b.path.length - (agent.id === "scout" ? b.unknown * 2 : b.unknown);
       return aScore - bScore;
     });
-    if (frontiers.length) return neighbors.find(n => n.name === frontiers[0].path[0]);
-    if (safeKnown.length) return safeKnown.sort((a, b) => (Math.abs(a.x - (episode.size - 2)) + Math.abs(a.y - (episode.size - 2))) - (Math.abs(b.x - (episode.size - 2)) + Math.abs(b.y - (episode.size - 2))))[0];
+    if (frontiers.length) {
+      const chosen = frontiers[0], proposal = neighbors.find(n => n.name === chosen.path[0]);
+      if (proposal) {
+        const weight = agent.id === "scout" ? 2 : 1;
+        agent.lastDecision = {
+          rule: "explore-frontier", target: { x: chosen.x, y: chosen.y }, pathLength: chosen.path.length,
+          frontierScore: chosen.path.length - chosen.unknown * weight, candidatesConsidered: frontiers.length,
+          unknownNeighbors: chosen.unknown,
+          explanation: `${agent.name} selected a reachable frontier with ${chosen.unknown} unknown neighboring cells; ${frontiers.length} frontier(s) were ranked by route length and exploration value.`
+        };
+        return proposal;
+      }
+    }
+    if (safeKnown.length) {
+      const proposal = safeKnown.sort((a, b) => (Math.abs(a.x - (episode.size - 2)) + Math.abs(a.y - (episode.size - 2))) - (Math.abs(b.x - (episode.size - 2)) + Math.abs(b.y - (episode.size - 2))))[0];
+      agent.lastDecision = {
+        rule: "fallback-safe-known-move", target: { x: episode.size - 2, y: episode.size - 2 },
+        explanation: "No reachable frontier or known objective was selected; choose a traversable observed neighbor that reduces Manhattan distance to the far corner."
+      };
+      return proposal;
+    }
+    agent.lastDecision = { rule: "wait-no-safe-known-move", explanation: "No traversable neighboring cell is currently known, so the agent makes no move rather than guessing." };
     return null;
   }
 
@@ -237,17 +296,34 @@ class AgentTrainingService {
     let ep = this.state.currentEpisode;
     if (!ep || ep.status !== "running") { ep = this._beginEpisode(); this.state.currentEpisode = ep; }
     ep.step += 1; ep.turns += 1; this.state.totalSteps += 1;
+    const trace = { at: new Date().toISOString(), episodeId: ep.id, episode: this.state.episodes + 1, step: ep.step, size: ep.size, decisions: [] };
     for (const agent of ep.agents) {
       if (!this.enabled || ep.status !== "running") break;
-      if (agent.cooldown > 0) { agent.cooldown -= 1; continue; }
-      const collectSample = this.maxSamplesPerEpisode > 0 && ep.samples.length < this.maxSamplesPerEpisode;
-      const inputObservation = collectSample ? ep.observation.map(row => row.join("")).join("") : "";
+      if (agent.cooldown > 0) {
+        agent.cooldown -= 1;
+        agent.lastDecision = { rule: "safety-cooldown", explanation: `Safety cooldown: ${agent.cooldown} turn(s) remain.` };
+        trace.decisions.push({ agent: agent.id, position: { x: agent.x, y: agent.y }, action: "cooldown", ...agent.lastDecision });
+        continue;
+      }
+      const collectSample = !this.requireMongo && this.maxSamplesPerEpisode > 0 && ep.samples.length < this.maxSamplesPerEpisode;
+      const inputObservation = !this.requireMongo || collectSample ? ep.observation.map(row => row.join("")).join("") : "";
       const inputPosition = { x: agent.x, y: agent.y };
       const proposal = this._chooseMove(ep, agent);
-      if (!proposal) continue;
+      if (!proposal) {
+        trace.decisions.push({ agent: agent.id, position: inputPosition, observation: inputObservation, action: "wait", ...(agent.lastDecision || {}) });
+        continue;
+      }
       const dx = Math.abs(proposal.x - agent.x), dy = Math.abs(proposal.y - agent.y);
-      if (dx + dy !== 1) { this._sanction(ep, agent, "non-adjacent move / teleport attempt"); continue; }
-      if (ep.maze.grid[proposal.y][proposal.x] === "#") { this._sanction(ep, agent, "attempted move through a wall"); continue; }
+      if (dx + dy !== 1) {
+        this._sanction(ep, agent, "non-adjacent move / teleport attempt");
+        trace.decisions.push({ agent: agent.id, position: inputPosition, observation: inputObservation, action: "blocked", ...(agent.lastDecision || {}) });
+        continue;
+      }
+      if (ep.maze.grid[proposal.y][proposal.x] === "#") {
+        this._sanction(ep, agent, "attempted move through a wall");
+        trace.decisions.push({ agent: agent.id, position: inputPosition, observation: inputObservation, action: "blocked", ...(agent.lastDecision || {}) });
+        continue;
+      }
       const previous = { x: agent.x, y: agent.y };
       agent.x = proposal.x; agent.y = proposal.y; ep.score += 1;
       let sampleReward = 1;
@@ -269,8 +345,9 @@ class AgentTrainingService {
       if (collectSample) this._recordSample(ep, {
         step: ep.step, agent: agent.id, size: ep.size, position: inputPosition,
         observation: inputObservation, action: proposal.name, reward: sampleReward,
-        nextPosition: { x: agent.x, y: agent.y }, done: solved
+        nextPosition: { x: agent.x, y: agent.y }, done: solved, decision: agent.lastDecision || null
       });
+      trace.decisions.push({ agent: agent.id, position: inputPosition, observation: inputObservation, action: proposal.name, nextPosition: { x: agent.x, y: agent.y }, reward: sampleReward, ...(agent.lastDecision || {}) });
       if (solved) {
         this._finishEpisode(ep, true); break;
       }
@@ -283,6 +360,10 @@ class AgentTrainingService {
       if (lastSample?.step === ep.step) lastSample.done = true;
       this._finishEpisode(ep, false);
     }
+    trace.score = ep.score;
+    trace.keyCount = ep.foundKeys.length;
+    trace.status = ep.status;
+    this._appendLiveTrace(trace);
     this.state.status = this.enabled ? "running" : "paused";
     if (ep.step % this.checkpointEverySteps === 0 || ep.status !== "running") void this._persist(false);
   }
@@ -393,12 +474,15 @@ class AgentTrainingService {
         checkpointSavedToMongo: !!this.state.savedToMongo, localCheckpoint: this.requireMongo ? false : this.stateFile,
         localEpisodeHistory: this.requireMongo ? false : this.episodeHistoryFile,
         localEpisodesRetained: this.requireMongo ? 0 : this.localEpisodeCount,
-        localEpisodeLimit: this.requireMongo ? 0 : this.localEpisodeLimit
+        localEpisodeLimit: this.requireMongo ? 0 : this.localEpisodeLimit,
+        localLiveTrace: this.requireMongo ? false : this.liveTraceFile,
+        localLiveTraceStepsRetained: this.requireMongo ? 0 : this.localLiveLogCount,
+        localLiveTraceStepLimit: this.requireMongo ? 0 : this.localLiveLogLimit
       },
       curriculum: { challenge: "cooperative-maze", difficulty: ep ? ep.size : Math.min(this.maxMazeSize, 9 + 2 * Math.min(6, Math.floor(this.state.episodes / 4))), maxDifficulty: this.maxMazeSize, agents: ROLES.map(({ id, name, task }) => ({ id, name, task })), coordination: "shared verified map messages; scout, mapper, coordinator" },
       counters: { episodes: this.state.episodes, successfulEpisodes: this.state.successfulEpisodes, successRate: this.state.episodes ? Math.round(this.state.successfulEpisodes / this.state.episodes * 1000) / 10 : 0, totalSteps: this.state.totalSteps, sanctions: this.state.totalSanctions, lastScore: this.state.lastScore, bestScore: this.state.bestScore },
       policy: this.state.policy,
-      live: ep ? { episodeId: ep.id, step: ep.step, size: ep.size, score: ep.score, keyCount: ep.foundKeys.length, requiredKeys: ep.maze.keys.length, status: ep.status, observation: ep.observation.map(row => row.join("")), agents: ep.agents.map(({ id, name, task, x, y, sanctions, cooldown, messages }) => ({ id, name, task, x, y, sanctions, cooldown, messages })), messages: ep.messages.slice(-12) } : null,
+      live: ep ? { episodeId: ep.id, step: ep.step, size: ep.size, score: ep.score, keyCount: ep.foundKeys.length, requiredKeys: ep.maze.keys.length, status: ep.status, observation: ep.observation.map(row => row.join("")), agents: ep.agents.map(({ id, name, task, x, y, sanctions, cooldown, messages, lastDecision }) => ({ id, name, task, x, y, sanctions, cooldown, messages, lastDecision: lastDecision || null })), messages: ep.messages.slice(-12) } : null,
       events: this.state.events.slice(-30)
     };
   }

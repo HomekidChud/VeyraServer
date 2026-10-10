@@ -84,13 +84,14 @@ export VEYRA_AGENT_TRAINING_CHECKPOINT_STEPS='20'
 export VEYRA_AGENT_TRAINING_MAX_MAZE='15'
 export VEYRA_AGENT_TRAINING_SAMPLES_PER_EPISODE='256'
 export VEYRA_AGENT_TRAINING_LOCAL_EPISODES='500'
+export VEYRA_AGENT_TRAINING_LIVE_LOG_STEPS='5000'
 export BROWSER_ENABLED='false'
 export PORT='10000'
 ```
 
 The correct admin setting is **`VEYRA_ADMIN_EMAILS`**, not `ADMIN_EMAILS`. Save the lines in `nano` using **Ctrl+O**, Enter, then **Ctrl+X**; typing `export ...` at the shell prompt does not save them to the env file. `VEYRA_AGENT_TRAINING_REQUIRE_MONGO=false` is deliberate: on-device mode saves its checkpoint and generated experience locally and does not pause waiting for a MongoDB server. You do not need to set `MONGODB_URI` for this mode. `VEYRA_JOB_DIR` also avoids the Linux `/tmp/veyra-browse-jobs` path that caused `EACCES` on your phone; use the updated branch containing the fix.
 
-The local archive is `episodes.jsonl` in the training directory. It keeps the newest 500 episode records by default and at most 256 visible-observation/action/reward samples per episode. It excludes the hidden maze layout. The sample cap and episode cap prevent unbounded storage growth; raise them only if you have enough free storage. The archive is a reusable synthetic dataset, but the current rule-based policy does **not** learn neural-network weights from it automatically.
+The local archive is `episodes.jsonl` in the training directory. It keeps the newest 500 episode records by default and at most 256 visible-observation/action/reward samples per episode. It excludes the hidden maze layout. `live-training.jsonl` is updated every turn and retains about the latest 5,000 turns by default; it compacts in batches to avoid rewriting a large file on every phone tick. The caps prevent unbounded storage growth; raise them only if you have enough free storage. The archive is a reusable synthetic dataset, but the current rule-based policy does **not** learn neural-network weights from it automatically.
 
 Secure the file:
 
@@ -115,7 +116,7 @@ curl -fsS http://127.0.0.1:10000/health
 wc -l "$HOME/.local/share/veyra/agent-training/episodes.jsonl"
 ```
 
-The episode file appears after an episode completes. To view the admin training status, use the signed-in admin interface or the protected `/api/admin/agent-training` route. The earlier pasted `/api/assistant/status` check is not the training-status endpoint.
+The episode archive appears after an episode completes; the live JSONL trace updates each training turn. Open `http://127.0.0.1:10000/admin/agent-training` on the phone in a browser signed in as the Veyra admin to see the protected live map, score, decisions and events. You can also follow the file in another Termux session with `tail -f "$HOME/.local/share/veyra/agent-training/live-training.jsonl"`. The admin JSON route is `/api/admin/agent-training`; the earlier pasted `/api/assistant/status` check is not the training-status endpoint. The displayed “why this action” details summarize explicit rules and visible evidence; they are not hidden chain-of-thought.
 
 Stop the foreground test with Ctrl+C before creating the runit service.
 

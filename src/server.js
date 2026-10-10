@@ -30,6 +30,7 @@ const { AIAnswerEngine } = require("./services/ai-answer");
 const { ExtensionStoreSecurity, ExtensionSecurityError } = require("./services/extension-security");
 const { VeyraAssistant, AssistantFeedbackStore, AssistantError } = require("./services/veyra-assistant");
 const { AgentTrainingService } = require("./services/agent-training");
+const { agentTrainingPage } = require("./services/agent-training-page");
 const { RenewingManager } = require("./services/renewing-system");
 const fullPage = require("./browser/full-page.js");
 const { FailoverController } = require("./browser/browser-failover.js");
@@ -430,6 +431,7 @@ const agentTraining = new AgentTrainingService({
   maxMazeSize: numberEnv("VEYRA_AGENT_TRAINING_MAX_MAZE", 21, 9, 31),
   maxSamplesPerEpisode: numberEnv("VEYRA_AGENT_TRAINING_SAMPLES_PER_EPISODE", 256, 0, 10000),
   localEpisodeLimit: numberEnv("VEYRA_AGENT_TRAINING_LOCAL_EPISODES", 500, 1, 10000),
+  localLiveLogLimit: numberEnv("VEYRA_AGENT_TRAINING_LIVE_LOG_STEPS", 5000, 1, 100000),
   requireMongo: boolEnv("VEYRA_AGENT_TRAINING_REQUIRE_MONGO", String(process.env.VEYRA_ENV || "").toLowerCase() === "production"),
   enabled: boolEnv("VEYRA_AGENT_TRAINING_ENABLED", true),
   log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
@@ -4355,6 +4357,17 @@ app.post('/api/assistant/feedback', requireUser, (req, res) => {
   }
 });
 
+app.get("/admin/agent-training", requireAdmin, (req, res) => res.type("html").set("Cache-Control", "no-store").send(agentTrainingPage()));
+app.get("/api/admin/agent-training/live-log", requireAdmin, (req, res) => {
+  if (agentTraining.report().persistence.localLiveTrace === false) return respondError(res, 404, "Local live trace is disabled when MongoDB persistence is required.", "AGENT_TRAINING_TRACE_DISABLED");
+  try {
+    const trace = fs.readFileSync(agentTraining.liveTraceFile, "utf8");
+    res.set("Cache-Control", "no-store").attachment("live-training.jsonl").type("application/x-ndjson").send(trace);
+  } catch (error) {
+    if (error.code === "ENOENT") return respondError(res, 404, "No live trace has been written yet.", "AGENT_TRAINING_TRACE_EMPTY");
+    respondError(res, 500, "Could not read the local live trace.", "AGENT_TRAINING_TRACE_READ_FAILED");
+  }
+});
 app.get("/api/admin/agent-training", requireAdmin, (req, res) => res.json({ ok: true, training: agentTraining.report() }));
 app.post("/api/admin/agent-training/control", requireAdmin, async (req, res) => {
   const action = String(req.body?.action || "").toLowerCase();

@@ -5,6 +5,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { AgentTrainingService, MODEL_ID, createMaze, shortestPath } = require("../src/services/agent-training");
+const { agentTrainingPage } = require("../src/services/agent-training-page");
 
 (async () => {
   const maze = createMaze(9, 12345);
@@ -24,6 +25,8 @@ const { AgentTrainingService, MODEL_ID, createMaze, shortestPath } = require("..
   assert.match(answer.answer, /no external model API or API key/i);
   assert.equal(answer.context.automaticPageAccess, false);
   assert.equal(answer.mode, "server-keyless-prototype");
+  assert.match(agentTrainingPage(), /Live shared observation/);
+  assert.match(agentTrainingPage(), /Decision trace, not hidden thoughts/);
   assert.throws(() => service.answerLocal("", { id: "admin-test" }), /question is required/i);
 
   const episode = service._beginEpisode();
@@ -47,13 +50,22 @@ const { AgentTrainingService, MODEL_ID, createMaze, shortestPath } = require("..
   archive._recordSample(sampleEpisode, { step: 2, observation: "safe-visible-map", action: "north", reward: 1, done: false });
   assert.equal(sampleEpisode.samples.length, 1, "per-episode sample collection should be capped");
   assert.equal(sampleEpisode.samplesTruncated, true);
-  const liveSampler = new AgentTrainingService({ dataDir: archiveDir, enabled: true, maxMazeSize: 9, maxSamplesPerEpisode: 2 });
+  const liveSampler = new AgentTrainingService({ dataDir: archiveDir, enabled: true, maxMazeSize: 9, maxSamplesPerEpisode: 2, localLiveLogLimit: 2 });
   await liveSampler._step();
   const liveSample = liveSampler.state.currentEpisode.samples[0];
   assert.ok(liveSample, "a real maze step should record an experience sample");
   assert.equal(liveSample.observation.length, 81, "sample observation should be the visible 9×9 map");
   assert.ok(["north", "east", "south", "west"].includes(liveSample.action));
   assert.equal(typeof liveSample.reward, "number");
+  assert.ok(liveSample.decision?.rule, "experience samples should expose a concise rule-based rationale");
+  for (let i = 0; i < 5; i++) await liveSampler._step();
+  const livePath = path.join(archiveDir, "live-training.jsonl");
+  const liveRows = fs.readFileSync(livePath, "utf8").trim().split("\n").map(line => JSON.parse(line));
+  assert.ok(liveRows.length <= 2, "live trace should retain no more than its configured maximum after compaction");
+  assert.ok(liveRows.some(row => row.decisions.some(decision => decision.observation?.length === 81 && decision.rule)), "live trace should include visible maps and explicit decision rules");
+  assert.equal(Object.hasOwn(liveRows.at(-1), "maze"), false, "live trace must not contain the hidden maze layout");
+  assert.equal(fs.statSync(livePath).mode & 0o777, 0o600, "live trace should be owner-only on the local filesystem");
+  assert.equal(liveSampler.report().persistence.localLiveTraceStepsRetained, 2);
   liveSampler.close();
   for (let i = 1; i <= 3; i++) {
     const ep = { ...archive._beginEpisode(), id: `local-${i}`, status: "solved", completedAt: new Date().toISOString(), samples: [{ step: i, observation: "visible-only", action: "east", reward: 1, done: true }] };
@@ -78,8 +90,10 @@ const { AgentTrainingService, MODEL_ID, createMaze, shortestPath } = require("..
   assert.equal(strictStatus.persistence.localCheckpoint, false);
   await strict._persist(true);
   await strict._persistEpisode({ id: "strict-no-local", agents: [], messages: [], foundKeys: [], samples: [] });
+  strict._appendLiveTrace({ step: 1 });
   assert.equal(fs.existsSync(path.join(strictDir, "checkpoint.json")), false, "strict mode must never write local checkpoints");
   assert.equal(fs.existsSync(path.join(strictDir, "episodes.jsonl")), false, "Mongo-required mode must not create a local episode archive");
+  assert.equal(fs.existsSync(path.join(strictDir, "live-training.jsonl")), false, "Mongo-required mode must not create a local live trace");
   strict.close();
   fs.rmSync(strictDir, { recursive: true, force: true });
 

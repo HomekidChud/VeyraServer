@@ -21,6 +21,7 @@ Configuration:
 | `VEYRA_AGENT_TRAINING_MAX_MAZE` | `21` | Maximum odd maze side length (clamped to 9–31) |
 | `VEYRA_AGENT_TRAINING_SAMPLES_PER_EPISODE` | `256` | Maximum visible-observation/action/reward samples stored for each completed episode; `0` disables samples |
 | `VEYRA_AGENT_TRAINING_LOCAL_EPISODES` | `500` | Maximum completed episode records retained in the local JSONL archive when MongoDB is not required |
+| `VEYRA_AGENT_TRAINING_LIVE_LOG_STEPS` | `5000` | Target number of recent live-turn records in the local JSONL decision trace; file compaction runs in bounded batches to avoid rewriting it on every phone tick |
 | `VEYRA_AGENT_TRAINING_DIR` | `<authDataDir>/agent-training` | Protected development-only checkpoint fallback when MongoDB is not required |
 | `MONGODB_URI` / `MONGODB_DB` | unset / `veyra` | Existing Veyra MongoDB connection configuration |
 
@@ -32,7 +33,9 @@ The archive makes experience available for analysis or a future learning impleme
 
 ## Admin live view
 
-Open **Admin panel → Agent training**. The route and backing `/api/admin/agent-training` and `/api/admin/agent-training/control` endpoints require the existing Veyra administrator gate. The screen refreshes using the Admin panel's existing live-poll setting and displays the current observation map, agent positions, messages, episode counts, solve rate, bounded reward statistics, and safety sanctions. Admins may pause or resume the loop.
+Open **`/admin/agent-training`** on the same Veyra Server host (for a phone-only Termux server, `http://127.0.0.1:10000/admin/agent-training`). The standalone mobile-friendly page and backing `/api/admin/agent-training` and `/api/admin/agent-training/control` endpoints require the existing administrator gate. It refreshes the visible map, agent positions, latest rule-based decision explanations, messages, episode counts, solve rate, reward statistics, and sanctions; admins can pause/resume and download the live trace. The local trace file is `live-training.jsonl` beside the checkpoint and completed-episode archive. It is a rolling, private JSONL log of recent observed maps, selected actions/rules, outcomes, and score—not hidden maze layouts. `tail -f` can follow it from Termux.
+
+The decision explanations are a transparent account of the implemented rules and visible evidence, not a dump of private chain-of-thought. These agents are deterministic rule-based code, not a language model with hidden thoughts.
 
 **Voice events** is off by default and can be enabled locally in the browser. It uses built-in browser speech synthesis for a small set of major training events; it sends no audio to the server.
 
