@@ -28,6 +28,8 @@ const { agentTrainingPage } = require("../src/services/agent-training-page");
   assert.match(agentTrainingPage(), /Live shared observation/);
   assert.match(agentTrainingPage(), /Decision trace, not hidden thoughts/);
   assert.match(agentTrainingPage(), /loginForm/);
+  assert.match(agentTrainingPage(), /New to this local server\? Create account/);
+  assert.match(agentTrainingPage(), /authMode==="login"\?"\/api\/auth\/login":"\/api\/auth\/signup"/);
   assert.match(agentTrainingPage(), /headers\.set\("Authorization","Bearer \"\+authToken\)/);
   assert.match(agentTrainingPage(), /VEYRA_ADMIN_EMAILS/);
   assert.throws(() => service.answerLocal("", { id: "admin-test" }), /question is required/i);
