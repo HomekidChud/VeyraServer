@@ -1461,7 +1461,7 @@ app.get("/view_source/:sourceId/:link", (req, res) => {
   if (!entry) return res.status(404).type("text").send("Source view not found or expired.");
   res.set({
     "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
-    "Content-Security-Policy": `default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors ${sourceViewerFrameAncestors()}`
+    "Content-Security-Policy": `default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; img-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors ${sourceViewerFrameAncestors()}`
   }).type("html").send(sourcePage(entry));
 });
 
