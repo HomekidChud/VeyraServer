@@ -1,11 +1,19 @@
 
+## Veyra Assistance — server agent-training prototype
+
+- Runs a keyless cooperative maze simulation with Scout, Mapper, and Coordinator roles; admin panel exposes live maps, messages, rewards, sanctions, and pause/resume controls.
+- The user-facing Assistant is intentionally limited to training status and related questions. No external model API is called. The policy reward updates are not foundation-model training; this prototype is not AGI.
+- Render strict mode requires MongoDB, never falls back to local files, and pauses if Mongo is unavailable. Development may use protected checkpoints. The repository blueprint requests a paid Render `pro` plan; the currently observed live service is `free`, which sleeps after idle and cannot train 24/7 until upgraded.
+- See [`docs/AGENT_TRAINING.md`](docs/AGENT_TRAINING.md) for safety boundaries, configuration, persistence, admin endpoints, and known limitations.
+
 ## 8.17.1 compatibility hardening
 
 - API proxy accepts `OPTIONS` in addition to the existing browser methods.
 - Explicit target `Authorization` headers are forwarded for API compatibility and force no-cache behavior.
 - Redirects remain hop-by-hop validated through the public-destination/SSRF checks.
-- The custom extension store serves only verified CSS-only packages.
-- Extension verification rejects scripts, background/service-worker capabilities, external CSS imports/resources and unsupported permissions.
+- The extension store supports legacy CSS-only v1 and signed, human-reviewed v2 bundles with content scripts and an opaque-origin background sandbox.
+- Executable packages require a trusted Ed25519 signature, specific HTTPS host matches, a separate administrator review, and per-device installation consent. Signatures and static heuristics do not guarantee benign behavior.
+- Archive/binary extraction, service workers, WebAssembly, remote code, and unreviewed executable packages remain unsupported.
 
 ## Veyra 8.17.1
 
