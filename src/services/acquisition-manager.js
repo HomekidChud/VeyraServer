@@ -64,11 +64,17 @@ class AcquisitionManager {
     this.hosts = new Map();
     this.inflight = new Map();
     this.records = new Map();
-    this.stats = { requests: 0, cacheHits: 0, conditionalHits: 0, bytes: 0, errors: 0, blocked: 0, byEngine: {} };
+    this.stats = { requests: 0, cacheHits: 0, conditionalHits: 0, bytes: 0, errors: 0, blocked: 0, byEngine: {}, errorsByCode: {}, recentErrors: [] };
     this.dispatcher = opts.dispatcher || new Agent({ connections: Math.max(2, this.perHostConcurrency), pipelining: 1, keepAliveTimeout: 10_000 });
   }
   _limiter(host) { if (!this.hosts.has(host)) this.hosts.set(host, new HostLimiter(this.perHostConcurrency)); return this.hosts.get(host); }
   _record(engine, patch = {}) { this.stats.byEngine[engine] = (this.stats.byEngine[engine] || 0) + 1; return { engine, ...patch }; }
+  _error(error, url = "") {
+    const code = String(error?.code || error?.name || "ACQUISITION_ERROR").slice(0, 80);
+    this.stats.errorsByCode[code] = (this.stats.errorsByCode[code] || 0) + 1;
+    this.stats.recentErrors.push({ code, message: String(error?.message || error || "Acquisition failed").slice(0, 180), host: hostOf(url) });
+    if (this.stats.recentErrors.length > 20) this.stats.recentErrors.shift();
+  }
   async _assertPublicUrl(url) {
     const u = new URL(url);
     if (!/^https?:$/.test(u.protocol)) throw Object.assign(new Error("Only HTTP(S) URLs are permitted."), { code: "INVALID_URL" });
@@ -129,7 +135,7 @@ class AcquisitionManager {
             return { ok: true, status: response.status, url, finalUrl: url, redirectChain, body, contentType: type, etag: response.headers.get("etag") || "", lastModified: response.headers.get("last-modified") || "", cacheControl: response.headers.get("cache-control") || "", headers: response.headers, engine: opts.engine || "direct-http" };
           } catch (error) { clearTimeout(timer); lastError = error; if (attempt >= (opts.retries ?? this.maxRetries) || error.code === "SSRF_BLOCKED" || error.code === "CONTENT_TYPE_UNSUPPORTED") break; await sleep(150 * 2 ** attempt + Math.random() * 100); }
         }
-        if (lastError) { this.stats.errors += 1; throw lastError; }
+        if (lastError) { this.stats.errors += 1; this._error(lastError, url); throw lastError; }
       });
       if (outcome?.redirect) { redirectChain.push(url); url = outcome.redirect; continue; }
       return outcome;
@@ -146,7 +152,7 @@ class AcquisitionManager {
       const headers = { ...(opts.headers || {}) }; if (cached?.result?.etag) headers["If-None-Match"] = cached.result.etag; if (cached?.result?.lastModified) headers["If-Modified-Since"] = cached.result.lastModified;
       let result;
       try { result = await this._request(key, { ...opts, headers }); }
-      catch (e) { this.records.set(key, { url: key, lastAttempted: Date.now(), status: "failed", error: e.code || e.message }); throw e; }
+      catch (e) { this._error(e, key); this.records.set(key, { url: key, lastAttempted: Date.now(), status: "failed", error: e.code || e.message }); throw e; }
       if (result.status === 304 && cached) { this.stats.conditionalHits += 1; result = { ...cached.result, cacheHit: true, revalidated: true }; }
       const entry = { result, expiresAt: Date.now() + this.cacheTtlMs, hash: hash(result.body) }; this.cache.set(key, entry); while (this.cache.size > this.cacheMax) this.cache.delete(this.cache.keys().next().value);
       this.records.set(key, { url: key, lastAttempted: Date.now(), lastSuccessful: Date.now(), etag: result.etag, lastModified: result.lastModified, contentHash: entry.hash, status: "complete", engine: opts.engine || "direct-http" });
