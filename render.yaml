@@ -48,6 +48,10 @@ services:
       - key: VEYRA_ENV
         value: production
       # Secrets — set these in the Render dashboard, never in git:
+      - key: VEYRA_AUTH_SECRET
+        sync: false
+      - key: VEYRA_SIGNUP_KEY
+        sync: false
       # VEYRA_ADMIN_TOKEN, VPN_PROFILES_JSON, VPN_WIREGUARD_CONFIG_B64
       # Optional durable MongoDB persistence/cache. Set MONGODB_URI in Render.
       - key: MONGODB_URI

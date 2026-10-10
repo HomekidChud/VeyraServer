@@ -27,6 +27,7 @@ class AuthStore {
     this.tokenTtlMs = opts.tokenTtlMs || 7 * 24 * 60 * 60 * 1000;
     this.adminEmails = new Set((opts.adminEmails || []).map(e => String(e).trim().toLowerCase()).filter(Boolean));
     this.allowSignup = opts.allowSignup !== false;
+    this.signupKey = String(opts.signupKey || "");
     this.maxUsers = opts.maxUsers || 5000;
     this.maxDataBytes = opts.maxDataBytes || 512 * 1024;
     this.log = opts.log || (() => {});
@@ -170,8 +171,9 @@ class AuthStore {
   publicUser(u) {
     return { id: u.id, email: u.email, name: u.name, role: this.roleFor(u.email), createdAt: u.createdAt, lastLoginAt: u.lastLoginAt || null };
   }
-  signup({ email, password, name }, ip = "") {
+  signup({ email, password, name, signupKey }, ip = "") {
     if (!this.allowSignup) throw authError(403, "Sign ups are disabled on this server.", "AUTH_SIGNUP_DISABLED");
+    if (this.signupKey && !this.verifySignupKey(signupKey)) throw authError(403, "A valid Veyra signup key is required.", "AUTH_SIGNUP_KEY_REQUIRED");
     email = String(email || "").trim().toLowerCase();
     name = String(name || "").trim().replace(/\s+/g, " ").slice(0, 60);
     this.guard(ip, email);
@@ -187,6 +189,11 @@ class AuthStore {
     void this.persistence?.upsertUser(user);
     this.log("info", "AUTH", `New account ${email}.`);
     return { user: this.publicUser(user), token: this.sign(user) };
+  }
+  verifySignupKey(candidate) {
+    const expected = crypto.createHash("sha256").update(this.signupKey, "utf8").digest();
+    const received = crypto.createHash("sha256").update(String(candidate || ""), "utf8").digest();
+    return crypto.timingSafeEqual(expected, received);
   }
   login({ email, password }, ip = "") {
     email = String(email || "").trim().toLowerCase();
@@ -230,7 +237,7 @@ class AuthStore {
     void this.persistence?.deleteUser(user.id);
   }
   status() {
-    return { accounts: this.users.size, signupEnabled: this.allowSignup, persistentSecret: !this.ephemeralSecret, admins: this.adminEmails.size, file: this.file, mongo: this.persistence?.status?.() || null, testMode: this.testMode, testAdmin: this.testMode ? this.getTestAdminCredentials() : null };
+    return { accounts: this.users.size, signupEnabled: this.allowSignup, signupKeyRequired: !!this.signupKey, persistentSecret: !this.ephemeralSecret, admins: this.adminEmails.size, file: this.file, mongo: this.persistence?.status?.() || null, testMode: this.testMode, testAdmin: this.testMode ? this.getTestAdminCredentials() : null };
   }
 }
 

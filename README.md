@@ -17,6 +17,23 @@ Browsing crawls are bounded page accelerators. They do not expand same-origin na
 
 This release keeps the existing Express proxy, crawler, search index, browser scheduler, and browser-engine architecture and strengthens the scheduling/discovery path in place.
 
+## Local Termux authentication
+
+For a private local instance, set both secrets before starting the server. The signup key is a server-side gate: it is never stored in Git, returned by `/api/auth/config`, or logged.
+
+```bash
+node scripts/generate-signup-key.js
+# Copy the two export lines printed by the command into this shell.
+export VEYRA_DATA_DIR="$PWD/data"
+export VEYRA_ALLOW_SIGNUP=true
+npm install
+npm start
+```
+
+Anyone creating an account must enter the value of `VEYRA_SIGNUP_KEY` in the signup form. Leave `VEYRA_SIGNUP_KEY` unset only when you intentionally want open registration. Keep `VEYRA_AUTH_SECRET` stable across restarts or existing login tokens will be invalidated.
+
+For Render, set `VEYRA_AUTH_SECRET`, `VEYRA_SIGNUP_KEY`, and a durable `VEYRA_DATA_DIR`/MongoDB persistence in the Render dashboard. Do not put any of these values in `render.yaml` or commit them.
+
 ## Key fixes
 - Robust browser/foreground request lane remains independent from the crawler.
 - Chromium installation is checked during both dependency installation and `npm start` so a missing browser binary reports a clear warning instead of silently breaking browser mode.

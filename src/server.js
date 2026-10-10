@@ -301,6 +301,7 @@ const CFG = Object.freeze({
   authSecret: process.env.VEYRA_AUTH_SECRET || "",
   authDataDir: process.env.VEYRA_DATA_DIR || path.join(__dirname, "..", "data"),
   authAllowSignup: boolEnv("VEYRA_ALLOW_SIGNUP", true),
+  authSignupKey: process.env.VEYRA_SIGNUP_KEY || "",
   authTokenTtlMs: numberEnv("VEYRA_AUTH_TOKEN_TTL_MS", 7 * 24 * 60 * 60 * 1000, 10 * 60 * 1000, 90 * 24 * 60 * 60 * 1000),
   adminEmails: String(process.env.VEYRA_ADMIN_EMAILS || "").split(",").map(x => x.trim().toLowerCase()).filter(Boolean),
   testMode: boolEnv("VEYRA_TEST_MODE", false),
@@ -397,7 +398,7 @@ const neuralTrainer = new NeuralLearningWorker({
 });
 const authStore = new AuthStore({
   dataDir: CFG.authDataDir, secret: CFG.authSecret, tokenTtlMs: CFG.authTokenTtlMs,
-  adminEmails: CFG.adminEmails, allowSignup: CFG.authAllowSignup, persistence: mongoStore, testMode: CFG.testMode,
+  adminEmails: CFG.adminEmails, allowSignup: CFG.authAllowSignup, signupKey: CFG.authSignupKey, persistence: mongoStore, testMode: CFG.testMode,
   
   log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
 });
@@ -3854,7 +3855,7 @@ app.put('/api/auth/data', requireUser, (req, res) => { try { res.json({ ok: true
 app.get('/api/auth/config', (req, res) => {
   const user = authStore.userFromRequest(req);
   const admin = !!(user && authStore.roleFor(user.email) === "admin");
-  res.json({ ok: true, signupEnabled: CFG.authAllowSignup, sessionTimeLimitMs: admin ? runtimeSessionPolicy.adminTimeLimitMs : runtimeSessionPolicy.guestTimeLimitMs, admin: admin || configEditAllowed(req), testMode: CFG.testMode, testAdmin: CFG.testMode ? authStore.getTestAdminCredentials() : null });
+  res.json({ ok: true, signupEnabled: CFG.authAllowSignup, signupKeyRequired: !!CFG.authSignupKey, sessionTimeLimitMs: admin ? runtimeSessionPolicy.adminTimeLimitMs : runtimeSessionPolicy.guestTimeLimitMs, admin: admin || configEditAllowed(req), testMode: CFG.testMode, testAdmin: CFG.testMode ? authStore.getTestAdminCredentials() : null });
 });
 
 
