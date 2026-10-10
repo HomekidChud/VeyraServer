@@ -305,6 +305,7 @@ const CFG = Object.freeze({
   authTokenTtlMs: numberEnv("VEYRA_AUTH_TOKEN_TTL_MS", 7 * 24 * 60 * 60 * 1000, 10 * 60 * 1000, 90 * 24 * 60 * 60 * 1000),
   adminEmails: String(process.env.VEYRA_ADMIN_EMAILS || "").split(",").map(x => x.trim().toLowerCase()).filter(Boolean),
   testMode: boolEnv("VEYRA_TEST_MODE", false),
+  workDir: process.env.VEYRA_WORK_DIR || path.join(os.tmpdir(), "veyra-browse-jobs"),
   sessionMaxCookieBytes: numberEnv("SESSION_MAX_COOKIE_BYTES", 128 * 1024, 4 * 1024, 4 * 1024 * 1024),
   serverIdleSleepMs: numberEnv("SERVER_IDLE_SLEEP_MS", 10 * 60 * 1000, 0, 24 * 60 * 60 * 1000),
   browserWarmIdleMs: numberEnv("BROWSER_WARM_IDLE_MS", 15 * 60 * 1000, 0, 24 * 60 * 60 * 1000),
@@ -768,7 +769,7 @@ function recordRewriteFailure(url, mode, err) {
   if (rewriteFailures.length > 100) rewriteFailures.splice(0, rewriteFailures.length - 100);
   serverLog("error", "PROXY", `HTML/CSS/JS rewrite failed for ${url} (${mode}): ${err?.message || err} — served the page unrewritten instead of failing the request.`);
 }
-const ROOT = path.join("/tmp", "veyra-browse-jobs");
+const ROOT = CFG.workDir;
 fs.mkdirSync(ROOT, { recursive: true });
 
 const sourceStore = {

@@ -25,7 +25,9 @@ For a private local instance, set both secrets before starting the server. The s
 node scripts/generate-signup-key.js
 # Copy the two export lines printed by the command into this shell.
 export VEYRA_DATA_DIR="$PWD/data"
+export VEYRA_WORK_DIR="$HOME/.veyra-work"
 export VEYRA_ALLOW_SIGNUP=true
+export BROWSER_ENABLED=false
 npm install
 npm start
 ```
