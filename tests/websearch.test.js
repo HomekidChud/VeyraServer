@@ -35,7 +35,7 @@ const { createWebSearch, classifyGoogleResponse } = require("../src/services/web
 
   const bingPageStarts = [];
   const bingTwenty = createWebSearch({ env: { WEB_SEARCH_ORDER: "bing", WEB_SEARCH_CACHE_TTL_MS: "0" }, fetchText: async url => {
-    const parsed = new URL(url); const first = Number(parsed.searchParams.get("first")); bingPageStarts.push(first);
+    const parsed = new URL(url); const rawFirst = parsed.searchParams.get("first"); const first = Number(rawFirst || 1); bingPageStarts.push(rawFirst);
     const rows = Array.from({ length: 10 }, (_, i) => {
       const number = first + i;
       return `<li class="b_algo"><h2><a href="https://bing-fixture.example/result/${number}">Veyra result ${number}</a></h2><div class="b_caption"><p>Controlled Bing page ${number}.</p></div></li>`;
@@ -44,7 +44,7 @@ const { createWebSearch, classifyGoogleResponse } = require("../src/services/web
   } });
   const twenty = await bingTwenty.search("Veyra results", { engine: "bing", limit: 20 });
   assert.equal(twenty.results.length, 20, "Bing HTML should fetch and return two result pages when the caller requests 20");
-  assert.deepEqual(bingPageStarts.sort((a, b) => a - b), [1, 11], "Bing HTML pagination should request result offsets 1 and 11");
+  assert.deepEqual(bingPageStarts, [null, "11"], "Bing HTML pagination should use the default first page, then request result offset 11");
   assert.equal(twenty.attempts[0].count, 20);
   assert.equal(twenty.bingConfigured, true, "HTML search availability should be reflected independently of API-key configuration");
 

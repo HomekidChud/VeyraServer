@@ -103,9 +103,11 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       if (bingKey) { u.searchParams.set("count", String(requestedLimit)); u.searchParams.set("offset", String(offset || 0)); if (lang) u.searchParams.set("setLang", lang); }
       else {
         if (lang) u.searchParams.set("setlang", lang);
-        const pageSize = 10, starts = Array.from({ length: Math.ceil(requestedLimit / pageSize) }, (_, i) => Math.max(0, Number(offset) || 0) + 1 + i * pageSize);
-        const pages = await Promise.allSettled(starts.map(async first => {
-          const pageUrl = new URL(u.href); pageUrl.searchParams.set("first", String(first)); pageUrl.searchParams.set("count", String(pageSize));
+        const pageSize = 10, starts = Array.from({ length: Math.ceil(requestedLimit / pageSize) }, (_, i) => Math.max(0, Number(offset) || 0) + i * pageSize);
+        const pages = await Promise.allSettled(starts.map(async resultOffset => {
+          const pageUrl = new URL(u.href);
+          if (resultOffset > 0) pageUrl.searchParams.set("first", String(resultOffset + 1));
+          pageUrl.searchParams.set("count", String(pageSize));
           const response = await fetchText(pageUrl.href, { accept: "text/html", signal, timeoutMs });
           if (!response.ok) throw Object.assign(new Error("Bing search request failed"), { status: response.status, retryAfterMs: response.retryAfterMs });
           return parseBingHtml(response.text);
