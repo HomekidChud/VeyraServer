@@ -19,7 +19,17 @@ Use the provider's official console, create a secret key, and copy it before lea
 | [DeepSeek](https://platform.deepseek.com/api_keys) | [DeepSeek API keys](https://platform.deepseek.com/api_keys) | Sign in to the DeepSeek Platform, open API Keys, create a key, and copy it for server-side storage. | `https://api.deepseek.com` · [Chat Completions reference](https://api-docs.deepseek.com/api/create-chat-completion/) |
 | [Azure OpenAI](https://portal.azure.com/?microsoft_azure_marketplace_ItemHideKey=microsoft_openai_tip/Microsoft.CognitiveServicesOpenAI) | [Azure OpenAI in the Azure portal](https://portal.azure.com/?microsoft_azure_marketplace_ItemHideKey=microsoft_openai_tip/Microsoft.CognitiveServicesOpenAI) | Requires an Azure subscription and resource-creation/deployment permission. Create/select a resource, deploy a chat model, then copy Key 1 or Key 2 from **Keys and Endpoint**. Use the deployment name as the model value. | `https://<resource-name>.openai.azure.com/openai/v1` · [Azure v1 API reference](https://learn.microsoft.com/en-us/rest/api/microsoft-foundry/azureopenai/chat?view=rest-microsoft-foundry-v1) |
 
-Provider dashboards change occasionally. Follow each linked provider's current instructions if the labels or steps differ. The exact base URL and API behavior for a selected model are also documented by its provider. Some providers accept only a subset of OpenAI options; Veyra defaults to `max_tokens` and disables the OpenAI-only JSON Schema response-format extension for non-OpenAI providers. Override these defaults only when that endpoint's documentation says to.
+## Simplest setup: Groq
+
+For Groq, you only need one Veyra environment variable:
+
+```text
+GROQ_API_KEY=<your Groq API key>
+```
+
+Create the key in the [Groq Console](https://console.groq.com/keys), then add that variable to the **Veyra server** service's Environment page in Render and save/deploy. Veyra recognizes Groq from the variable name, uses Groq's API endpoint, and calls its [active-model API](https://console.groq.com/docs/models) to choose an available chat model. It prefers active GPT-OSS models, then other known Groq chat models; it filters out audio, embedding, guard, and speech models. You do not need to set `AI_PROVIDER`, a base URL, or a model name. The first answer may take a few seconds longer while Veyra discovers and caches the model. If the list request is unavailable, it falls back to Groq's documented `openai/gpt-oss-120b` model ID.
+
+Provider dashboards change occasionally. Follow each linked provider's current instructions if the labels or steps differ. The exact base URL and API behavior for a selected model are also documented by its provider. Some providers accept only a subset of OpenAI options; Veyra uses `max_completion_tokens` for OpenAI and Groq and `max_tokens` for other providers, and disables the OpenAI-only JSON Schema response-format extension for non-OpenAI providers. Override these defaults only when that endpoint's documentation says to.
 
 ## Set the key and endpoint on Render
 
@@ -47,7 +57,7 @@ Optional compatibility settings:
 | `AI_API_KEY_HEADER` | Header used for the key, e.g. `api-key`, `x-api-key`, or `x-goog-api-key`. | `Authorization` |
 | `AI_API_KEY_PREFIX` | Text prepended to the key. Set to an empty value when a provider expects the bare key. | `Bearer ` for `Authorization`; empty for other header names |
 | `AI_API_HEADERS_JSON` | Additional headers as a JSON object of string values (for example, an API-version header). | `{}` |
-| `AI_API_TOKEN_FIELD` | Completion limit field supported by the endpoint. | `max_completion_tokens` for OpenAI; `max_tokens` for other providers |
+| `AI_API_TOKEN_FIELD` | Completion limit field supported by the endpoint. | `max_completion_tokens` for OpenAI/Groq; `max_tokens` for other providers |
 | `AI_API_STRUCTURED_OUTPUT` | Include the OpenAI JSON Schema `response_format` extension. | `true` for OpenAI; `false` for other providers; set `true` only if supported |
 | `AI_API_OPTIONS_JSON` | Additional JSON request properties for compatible endpoints (for example, `{"temperature":0.2}`). | `{}` |
 | `AI_API_RESPONSE_PATH` | Dot-separated path to the model's JSON text in the response. Array indices are supported. | `choices.0.message.content` |

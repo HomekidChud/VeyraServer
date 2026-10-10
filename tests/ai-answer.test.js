@@ -78,7 +78,7 @@ assert.ok(Math.abs(restoredQualityLearner.predict(goodAnswerFeatures) - qualityL
   assert.deepEqual(feedbackWrite.update.$setOnInsert.features, [1, 1, -1]);
   assert.equal(feedbackWrite.options.upsert, true);
 
-  const aiEnvNames = ["AI_API_KEY", "AI_API_BASE_URL", "AI_API_URL", "AI_API_PATH", "AI_API_KEY_HEADER", "AI_API_KEY_PREFIX", "AI_API_HEADERS_JSON", "AI_API_TOKEN_FIELD", "AI_API_STRUCTURED_OUTPUT", "AI_API_OPTIONS_JSON", "AI_API_REQUEST_TEMPLATE_JSON", "AI_API_RESPONSE_PATH", "AI_PROVIDER", "AI_PROVIDER_NAME", "AI_ANSWER_MODEL", "OPENAI_API_KEY", "OPENAI_API_BASE"];
+  const aiEnvNames = ["AI_API_KEY", "AI_API_BASE_URL", "AI_API_URL", "AI_API_PATH", "AI_API_KEY_HEADER", "AI_API_KEY_PREFIX", "AI_API_HEADERS_JSON", "AI_API_TOKEN_FIELD", "AI_API_STRUCTURED_OUTPUT", "AI_API_OPTIONS_JSON", "AI_API_REQUEST_TEMPLATE_JSON", "AI_API_RESPONSE_PATH", "AI_PROVIDER", "AI_PROVIDER_NAME", "AI_ANSWER_MODEL", "OPENAI_API_KEY", "OPENAI_API_BASE", "GROQ_API_KEY"];
   const savedAIEnv = Object.fromEntries(aiEnvNames.map(name => [name, process.env[name]])), savedFetch = global.fetch;
   const clearAIEnv = () => aiEnvNames.forEach(name => delete process.env[name]);
   const restoreAIEnv = () => aiEnvNames.forEach(name => savedAIEnv[name] == null ? delete process.env[name] : process.env[name] = savedAIEnv[name]);
@@ -137,6 +137,43 @@ assert.ok(Math.abs(restoredQualityLearner.predict(goodAnswerFeatures) - qualityL
   assert.equal(compatibleBody.max_tokens, 4000, "non-OpenAI-compatible providers should receive the widely supported max_tokens field by default");
   assert.equal(compatibleBody.max_completion_tokens, undefined);
   assert.equal(compatibleBody.response_format, undefined, "non-OpenAI providers should not receive the OpenAI-only JSON Schema extension by default");
+
+  clearAIEnv();
+  process.env.GROQ_API_KEY = "offline-groq-autodetect-key";
+  const groqEngine = new AIAnswerEngine();
+  assert.equal(groqEngine.report().provider, "Groq", "GROQ_API_KEY alone should identify Groq");
+  assert.equal(groqEngine.report().model, "Auto-detect (Groq)");
+  assert.equal(groqEngine.report().llmConfigured, true, "Groq should not require a separately configured base URL or model");
+  process.env.AI_PROVIDER = "openai";
+  process.env.AI_API_KEY = "stale-generic-key";
+  process.env.AI_API_BASE_URL = "https://stale-endpoint.invalid/v1";
+  process.env.AI_API_URL = "https://stale-endpoint.invalid/generate";
+  process.env.AI_API_KEY_HEADER = "x-stale-key";
+  process.env.AI_ANSWER_MODEL = "stale-model";
+  assert.equal(groqEngine.report().provider, "Groq", "a dedicated Groq key should supersede stale generic provider settings");
+  assert.equal(groqEngine.report().model, "Auto-detect (Groq)");
+  const groqRequests = [];
+  global.fetch = async (url, options = {}) => {
+    groqRequests.push({ url: String(url), options });
+    if (String(url) === "https://api.groq.com/openai/v1/models") return { ok: true, json: async () => ({ data: [
+      { id: "whisper-large-v3", active: true },
+      { id: "openai/gpt-oss-120b", active: false },
+      { id: "openai/gpt-oss-20b", active: true }
+    ] }) };
+    return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ answer: "Veyra is a browser client that retrieves public webpages through its server and presents them in an isolated browsing session. [S1] It keeps page access separate from direct client connections and grounds its results in cited source material. [S1]", keyPoints: [], caveats: [], sourceIds: ["S1"] }) } }] }) };
+  };
+  const groqResult = await groqEngine.synthesizeWithLLM("What is Veyra?", { type: "definition" }, [{ id: "S1", sourceIdentity: "fixture.test", title: "Fixture", url: "https://fixture.test", matched: ["Veyra uses a server-side proxy to retrieve pages and associates citations with source material."], verificationSentences: ["Veyra uses a server-side proxy to retrieve pages and associates citations with source material."], documentText: "Veyra uses a server-side proxy to retrieve public webpages and associates citations with source material." }]);
+  assert.ok(groqResult, "Groq model output should be accepted through the auto-detected endpoint");
+  assert.equal(groqRequests[0].url, "https://api.groq.com/openai/v1/models", "Groq model IDs should be discovered from its official active-model endpoint");
+  assert.match(groqRequests[0].options.headers.Authorization, /^Bearer offline-groq-autodetect-key$/);
+  assert.equal(groqRequests[1].url, "https://api.groq.com/openai/v1/chat/completions");
+  assert.equal(groqRequests[1].options.headers.Authorization, "Bearer offline-groq-autodetect-key");
+  const groqBody = JSON.parse(groqRequests[1].options.body);
+  assert.equal(groqBody.model, "openai/gpt-oss-20b", "auto-selection should ignore inactive and non-chat models");
+  assert.equal(groqBody.max_completion_tokens, 4000, "Groq should use its current max_completion_tokens field");
+  assert.equal(groqBody.max_tokens, undefined);
+  assert.equal(groqBody.response_format, undefined);
+  assert.equal(groqEngine.report().model, "openai/gpt-oss-20b");
   global.fetch = savedFetch;
   restoreAIEnv();
 

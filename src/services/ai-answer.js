@@ -13,6 +13,11 @@ const { URL } = require("url");
 const cheerio = require("cheerio");
 
 const STOP = new Set(`the a an is are was were be been being have has had do does did will would could should may might can shall to of in on at by for with about as into like through after over between out against during without before under around among and but or nor not so yet both either neither each every all any few more most other some such no only own same than too very just also this that these those what which who whom whose when where why how it its it's i you he she we they me him her us them my your his our their mine yours hers ours theirs if then because while until though although since unless whether however therefore moreover furthermore what's whats meaning definition define mean`.split(/\s+/));
+const GROQ_API_BASE = "https://api.groq.com/openai/v1";
+const GROQ_MODELS_URL = `${GROQ_API_BASE}/models`;
+const GROQ_DEFAULT_MODEL = "openai/gpt-oss-120b";
+const GROQ_PREFERRED_MODELS = [GROQ_DEFAULT_MODEL, "openai/gpt-oss-20b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"];
+let groqModelCache = null;
 
 function cleanText(value, max = 10000) {
   return String(value || "").replace(/\u00a0/g, " ").replace(/[ \t\r\n]+/g, " ").trim().slice(0, max);
@@ -98,13 +103,16 @@ function jsonObjectEnv(value) {
   try { const parsed = JSON.parse(value); return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {}; } catch { return {}; }
 }
 function providerConfig(env = process.env, modelOverride = "") {
-  const key = String(env.AI_API_KEY || env.OPENAI_API_KEY || "").trim();
-  const provider = String(env.AI_PROVIDER || (env.OPENAI_API_KEY && !env.AI_API_KEY ? "openai" : "custom")).trim().slice(0, 80) || "custom";
+  const requestedProvider = String(env.AI_PROVIDER || "").trim();
+  const groqKeyShortcut = !!env.GROQ_API_KEY;
+  const provider = String(groqKeyShortcut ? "groq" : requestedProvider || (env.GROQ_API_KEY ? "groq" : env.OPENAI_API_KEY && !env.AI_API_KEY ? "openai" : "custom")).trim().slice(0, 80) || "custom";
   const normalizedProvider = provider.toLowerCase();
-  const openAiDefault = normalizedProvider === "openai" || (!env.AI_PROVIDER && !!env.OPENAI_API_KEY && !env.AI_API_KEY);
-  const base = String(env.AI_API_BASE_URL || env.OPENAI_API_BASE || (openAiDefault && key ? "https://api.openai.com/v1" : "")).trim().replace(/\/+$/, "");
-  const configuredUrl = String(env.AI_API_URL || "").trim();
-  const path = String(env.AI_API_PATH || "/chat/completions").trim();
+  const groqDefault = normalizedProvider === "groq";
+  const openAiDefault = normalizedProvider === "openai" || (!groqKeyShortcut && !env.AI_PROVIDER && !!env.OPENAI_API_KEY && !env.AI_API_KEY);
+  const key = String(groqKeyShortcut || groqDefault && env.GROQ_API_KEY ? env.GROQ_API_KEY : env.AI_API_KEY || env.OPENAI_API_KEY || "").trim();
+  const base = String(groqKeyShortcut ? GROQ_API_BASE : env.AI_API_BASE_URL || (groqDefault ? GROQ_API_BASE : env.OPENAI_API_BASE) || (openAiDefault && key ? "https://api.openai.com/v1" : "")).trim().replace(/\/+$/, "");
+  const configuredUrl = String(groqKeyShortcut ? "" : env.AI_API_URL || "").trim();
+  const path = String(groqKeyShortcut ? "/chat/completions" : env.AI_API_PATH || "/chat/completions").trim();
   let endpoint = configuredUrl;
   if (!endpoint && base) endpoint = /\/chat\/completions(?:\?|$)/i.test(base) ? base : `${base}${path.startsWith("/") ? path : `/${path}`}`;
   try {
@@ -112,22 +120,24 @@ function providerConfig(env = process.env, modelOverride = "") {
     if (!/^https?:$/.test(parsed.protocol) || parsed.username || parsed.password || parsed.hash) endpoint = "";
     else endpoint = parsed.href;
   } catch { endpoint = ""; }
-  const authHeader = String(env.AI_API_KEY_HEADER || "Authorization").trim();
-  const prefix = env.AI_API_KEY_PREFIX == null ? (authHeader.toLowerCase() === "authorization" ? "Bearer " : "") : String(env.AI_API_KEY_PREFIX);
-  const headers = { "Content-Type": "application/json", ...Object.fromEntries(Object.entries(jsonObjectEnv(env.AI_API_HEADERS_JSON)).filter(([name, value]) => /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) && typeof value === "string" && !/[\r\n]/.test(value))) };
+  const authHeader = String(groqKeyShortcut ? "Authorization" : env.AI_API_KEY_HEADER || "Authorization").trim();
+  const prefix = groqKeyShortcut ? "Bearer " : env.AI_API_KEY_PREFIX == null ? (authHeader.toLowerCase() === "authorization" ? "Bearer " : "") : String(env.AI_API_KEY_PREFIX);
+  const extraHeaders = groqKeyShortcut ? {} : jsonObjectEnv(env.AI_API_HEADERS_JSON);
+  const headers = { "Content-Type": "application/json", ...Object.fromEntries(Object.entries(extraHeaders).filter(([name, value]) => /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(name) && typeof value === "string" && !/[\r\n]/.test(value))) };
   if (key && /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(authHeader) && !/[\r\n]/.test(prefix + key)) headers[authHeader] = `${prefix}${key}`;
   const defaultModel = openAiDefault ? "gpt-5-mini" : "";
-  const model = String(modelOverride || env.AI_ANSWER_MODEL || defaultModel).trim();
-  const requestedTokenField = String(env.AI_API_TOKEN_FIELD || "").trim();
-  const tokenField = requestedTokenField === "max_tokens" || (!requestedTokenField && !openAiDefault) ? "max_tokens" : "max_completion_tokens";
-  const structuredSetting = env.AI_API_STRUCTURED_OUTPUT == null ? String(openAiDefault) : String(env.AI_API_STRUCTURED_OUTPUT);
+  const model = String(modelOverride || (groqKeyShortcut ? "" : env.AI_ANSWER_MODEL) || defaultModel).trim();
+  const requestedTokenField = String(groqKeyShortcut ? "" : env.AI_API_TOKEN_FIELD || "").trim();
+  const tokenField = requestedTokenField === "max_tokens" || requestedTokenField === "max_completion_tokens" ? requestedTokenField : groqDefault || openAiDefault ? "max_completion_tokens" : "max_tokens";
+  const structuredSetting = groqKeyShortcut || env.AI_API_STRUCTURED_OUTPUT == null ? String(openAiDefault) : String(env.AI_API_STRUCTURED_OUTPUT);
   const structuredOutput = !/^(0|false|no|off)$/i.test(structuredSetting);
-  const customOptions = jsonObjectEnv(env.AI_API_OPTIONS_JSON);
+  const autoModelDiscovery = groqDefault && !model;
+  const customOptions = groqKeyShortcut ? {} : jsonObjectEnv(env.AI_API_OPTIONS_JSON);
   return {
-    key, provider, providerName: String(env.AI_PROVIDER_NAME || provider).trim().slice(0, 80) || provider,
-    model, endpoint, headers, configured: !!(key && endpoint && model), tokenField, structuredOutput,
-    customOptions, requestTemplate: jsonObjectEnv(env.AI_API_REQUEST_TEMPLATE_JSON),
-    responsePath: String(env.AI_API_RESPONSE_PATH || "choices.0.message.content").trim()
+    key, provider, providerName: String(groqKeyShortcut ? "Groq" : env.AI_PROVIDER_NAME || (groqDefault ? "Groq" : provider)).trim().slice(0, 80) || provider,
+    model, endpoint, headers, autoModelDiscovery, configured: !!(key && endpoint && (model || autoModelDiscovery)), tokenField, structuredOutput,
+    customOptions, requestTemplate: groqKeyShortcut ? {} : jsonObjectEnv(env.AI_API_REQUEST_TEMPLATE_JSON),
+    responsePath: String(groqKeyShortcut ? "choices.0.message.content" : env.AI_API_RESPONSE_PATH || "choices.0.message.content").trim()
   };
 }
 function expandRequestTemplate(value, variables) {
@@ -147,6 +157,30 @@ function modelText(data, path) {
   if (Array.isArray(value)) value = value.map(part => typeof part === "string" ? part : part?.text || part?.content || "").join("");
   if (value && typeof value === "object") value = typeof value.answer === "string" ? JSON.stringify(value) : value.text ?? value.content ?? "";
   return String(value || "").replace(/^\s*```(?:json)?\s*/i, "").replace(/\s*```\s*$/, "").trim();
+}
+function selectGroqModel(payload) {
+  const chatModelFamily = /(?:gpt-oss|llama|qwen|gemma|mixtral|mistral|deepseek|minimax)/i;
+  const nonChatModel = /(?:whisper|tts|speech|transcrib|embed|guard|safeguard|moderation|orpheus)/i;
+  const models = Array.isArray(payload?.data) ? payload.data.filter(model => model && typeof model.id === "string" && model.active !== false && chatModelFamily.test(model.id) && !nonChatModel.test(model.id)) : [];
+  const available = new Set(models.map(model => model.id));
+  return GROQ_PREFERRED_MODELS.find(id => available.has(id)) || models[0]?.id || GROQ_DEFAULT_MODEL;
+}
+async function discoverGroqModel(apiKey, timeoutMs = 6000) {
+  const fingerprint = crypto.createHash("sha256").update(String(apiKey || "")).digest("hex");
+  if (groqModelCache?.fingerprint === fingerprint && groqModelCache.expiresAt > Date.now()) return groqModelCache.model;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(1000, Math.min(6000, Number(timeoutMs) || 6000)));
+  try {
+    const response = await fetch(GROQ_MODELS_URL, { headers: { Authorization: `Bearer ${apiKey}` }, signal: controller.signal });
+    if (response.ok) {
+      const model = selectGroqModel(await response.json());
+      groqModelCache = { fingerprint, model, expiresAt: Date.now() + 5 * 60_000 };
+      return model;
+    }
+  } catch {} finally { clearTimeout(timer); }
+  const model = GROQ_DEFAULT_MODEL;
+  groqModelCache = { fingerprint, model, expiresAt: Date.now() + 30_000 };
+  return model;
 }
 function similarity(a, b) {
   const aa = new Set(terms(a)), bb = new Set(terms(b));
@@ -378,6 +412,9 @@ class AIAnswerEngine {
   async synthesizeWithLLM(query, intent, evidence) {
     const settings = providerConfig(process.env, this.model);
     if (!settings.configured) return null;
+    const model = settings.autoModelDiscovery ? await discoverGroqModel(settings.key, this.llmTimeoutMs) : settings.model;
+    if (!model) return null;
+    this.model = model;
     const explore = intent.type === "explore";
     const simple = !explore && terms(query).length <= 5 && !["howto", "why"].includes(intent.type);
     const documentBudget = 90000;
@@ -397,12 +434,12 @@ class AIAnswerEngine {
     const responseFormat = settings.structuredOutput ? { type: "json_schema", json_schema: { name: "veyra_answer", strict: true, schema: responseSchema } } : undefined;
     let body;
     if (Object.keys(settings.requestTemplate).length) {
-      body = expandRequestTemplate(settings.requestTemplate, { model: this.model, system: systemPrompt, user: userPrompt, messages, max_tokens: 4000, response_schema: responseSchema, response_format: responseFormat });
+      body = expandRequestTemplate(settings.requestTemplate, { model, system: systemPrompt, user: userPrompt, messages, max_tokens: 4000, response_schema: responseSchema, response_format: responseFormat });
     } else {
-      body = { model: this.model, messages, [settings.tokenField]: 4000 };
+      body = { model, messages, [settings.tokenField]: 4000 };
       if (responseFormat) body.response_format = responseFormat;
       for (const [name, value] of Object.entries(settings.customOptions)) if (!["model", "messages"].includes(name)) body[name] = value;
-      body.model = this.model;
+      body.model = model;
     }
     const controller = new AbortController(), timer = setTimeout(() => controller.abort(), this.llmTimeoutMs);
     try {
@@ -430,6 +467,6 @@ class AIAnswerEngine {
       return evidence.some(source => (source.verificationSentences || source.matched || []).some(line => similarity(claim, line) >= 0.88));
     });
   }
-  report() { const settings = providerConfig(process.env, this.model); return { maxPages: this.maxPagesToRead, provider: settings.providerName, model: this.model, llmConfigured: settings.configured, extractiveFallback: this.allowExtractiveFallback, mode: "multi-source-grounded-synthesis", confidence: "evidence-quality score, not calibrated probability", qualityLearning: this.qualityModel.report() }; }
+  report() { const settings = providerConfig(process.env, this.model); return { maxPages: this.maxPagesToRead, provider: settings.providerName, model: settings.model || (settings.autoModelDiscovery ? "Auto-detect (Groq)" : ""), llmConfigured: settings.configured, extractiveFallback: this.allowExtractiveFallback, mode: "multi-source-grounded-synthesis", confidence: "evidence-quality score, not calibrated probability", qualityLearning: this.qualityModel.report() }; }
 }
 module.exports = { AIAnswerEngine, AnswerQualityModel, ANSWER_QUALITY_FEATURES, cleanText, normalizeAnswerFormat, evidenceText, extractReadable, normalizeUrl, similarity };
