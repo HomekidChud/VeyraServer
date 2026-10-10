@@ -61,7 +61,9 @@ class MongoStore {
           this.db.collection("ai_observations").createIndex({ createdAt: -1 }).catch(() => {}),
           this.db.collection("ai_feedback").createIndex({ id: 1 }, { unique: true }).catch(() => {}),
           this.db.collection("ai_feedback").createIndex({ status: 1, createdAt: 1 }).catch(() => {}),
-          this.db.collection("ai_neural_models").createIndex({ id: 1 }, { unique: true }).catch(() => {})
+          this.db.collection("ai_neural_models").createIndex({ id: 1 }, { unique: true }).catch(() => {}),
+          this.db.collection("ai_answer_feedback").createIndex({ observationId: 1 }, { unique: true }).catch(() => {}),
+          this.db.collection("ai_answer_feedback").createIndex({ createdAt: -1 }).catch(() => {})
         ]);
         this.connected = true; this.disabledReason = ""; this.retryAfter = 0; return true;
       } catch (e) {
@@ -204,6 +206,15 @@ class MongoStore {
     const doc = { id: String(id), storagePath: `ai/neural/${String(id)}`, ...data, updatedAt: new Date() };
     this.stats.writes += 1;
     return this.withDb(db => db.collection("ai_neural_models").updateOne({ id: doc.id }, { $set: doc }, { upsert: true }));
+  }
+
+  async recordAIAnswerFeedback(feedback) {
+    if (!feedback?.id || !feedback?.observationId || !["helpful", "unhelpful"].includes(feedback.rating)) return false;
+    const doc = JSON.parse(JSON.stringify({ id: String(feedback.id), observationId: String(feedback.observationId), storagePath: `ai/answer-feedback/${String(feedback.id)}`, rating: feedback.rating, scoreBefore: Number(feedback.scoreBefore) || 0, scoreAfter: Number(feedback.scoreAfter) || 0, step: Math.max(0, Number(feedback.step) || 0), features: Array.isArray(feedback.features) ? feedback.features.slice(0, 16).map(x => Math.max(-1, Math.min(1, Number(x) || 0))) : [], createdAt: new Date() }));
+    const result = await this.withDb(db => db.collection("ai_answer_feedback").updateOne({ observationId: doc.observationId }, { $setOnInsert: doc }, { upsert: true }));
+    if (result == null) return false;
+    this.stats.writes += 1;
+    return true;
   }
 
   

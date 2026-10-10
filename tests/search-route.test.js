@@ -77,6 +77,19 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     assert.equal(answer.grounding.claims.every(claim => claim.sourceIds.length > 0), true);
     assert.equal(webSearchCalls, 2);
 
+    assert.match(answer.observationId, /^obs_[A-Za-z0-9_-]{20,40}$/);
+    assert.equal(answer.qualityLearning.calibrated, false, "the learned quality estimate must not be presented as calibrated confidence");
+    const feedbackResponse = await fetch(`${base}/api/search/answer/feedback`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ observationId: answer.observationId, rating: "unhelpful" }) });
+    const feedback = await feedbackResponse.json();
+    assert.equal(feedbackResponse.status, 200);
+    assert.equal(feedback.trained, true);
+    assert.equal(feedback.optimizer, "AdamW");
+    assert.ok(feedback.scoreAfter < feedback.scoreBefore, "unhelpful feedback should lower the predicted quality for that profile");
+    const replay = await fetch(`${base}/api/search/answer/feedback`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ observationId: answer.observationId, rating: "helpful" }) });
+    assert.equal(replay.status, 409, "the same answer feedback token cannot train the model twice");
+    const aiStatus = await (await fetch(`${base}/api/answer/status`)).json();
+    assert.equal(aiStatus.qualityLearning.trainingExamples, 1);
+
     let oembedCalls = 0;
     app.locals.veyraYoutubeFetch = async (target) => {
       oembedCalls += 1;

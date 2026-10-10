@@ -50,3 +50,11 @@ The answer endpoint abstains when native neural synthesis cannot produce a cited
 ## Recommended next evaluation stage
 
 Add reviewed fixtures for definitions, conflicts, current facts, insufficient evidence, malicious source instructions and provider failures. Compare the same fixtures before and after this pipeline using citation correctness, unsupported-claim rate, extraction quality and latency.
+
+## Answer feedback learning (2026-10-10)
+
+The answer service now exposes one-time feedback tokens on successful summaries and accepts `POST /api/search/answer/feedback` with `{ observationId, rating: "helpful" | "unhelpful" }`. Each rating updates a seven-feature logistic quality evaluator (grounding, citation coverage, source diversity, length coverage, originality, format consistency and bias) with online AdamW. Its objective is binary cross-entropy, `L(θ)=−[y log(p)+(1−y)log(1−p)]`, with `p=σ(θ·x)`; the decoupled AdamW update is `θ_t=(1−ηλ)θ_{t−1}−η m̂_t/(√v̂_t+ε)`. The learned estimate is explicitly uncalibrated. After several samples, its learned preferences add guidance to future LLM prompts; this is not weight fine-tuning of the hosted generative model.
+
+When MongoDB is enabled, the answer-quality weights, AdamW moments and feedback records are persisted; the model hydrates on restart. Feedback tokens are random, process-local for at most 24 hours, bounded in count, and one vote per token is enforced. When MongoDB is disabled, learning lasts only for the current process. Route and unit regressions test prediction direction, optimizer-state restore, exact equations, token replay rejection and feedback persistence shape.
+
+Live `/api/answer/status` inspection during this follow-up reported `llmConfigured: false` and `extractiveFallback: false`. Thus the hosted abstractive summarizer cannot produce paraphrased summaries until the `OPENAI_API_KEY` secret is configured in Render; copied excerpts remain disabled deliberately. The current VeyraBrowser frontend hides its AI card on `hasAnswer:false` and has no feedback buttons; those presentation changes require the separate VeyraBrowser repository. The source URI's HTTP viewer route is functional, but the frontend address field still shows its HTTP URL until that separate app adds a display-only `veyra://` value.

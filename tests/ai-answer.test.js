@@ -1,6 +1,7 @@
 "use strict";
 const assert = require("assert");
-const { AIAnswerEngine, extractReadable, evidenceText, normalizeUrl, normalizeAnswerFormat } = require("../src/services/ai-answer");
+const { AIAnswerEngine, AnswerQualityModel, ANSWER_QUALITY_FEATURES, extractReadable, evidenceText, normalizeUrl, normalizeAnswerFormat } = require("../src/services/ai-answer");
+const { MongoStore } = require("../src/core/mongo-store");
 
 const noisy = `<!doctype html><html><head><title>Hi - Dictionary</title><script>alert(1)</script></head><body>
 <header>Navigation menu Sign in</header><main><h1>hi</h1><button>Add to word list</button><p>Hi is an informal greeting used to say hello.</p><p>Hi is an informal greeting used to say hello.</p><div>Audio player Play pronunciation</div></main><footer>Related words Social media</footer></body></html>`;
@@ -45,7 +46,38 @@ const quality = engine.evidenceQuality(evidence, evidence.slice(0, 1), verified,
 assert.ok(quality.score >= 0 && quality.score <= 1);
 assert.match(quality.label, /evidence|verify/i);
 
+const qualityLearner = new AnswerQualityModel({ learningRate: 0.05 });
+const goodAnswerFeatures = Float64Array.from([1, 1, 1, 1, 1, 1, 1]);
+const badAnswerFeatures = Float64Array.from([1, 0, 0, 0, 0, 0, 0]);
+const initialGoodScore = qualityLearner.predict(goodAnswerFeatures);
+for (let i = 0; i < 8; i++) qualityLearner.train(goodAnswerFeatures, true);
+assert.ok(qualityLearner.predict(goodAnswerFeatures) > initialGoodScore, "positive feedback should increase predicted answer utility");
+const beforeNegative = qualityLearner.predict(badAnswerFeatures);
+const negativeUpdate = qualityLearner.train(badAnswerFeatures, false);
+assert.ok(negativeUpdate.after < beforeNegative, "negative feedback should lower predicted utility for that answer profile");
+assert.equal(ANSWER_QUALITY_FEATURES.length, 7);
+assert.match(qualityLearner.report().equation, /log\(p\).*sigma|σ\(θ/i);
+assert.match(qualityLearner.report().updateEquation, /1−ηλ/);
+assert.match(qualityLearner.guidance(), /source citation/i, "several feedback examples should produce explicit learned prompt guidance");
+const measuredFeatures = qualityLearner.features({ answer: "GeoFS is a browser flight simulator that uses satellite imagery for its virtual world. [S1]", grounding: { verifiedClaims: 1, unsupportedClaims: 0 }, sources: [{ url: "https://geofs.example/", matched: ["GeoFS is a browser flight simulator using satellite images for its virtual world."] }], intent: "factual" });
+assert.equal(measuredFeatures.length, ANSWER_QUALITY_FEATURES.length);
+assert.ok([...measuredFeatures].every(value => Number.isFinite(value) && value >= 0 && value <= 1));
+const qualitySnapshot = qualityLearner.serialize();
+const restoredQualityLearner = new AnswerQualityModel();
+assert.equal(restoredQualityLearner.loadData(qualitySnapshot), true);
+assert.equal(restoredQualityLearner.report().optimizerSteps, qualityLearner.report().optimizerSteps);
+assert.ok(Math.abs(restoredQualityLearner.predict(goodAnswerFeatures) - qualityLearner.predict(goodAnswerFeatures)) < 1e-12, "saved weights and AdamW moments should restore deterministically");
+
 (async () => {
+  const feedbackStore = new MongoStore({ uri: "" });
+  let feedbackWrite = null;
+  feedbackStore.withDb = async callback => callback({ collection(name) { return { async updateOne(filter, update, options) { feedbackWrite = { name, filter, update, options }; return { acknowledged: true }; } }; } });
+  assert.equal(await feedbackStore.recordAIAnswerFeedback({ id: "af_test", observationId: "obs_test", rating: "helpful", features: [1, 99, -99] }), true);
+  assert.equal(feedbackWrite.name, "ai_answer_feedback");
+  assert.deepEqual(feedbackWrite.filter, { observationId: "obs_test" });
+  assert.deepEqual(feedbackWrite.update.$setOnInsert.features, [1, 1, -1]);
+  assert.equal(feedbackWrite.options.upsert, true);
+
   const savedApiKey = process.env.OPENAI_API_KEY, savedApiBase = process.env.OPENAI_API_BASE, savedFetch = global.fetch;
   process.env.OPENAI_API_KEY = "offline-readiness-test-key";
   delete process.env.OPENAI_API_BASE;
@@ -78,11 +110,16 @@ assert.match(quality.label, /evidence|verify/i);
 
   const abstaining = new AIAnswerEngine({ allowExtractiveFallback: false });
   abstaining.synthesizeWithLLM = async () => null;
+  const previousAnswerKey = process.env.OPENAI_API_KEY, previousAnswerBase = process.env.OPENAI_API_BASE;
+  delete process.env.OPENAI_API_KEY; delete process.env.OPENAI_API_BASE;
   const unavailable = await abstaining.answer("What does the Veyra index store?", [
     { url: "https://docs.example/index", title: "Index docs", contentText: "The Veyra crawler stores source metadata and page text in the local search index for later answer generation." }
   ]);
+  if (previousAnswerKey == null) delete process.env.OPENAI_API_KEY; else process.env.OPENAI_API_KEY = previousAnswerKey;
+  if (previousAnswerBase == null) delete process.env.OPENAI_API_BASE; else process.env.OPENAI_API_BASE = previousAnswerBase;
   assert.equal(unavailable.hasAnswer, false, "synthesis failure should not return copied source text as an AI answer");
-  assert.match(unavailable.reason, /paraphrase could not be verified/i);
+  assert.equal(unavailable.code, "AI_MODEL_NOT_CONFIGURED");
+  assert.match(unavailable.reason, /not configured/i);
 
   const originalFetch = global.fetch;
   process.env.OPENAI_API_KEY = "offline-test-key";

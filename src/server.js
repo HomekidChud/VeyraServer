@@ -4442,9 +4442,16 @@ function queueNeuralIndexFindings(query, sources = []) {
   while (aiIndexRuns.size > 1000) aiIndexRuns.delete(aiIndexRuns.keys().next().value);
 }
 const aiAnswerEngine = new AIAnswerEngine({ acquisitionManager });
-async function persistAIObservation(query, results, answer) {
+const aiAnswerFeedbackObservations = new Map();
+function rememberAIAnswerForFeedback(id, answer) {
+  const now = Date.now();
+  for (const [key, value] of aiAnswerFeedbackObservations) if (now - value.createdAt > 24 * 60 * 60 * 1000) aiAnswerFeedbackObservations.delete(key);
+  const features = aiAnswerEngine.qualityModel.features({ answer: answer.answer, grounding: answer.grounding, sources: answer.sources, intent: answer.intent });
+  aiAnswerFeedbackObservations.set(id, { features: Array.from(features), createdAt: now, feedbackGiven: false });
+  while (aiAnswerFeedbackObservations.size > 2000) aiAnswerFeedbackObservations.delete(aiAnswerFeedbackObservations.keys().next().value);
+}
+async function persistAIObservation(id, query, results, answer) {
   if (!mongoStore.enabled) return;
-  const id = `ai_${Date.now().toString(36)}_${crypto.randomBytes(6).toString("hex")}`;
   const rows = Array.isArray(results) ? results.slice(0, 24) : [];
   const used = new Set((answer?.sources || []).map(s => normalizeUrl(s?.url || s)).filter(Boolean));
   await mongoStore.recordAIObservation({ id, query, answer: answer?.answer || "", hasAnswer: !!answer?.hasAnswer, generatedBy: answer?.generatedBy || "", sources: answer?.sources || [], results: rows, pipeline: answer?.pipeline || {}, grounding: answer?.grounding || {} });
@@ -4496,10 +4503,29 @@ app.post('/api/search/answer', async (req, res) => {
     const routeResponseTimeMs = Date.now() - routeStartedAt;
     answer.responseTimeMs = routeResponseTimeMs;
     answer.pipeline = { ...(answer.pipeline || {}), answerGenerationMs: answer.pipeline?.latencyMs ?? null, responseTimeMs: routeResponseTimeMs };
-    void persistAIObservation(query, results || [], answer).catch(e => serverLog("warn", "AI", `AI observation persistence failed: ${e.message}`));
+    if (answer.hasAnswer) {
+      const observationId = `obs_${crypto.randomBytes(18).toString("base64url")}`;
+      answer.observationId = observationId;
+      rememberAIAnswerForFeedback(observationId, answer);
+      void persistAIObservation(observationId, query, results || [], answer).catch(e => serverLog("warn", "AI", `AI observation persistence failed: ${e.message}`));
+    }
     res.json(answer);
   } catch (e) { res.json({ hasAnswer: false, reason: "Answer retrieval or synthesis failed.", code: /^[A-Z0-9_:-]{1,64}$/i.test(String(e?.code || "")) ? String(e.code) : "ANSWER_PIPELINE_ERROR" }); }
   finally { request.dispose(); }
+});
+app.post("/api/search/answer/feedback", async (req, res) => {
+  const observationId = String(req.body?.observationId || "");
+  const rating = String(req.body?.rating || "").toLowerCase();
+  if (!/^obs_[A-Za-z0-9_-]{20,40}$/.test(observationId) || !["helpful", "unhelpful"].includes(rating)) return res.status(400).json({ ok: false, error: "A valid observationId and helpful/unhelpful rating are required." });
+  const observation = aiAnswerFeedbackObservations.get(observationId);
+  if (!observation) return res.status(410).json({ ok: false, error: "This answer feedback token has expired or is unknown." });
+  if (observation.feedbackGiven) return res.status(409).json({ ok: false, error: "Feedback was already recorded for this answer." });
+  const training = aiAnswerEngine.qualityModel.train(observation.features, rating === "helpful");
+  observation.feedbackGiven = true;
+  const recordId = `af_${observationId.slice(4)}`;
+  void mongoStore.recordAIAnswerFeedback({ id: recordId, observationId, rating, scoreBefore: training.before, scoreAfter: training.after, step: training.step, features: observation.features }).catch(error => serverLog("warn", "AI", `Answer feedback persistence failed: ${error.message}`));
+  void mongoStore.saveAINeuralModel("answer-quality-v1", aiAnswerEngine.qualityModel.serialize()).catch(error => serverLog("warn", "AI", `Answer-quality model persistence failed: ${error.message}`));
+  res.json({ ok: true, trained: true, rating, scoreBefore: Math.round(training.before * 1000) / 1000, scoreAfter: Math.round(training.after * 1000) / 1000, optimizer: "AdamW", trainingExamples: aiAnswerEngine.qualityModel.examples, calibrated: false });
 });
 app.get('/api/answer/status', (req, res) => res.json(aiAnswerEngine.report()));
 
@@ -6161,9 +6187,11 @@ async function hydrateNeuralFromMongo() {
   try {
     const snapshot = await mongoStore.loadNeuralModel("relevance-v1");
     if (snapshot && neuralModel.loadData(snapshot)) modelLoaded = true;
+    const qualitySnapshot = await mongoStore.loadNeuralModel("answer-quality-v1");
+    const qualityLoaded = !!(qualitySnapshot && aiAnswerEngine.qualityModel.loadData(qualitySnapshot));
     const queued = await mongoStore.loadQueuedNeuralFeedback(neuralTrainer.maxQueue);
     for (const item of queued) if (neuralTrainer.enqueue(item)) feedbackLoaded += 1;
-    if (modelLoaded || feedbackLoaded) serverLog("info", "NEURAL", `Hydrated model=${modelLoaded} and ${feedbackLoaded} queued feedback event(s) from MongoDB.`);
+    if (modelLoaded || feedbackLoaded || qualityLoaded) serverLog("info", "NEURAL", `Hydrated relevance=${modelLoaded}, answer-quality=${qualityLoaded}, queued feedback=${feedbackLoaded} from MongoDB.`);
   } catch (e) { serverLog("warn", "NEURAL", `Mongo neural hydration skipped: ${e.message}`); }
   return { model: modelLoaded, feedback: feedbackLoaded };
 }
