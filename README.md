@@ -9,11 +9,31 @@ VEYRA_CHROMIUM_ENABLED=false
 
 Set `VEYRA_CHROMIUM_ENABLED=true` only when browser rendering is explicitly required and Chromium is installed in the runtime image. The normal crawler, search, and answer paths do not launch or download Chromium. Operational status is available at `GET /api/acquisition/status`.
 
+Acquisition is bounded by per-host/global concurrency and the `SEARCH_FIRST_DEADLINE_MS` budget (default 20 seconds, bounded to 250–120000 ms). `GET /api/acquisition/status` reports active/queued work and limits, HTTP outcomes/retries/timeouts/cancellations, cache hit rate, extraction outcomes and p50/p95 extraction latency, request throughput and RSS memory. DNS results are rechecked at socket lookup time and private/reserved addresses are rejected, including when a hostname changes between validation and connection. Retry waits are cancellable; a `Retry-After` value longer than the short per-request retry budget is honored by declining to retry rather than ignoring the server's guidance. Challenge/consent/empty pages are classified and withheld as answer evidence.
+
+When Mongo persistence is enabled, the acquisition manager can reuse public text responses across restarts. The durable cache uses an acquisition-specific key namespace in the existing proxy-cache store; it honors the smaller of upstream freshness (`max-age`) and configured cache TTL. Authenticated/cookie-bearing requests, signed/token credential query URLs, `private`, `no-store`, any `Vary` response, and `Set-Cookie` responses are never shared. The proxy cache also uses a new key version so earlier cache entries are not re-used after the stricter policy change. Mongo persistence is optional and a cache outage does not stop direct retrieval.
+
+## Search-to-answer retrieval
+
+`POST /api/search/answer` combines up to four results from the existing local Veyra index with pages retrieved by the same bounded external web-search service used by `/api/search/web`. External candidates are ranked before fetch using query/title/snippet relevance, domain diversity, freshness when the query is time-sensitive, URL/fetch cost, and optional prior extraction/source quality, retry, novelty and duplicate-risk signals. Canonical URLs are merged with provider provenance retained, and already retrieved/local-index text is reused rather than fetched a second time. Evidence records include exact-text passage offsets, content hashes, extraction status, timestamps and per-sentence claim/source mappings. If the LLM is unavailable, the default fallback returns clearly quoted source excerpts with citations; set `AI_ANSWER_ALLOW_EXTRACTIVE_FALLBACK=false` to require LLM synthesis. Citation overlap is a safety heuristic, not a semantic proof or calibrated confidence score.
+
 ## Google search
 
 Google's public HTML search often challenges cloud datacenter IPs. Veyra does not bypass that challenge or rotate IPs to evade it. The preferred solution is the official Google Programmable Search JSON API: set `GOOGLE_SEARCH_API_KEY` and `GOOGLE_SEARCH_CX` as secret Render environment variables. No residential IP is needed for that API path. If those variables are absent, an explicit `engine=google` request reports `not-configured` instead of silently returning another provider's results; ordinary search may still use the configured Bing, Brave, or other permitted provider.
 
 If direct Google pages are required, use a legitimate residential or mobile egress service that you control or are authorized to use, configure it as a Veyra VPN profile, and respect Google's terms and rate limits. Do not use rotating proxies to evade CAPTCHA, bans, authentication, or access controls.
+
+## Live web-search provider behavior
+
+`GET /api/search/web` uses the shared hardened direct-fetch path and concurrently queries up to three providers by default (`WEB_SEARCH_MAX_PROVIDERS`, range 1–4; `WEB_SEARCH_CONCURRENCY`, range 1–4). Each provider has an 8-second default deadline (`WEB_SEARCH_PROVIDER_TIMEOUT_MS`, range 250–30000 ms), with an additional 12-second overall request deadline (`WEB_SEARCH_DEADLINE_MS`, range 250–60000 ms). `WEB_SEARCH_ORDER` sets the initial order; subsequent requests adapt order using bounded success-rate and latency history. If at least `WEB_SEARCH_EARLY_RESULT_THRESHOLD` (default 20) unique results arrive within `WEB_SEARCH_EARLY_CANCEL_WINDOW_MS` (default 1000 ms) of the deadline, slower peer calls are cancelled without counting as provider failures. Rate-limit/transport failures receive cooldowns informed by bounded `Retry-After`; safe diagnostics include p50/p95 latency, EWMA, success rate and circuit state without API keys. Search results are URL-deduplicated while preserving provider provenance; only successful non-empty result sets are cached (`WEB_SEARCH_CACHE_TTL_MS`, default 30000, maximum 600000). Brave requires `BRAVE_SEARCH_API_KEY`, Google requires both `GOOGLE_SEARCH_API_KEY` (or `GOOGLE_API_KEY`) and `GOOGLE_SEARCH_CX` (or `GOOGLE_CSE_ID`); Bing's HTML mode needs no key, while its API mode uses `BING_SEARCH_API_KEY`. A provider failure is recorded as a typed attempt and does not fabricate a result or prevent other providers from returning partial results. CAPTCHA/challenge responses are not retried as a way to get around the block.
+
+## Diagnostics and tests
+
+Run `npm test` for deterministic regressions, including controlled local Express tests for `/api/search/web`, `/api/search/answer`, and `/api/youtube/resolve`, with external providers, LLM calls, Chromium and Mongo writes disabled. Tests include prompt-injection-in-source coverage and deadline-aware early cancellation. The ranker fixture contains relevant, irrelevant, duplicate and misleading-snippet cases and reports Precision@2 for that fixed fixture only—not production quality. `npm run benchmark:search` compares baseline versus upgraded orchestration using a fixed mock provider delay; it measures scheduling behavior only, not real network speed. `npm run diagnostics:network -- --route=direct` makes one bounded request to each configured public diagnostic endpoint (IPv4/IPv6 address services, Google/Bing/DuckDuckGo) and prints DNS, TLS/HTTP, parsing and block classifications; it does **not** classify the egress as residential. Use `--route=proxy` only when an authorized proxy is configured. The command does not retry or bypass challenges. No diagnostic command writes cookies or authorization headers to its report.
+
+## YouTube URL resolution
+
+`POST /api/youtube/resolve` uses the existing YouTube parser and public oEmbed metadata endpoint. Watch, Shorts, live, embed, short-link, mobile, timestamp and playlist URLs are supported by parsing/tests, and a mocked Express route test verifies successful metadata and a disabled-embed response. Responses distinguish URL kind and preserve timestamp/playlist fields; `metadataSource` is `youtube-oembed` and `playbackVerified` is always `false`. A successful oEmbed result confirms public metadata/embeddability only; it does not establish that a specific client's player can play the video.
 
 ## 8.17.1 compatibility hardening
 
@@ -54,7 +74,7 @@ For Render, set `VEYRA_AUTH_SECRET`, `VEYRA_SIGNUP_KEY`, and a durable `VEYRA_DA
 
 ## Key fixes
 - Robust browser/foreground request lane remains independent from the crawler.
-- Chromium installation is checked during both dependency installation and `npm start` so a missing browser binary reports a clear warning instead of silently breaking browser mode.
+- Chromium availability is checked during `npm start`; the check only warns and never downloads or installs a browser. Browser mode remains opt-in.
 - Logical crawler robots remain separate from real upstream network slots.
 - Robot task bundling fills per-robot queues so robots can multitask instead of receiving a single task at a time.
 - Idle robots can request work from overloaded robots; the target robot explicitly accepts or declines.
@@ -81,7 +101,7 @@ For Render, the recommended build command is:
 npm install && npx playwright install chromium
 ```
 
-The package also runs a browser-binary check on startup. If Chromium is missing, the application will try to install it once and otherwise fall back gracefully to FAST_PROXY with `BROWSER_ENGINE_UNAVAILABLE` telemetry.
+The package runs a browser-binary check on startup. If Chromium is missing, the application reports `BROWSER_ENGINE_UNAVAILABLE`; it does not download Chromium at startup. Install it explicitly in the build image only when browser mode is intentionally enabled.
 
 ## Modes
 - `FAST_PROXY`: HTTP fetch + minimal URL/resource rewriting.
@@ -92,7 +112,7 @@ Security verification remains user-assisted. Veyra does not solve or bypass anti
 
 ## Tests
 
-The release package ships without test files. Keep regression tests in your development checkout; they are not needed to run or deploy Veyra.
+Run `npm test` in a development checkout to execute the deterministic regression, security and route-integration suites. Tests use mocks and local fixtures; they do not need live provider credentials.
 
 
 ## v8.10.0 stability profile

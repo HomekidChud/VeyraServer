@@ -1,6 +1,20 @@
 "use strict";
 
 const zlib = require("zlib");
+function proxyCacheInputSafe(result, meta) {
+  const rawUrl = String(result?.finalUrl || meta?.url || "");
+  try {
+    const url = new URL(rawUrl);
+    if (!/^https?:$/.test(url.protocol) || url.username || url.password) return false;
+    if ([...url.searchParams.keys()].some(name => /(?:token|secret|password|session|signature|credential|authorization|accesskey|api[_-]?key|(?:^|[_-])key(?:$|[_-])|(?:^|[_-])sig(?:$|[_-])|^(?:auth|code|jwt)$)/i.test(name))) return false;
+  } catch { return false; }
+  const header = name => { try { return result.headers?.get?.(name) || result.headers?.[name] || ""; } catch { return ""; } };
+  const cacheControl = String(result.cacheControl || header("cache-control"));
+  const vary = String(result.vary || header("vary")).trim();
+  const setCookie = String(result.setCookieHeader || header("set-cookie"));
+  const status = Number(result.status || 200);
+  return !meta.sessionId && result.ok !== false && status >= 200 && status < 300 && !result.truncated && !result.tooLarge && !/(?:^|,)\s*(?:no-store|private)\b/i.test(cacheControl) && !vary && !setCookie;
+}
 class MongoStore {
   constructor(opts = {}) {
     this.uri = String(opts.uri || process.env.MONGODB_URI || "").trim();
@@ -81,16 +95,24 @@ class MongoStore {
     if (!doc?.bodyGzip || (doc.expiresAt && Date.parse(doc.expiresAt) <= Date.now())) return null;
     try {
       this.stats.hits += 1; const body = zlib.gunzipSync(Buffer.from(doc.bodyGzip, "base64"));
-      return { time: Number(doc.createdAtMs || Date.now()), response: { ok: doc.ok !== false, status: Number(doc.status || 200), finalUrl: doc.finalUrl || doc.url, contentType: doc.contentType || "application/octet-stream", contentEncoding: doc.contentEncoding || "", cacheControl: doc.cacheControl || "", etag: doc.etag || "", lastModified: doc.lastModified || "", expires: doc.expires || "", contentRange: doc.contentRange || "", acceptRanges: doc.acceptRanges || "", linkHeader: doc.linkHeader || "", contentDisposition: doc.contentDisposition || "", setCookieHeader: "", contentLength: doc.contentLength || "", serverHeader: doc.serverHeader || "", cfMitigated: doc.cfMitigated || "", xFrameOptions: doc.xFrameOptions || "", contentSecurityPolicy: doc.contentSecurityPolicy || "", bytes: body.length, truncated: false, tooLarge: false, stream: null, body, redirectChain: Array.isArray(doc.redirectChain) ? doc.redirectChain : [], retries: 0, sessionId: doc.sessionId || "", revalidated: false, cacheHit: true, mongoCacheHit: true }, etag: doc.etag || "", lastModified: doc.lastModified || "" };
+      return { time: Number(doc.createdAtMs || Date.now()), expiresAtMs: doc.expiresAt ? Date.parse(doc.expiresAt) : Number(doc.createdAtMs || Date.now()) + this.cacheTtlMs, response: { ok: doc.ok !== false, status: Number(doc.status || 200), finalUrl: doc.finalUrl || doc.url, contentType: doc.contentType || "application/octet-stream", contentEncoding: doc.contentEncoding || "", cacheControl: doc.cacheControl || "", etag: doc.etag || "", lastModified: doc.lastModified || "", expires: doc.expires || "", contentRange: doc.contentRange || "", acceptRanges: doc.acceptRanges || "", linkHeader: doc.linkHeader || "", contentDisposition: doc.contentDisposition || "", setCookieHeader: "", contentLength: doc.contentLength || "", serverHeader: doc.serverHeader || "", cfMitigated: doc.cfMitigated || "", xFrameOptions: doc.xFrameOptions || "", contentSecurityPolicy: doc.contentSecurityPolicy || "", bytes: body.length, truncated: false, tooLarge: false, stream: null, body, redirectChain: Array.isArray(doc.redirectChain) ? doc.redirectChain : [], retries: 0, sessionId: doc.sessionId || "", revalidated: false, cacheHit: true, mongoCacheHit: true }, etag: doc.etag || "", lastModified: doc.lastModified || "" };
     } catch { return null; }
   }
   async putProxyCache(key, result, meta = {}) {
     if (!key || !result?.body || result.body.length > this.cacheBodyMaxBytes) return;
     const type = String(result.contentType || "").toLowerCase(); if (!(type.includes("text/") || /javascript|json|xml|svg|css|font/.test(type))) return;
-    const cacheControl = String(result.cacheControl || ""); if (/no-store|private/i.test(cacheControl)) return;
+    if (!proxyCacheInputSafe(result, meta)) return;
+    const cacheControl = String(result.cacheControl || "");
     const now = Date.now(); const bodyGzip = zlib.gzipSync(Buffer.from(result.body), { level: 4 }).toString("base64");
-    const doc = { key, url: result.finalUrl || meta.url || "", ok: !!result.ok, status: result.status, contentType: result.contentType || "", contentEncoding: result.contentEncoding || "", cacheControl, etag: result.etag || "", lastModified: result.lastModified || "", expires: result.expires || "", contentRange: result.contentRange || "", acceptRanges: result.acceptRanges || "", linkHeader: result.linkHeader || "", contentDisposition: result.contentDisposition || "", contentLength: result.contentLength || "", serverHeader: result.serverHeader || "", cfMitigated: result.cfMitigated || "", xFrameOptions: result.xFrameOptions || "", contentSecurityPolicy: result.contentSecurityPolicy || "", redirectChain: result.redirectChain || [], sessionId: meta.sessionId || "", createdAtMs: now, expiresAt: new Date(now + this.cacheTtlMs), bodyGzip };
+    const ttlMs = Math.min(this.cacheTtlMs, Math.max(0, Number(meta.ttlMs ?? this.cacheTtlMs)));
+    if (!ttlMs) return;
+    const doc = { key, url: result.finalUrl || meta.url || "", ok: !!result.ok, status: result.status, contentType: result.contentType || "", contentEncoding: result.contentEncoding || "", cacheControl, etag: result.etag || "", lastModified: result.lastModified || "", expires: result.expires || "", contentRange: result.contentRange || "", acceptRanges: result.acceptRanges || "", linkHeader: result.linkHeader || "", contentDisposition: result.contentDisposition || "", contentLength: result.contentLength || "", serverHeader: result.serverHeader || "", cfMitigated: result.cfMitigated || "", xFrameOptions: result.xFrameOptions || "", contentSecurityPolicy: result.contentSecurityPolicy || "", redirectChain: result.redirectChain || [], sessionId: meta.sessionId || "", createdAtMs: now, expiresAt: new Date(now + ttlMs), bodyGzip };
     this.stats.writes += 1; void this.withDb(db => db.collection("proxy_cache").updateOne({ key }, { $set: doc }, { upsert: true }));
+  }
+  async deleteProxyCache(key) {
+    if (!key) return;
+    this.stats.writes += 1;
+    return this.withDb(db => db.collection("proxy_cache").deleteOne({ key }));
   }
   async loadSearchDocuments(limit = 20000) { const rows = await this.withDb(db => db.collection("search_documents").find({}, { projection: { _id: 0 } }).sort({ indexedAt: -1 }).limit(Math.max(1, Number(limit) || 1000)).toArray()); return Array.isArray(rows) ? rows : []; }
   async upsertSearchDocument(doc) { if (!doc?.url) return; const safe = { ...doc, termFreq: Object.fromEntries(doc.termFreq instanceof Map ? doc.termFreq.entries() : Object.entries(doc.termFreq || {})) }; delete safe._id; this.stats.writes += 1; void this.withDb(db => db.collection("search_documents").updateOne({ url: safe.url }, { $set: safe }, { upsert: true })); }

@@ -332,8 +332,22 @@ try { fs.mkdirSync(CFG.authDataDir, { recursive: true }); } catch {}
 
 
 
+function createPublicSocketLookup(resolve = dns.lookup) {
+  return (hostname, options, callback) => {
+    const opts = typeof options === "function" ? {} : (options || {});
+    const cb = typeof options === "function" ? options : callback;
+    Promise.resolve().then(() => withTimeout(resolve(hostname, { all: true, verbatim: true }), CFG.dnsTimeoutMs, "DNS lookup timed out.")).then(records => {
+      if (!records?.length) throw Object.assign(new Error("Destination could not be resolved."), { code: "ENOTFOUND" });
+      if (records.some(record => !assertIpPublic(record.address))) throw Object.assign(new Error("DNS resolved to a private or reserved address."), { code: "SSRF_BLOCKED" });
+      const preferred = opts.family ? records.filter(record => record.family === opts.family) : records;
+      const addresses = preferred.length ? preferred : records;
+      if (opts.all) cb(null, addresses.map(record => ({ address: record.address, family: record.family })));
+      else cb(null, addresses[0].address, addresses[0].family);
+    }).catch(error => cb(error));
+  };
+}
 const DIRECT_HTTP_AGENT = new UndiciAgent({
-  connect: { timeout: 12000, autoSelectFamily: true, autoSelectFamilyAttemptTimeout: 250 },
+  connect: { timeout: 12000, autoSelectFamily: true, autoSelectFamilyAttemptTimeout: 250, lookup: createPublicSocketLookup() },
   keepAliveTimeout: 10000,
   keepAliveMaxTimeout: 30000,
   connections: 24,
@@ -953,6 +967,7 @@ function normalizeUrl(value, base) {
     if (!raw) return null;
     const u = new URL(raw, base);
     if (!['http:', 'https:'].includes(u.protocol)) return null;
+    if (u.username || u.password) return null;
     return normalizedSearch(u.href);
   } catch { return null; }
 }
@@ -963,6 +978,7 @@ function resolveNavigation(value, documentUrl) {
   try {
     const u = new URL(raw, documentUrl);
     if (!['http:', 'https:'].includes(u.protocol)) return null;
+    if (u.username || u.password) return null;
     return u.href;
   } catch { return null; }
 }
@@ -1259,7 +1275,7 @@ async function fetchBuffer(url, opts = {}) {
           throw e;
         }
         const directMode = !suppliedDispatcher && !vpnEnabledForRequest;
-        const dispatcher = suppliedDispatcher || (directMode ? (attempt % 2 === 0 ? DIRECT_HTTP_AGENT : undefined) : undefined);
+        const dispatcher = suppliedDispatcher || (directMode ? DIRECT_HTTP_AGENT : undefined);
         const response = await undiciFetch(current, {
           method,
           headers: reqHeaders,
@@ -1324,6 +1340,7 @@ async function fetchBuffer(url, opts = {}) {
           linkHeader: response.headers.get("link") || "",
           contentDisposition: response.headers.get("content-disposition") || "",
           setCookieHeader: response.headers.get("set-cookie") || "",
+          retryAfterMs: retryAfterMs(response.headers),
           contentEncoding: upstreamEncoding,
           contentLength,
           serverHeader: response.headers.get("server") || "",
@@ -1365,10 +1382,10 @@ async function fetchBuffer(url, opts = {}) {
 const webSearch = createWebSearch({
   fetchText: async (url, opts = {}) => {
     const r = await fetchBuffer(url, {
-      headers: opts.headers || {}, accept: opts.accept || "application/json", timeout: 12000,
-      retries: 1, limit: 2 * 1024 * 1024
+      headers: opts.headers || {}, accept: opts.accept || "application/json", timeout: opts.timeoutMs || 12000,
+      signal: opts.signal, retries: 0, limit: 2 * 1024 * 1024
     });
-    return { ok: r.ok, status: r.status, text: r.body.toString("utf8"), finalUrl: r.finalUrl };
+    return { ok: r.ok, status: r.status, text: r.body.toString("utf8"), finalUrl: r.finalUrl, retryAfterMs: r.retryAfterMs };
   },
   env: process.env,
   log: (level, source, message) => serverLog(level, source, message)
@@ -1381,9 +1398,12 @@ const acquisitionManager = new AcquisitionManager({
   maxBytes: CFG.maxProxyTextBytes,
   maxRedirects: CFG.maxRedirects,
   maxRetries: CFG.maxRetries,
+  searchFirstDeadlineMs: Number(process.env.SEARCH_FIRST_DEADLINE_MS) || 20000,
   perHostConcurrency: CFG.perHostConcurrency,
+  globalConcurrency: CFG.maxActiveFetches,
   cacheTtlMs: CFG.mongoCacheTtlMs,
   cacheMax: CFG.maxProxyCacheEntries,
+  persistence: mongoStore,
 });
 app.get("/api/acquisition/status", (req, res) => res.json({ ok: true, chromiumEnabled: CFG.browserEnabled, ...acquisitionManager.report() }));
 
@@ -1397,6 +1417,35 @@ function cacheSet(map, key, value, maxEntries) {
   map.set(key, { time: Date.now(), ...value });
   while (map.size > maxEntries) map.delete(map.keys().next().value);
 }
+function cacheSafeUrl(raw) {
+  try {
+    const url = new URL(String(raw || ""));
+    if (!/^https?:$/.test(url.protocol) || url.username || url.password) return false;
+    return ![...url.searchParams.keys()].some(name => /(?:token|secret|password|session|signature|credential|authorization|accesskey|api[_-]?key|(?:^|[_-])key(?:$|[_-])|(?:^|[_-])sig(?:$|[_-])|^(?:auth|code|jwt)$)/i.test(name));
+  } catch { return false; }
+}
+function cacheSafeResponse(result, url) {
+  if (!result || typeof result !== "object" || !cacheSafeUrl(url) || result.ok === false || result.truncated || result.tooLarge) return false;
+  if (result.status != null && (Number(result.status) < 200 || Number(result.status) >= 300)) return false;
+  const header = name => { try { return result.headers?.get?.(name) || result.headers?.[name] || ""; } catch { return ""; } };
+  const cacheControl = String(result.cacheControl || header("cache-control"));
+  const vary = String(result.vary || header("vary")).trim();
+  const setCookie = String(result.setCookieHeader || header("set-cookie"));
+  if (/(?:^|,)\s*(?:no-store|private)\b/i.test(cacheControl) || vary || setCookie) return false;
+  return true;
+}
+function hasCredentialRequestHeaders(headers) {
+  const names = [];
+  if (headers && typeof headers.forEach === "function") headers.forEach((_value, name) => names.push(name));
+  else names.push(...Object.keys(headers || {}));
+  return names.some(name => /^(?:authorization|cookie|proxy-authorization)$/i.test(name));
+}
+async function validateCacheEntry(entry, key, url) {
+  if (!entry || cacheSafeResponse(entry.response, url)) return entry;
+  proxyCache.delete(key);
+  if (mongoStore.enabled) { try { await mongoStore.deleteProxyCache(key); } catch {} }
+  return null;
+}
 async function fetchCached(url, opts = {}) {
   const method = String(opts.method || "GET").toUpperCase();
   const normalized = normalizeUrl(url);
@@ -1406,21 +1455,23 @@ async function fetchCached(url, opts = {}) {
   
   
   const userAgentKey = opts.userAgent ? crypto.createHash("sha1").update(String(opts.userAgent)).digest("hex").slice(0, 16) : "default";
-  const baseKey = `${method} ${normalized} | ref=${referrerKey} | ua=${userAgentKey}`;
+  const baseKey = `proxy-cache:v2 ${method} ${normalized} | ref=${referrerKey} | ua=${userAgentKey}`;
   const key = `${baseKey} | sid=${sid}`;
-  const sharedKey = `${method} ${normalized} | ua=${userAgentKey} | sid=*`;
-  const canCoalesce = method === "GET" && !opts.noCache && !opts.streamOversize;
+  const sharedKey = `proxy-cache:v2 ${method} ${normalized} | ua=${userAgentKey} | sid=*`;
+  const isolatedRequest = !cacheSafeUrl(normalized) || !!opts.private || hasCredentialRequestHeaders(opts.headers);
+  const cacheReadAllowed = method === "GET" && !opts.noCache && !opts.streamOversize && !isolatedRequest;
+  const canCoalesce = cacheReadAllowed;
   if (canCoalesce) { const existing = fetchInflight.get(key); if (existing) return existing; }
   const work = (async () => {
-    let cachedEntry = opts.noCache || method !== "GET" ? null : proxyCache.get(key) || null;
-    if (!cachedEntry && method === "GET" && CFG.mongoSharedCache) cachedEntry = proxyCache.get(sharedKey) || null;
-    if (!cachedEntry && method === "GET" && mongoStore.enabled) {
+    let cachedEntry = cacheReadAllowed ? await validateCacheEntry(proxyCache.get(key) || null, key, normalized) : null;
+    if (!cachedEntry && cacheReadAllowed && CFG.mongoSharedCache) cachedEntry = await validateCacheEntry(proxyCache.get(sharedKey) || null, sharedKey, normalized);
+    if (!cachedEntry && cacheReadAllowed && mongoStore.enabled) {
       const persisted = await mongoStore.getProxyCache(key);
-      if (persisted) { cacheSet(proxyCache, key, persisted, CFG.maxProxyCacheEntries); cachedEntry = persisted; }
+      if (persisted) { cachedEntry = await validateCacheEntry(persisted, key, normalized); if (cachedEntry) cacheSet(proxyCache, key, cachedEntry, CFG.maxProxyCacheEntries); }
     }
-    if (!cachedEntry && method === "GET" && CFG.mongoSharedCache && mongoStore.enabled) {
+    if (!cachedEntry && cacheReadAllowed && CFG.mongoSharedCache && mongoStore.enabled) {
       const persisted = await mongoStore.getProxyCache(sharedKey);
-      if (persisted) { cacheSet(proxyCache, sharedKey, persisted, CFG.maxProxyCacheEntries); cachedEntry = persisted; }
+      if (persisted) { cachedEntry = await validateCacheEntry(persisted, sharedKey, normalized); if (cachedEntry) cacheSet(proxyCache, sharedKey, cachedEntry, CFG.maxProxyCacheEntries); }
     }
     const cacheAge = cachedEntry ? Date.now() - cachedEntry.time : Infinity;
     if (cachedEntry && cacheAge <= CFG.proxyCacheMs && !opts.revalidate) return { ...cachedEntry.response, cacheHit: true, cacheAgeMs: cacheAge };
@@ -1436,14 +1487,18 @@ async function fetchCached(url, opts = {}) {
       const noStore = /no-store/i.test(result.cacheControl || "");
       const bodyBytes = Buffer.byteLength(result.body || Buffer.alloc(0));
       const youtubeDocument = CFG.youtubeDocumentCache && /text\/html|application\/xhtml/i.test(String(result.contentType || "")) && isYoutubeHost(new URL(normalized).hostname) && !result.setCookieHeader && !cookieHeader(sid, normalized);
-      const cacheableDocument = youtubeDocument && !result.truncated && !result.tooLarge && bodyBytes <= CFG.maxCacheBodyBytes;
-      if ((!noStore || cacheableDocument) && !result.truncated && !result.tooLarge && bodyBytes <= CFG.maxCacheBodyBytes) cacheSet(proxyCache, key, { response: result, etag: result.etag, lastModified: result.lastModified }, CFG.maxProxyCacheEntries);
+      const responseCacheable = cacheSafeResponse(result, normalized) && !isolatedRequest && !opts.noCache && bodyBytes <= CFG.maxCacheBodyBytes;
+      if (responseCacheable) cacheSet(proxyCache, key, { response: result, etag: result.etag, lastModified: result.lastModified }, CFG.maxProxyCacheEntries);
+      else {
+        proxyCache.delete(key); proxyCache.delete(sharedKey);
+        if (mongoStore.enabled) { void mongoStore.deleteProxyCache(key).catch(() => {}); void mongoStore.deleteProxyCache(sharedKey).catch(() => {}); }
+      }
       const shareableType = /(?:text\/css|javascript|font\/|image\/|image\/svg\+xml)/i.test(String(result.contentType || ""));
       const noSessionCookies = !result.setCookieHeader && (!sid || !cookieHeader(sid, normalized));
       const incognito = isIncognitoSid(sid);
-      const shared = CFG.mongoSharedCache && (shareableType || youtubeDocument) && noSessionCookies && (!noStore || youtubeDocument) && !result.truncated && !result.tooLarge && bodyBytes <= Math.min(CFG.maxCacheBodyBytes, CFG.mongoCacheBodyMaxBytes) && (!incognito || youtubeDocument);
+      const shared = responseCacheable && CFG.mongoSharedCache && (shareableType || youtubeDocument) && noSessionCookies && !noStore && !result.truncated && !result.tooLarge && bodyBytes <= Math.min(CFG.maxCacheBodyBytes, CFG.mongoCacheBodyMaxBytes) && (!incognito || youtubeDocument);
       if (shared) { const sharedResult = { ...result, sessionId: "" }; cacheSet(proxyCache, sharedKey, { response: sharedResult, etag: result.etag, lastModified: result.lastModified }, CFG.maxProxyCacheEntries); void mongoStore.putProxyCache(sharedKey, result, { url: result.finalUrl || normalized, sessionId: "" }); }
-      else if (!sid && !incognito && !noStore && !result.truncated && !result.tooLarge && bodyBytes <= Math.min(CFG.maxCacheBodyBytes, CFG.mongoCacheBodyMaxBytes)) void mongoStore.putProxyCache(key, result, { url: result.finalUrl || normalized, sessionId: "" });
+      else if (responseCacheable && !sid && !incognito && !noStore && !result.truncated && !result.tooLarge && bodyBytes <= Math.min(CFG.maxCacheBodyBytes, CFG.mongoCacheBodyMaxBytes)) void mongoStore.putProxyCache(key, result, { url: result.finalUrl || normalized, sessionId: "" });
     }
     return result;
   })();
@@ -2207,7 +2262,7 @@ function makeSearchSnippet(doc, parsed) {
   const start = Math.max(0, hit - 90), end = Math.min(source.length, start + 300);
   return `${start > 0 ? "…" : ""}${source.slice(start, end)}${end < source.length ? "…" : ""}`;
 }
-function localSearch(query, offset, limit) {
+function localSearch(query, offset, limit, options = {}) {
   const parsed = parseSearchQuery(query);
   const N = searchIndex.size;
   if (!N) return { total: 0, results: [], indexSize: 0, terms: parsed.terms, filters: parsed.filters };
@@ -2263,7 +2318,8 @@ function localSearch(query, offset, limit) {
     return {
       title: doc.title, url: doc.url, snippet: makeSearchSnippet(doc, parsed), displayUrl: doc.displayUrl,
       favicon: doc.favicon || searchFavicon(doc.url), source: "veyra-index", score: Number(score.toFixed(4)), neuralScore: Number(neuralScore.toFixed(4)),
-      indexedAt: doc.indexedAt, lang: doc.lang, domain: doc.host
+      indexedAt: doc.indexedAt, lang: doc.lang, domain: doc.host,
+      ...(options.includeText ? { canonicalUrl: doc.url, contentText: String(doc.text || "").slice(0, Math.max(1000, Math.min(60000, Number(options.maxTextChars) || 30000))), description: doc.description || "", headings: doc.headings || "" } : {})
     };
   });
   return { total, results, indexSize: N, terms: parsed.terms, filters: parsed.filters };
@@ -3553,14 +3609,24 @@ app.post('/api/youtube/resolve', async (req, res) => {
   if (!raw || !youtubeCompat.isYoutubeUrl(raw)) return respondError(res, 400, 'Not a YouTube URL.', 'INVALID_URL');
   const parsed = youtubeCompat.parseYoutubeUrl(raw);
   if (!parsed) return respondError(res, 400, 'No playable video ID found in this URL.', 'YOUTUBE_NO_VIDEO_ID');
-  const check = await youtubeCompat.checkEmbeddable(parsed.videoId, fetchOfficialJson);
-  if (!check.ok) return res.json({ ok: false, code: check.code, videoId: parsed.videoId });
+  let check;
+  try { check = await youtubeCompat.checkEmbeddable(parsed.videoId, app.locals.veyraYoutubeFetch || fetchOfficialJson); }
+  catch { check = { ok: false, code: 'YOUTUBE_UNAVAILABLE' }; }
+  if (!check?.ok) return res.json({ ok: false, code: check?.code || 'YOUTUBE_UNAVAILABLE', videoId: parsed.videoId, kind: parsed.kind, isShortsUrl: parsed.kind === 'shorts', metadataSource: 'youtube-oembed', playbackVerified: false });
   res.json({
     ok: true,
     videoId: parsed.videoId,
+    kind: parsed.kind,
+    isShortsUrl: parsed.kind === 'shorts',
+    startSeconds: parsed.startSeconds,
+    list: parsed.list,
+    index: parsed.index,
+    canonicalUrl: `https://www.youtube.com/watch?v=${encodeURIComponent(parsed.videoId)}`,
     title: check.title,
     authorName: check.authorName,
     thumbnailUrl: check.thumbnailUrl,
+    metadataSource: 'youtube-oembed',
+    playbackVerified: false,
     embedUrl: youtubeCompat.buildEmbedUrl(parsed, req.get('origin') || undefined),
   });
 });
@@ -4217,7 +4283,15 @@ app.get('/api/search/suggest', (req, res) => {
   res.json({ ok: true, suggestions: localSearchSuggestions(q, limit) });
 });
 app.get('/api/search/correct', (req, res) => res.json({ ok: true, ...correctSearchQuery(req.query.q || "") }));
+function requestAbortSignal(req, res) {
+  const controller = new AbortController();
+  const abort = () => { if (!res.writableEnded) controller.abort(); };
+  req.once("aborted", abort);
+  res.once("close", abort);
+  return { signal: controller.signal, dispose() { req.removeListener("aborted", abort); res.removeListener("close", abort); } };
+}
 app.get('/api/search/web', async (req, res) => {
+  const request = requestAbortSignal(req, res);
   try {
     const q = String(req.query.q || "").trim().slice(0, 600);
     if (!q) return res.json({ ok: true, provider: "none", results: [], attempts: [], responseTimeMs: 0 });
@@ -4227,11 +4301,11 @@ app.get('/api/search/web', async (req, res) => {
     const offset = Math.max(0, Number(req.query.offset || 0) || 0);
     const lang = String(req.query.lang || "en").slice(0, 16);
     const started = Date.now();
-    const result = await webSearch.search(q, { offset, engine: selected, lang });
+    const result = await (app.locals.veyraWebSearch || webSearch).search(q, { offset, engine: selected, lang, signal: request.signal });
     res.json({ ok: true, ...result, source: "web", responseTimeMs: Date.now() - started });
   } catch (e) {
-    respondError(res, 502, `Veyra web search failed: ${e.message}`, "SEARCH_WEB_ERROR");
-  }
+    respondError(res, 502, "Veyra web search is temporarily unavailable.", "SEARCH_WEB_ERROR");
+  } finally { request.dispose(); }
 });
 
 app.get('/api/browser/status', (req, res) => res.json({ ok: true, ...browserEngine.status(), failover: failoverController ? failoverController.report() : null, snapshots: snapshotStore ? snapshotStore.report() : null, config: { backend: CFG.browserBackend, enabled: CFG.browserEnabled, headless: CFG.browserHeadless, maxSessions: CFG.maxBrowserSessions, maxPages: CFG.maxBrowserPages, maxContexts: CFG.maxBrowserContexts } }));
@@ -4289,19 +4363,47 @@ async function persistAIObservation(query, results, answer) {
   }));
 }
 app.post('/api/search/answer', async (req, res) => {
+  const routeStartedAt = Date.now();
+  const request = requestAbortSignal(req, res);
   try {
     const { query } = req.body;
     let { results } = req.body;
+    let retrievalDiagnostics = null;
     if (!query) return res.json({ hasAnswer: false, reason: 'No query provided' });
     if (!Array.isArray(results) || !results.length) {
-      const discovered = await acquisitionManager.searchFirst(String(query).slice(0, CFG.maxSearchQueryChars), (q, opts) => webSearch.search(q, opts), { limit: CFG.maxSearchResults });
-      results = discovered.pages.map(page => ({ url: page.url, title: page.title, snippet: page.text.slice(0, 600) }));
+      const normalizedQuery = String(query).slice(0, CFG.maxSearchQueryChars);
+      const localSearchStartedAt = Date.now();
+      const local = localSearch(normalizedQuery, 0, Math.min(4, CFG.maxSearchResults), { includeText: true, maxTextChars: 30000 });
+      const localSearchMs = Date.now() - localSearchStartedAt;
+      const externalDiscoveryStartedAt = Date.now();
+      let discovered = { pages: [], metrics: { candidates: 0, fetched: 0, extracted: 0, failed: 0 }, provider: "none", attempts: [] };
+      try { discovered = await acquisitionManager.searchFirst(normalizedQuery, (q, opts) => (app.locals.veyraWebSearch || webSearch).search(q, opts), { limit: CFG.maxSearchResults, signal: request.signal }); }
+      catch { serverLog("warn", "SEARCH", "Search-to-answer external discovery failed; continuing with local-index candidates."); }
+      const combined = new Map();
+      const add = candidate => {
+        const key = normalizeUrl(candidate.canonicalUrl || candidate.url); if (!key) return;
+        const existing = combined.get(key);
+        if (!existing) { combined.set(key, { ...candidate, canonicalUrl: key, providers: [...new Set(candidate.providers || [candidate.provider].filter(Boolean))] }); return; }
+        const providers = [...new Set([...(existing.providers || []), ...(candidate.providers || []), candidate.provider].filter(Boolean))];
+        combined.set(key, { ...existing, ...candidate, canonicalUrl: key, contentText: candidate.contentText || existing.contentText || "", providers, source: candidate.source || existing.source });
+      };
+      for (const row of local.results) add({ ...row, provider: "veyra-index", retrievedAt: row.indexedAt, sourceIdentity: row.domain, fetchStatus: "indexed", extractionStatus: "local-index" });
+      for (const page of discovered.pages) {
+        if (["challenge", "consent", "empty"].includes(page.extractionStatus) || String(page.text || "").trim().length < 80) continue;
+        add({ url: page.url, canonicalUrl: page.canonical, title: page.title, snippet: page.description || page.text.slice(0, 600), contentText: page.text, provider: page.source?.provider || page.source?.source, providers: page.source?.providers || [], source: page.source, sourceIdentity: new URL(page.url).hostname.replace(/^www\./, ""), retrievedAt: page.fetchedAt, publishedAt: page.publishedAt, fetchStatus: "fetched", extractionStatus: page.extractionStatus });
+      }
+      results = [...combined.values()];
+      retrievalDiagnostics = { localCandidates: local.results.length, localSearchMs, externalDiscoveryMs: Date.now() - externalDiscoveryStartedAt, external: discovered.metrics, providers: discovered.attempts || [], mergedCandidates: results.length };
     }
-    const answer = await aiAnswerEngine.answer(query, results || []);
+    const answer = await aiAnswerEngine.answer(query, results || [], { signal: request.signal, retrievalDiagnostics });
+    const routeResponseTimeMs = Date.now() - routeStartedAt;
+    answer.responseTimeMs = routeResponseTimeMs;
+    answer.pipeline = { ...(answer.pipeline || {}), answerGenerationMs: answer.pipeline?.latencyMs ?? null, responseTimeMs: routeResponseTimeMs };
     void persistAIObservation(query, results || [], answer).catch(e => serverLog("warn", "AI", `AI observation persistence failed: ${e.message}`));
     if (answer.hasAnswer) queueNeuralIndexFindings(query, answer.sources || []);
     res.json(answer);
-  } catch (e) { res.json({ hasAnswer: false, reason: e.message }); }
+  } catch (e) { res.json({ hasAnswer: false, reason: "Answer retrieval or synthesis failed.", code: /^[A-Z0-9_:-]{1,64}$/i.test(String(e?.code || "")) ? String(e.code) : "ANSWER_PIPELINE_ERROR" }); }
+  finally { request.dispose(); }
 });
 app.get('/api/answer/status', (req, res) => res.json(aiAnswerEngine.report()));
 
@@ -6064,4 +6166,4 @@ const __workerOps = {
   discover: (text, kind, base, contentType) => collectDiscovery(text, kind, base, contentType)
 };
 
-module.exports = { app, mongoStore, mergeStrayProxyParams, detectChallenge, CFG, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions, normalizeOpenEngineMode, shouldStartCrawlerForEngineMode, startVeyraServer };
+module.exports = { app, mongoStore, mergeStrayProxyParams, detectChallenge, CFG, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions, normalizeOpenEngineMode, shouldStartCrawlerForEngineMode, startVeyraServer, cacheSafeUrl, cacheSafeResponse };

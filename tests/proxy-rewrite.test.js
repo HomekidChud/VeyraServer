@@ -1,5 +1,18 @@
 const assert = require('assert');
-const { rewriteHtml } = require('../src/server');
+const { rewriteHtml, cacheSafeUrl, cacheSafeResponse } = require('../src/server');
+
+assert.equal(cacheSafeUrl('https://example.com/public?page=2'), true);
+assert.equal(cacheSafeUrl('https://example.com/private?access_token=secret'), false);
+assert.equal(cacheSafeUrl('https://user:pass@example.com/public'), false);
+assert.equal(cacheSafeResponse({ ok: true, status: 200, cacheControl: 'public, max-age=60' }, 'https://example.com/public'), true);
+for (const response of [
+  { ok: true, status: 200, cacheControl: 'private, max-age=60' },
+  { ok: true, status: 200, cacheControl: 'no-store' },
+  { ok: true, status: 200, vary: 'Accept-Language' },
+  { ok: true, status: 200, setCookieHeader: 'sid=secret' },
+  { ok: true, status: 503 },
+  { ok: true, status: 200, truncated: true }
+]) assert.equal(cacheSafeResponse(response, 'https://example.com/public'), false);
 
 const html = `<!doctype html><html><head></head><body>
   <script data-deferredsrc="/js/geofs.js?kc=3910"></script>

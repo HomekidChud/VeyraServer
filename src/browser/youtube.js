@@ -64,7 +64,7 @@ function parseYoutubeUrl(raw, { depth = 0 } = {}) {
   let kind = "watch";
 
   if (hostIsShortLink(host)) {
-    id = decodeURIComponent(u.pathname.split("/").filter(Boolean)[0] || "");
+    try { id = decodeURIComponent(u.pathname.split("/").filter(Boolean)[0] || ""); } catch { return null; }
     kind = "short-link";
   } else if (hostIsYoutube(host)) {
     const segs = u.pathname.split("/").filter(Boolean);
