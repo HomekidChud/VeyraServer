@@ -125,7 +125,9 @@ const CFG = Object.freeze({
   
   
   
-  logicalRobots: numberEnv("CRAWLER_ROBOTS", 10000, 1, 10000),
+  // Logical robots are schedulers, not sockets. Keep the fleet above 10k for
+  // broad work sharing while MAX_ACTIVE_FETCHES remains the real network cap.
+  logicalRobots: numberEnv("CRAWLER_ROBOTS", 12000, 1, 20000),
   requestedMaxActiveFetches: numberEnv("MAX_ACTIVE_FETCHES", numberEnv("MAX_GLOBAL_CONCURRENCY", P.maxActiveFetches, 1, 256), 1, 256),
   maxActiveFetches: Math.min(numberEnv("MAX_ACTIVE_FETCHES", numberEnv("MAX_GLOBAL_CONCURRENCY", P.maxActiveFetches, 1, 256), 1, 256), P.maxActiveFetches),
   globalConcurrency: Math.min(numberEnv("MAX_ACTIVE_FETCHES", numberEnv("MAX_GLOBAL_CONCURRENCY", P.maxActiveFetches, 1, 256), 1, 256), P.maxActiveFetches),
@@ -5184,7 +5186,7 @@ const STATUS_VAR_DEFS = [
   { group: "Frontend / CORS", key: "frontendOrigin", label: "Allowed frontend origin(s)", kind: "csv", names: ["FRONTEND_ORIGIN"], fallback: ["*"] },
   { group: "Frontend / CORS", key: "publicApiOrigin", label: "Public API origin (for rewritten pages)", kind: "string", names: ["PUBLIC_API_ORIGIN"], fallback: "" },
   { group: "Frontend / CORS", key: "userAgent", label: "Crawler user agent", kind: "string", names: ["VEYRA_USER_AGENT"], fallback: "VeyraBrowseCrawler/8.0 (+https://github.com/)" },
-  { group: "Crawler concurrency", key: "logicalRobots", label: "Logical crawler robots", kind: "number", names: ["CRAWLER_ROBOTS"], fallback: 10000, min: 1, max: 10000 },
+  { group: "Crawler concurrency", key: "logicalRobots", label: "Logical crawler robots", kind: "number", names: ["CRAWLER_ROBOTS"], fallback: 12000, min: 1, max: 20000 },
   { group: "Robot mesh", key: "robotWorksetSize", label: "Robot workset size", kind: "number", names: ["ROBOT_WORKSET_SIZE"], fallback: 10000, min: 8, max: 10000 },
   { group: "Robot mesh", key: "robotQueueCapacity", label: "Robot local queue capacity", kind: "number", names: ["ROBOT_QUEUE_CAPACITY"], fallback: 8, min: 2, max: 32 },
   { group: "Robot mesh", key: "robotStealBatch", label: "Help steal batch", kind: "number", names: ["ROBOT_STEAL_BATCH"], fallback: 4, min: 1, max: 8 },
