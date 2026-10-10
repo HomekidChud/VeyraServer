@@ -2,6 +2,8 @@
 
 This is a **best-effort Android phone setup**, not guaranteed 24/7 compute. Android can stop background apps, and continuous CPU use can heat the phone and drain or age its battery. The training loop is a synthetic maze simulation; it is not LLM/foundation-model training and it does not gather internet or personal data.
 
+**Secret warning:** if you pasted a real `VEYRA_AUTH_SECRET` into a message, screenshot, or shared log, consider it exposed. Generate a new one on the phone and replace it in the private env file before running the server. Do not send the new value to anyone.
+
 ## 1. Repair the package error shown in the log
 
 The failure is in `python-scipy`'s post-install step from the enabled TUR package source. It is not a Veyra or Node error. Veyra is a Node project and does not need SciPy. TUR is an additional, non-core Termux repository; do not use `sudo` or `systemctl` in Termux.
@@ -55,12 +57,12 @@ The browser engine is disabled for this phone profile, so there is no need to in
 
 ## 3. Configure private local checkpoints and data capture
 
-Create a private data/config directory and generate an auth secret on the phone:
+Create a private data/config directory and generate a fresh auth secret on the phone:
 
 ```sh
-mkdir -p "$HOME/.config/veyra" "$HOME/.local/share/veyra/data" "$HOME/.local/share/veyra/agent-training"
-chmod 700 "$HOME/.config/veyra" "$HOME/.local/share/veyra" \
-  "$HOME/.local/share/veyra/data" "$HOME/.local/share/veyra/agent-training"
+mkdir -p "$HOME/.config/veyra" "$HOME/.local/share/veyra/data" "$HOME/.local/share/veyra/agent-training" "$HOME/.local/share/veyra/jobs"
+chmod 700 "$HOME/.config/veyra" "$HOME/.local/share/veyra" \\
+  "$HOME/.local/share/veyra/data" "$HOME/.local/share/veyra/agent-training" "$HOME/.local/share/veyra/jobs"
 openssl rand -hex 32
 nano "$HOME/.config/veyra/server.env"
 ```
@@ -72,6 +74,8 @@ export VEYRA_AUTH_SECRET='PASTE_THE_RANDOM_VALUE_HERE'
 export VEYRA_ADMIN_EMAILS='your-admin-email@example.com'
 export VEYRA_DATA_DIR="$HOME/.local/share/veyra/data"
 export VEYRA_AGENT_TRAINING_DIR="$HOME/.local/share/veyra/agent-training"
+export VEYRA_JOB_DIR="$HOME/.local/share/veyra/jobs"
+export INDEX_SNAPSHOT_PATH="$HOME/.local/share/veyra/search-index.json"
 export VEYRA_ENV='production'
 export VEYRA_AGENT_TRAINING_ENABLED='true'
 export VEYRA_AGENT_TRAINING_REQUIRE_MONGO='false'
@@ -84,7 +88,7 @@ export BROWSER_ENABLED='false'
 export PORT='10000'
 ```
 
-The correct admin setting is **`VEYRA_ADMIN_EMAILS`**, not `ADMIN_EMAILS`. `VEYRA_AGENT_TRAINING_REQUIRE_MONGO=false` is deliberate: on-device mode saves its checkpoint and generated experience locally and does not pause waiting for a MongoDB server. You do not need to set `MONGODB_URI` for this mode.
+The correct admin setting is **`VEYRA_ADMIN_EMAILS`**, not `ADMIN_EMAILS`. Save the lines in `nano` using **Ctrl+O**, Enter, then **Ctrl+X**; typing `export ...` at the shell prompt does not save them to the env file. `VEYRA_AGENT_TRAINING_REQUIRE_MONGO=false` is deliberate: on-device mode saves its checkpoint and generated experience locally and does not pause waiting for a MongoDB server. You do not need to set `MONGODB_URI` for this mode. `VEYRA_JOB_DIR` also avoids the Linux `/tmp/veyra-browse-jobs` path that caused `EACCES` on your phone; use the updated branch containing the fix.
 
 The local archive is `episodes.jsonl` in the training directory. It keeps the newest 500 episode records by default and at most 256 visible-observation/action/reward samples per episode. It excludes the hidden maze layout. The sample cap and episode cap prevent unbounded storage growth; raise them only if you have enough free storage. The archive is a reusable synthetic dataset, but the current rule-based policy does **not** learn neural-network weights from it automatically.
 

@@ -261,7 +261,7 @@ const CFG = Object.freeze({
   indexAiMaxPages: numberEnv("INDEX_AI_MAX_PAGES", 24, 1, 100),
   indexAiMaxDepth: numberEnv("INDEX_AI_MAX_DEPTH", 2, 0, 5),
   indexSnapshotEnabled: boolEnv("INDEX_SNAPSHOT_ENABLED", false),
-  indexSnapshotPath: process.env.INDEX_SNAPSHOT_PATH || "/tmp/veyra-search-index.json",
+  indexSnapshotPath: process.env.INDEX_SNAPSHOT_PATH || path.join(os.tmpdir(), "veyra-search-index.json"),
   processBrowserFallback: boolEnv("BROWSER_RENDER_FALLBACK", false),
   logLevel: enumEnv("SERVER_LOG_LEVEL", "info", ["error", "warn", "info", "debug"]),
   sortQueryParams: boolEnv("NORMALIZE_SORT_QUERY_PARAMS", false),
@@ -808,7 +808,7 @@ function recordRewriteFailure(url, mode, err) {
   if (rewriteFailures.length > 100) rewriteFailures.splice(0, rewriteFailures.length - 100);
   serverLog("error", "PROXY", `HTML/CSS/JS rewrite failed for ${url} (${mode}): ${err?.message || err} — served the page unrewritten instead of failing the request.`);
 }
-const ROOT = path.join("/tmp", "veyra-browse-jobs");
+const ROOT = path.resolve(process.env.VEYRA_JOB_DIR || path.join(os.tmpdir(), "veyra-browse-jobs"));
 fs.mkdirSync(ROOT, { recursive: true });
 
 const sourceStore = {
