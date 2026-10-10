@@ -426,7 +426,9 @@ const agentTraining = new AgentTrainingService({
   mongo: mongoStore,
   dataDir: process.env.VEYRA_AGENT_TRAINING_DIR || path.join(CFG.authDataDir, "agent-training"),
   tickMs: numberEnv("VEYRA_AGENT_TRAINING_TICK_MS", 350, 100, 5000),
+  checkpointEverySteps: numberEnv("VEYRA_AGENT_TRAINING_CHECKPOINT_STEPS", 20, 1, 1000),
   maxMazeSize: numberEnv("VEYRA_AGENT_TRAINING_MAX_MAZE", 21, 9, 31),
+  requireMongo: boolEnv("VEYRA_AGENT_TRAINING_REQUIRE_MONGO", String(process.env.VEYRA_ENV || "").toLowerCase() === "production"),
   enabled: boolEnv("VEYRA_AGENT_TRAINING_ENABLED", true),
   log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
 });
@@ -4324,7 +4326,7 @@ app.post('/api/search/answer', async (req, res) => {
 });
 app.get('/api/answer/status', (req, res) => res.json(aiAnswerEngine.report()));
 
-app.get('/api/assistant/status', (req, res) => res.json({ ok: true, available: true, mode: "local-keyless-prototype", externalApiKeyRequired: false, externalProviderUsed: false, execution: "local cooperative maze-training agents; bounded rule-based responses", contextPolicy: "Questions are processed locally; no external AI provider or page context is used.", training: "A cooperative simulation adapts bounded reward statistics; it does not train a foundation model and is not AGI.", feedback: assistantFeedbackStore.status() }));
+app.get('/api/assistant/status', (req, res) => res.json({ ok: true, available: true, mode: "server-keyless-prototype", externalApiKeyRequired: false, externalProviderUsed: false, execution: "server-side cooperative maze-training agents; bounded rule-based responses", contextPolicy: "Questions are processed by the Veyra Server; no external AI provider or page context is used.", training: "A cooperative simulation adapts bounded reward statistics; it does not train a foundation model and is not AGI.", feedback: assistantFeedbackStore.status() }));
 app.post('/api/assistant/ask', requireUser, async (req, res) => {
   try {
     const result = agentTraining.answerLocal(req.body?.question, req.veyraUser);

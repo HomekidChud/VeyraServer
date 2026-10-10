@@ -71,9 +71,11 @@ class AgentTrainingService {
     this.dataDir = options.dataDir || path.join(process.cwd(), "data", "agent-training");
     this.stateFile = path.join(this.dataDir, "checkpoint.json");
     this.tickMs = boundedInt(options.tickMs, 100, 5000, 350);
+    this.checkpointEverySteps = boundedInt(options.checkpointEverySteps, 1, 1000, 20);
     this.maxMazeSize = boundedInt(options.maxMazeSize, 9, 31, 21);
+    this.requireMongo = options.requireMongo === true;
     this.enabled = options.enabled !== false;
-    this.timer = null; this.persistBusy = false;
+    this.timer = null; this.persistBusy = false; this.waitLogged = false;
     this.startedAt = null;
     this.askRequests = new Map();
     this.state = {
@@ -82,7 +84,7 @@ class AgentTrainingService {
       policy: Object.fromEntries(ROLES.map(role => [role.id, { reward: 0, episodes: 0, mistakes: 0 }])),
       currentEpisode: null, events: [], savedToMongo: false
     };
-    this._loadLocal();
+    if (!this.requireMongo) this._loadLocal();
     if (!this.enabled) this.state.status = "paused";
   }
 
@@ -102,11 +104,27 @@ class AgentTrainingService {
 
   async start() {
     if (this.timer) return this.report();
-    this.enabled = true; this.startedAt ||= new Date().toISOString(); this.state.status = "running";
-    this._emit("system", "Keyless cooperative training loop started; agent actions are bounded to the maze sandbox.");
-    await this._loadMongo();
+    this.enabled = true; this.startedAt ||= new Date().toISOString();
+    const mongoReady = await this._loadMongo();
+    if (this.requireMongo && !mongoReady) { this._waitForMongo(); return this.report(); }
+    this.state.status = "running"; this.waitLogged = false;
+    this._emit("system", `Keyless cooperative training loop started; MongoDB persistence is ${this.requireMongo ? "required" : "preferred"}; agent actions are bounded to the maze sandbox.`);
     this._schedule(0);
     return this.report();
+  }
+
+  _waitForMongo() {
+    this.state.status = "waiting-for-mongodb";
+    if (!this.waitLogged) { this._emit("warning", "Training is paused until the configured MongoDB connection is available; production mode will not write local checkpoints."); this.waitLogged = true; }
+    clearTimeout(this.timer);
+    if (!this.enabled) return;
+    this.timer = setTimeout(async () => {
+      this.timer = null;
+      const ready = await this._loadMongo();
+      if (ready && this.enabled) { this.waitLogged = false; this.state.status = "running"; this._emit("system", "MongoDB is available; continuous training resumed."); this._schedule(0); }
+      else this._waitForMongo();
+    }, 30_000);
+    this.timer.unref?.();
   }
 
   pause() {
@@ -117,7 +135,7 @@ class AgentTrainingService {
   _schedule(delay = this.tickMs) {
     clearTimeout(this.timer);
     if (!this.enabled) return;
-    this.timer = setTimeout(() => { this.timer = null; this._step().catch(error => { this.state.status = "degraded"; this._emit("error", `Training step failed: ${error.message}`); }).finally(() => this._schedule()); }, delay);
+    this.timer = setTimeout(() => { this.timer = null; this._step().catch(error => { this.state.status = "degraded"; this._emit("error", `Training step failed: ${error.message}`); }).finally(() => { if (this.enabled && this.state.status !== "waiting-for-mongodb") this._schedule(); }); }, delay);
     this.timer.unref?.();
   }
 
@@ -194,6 +212,10 @@ class AgentTrainingService {
 
   async _step() {
     if (!this.enabled) return;
+    if (this.requireMongo && !this.mongo?.connected) {
+      if (!(await this._loadMongo())) { this._waitForMongo(); return; }
+      this.waitLogged = false;
+    }
     let ep = this.state.currentEpisode;
     if (!ep || ep.status !== "running") { ep = this._beginEpisode(); this.state.currentEpisode = ep; }
     ep.step += 1; ep.turns += 1; this.state.totalSteps += 1;
@@ -228,7 +250,7 @@ class AgentTrainingService {
     }
     if (ep.step >= ep.size * ep.size * 8 && ep.status === "running") { ep.status = "timeout"; ep.score -= 20; this._finishEpisode(ep, false); }
     this.state.status = this.enabled ? "running" : "paused";
-    if (ep.step % 4 === 0 || ep.status !== "running") void this._persist(false);
+    if (ep.step % this.checkpointEverySteps === 0 || ep.status !== "running") void this._persist(false);
   }
 
   _finishEpisode(ep, solved) {
@@ -247,13 +269,14 @@ class AgentTrainingService {
   }
 
   async _loadMongo() {
-    if (!this.mongo?.enabled) return;
+    if (!this.mongo?.enabled) return false;
     const loaded = await this.mongo.withDb(db => db.collection("agent_training_models").findOne({ id: MODEL_ID }, { projection: { _id: 0 } }));
     if (loaded?.state?.modelId === MODEL_ID) {
       const oldEvents = this.state.events;
       this.state = { ...this.state, ...loaded.state, events: [...(loaded.state.events || []), ...oldEvents].slice(-100), currentEpisode: null, status: this.enabled ? "running" : "paused", savedToMongo: true };
       this._emit("system", "Training policy and episode counters hydrated from MongoDB.");
     }
+    return !!this.mongo.connected;
   }
 
   async _persist(force) {
@@ -264,6 +287,16 @@ class AgentTrainingService {
       maze: undefined // Never persist hidden maze truth in a checkpoint; only the visible team observation is saved.
     } }));
     try {
+      if (this.requireMongo) {
+        if (!this.mongo?.enabled) { if (this.enabled) this.state.status = "waiting-for-mongodb"; return; }
+        const result = await this.mongo.withDb(async db => {
+          await db.collection("agent_training_models").updateOne({ id: MODEL_ID }, { $set: { id: MODEL_ID, state: snapshot, updatedAt: new Date() } }, { upsert: true });
+          return true;
+        });
+        this.state.savedToMongo = result === true;
+        if (result !== true && this.enabled) this.state.status = "waiting-for-mongodb";
+        return;
+      }
       fs.mkdirSync(this.dataDir, { recursive: true, mode: 0o700 });
       const temp = `${this.stateFile}.${process.pid}.tmp`;
       fs.writeFileSync(temp, `${JSON.stringify(snapshot)}\n`, { mode: 0o600 }); fs.renameSync(temp, this.stateFile);
@@ -293,10 +326,10 @@ class AgentTrainingService {
   report() {
     const ep = this.state.currentEpisode;
     return {
-      available: true, mode: "local-cooperative-training", modelId: MODEL_ID,
+      available: true, mode: "server-cooperative-training", modelId: MODEL_ID,
       externalApiKeyRequired: false, foundationModelTraining: false,
-      status: this.state.status, startedAt: this.startedAt, tickMs: this.tickMs,
-      persistence: { mongodbConfigured: !!this.mongo?.enabled, mongodbConnected: !!this.mongo?.connected, checkpointSavedToMongo: !!this.state.savedToMongo, localCheckpoint: this.stateFile },
+      status: this.state.status, startedAt: this.startedAt, tickMs: this.tickMs, checkpointEverySteps: this.checkpointEverySteps,
+      persistence: { mongodbConfigured: !!this.mongo?.enabled, mongodbRequired: this.requireMongo, mongodbConnected: !!this.mongo?.connected, checkpointSavedToMongo: !!this.state.savedToMongo, localCheckpoint: this.requireMongo ? false : this.stateFile },
       curriculum: { challenge: "cooperative-maze", difficulty: ep ? ep.size : Math.min(this.maxMazeSize, 9 + 2 * Math.min(6, Math.floor(this.state.episodes / 4))), maxDifficulty: this.maxMazeSize, agents: ROLES.map(({ id, name, task }) => ({ id, name, task })), coordination: "shared verified map messages; scout, mapper, coordinator" },
       counters: { episodes: this.state.episodes, successfulEpisodes: this.state.successfulEpisodes, successRate: this.state.episodes ? Math.round(this.state.successfulEpisodes / this.state.episodes * 1000) / 10 : 0, totalSteps: this.state.totalSteps, sanctions: this.state.totalSanctions, lastScore: this.state.lastScore, bestScore: this.state.bestScore },
       policy: this.state.policy,
@@ -316,15 +349,15 @@ class AgentTrainingService {
     const stats = this.report();
     const trainingIntent = /train|maze|agent|episode|progress|punish|sanction|cheat/i.test(text);
     const answer = trainingIntent
-      ? `I am Veyra Assistance running as three local rule-driven roles—Scout, Mapper, and Coordinator—with no external model API or API key. The server is currently ${stats.status}; ${stats.counters.episodes} maze episodes have completed, ${stats.counters.successfulEpisodes} were solved (${stats.counters.successRate}% success), across ${stats.counters.totalSteps} steps. The policy updates bounded reward statistics from outcomes; it does not train a foundation model. Invalid actions are blocked and receive a reward penalty plus a short cooldown. This is a cooperative simulation, not AGI.`
-      : "I am the local Veyra Assistance prototype. I can report on the cooperative maze-training system, its agents, safety checks, and progress, but I do not yet have a general-purpose language model for open-ended questions. Your question was processed locally and was not sent to an external AI provider.";
+      ? `I am Veyra Assistance running on the Veyra Server as three rule-driven roles—Scout, Mapper, and Coordinator—with no external model API or API key. The server is currently ${stats.status}; ${stats.counters.episodes} maze episodes have completed, ${stats.counters.successfulEpisodes} were solved (${stats.counters.successRate}% success), across ${stats.counters.totalSteps} steps. The policy updates bounded reward statistics from outcomes; it does not train a foundation model. Invalid actions are blocked and receive a reward penalty plus a short cooldown. This is a cooperative simulation, not AGI.`
+      : "I am the server-side Veyra Assistance prototype. I can report on the cooperative maze-training system, its agents, safety checks, and progress, but I do not yet have a general-purpose language model for open-ended questions. Your question was processed by the Veyra Server and was not sent to an external AI provider.";
     return {
       taskId: crypto.randomUUID(), answer,
-      caveats: ["This local prototype is not AGI and does not perform foundation-model training.", "No external AI API was called; the question and answer are not retained by this endpoint."],
+      caveats: ["This server-side prototype is not AGI and does not perform foundation-model training.", "No external AI API was called; the question and answer are not retained by this endpoint."],
       nextSteps: trainingIntent ? ["Open Admin panel → Agent training for the live maze, team messages, rewards, and safe sanctions."] : ["Ask about the current maze challenge or the training system; broader assistant capabilities are not implemented yet."],
-      evidenceStatus: "local-training-state", context: { included: false, automaticPageAccess: false, externalProvider: false },
-      workflow: { pattern: "local-bounded-agent-workflow", agents: ROLES.map(agent => ({ id: agent.id, role: agent.name, status: "ready" })) },
-      mode: "local-keyless-prototype"
+      evidenceStatus: "server-training-state", context: { included: false, automaticPageAccess: false, externalProvider: false },
+      workflow: { pattern: "server-bounded-agent-workflow", agents: ROLES.map(agent => ({ id: agent.id, role: agent.name, status: "ready" })) },
+      mode: "server-keyless-prototype"
     };
   }
 

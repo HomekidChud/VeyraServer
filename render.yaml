@@ -50,6 +50,12 @@ services:
       # Secrets — set these in the Render dashboard, never in git:
       # VEYRA_ADMIN_TOKEN, VPN_PROFILES_JSON, VPN_WIREGUARD_CONFIG_B64
       # Optional durable MongoDB persistence/cache. Set MONGODB_URI in Render.
+      - key: VEYRA_AGENT_TRAINING_ENABLED
+        value: "true"
+      - key: VEYRA_AGENT_TRAINING_REQUIRE_MONGO
+        value: "true"
+      - key: VEYRA_AGENT_TRAINING_CHECKPOINT_STEPS
+        value: "20"
       - key: MONGODB_URI
         sync: false
       # 8.16: Veyra Shield level (low | medium | high | under_attack).

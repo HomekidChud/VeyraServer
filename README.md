@@ -1,9 +1,9 @@
 
-## Veyra Assistance — local agent-training prototype
+## Veyra Assistance — server agent-training prototype
 
 - Runs a keyless cooperative maze simulation with Scout, Mapper, and Coordinator roles; admin panel exposes live maps, messages, rewards, sanctions, and pause/resume controls.
-- The local user-facing Assistant is intentionally limited to training status and related questions. No external model API is called. The policy reward updates are not foundation-model training; this prototype is not AGI.
-- MongoDB persistence uses the existing `MONGODB_URI` configuration; protected local checkpoints are the fallback. Configure an always-on server process and Mongo URI for continuous durable production training.
+- The user-facing Assistant is intentionally limited to training status and related questions. No external model API is called. The policy reward updates are not foundation-model training; this prototype is not AGI.
+- Render strict mode requires MongoDB, never falls back to local files, and pauses if Mongo is unavailable. Development may use protected checkpoints. The repository blueprint requests a paid Render `pro` plan; the currently observed live service is `free`, which sleeps after idle and cannot train 24/7 until upgraded.
 - See [`docs/AGENT_TRAINING.md`](docs/AGENT_TRAINING.md) for safety boundaries, configuration, persistence, admin endpoints, and known limitations.
 
 ## 8.17.1 compatibility hardening

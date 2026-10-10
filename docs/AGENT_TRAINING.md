@@ -1,26 +1,28 @@
-# Veyra Assistance — Local Agent Training Prototype
+# Veyra Assistance — Server Agent Training Prototype
 
 ## What it is
 
-Veyra Assistance now has a local, keyless cooperative-training path. The Veyra Server process runs three bounded rule-driven roles—**Scout**, **Mapper**, and **Coordinator**—through generated mazes. They share verified map observations and team messages, collect objectives, and attempt to reach the exit. Difficulty increases gradually within a configured maze-size limit.
+Veyra Assistance has a server-side, keyless cooperative-training path. The Veyra Server process runs three rule-driven roles—**Scout**, **Mapper**, and **Coordinator**—through generated mazes. They share verified map observations and team messages, collect objectives, and attempt to reach the exit. Difficulty increases gradually within a configured maze-size limit.
 
 This is a software-agent simulation with bounded reward-statistic updates. It is **not** a general-purpose language model, foundation-model training, or AGI. The environment does not execute agent-generated programs, access user browser sessions, make network calls on the agents' behalf, or expose host files to maze agents. The public Assistant endpoint handles questions locally and honestly states when a question is outside its limited domain. It does not call an external model API, even when provider credentials happen to exist in the server environment.
 
 ## Continuous training loop
 
-The training loop starts with the main server process by default and pauses when that process exits. It does not keep a hosting provider awake, survive host suspension, or run after deployment shutdown. For uninterrupted operation, deploy Veyra Server on an always-on service/worker and configure its platform to restart the process after failure. Do not start a second training loop per worker replica unless shared coordination or a single-leader lock is added; the current design is one loop per server process.
+The training loop starts with the main server process by default and pauses when that process exits. Render free web services spin down after 15 minutes without inbound traffic and are not suitable for 24/7 training. The current Render blueprint specifies the paid `pro` compute plan (2 CPU / 4 GB RAM); the live VeyraServer service was observed on Render's `free` plan, so the blueprint and service are not yet aligned. Paid compute is required for the stated always-on goal. Do not start a second training loop per worker replica unless shared coordination or a single-leader lock is added; the current design is one loop per server process.
 
 Configuration:
 
 | Environment variable | Default | Purpose |
 |---|---:|---|
-| `VEYRA_AGENT_TRAINING_ENABLED` | `true` | Start the local training loop during main-server startup |
+| `VEYRA_AGENT_TRAINING_ENABLED` | `true` | Start the server training loop during main-server startup |
+| `VEYRA_AGENT_TRAINING_REQUIRE_MONGO` | `false` in development; `true` in Render blueprint | In strict mode, never read or write local checkpoints; pause training until MongoDB connects |
 | `VEYRA_AGENT_TRAINING_TICK_MS` | `350` | Delay between bounded simulation steps (clamped to 100–5000 ms) |
+| `VEYRA_AGENT_TRAINING_CHECKPOINT_STEPS` | `20` | Persist active state to Mongo every N steps; completed episodes are saved immediately |
 | `VEYRA_AGENT_TRAINING_MAX_MAZE` | `21` | Maximum odd maze side length (clamped to 9–31) |
-| `VEYRA_AGENT_TRAINING_DIR` | `<authDataDir>/agent-training` | Protected local checkpoint fallback directory |
+| `VEYRA_AGENT_TRAINING_DIR` | `<authDataDir>/agent-training` | Protected development-only checkpoint fallback when MongoDB is not required |
 | `MONGODB_URI` / `MONGODB_DB` | unset / `veyra` | Existing Veyra MongoDB connection configuration |
 
-The server maintains a local checkpoint regardless of MongoDB availability. If `MONGODB_URI` is configured and the existing Mongo adapter connects, Veyra stores the bounded policy/counters in `agent_training_models` and completed episode summaries in `agent_training_episodes`. Mongo persistence failures are logged; local checkpoint persistence remains the fallback. Configure a durable MongoDB URI in the deployment environment to meet the Mongo persistence requirement. No URI was configured in the development environment used for this code change, so live Mongo persistence was not exercised here.
+In Render production, `VEYRA_AGENT_TRAINING_REQUIRE_MONGO=true`: Veyra reads/writes the policy, counters, visible episode checkpoint, and completed summaries through the existing Mongo adapter, using `agent_training_models` and `agent_training_episodes`. On connection loss, the training loop pauses and retries; it never silently falls back to Render's ephemeral filesystem. Development can use a protected local checkpoint when strict Mongo mode is off. Render logs from the existing deployment confirm that Veyra's application Mongo database is configured and existing data hydrates successfully; the new agent-training collections still require a post-deployment write/read check.
 
 The visible maze observations are checkpointed; hidden maze truth is intentionally omitted from the live checkpoint. Completed summaries store scores, difficulty, outcomes, agent counters, and sanitized team messages—not full hidden solutions.
 

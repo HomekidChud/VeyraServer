@@ -25,7 +25,7 @@ Store listings intentionally do **not** display invented ratings or download tot
 ### Use Veyra Assistant
 
 1. Sign in and open **Veyra Assistance** from the browser menu or `/assistant` route.
-2. Ask about the local agent-training system. Questions are processed locally; the Assistant endpoint does not call an external model provider or require an API key.
+2. Ask about the server-side agent-training system. Questions are processed by Veyra Server; the Assistant endpoint does not call an external model provider or require an API key.
 3. Review the answer and caveats. The bounded roles report from training state; this prototype is not a general-purpose language model or AGI.
 4. Optional feedback is not retained for human review unless the separate training-consent switch is enabled.
 
@@ -134,8 +134,8 @@ All write endpoints use bearer authentication. Reviewer and audit endpoints requ
 | `POST` | `/api/extensions/reviews/:id/decision` | Admin | Approve or reject; reviewer must differ from publisher |
 | `POST` | `/api/extensions/reviews/:id/publish` | Admin | Publish an approved, passing package |
 | `GET` | `/api/extensions/audit` | Admin | Read audit events |
-| `GET` | `/api/assistant/status` | No | Report the active local, keyless Assistant mode |
-| `POST` | `/api/assistant/ask` | User | Ask the bounded local Veyra Assistance prototype; no external AI call |
+| `GET` | `/api/assistant/status` | No | Report the active server-side, keyless Assistant mode |
+| `POST` | `/api/assistant/ask` | User | Ask the bounded server-side Veyra Assistance prototype; no external AI call |
 | `POST` | `/api/assistant/feedback` | User | Submit optional feedback; content is retained only with explicit training consent |
 | `GET` | `/api/admin/agent-training` | Admin | Read sanitized live maze observations, counters, and events |
 | `POST` | `/api/admin/agent-training/control` | Admin | Pause or resume the bounded training worker |
@@ -146,9 +146,9 @@ All write endpoints use bearer authentication. Reviewer and audit endpoints requ
 { "question": "How are the maze agents progressing?" }
 ```
 
-The active local endpoint reads only `question`, ignores any supplied page context, applies a per-user in-process rate limit, and does not call the legacy provider-backed Assistant implementation. The browser UI does not offer page-context sharing in this mode.
+The active server endpoint reads only `question`, ignores any supplied page context, applies a per-user in-process rate limit, and does not call the legacy provider-backed Assistant implementation. The browser UI does not offer page-context sharing in this mode.
 
-The response contains a local status answer, limitations, suggested next steps, evidence status, and role labels—not hidden reasoning, system prompts, or fabricated model-training claims.
+The response contains a server-state answer, limitations, suggested next steps, evidence status, and role labels—not hidden reasoning, system prompts, or fabricated model-training claims.
 
 ## 5. Deployment and operations
 
@@ -170,32 +170,34 @@ The response contains a local status answer, limitations, suggested next steps, 
 
 Configure and test trusted publisher public keys in staging. Executable packages are rejected when no matching trusted key exists. Built-in catalog items are maintained source artifacts and are statically validated on read.
 
-### Veyra Assistance and local agent training
+### Veyra Assistance and server agent training
 
-The active Assistant path is local and keyless. The public ask endpoint does not call the legacy provider-backed class and ignores page context; model API credentials are not required or used by this path. The training worker is a bounded cooperative maze simulation with reward-statistic updates, not foundation-model training or AGI. See [`AGENT_TRAINING.md`](AGENT_TRAINING.md) for the full operational and safety contract.
+The active Assistant path is server-side and keyless. The public ask endpoint does not call the legacy provider-backed class and ignores page context; model API credentials are not required or used by this path. The training worker is a bounded cooperative maze simulation with reward-statistic updates, not foundation-model training or AGI. See [`AGENT_TRAINING.md`](AGENT_TRAINING.md) for the full operational and safety contract.
 
 | Variable | Default | Meaning |
 |---|---:|---|
 | `VEYRA_AGENT_TRAINING_ENABLED` | `true` | Start the training worker with the main server process |
+| `VEYRA_AGENT_TRAINING_REQUIRE_MONGO` | `false` in development; `true` in Render | Forbid local checkpoints and pause until MongoDB is connected |
 | `VEYRA_AGENT_TRAINING_TICK_MS` | `350` | Simulation tick delay, clamped to 100–5000 ms |
+| `VEYRA_AGENT_TRAINING_CHECKPOINT_STEPS` | `20` | Persist active state every N steps; completed episodes persist immediately |
 | `VEYRA_AGENT_TRAINING_MAX_MAZE` | `21` | Maximum maze side length, clamped to 9–31 |
-| `VEYRA_AGENT_TRAINING_DIR` | `${VEYRA_DATA_DIR}/agent-training` | Local checkpoint fallback |
+| `VEYRA_AGENT_TRAINING_DIR` | `${VEYRA_DATA_DIR}/agent-training` | Development-only local checkpoint fallback when MongoDB is not required |
 | `MONGODB_URI` / `MONGODB_DB` | unset / `veyra` | Existing Mongo connection; stores model counters and completed episode summaries when configured |
 | `VEYRA_ASSISTANT_DATA_DIR` | `${VEYRA_DATA_DIR}/assistant` | Opt-in feedback review queue location |
 | `VEYRA_ASSISTANT_FEEDBACK_RETENTION_MS` | 30 days | Feedback retention, bounded to 1–365 days |
 
-For continuous production training, keep the server process running on an always-on service/worker. Local checkpoints are written even when MongoDB is unavailable; set a durable `MONGODB_URI` to persist the training policy and episode summaries to MongoDB. This process-level loop does not prevent a host from suspending or terminating the deployment.
+Render's repository blueprint sets `VEYRA_AGENT_TRAINING_REQUIRE_MONGO=true`, `MONGODB_URI` as a dashboard secret, and a paid `pro` plan. Strict production mode stores state in MongoDB and pauses/retries during database outages rather than writing local files. The Render API reported the existing `VeyraServer` web service on the `free` plan; Free Render web services sleep after 15 minutes without incoming traffic, so they cannot meet the continuous-training requirement. Upgrade the actual service compute plan before expecting 24/7 operation; the paid `pro` blueprint maps to 2 CPU / 4 GB RAM.
 
 ### Rollout checklist
 
 1. Deploy to staging with trusted signing keys configured; test a CSS package and a signed executable package through all lifecycle states.
 2. Verify archives, unsigned code, wildcard executable scopes, and blocked remote CSS are rejected.
 3. Confirm reviewers inspect every JS file and scanner warning, and that the publisher cannot review their own submission.
-4. Verify the local Assistant status/ask routes and administrator authorization for live-training and pause/resume endpoints.
-5. Confirm whether MongoDB is configured; exercise the local checkpoint fallback and, in staging, the Mongo training collections.
+4. Verify the keyless server-side Assistant routes and administrator authorization for live-training and pause/resume endpoints.
+5. On Render, confirm MongoDB connection status through sanitized training telemetry and verify that strict mode never creates a local checkpoint.
 6. Enable monitoring for `STORE`, `ASSISTANT`, and `AGENT_TRAINING` log components.
 7. Back up the protected data directory and rehearse restore procedures.
-8. Promote as a **reviewed executable Store with explicit per-device install consent** and **local keyless Assistant prototype**.
+8. Promote as a **reviewed executable Store with explicit per-device install consent** and **keyless server-side Assistant prototype**.
 
 ## 6. Security design
 
@@ -219,7 +221,7 @@ Content scripts still execute in the visited page's JavaScript context. Review t
 - Page-derived context is not collected automatically. Context must be pasted and explicitly approved.
 - The active endpoint reads only the question field; it ignores page-context fields and contacts no external model.
 - No browser automation, browser-session access, credentials, cookies, or account data is made available to agents.
-- Per-user request and input-size limits reduce abuse. The bounded local training loop is independent from open-ended Assistant prompts.
+- Per-user request and input-size limits reduce abuse. The bounded server training loop is independent from open-ended Assistant prompts.
 - Opt-in feedback is stored for time-limited **human review** only. It does **not** automatically train, fine-tune, or modify a model.
 
 ## 7. Versioning and release notes
@@ -232,7 +234,7 @@ Maintain semantic versioning for each repository. This upgrade should be recorde
 - Quarantined CSS and signed executable v2 package lifecycle with audit history and per-device consent.
 - HTTPS-scoped content scripts plus a restrictive background iframe with extension-local storage.
 - SHA-256 integrity metadata, static security scan metadata, and optional Ed25519 trusted-publisher verification.
-- Keyless local Veyra Assistance prototype and a bounded cooperative maze training loop with live administrator monitoring.
+- Keyless server-side Veyra Assistance prototype and a bounded cooperative maze training loop with live administrator monitoring.
 - Explicit opt-in feedback queue with retention and human-review-only policy.
 
 **Changed**
