@@ -34,13 +34,13 @@ The live diagnostic command made one bounded request per endpoint; see `NETWORK_
 
 `npm run benchmark:search` compared the original Git revision (`59286f0150ee7532c44cf141ac5703a0aba99c57`) with the upgraded orchestrator over seven cold-cache runs. Three mocked providers each waited 60 ms; the first two returned empty responses and Brave returned one result. Both versions made 3 requests and returned 1 result. Latest baseline median/p95-nearest-rank: **183.2/190.4 ms**. Upgraded: **61.6/63 ms**. This reproducible mock-only measurement demonstrates orchestration scheduling behavior; it is not real-network latency or production throughput.
 
-A final single live Veyra route smoke on `/api/search/web` with Bing HTML mode returned HTTP 200 and 10 results; route time was **2,663 ms**, provider latency **2,661 ms**. This is one request, not an uptime or real performance benchmark; see `NETWORK_DIAGNOSTICS.md`.
+A final single live Veyra route smoke on `/api/search/web` with Bing HTML mode returned HTTP 200 and 10 results; route time was **2,663 ms**, provider latency **2,661 ms**. A one-page `https://en.wikipedia.org/wiki/Main_Page` crawl through `/api/robots/crawl` (one-page cap; robots respected; Chromium/Mongo disabled) returned HTTP 200 with zero errors: **240 ms** page fetch/parse, **301 ms** total route time, **252,676 bytes**, 79 links and 5,000 extracted text characters. These are single-sample sandbox timings, not a load test or deployed-site response times; see `NETWORK_DIAGNOSTICS.md`.
 
 ## Not verified / remaining limitations
 
-- No real-network baseline-vs-upgrade search/crawl benchmark, labelled ranking evaluation, throughput/latency comparison, memory stress run or deployment test; only the mock orchestration microbenchmark above was run.
+- No multi-run real-network baseline-vs-upgrade search/crawl benchmark, labelled ranking evaluation, throughput/latency comparison, memory stress run or deployment test; the one Bing request and one Wikipedia page crawl are smoke checks only, alongside the mock orchestration microbenchmark above.
 - No live MongoDB integration test; persistent-cache survival was tested through a deterministic storage adapter. Persistence remains optional.
-- Only one live Veyra Bing HTML search route request was run; no provider API credentials/quota check, external-provider-backed answer route or public-site crawl beyond the bounded diagnostics and this one search call was performed.
+- Only one live Veyra Bing HTML search route request and one public Wikipedia page crawl were run; no provider API credential/quota check, external-provider-backed answer route or multi-page site crawl was performed.
 - DNS pinning and mixed public/private socket-answer tests passed; no exhaustive concurrent DNS-rebinding race campaign was conducted.
 - No real YouTube playback, transcript, caption or private/age/region-restricted playback validation. oEmbed remains metadata/embeddability only.
 - `src/services/neural-search.js` remains a separate implementation; the production answer path now combines the existing local Veyra index with the one live `websearch.js` orchestration path rather than importing the duplicate implementation.

@@ -25,6 +25,8 @@ At approximately 2026-10-10 18:19 +01:00, one separate bounded request exercised
 
 Observed result: **HTTP 200**, `ok: true`, **provider `bing`**, **10 results**, **2,663 ms** total route response, and **2,661 ms** provider-reported latency. The single-sample p50/p95 were both 2,661 ms. This confirms that one live Veyra route call returned results through this direct sandbox path. It is one sample only; it does not establish uptime, quality, deployment behavior, baseline speedup, or residential status. No `/api/search/answer` request fetched external pages during this smoke.
 
+At approximately 2026-10-10 18:32 +01:00, a one-page crawl of Wikipedia's public Main Page was run through the actual local Express `/api/robots/crawl` route (`maxPages: 1`, depth 1, query `Wikipedia main page`). The robot checked `robots.txt` before fetching; Chromium and Mongo persistence were disabled. Result: **HTTP 200**, one page fetched, zero crawler errors, page fetch/parse latency **240 ms**, total route wall time **301 ms**, **252,676 bytes** received, 79 links found, and 5,000 extracted text characters (the crawler's per-page extraction cap). These are sandbox single-sample results; they include neither a deployment round trip nor a multi-page/load test and do not represent repeatable network performance.
+
 ## Interpretation and repeatable command
 
 The direct IPv4/IPv6 service results, DNS answers, raw provider HTML checks and Veyra's actual configured route are separate tests. This run does not classify the connection as residential. The sandbox's observations should not be generalized to a deployment or a user's network.
