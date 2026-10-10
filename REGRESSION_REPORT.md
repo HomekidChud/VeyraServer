@@ -36,6 +36,13 @@ The live diagnostic command made one bounded request per endpoint; see `NETWORK_
 
 A final single live Veyra route smoke on `/api/search/web` with Bing HTML mode returned HTTP 200 and 10 results; route time was **2,663 ms**, provider latency **2,661 ms**. A one-page `https://en.wikipedia.org/wiki/Main_Page` crawl through `/api/robots/crawl` (one-page cap; robots respected; Chromium/Mongo disabled) returned HTTP 200 with zero errors: **240 ms** page fetch/parse, **301 ms** total route time, **252,676 bytes**, 79 links and 5,000 extracted text characters. These are single-sample sandbox timings, not a load test or deployed-site response times; see `NETWORK_DIAGNOSTICS.md`.
 
+## Console and source-view follow-up (2026-10-10)
+
+- `/console` now provides Overview, Logs and View Source tabs. Overview includes crawler/index state plus live provider health from `/api/search/diagnostics` and acquisition queue, cache, throughput, extraction and resource metrics from `/api/acquisition/status`. The existing admin authorization on the logs API is unchanged; diagnostics expose health counters, not provider credentials.
+- `POST /api/view-source` uses the existing `AcquisitionManager` fetch path and explicit public-address checks. Robots policy, redirect/DNS protections, a 15-second maximum request timeout and 1 MiB response bound apply. Only text document content types are accepted; URLs with credential/signature query parameters are rejected.
+- Source snapshots are held in memory for at most five minutes, capped at 100 entries and 8 MiB aggregate. The URI is `veyra://view_source/<144-bit-random-id>/<base64url-link>`; the final segment encodes the normalized source URL. Expired/invalid links return 404. The viewer presents fetched bytes as inert text (never inserts source HTML), emits a restrictive CSP and disables external resources. Browser-session navigation resolves the custom scheme internally with `page.setContent`, not an external network navigation.
+- `tests/source-view.test.js` covers URI validation/tampering, inert `</script>` handling, console/provider diagnostics UI script parsing, private and credential URL rejection, content-type rejection, bounded fetch options and local Express routes. The complete `npm test` after this follow-up passed; source verification reported 53 JavaScript files. Chromium remains opt-in and no dependency was added.
+
 ## Not verified / remaining limitations
 
 - No multi-run real-network baseline-vs-upgrade search/crawl benchmark, labelled ranking evaluation, throughput/latency comparison, memory stress run or deployment test; the one Bing request and one Wikipedia page crawl are smoke checks only, alongside the mock orchestration microbenchmark above.

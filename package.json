@@ -13,7 +13,7 @@
     "dev": "node --watch src/server.js",
     "config": "node src/config/index.js",
     "check": "node scripts/verify-source.js",
-    "test": "npm run check && node tests/auth.test.js && node tests/ai-answer.test.js && node tests/neural-crawler.test.js && node tests/proxy-rewrite.test.js && node tests/acquisition-manager.test.js && node tests/youtube.test.js && node tests/websearch.test.js && node tests/search-route.test.js && node tests/network-diagnostics.test.js",
+    "test": "npm run check && node tests/auth.test.js && node tests/ai-answer.test.js && node tests/neural-crawler.test.js && node tests/proxy-rewrite.test.js && node tests/acquisition-manager.test.js && node tests/youtube.test.js && node tests/websearch.test.js && node tests/search-route.test.js && node tests/source-view.test.js && node tests/network-diagnostics.test.js",
     "test:legacy": "node tests/legacy/fixed-bugs.js && node tests/legacy/vpn-fixes.js"
   },
   "engines": {

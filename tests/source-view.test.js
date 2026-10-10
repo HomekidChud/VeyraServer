@@ -1,0 +1,107 @@
+"use strict";
+const assert = require("assert");
+const { Script } = require("vm");
+const { createSourceViewerStore, parseSourceScheme, sourcePage } = require("../src/services/console-ui");
+
+(async () => {
+  const store = createSourceViewerStore({ maxEntries: 2, maxBytes: 64, ttlMs: 25 });
+  const first = store.create({ url: "https://example.test/a?x=1", text: "<p>first</p>", contentType: "text/html" });
+  assert.match(first.schemeUrl, /^veyra:\/\/view_source\/[A-Za-z0-9_-]{20,40}\/[A-Za-z0-9_-]+$/);
+  assert.deepEqual(parseSourceScheme(first.schemeUrl), { id: first.id, link: first.link, uri: first.schemeUrl });
+  assert.equal(parseSourceScheme("veyra://view_source/not-valid/path"), null);
+  assert.equal(parseSourceScheme(`${first.schemeUrl}?ignored=1`), null);
+  assert.equal(parseSourceScheme(first.schemeUrl.replace(`/${first.link}`, `//${first.link}`)), null);
+  assert.equal(store.get(first.id, `${first.link}tampered`), null);
+  assert.equal(store.get(first.id, first.link).text, "<p>first</p>");
+  const injected = store.create({ url: "https://example.test/x", text: "</script><script>alert('owned')</script>\nHello & <world>", contentType: "text/html" });
+  const html = sourcePage({ ...store.get(injected.id, injected.link), ...injected });
+  const sourceScript = html.match(/<script>([\s\S]*?)<\/script>/)?.[1];
+  assert.ok(sourceScript, "source viewer should contain its local script");
+  new Script(sourceScript);
+  assert.equal(html.includes("</script><script>alert('owned')"), false, "captured source must not escape the inline-script context");
+  assert.equal(html.includes("\\u003c/script"), true, "source must remain encoded in the inert document");
+  assert.equal(store.get(first.id, first.link), null, "aggregate retention budget should evict the oldest snapshot");
+  const expiryStore = createSourceViewerStore({ ttlMs: 5 });
+  const expiring = expiryStore.create({ url: "https://example.test/short-lived", text: "temporary" });
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(expiryStore.get(expiring.id, expiring.link), null, "source links should expire automatically");
+
+  for (const name of ["OPENAI_API_KEY", "OPENAI_API_BASE", "GOOGLE_SEARCH_API_KEY", "GOOGLE_API_KEY", "GOOGLE_SEARCH_CX", "GOOGLE_CSE_ID", "BRAVE_SEARCH_API_KEY", "BING_SEARCH_API_KEY"]) delete process.env[name];
+  process.env.VEYRA_CHROMIUM_ENABLED = "false";
+  process.env.INDEX_AI_FINDINGS = "false";
+  const { app, mongoStore } = require("../src/server");
+  mongoStore.enabled = false;
+  mongoStore.uri = "";
+  let fetches = 0;
+  let nextResponse = { ok: true, status: 200, contentType: "text/html; charset=utf-8", body: Buffer.from("<!doctype html><html><body><script>alert('owned')</script><h1>Fixture</h1></body></html>"), finalUrl: "https://fixture-source.test/page" };
+  app.locals.veyraSourceAssertPublic = async url => {
+    const host = new URL(url).hostname.toLowerCase();
+    if (host === "127.0.0.1" || host === "localhost") throw Object.assign(new Error("Private address blocked"), { code: "SSRF_BLOCKED", status: 403 });
+  };
+  app.locals.veyraSourceFetch = async (url, options) => {
+    fetches += 1;
+    assert.equal(options.engine, "view-source");
+    assert.equal(options.noCache, true);
+    assert.equal(options.maxBytes, 1024 * 1024);
+    if (url.includes("unsupported")) nextResponse = { ...nextResponse, contentType: "application/pdf" };
+    else nextResponse = { ...nextResponse, contentType: "text/html; charset=utf-8" };
+    return nextResponse;
+  };
+  const server = app.listen(0, "127.0.0.1");
+  try {
+    await new Promise((resolve, reject) => { server.once("listening", resolve); server.once("error", reject); });
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const consoleResponse = await fetch(`${base}/console`);
+    const consoleHtml = await consoleResponse.text();
+    assert.equal(consoleResponse.status, 200);
+    assert.match(consoleHtml, /data-page="overview"/);
+    assert.match(consoleHtml, /data-page="logs"/);
+    assert.match(consoleHtml, /data-page="source"/);
+    const consoleScripts = [...consoleHtml.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(match => match[1]);
+    assert.equal(consoleScripts.length, 2, "console should include dashboard and live diagnostics scripts");
+    consoleScripts.forEach(script => new Script(script));
+    assert.match(consoleHtml, /providerHealth/);
+    assert.match(consoleHtml, /acquisitionHealth/);
+    const diagnosticsResponse = await fetch(`${base}/api/search/diagnostics`);
+    const diagnostics = await diagnosticsResponse.json();
+    assert.equal(diagnosticsResponse.status, 200);
+    assert.equal(diagnostics.ok, true);
+    assert.ok(diagnostics.providers);
+    const response = await fetch(`${base}/api/view-source`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url: "https://fixture-source.test/page" }) });
+    const payload = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(payload.ok, true);
+    assert.match(payload.schemeUrl, /^veyra:\/\/view_source\//);
+    assert.equal(payload.url, "https://fixture-source.test/page");
+    assert.equal(payload.bytes > 0, true);
+    const parsed = parseSourceScheme(payload.schemeUrl);
+    assert.equal(parsed.id, payload.id);
+    assert.equal(Buffer.from(parsed.link, "base64url").toString("utf8"), payload.url);
+
+    const pageResponse = await fetch(`${base}${payload.webUrl}`);
+    const page = await pageResponse.text();
+    assert.equal(pageResponse.status, 200);
+    assert.match(pageResponse.headers.get("content-security-policy"), /default-src 'none'/);
+    assert.match(pageResponse.headers.get("x-content-type-options"), /nosniff/i);
+    assert.equal(page.includes("</script><script>alert('owned')"), false);
+    assert.equal(page.includes("<h1>Fixture</h1>"), false, "response HTML must be presented as source text, not interpreted markup");
+    assert.equal(page.includes("\\u003cscript\\u003ealert"), true);
+
+    const tampered = await fetch(`${base}/view_source/${payload.id}/${payload.link}x`);
+    assert.equal(tampered.status, 404);
+    const privateUrl = await fetch(`${base}/api/view-source`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url: "http://127.0.0.1/admin" }) });
+    assert.equal(privateUrl.status, 403);
+    const secretUrl = await fetch(`${base}/api/view-source`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url: "https://fixture-source.test/page?access_token=notshareable" }) });
+    assert.equal(secretUrl.status, 400);
+    assert.equal(fetches, 1, "invalid, private and credential-bearing targets must be rejected before fetching");
+
+    const badType = await fetch(`${base}/api/view-source`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ url: "https://fixture-source.test/unsupported" }) });
+    assert.equal(badType.status, 415);
+    assert.equal((await badType.json()).code, "SOURCE_CONTENT_TYPE_UNSUPPORTED");
+    console.log("Source-view store, custom URI, inert rendering and Express capture routes passed local integration tests");
+  } finally {
+    delete app.locals.veyraSourceFetch;
+    delete app.locals.veyraSourceAssertPublic;
+    await new Promise(resolve => server.close(resolve));
+  }
+})().catch(error => { console.error(error); process.exitCode = 1; });

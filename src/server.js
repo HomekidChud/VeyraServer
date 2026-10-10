@@ -32,6 +32,7 @@ const { RenewingManager } = require("./services/renewing-system");
 const fullPage = require("./browser/full-page.js");
 const { FailoverController } = require("./browser/browser-failover.js");
 const { SnapshotStore } = require("./browser/snapshot-store.js");
+const { createSourceViewerStore, parseSourceScheme, sourcePage, consolePage: renderConsolePage } = require("./services/console-ui");
 
 
 const IS_THREAD_WORKER = !isMainThread && process.env.VEYRA_THREAD_WORKER === "1";
@@ -42,6 +43,7 @@ const veyraConfigModule = require("./config");
 const VEYRA_CONFIG = veyraConfigModule.applyToProcessEnv(veyraConfigModule.loadConfig());
 
 const app = express();
+const sourceViewerStore = createSourceViewerStore({ maxEntries: 100, ttlMs: 5 * 60_000 });
 const PORT = numberEnv("PORT", 10000, 1, 65535);
 
 function numberEnv(name, fallback, min, max) {
@@ -1406,6 +1408,51 @@ const acquisitionManager = new AcquisitionManager({
   persistence: mongoStore,
 });
 app.get("/api/acquisition/status", (req, res) => res.json({ ok: true, chromiumEnabled: CFG.browserEnabled, ...acquisitionManager.report() }));
+
+const MAX_VIEW_SOURCE_BYTES = 1024 * 1024;
+function viewSourceUrlHasSecrets(value) {
+  try { return [...new URL(value).searchParams.keys()].some(name => /(?:token|secret|password|session|signature|credential|authorization|accesskey|api[_-]?key|(?:^|[_-])key(?:$|[_-])|(?:^|[_-])sig(?:$|[_-])|^(?:auth|code|jwt)$)/i.test(name)); }
+  catch { return true; }
+}
+app.post("/api/view-source", async (req, res) => {
+  try {
+    const target = normalizeUrl(String(req.body?.url || ""));
+    if (!target) return res.status(400).json({ ok: false, error: "A valid public HTTP(S) URL is required.", code: "INVALID_URL" });
+    if (target.length > 2048) return res.status(400).json({ ok: false, error: "Source URLs are limited to 2,048 characters.", code: "SOURCE_URL_TOO_LONG" });
+    if (viewSourceUrlHasSecrets(target)) return res.status(400).json({ ok: false, error: "URLs containing credential or signature parameters cannot be stored in a source link.", code: "SENSITIVE_URL" });
+    const assertPublicSourceUrl = app.locals.veyraSourceAssertPublic || acquisitionManager.assertPublicUrl;
+    await assertPublicSourceUrl(target);
+    const fetchSource = app.locals.veyraSourceFetch || ((url, options) => acquisitionManager.fetch(url, options));
+    const response = await fetchSource(target, {
+      engine: "view-source", timeoutMs: Math.min(CFG.requestTimeoutMs, 15000), maxBytes: MAX_VIEW_SOURCE_BYTES,
+      retries: 0, noCache: true, accept: "text/html,application/xhtml+xml,text/plain,text/css,application/json,application/xml,text/xml,application/javascript"
+    });
+    const finalUrl = normalizeUrl(response?.finalUrl || target);
+    if (!finalUrl || viewSourceUrlHasSecrets(finalUrl)) return res.status(400).json({ ok: false, error: "The final source URL is not eligible for a shareable Veyra source link.", code: "SENSITIVE_URL" });
+    if (finalUrl.length > 2048) return res.status(400).json({ ok: false, error: "The final source URL is too long for a Veyra link.", code: "SOURCE_URL_TOO_LONG" });
+    await assertPublicSourceUrl(finalUrl);
+    const contentType = String(response?.contentType || "application/octet-stream").toLowerCase();
+    if (!response?.ok) return res.status(502).json({ ok: false, error: "Source response was unavailable.", code: "SOURCE_FETCH_FAILED" });
+    if (!/(?:text\/(?:html|plain|css|xml|javascript)|application\/(?:xhtml\+xml|json|xml|javascript))\b/i.test(contentType)) {
+      return res.status(415).json({ ok: false, error: "Only text-based web documents can be viewed as source.", code: "SOURCE_CONTENT_TYPE_UNSUPPORTED" });
+    }
+    const body = Buffer.isBuffer(response.body) ? response.body : Buffer.from(String(response.body || ""), "utf8");
+    if (body.length > MAX_VIEW_SOURCE_BYTES) return res.status(413).json({ ok: false, error: "Source exceeds the 1 MiB limit.", code: "SOURCE_TOO_LARGE" });
+    const link = sourceViewerStore.create({ url: finalUrl, text: body.toString("utf8"), contentType, status: response.status || 200 });
+    res.set("Cache-Control", "no-store").json({ ok: true, ...link, bytes: body.length });
+  } catch (error) {
+    const status = Number(error?.status) >= 400 && Number(error?.status) < 500 ? Number(error.status) : 502;
+    res.status(status).json({ ok: false, error: String(error?.message || "Source capture failed.").slice(0, 300), code: /^[A-Z0-9_:-]{1,64}$/i.test(String(error?.code || "")) ? String(error.code) : "SOURCE_FETCH_FAILED" });
+  }
+});
+app.get("/view_source/:sourceId/:link", (req, res) => {
+  const entry = sourceViewerStore.get(req.params.sourceId, req.params.link);
+  if (!entry) return res.status(404).type("text").send("Source view not found or expired.");
+  res.set({
+    "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+  }).type("html").send(sourcePage(entry));
+});
 
 function cacheGet(map, key, ttl) {
   const item = map.get(key);
@@ -4223,7 +4270,23 @@ app.get('/api/browser/session/:sid', (req, res) => {
 app.post('/api/browser/session/:sid/navigate', async (req, res) => {
   try {
     const s = browserSessionOrThrow(req.params.sid);
-    const url = normalizeUrl(String(req.body?.url || ""));
+    const rawTarget = String(req.body?.url || "").trim();
+    const sourceRef = parseSourceScheme(rawTarget);
+    if (sourceRef) {
+      const entry = sourceViewerStore.get(sourceRef.id, sourceRef.link);
+      if (!entry) throw Object.assign(new Error("Source view not found or expired."), { code: "SOURCE_VIEW_NOT_FOUND", status: 404 });
+      s.status = "LOADING"; s.navigationActive = true; s.error = ""; s.verification = null; s.screenshot = null; s.lastUsed = Date.now();
+      try {
+        await s.page.setContent(sourcePage(entry), { waitUntil: "domcontentloaded" });
+        s.canonicalUrl = sourceRef.uri; s.title = `View Source — ${entry.url}`; s.status = "NORMAL";
+        await browserEngine.capture(s, true);
+      } catch (error) {
+        s.status = "ERROR"; s.error = String(error?.message || "Source viewer could not be rendered.").slice(0, 300);
+        throw error;
+      } finally { s.navigationActive = false; s.lastUsed = Date.now(); }
+      return res.json({ ok: true, session: browserEngine.public(s) });
+    }
+    const url = normalizeUrl(rawTarget);
     if (!url) throw Object.assign(new Error("Invalid browser URL."), { code: "INVALID_URL", status: 400 });
     await browserEngine.navigateSession(s, url, { fast: !!req.body?.fastStart });
     
@@ -4277,6 +4340,12 @@ app.get('/api/search', (req, res) => {
   } catch (e) { respondError(res, 500, e.message, "SEARCH_ERROR"); }
 });
 app.get('/api/search/stats', (req, res) => res.json({ ok: true, ...searchIndexStats() }));
+app.get('/api/search/diagnostics', (req, res) => {
+  try {
+    const service = app.locals.veyraWebSearch || webSearch;
+    res.set("Cache-Control", "no-store").json({ ok: true, ...(service.diagnostics?.() || {}) });
+  } catch (error) { respondError(res, 500, error.message, "SEARCH_DIAGNOSTICS_ERROR"); }
+});
 app.get('/api/search/suggest', (req, res) => {
   const q = String(req.query.q || "").trim().slice(0, CFG.maxSearchQueryChars);
   const limit = Math.min(12, Math.max(1, Number(req.query.limit || 8) || 8));
@@ -5933,10 +6002,7 @@ app.get("/status", (req, res, next) => {
 });
 app.get("/status", (req, res) => res.type("html").send(statusPage()));
 
-function consolePage() {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Veyra Console</title><style>body{margin:0;background:#0e1116;color:#e7edf5;font:13px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace}header{padding:16px 20px;border-bottom:1px solid #2a313b;position:sticky;top:0;background:#11151b}h1{font:700 18px system-ui;margin:0 0 8px}.bar{display:flex;gap:8px;flex-wrap:wrap}select,button{background:#1a2029;color:#dce5ef;border:1px solid #343d49;border-radius:7px;padding:7px 9px}main{padding:16px 20px}.log{display:grid;grid-template-columns:155px 72px 72px 1fr;gap:10px;padding:7px 8px;border-bottom:1px solid #181e26;white-space:pre-wrap;word-break:break-word}.SERVER{background:#121821}.BROWSER{background:#11171b}.err{color:#ff9f9f}.warn{color:#e9c36f}.info{color:#a9c8f0}.debug{color:#8f9aaa}@media(max-width:800px){.log{grid-template-columns:1fr}.log span{display:block}}</style></head><body><header><h1>Veyra — /console</h1><div class="bar"><select id="source"><option>all</option><option>browser</option><option>server</option></select><select id="level"><option>all</option><option>error</option><option>warn</option><option>info</option><option>debug</option></select><button id="refresh">Refresh</button><button id="auto">Auto: on</button></div></header><main id="log">Loading…</main><script>let on=true;async function load(){try{const s=document.getElementById('source').value,l=document.getElementById('level').value;const r=await fetch('/api/debug/logs?source='+encodeURIComponent(s)+'&level='+encodeURIComponent(l)+'&limit=500');const b=await r.json();document.getElementById('log').innerHTML=(b.logs||[]).map(x=>'<div class="log '+(x.source||'')+'"><span>'+esc(x.time||'')+'</span><span>'+esc(x.source||'')+'</span><span class="'+esc(x.level||'')+'">'+esc(x.level||'')+'</span><span>'+esc(x.message||'')+' '+esc(x.requestId||'')+'</span></div>').join('')||'<p>No logs.</p>'}catch(e){document.getElementById('log').textContent=e.message}}function esc(s){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]) )}document.getElementById('refresh').onclick=load;document.getElementById('source').onchange=load;document.getElementById('level').onchange=load;document.getElementById('auto').onclick=()=>{on=!on;document.getElementById('auto').textContent='Auto: '+(on?'on':'off')};load();setInterval(()=>on&&load(),2000);</script></body></html>`;
-}
-app.get("/console", (req, res) => res.type("html").send(consolePage()));
+app.get("/console", (req, res) => res.set("Cache-Control", "no-store").type("html").send(renderConsolePage()));
 
 
 
