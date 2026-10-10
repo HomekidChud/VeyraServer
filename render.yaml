@@ -4,7 +4,7 @@ services:
     name: VeyraServer
     runtime: node
     plan: pro
-    buildCommand: npm install && npx playwright install chromium && node scripts/install-wireproxy.js
+    buildCommand: npm install && node scripts/install-wireproxy.js
     startCommand: npm start
     healthCheckPath: /health
     envVars:
@@ -23,9 +23,11 @@ services:
         value: https://homekidchud.github.io
       - key: NODE_VERSION
         value: "20"
-      # Pro is sized for the real Chromium fallback and browser sessions.
+      # Chromium is an explicit opt-in; normal acquisition is direct HTTP/search-first.
       - key: BROWSER_ENABLED
-        value: "true"
+        value: "false"
+      - key: VEYRA_CHROMIUM_ENABLED
+        value: "false"
       - key: YT_FAST_PROXY_ONLY
         value: "false"
       # YouTube's speculative asset graph can starve foreground mobile loads.

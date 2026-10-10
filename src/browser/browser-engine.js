@@ -78,6 +78,9 @@ class BrowserEngine {
   }
 
   async ensureBrowser() {
+    if (this.cfg.browserEnabled === false) {
+      throw Object.assign(new Error('Chromium is disabled. Set VEYRA_CHROMIUM_ENABLED=true to opt in.'), { code: 'BROWSER_ENGINE_UNAVAILABLE' });
+    }
     if (this.browser) return this.browser;
     if (this.startPromise) return this.startPromise;
     this.startPromise = (async () => {

@@ -27,6 +27,7 @@ const { NeuralLearningWorker } = require("./services/neural-learning");
 const { ChallengeSolver } = require("./browser/challenge-solver");
 const { CastServer, InternetConnectionManager } = require("./network/cast-server");
 const { AIAnswerEngine } = require("./services/ai-answer");
+const { AcquisitionManager } = require("./services/acquisition-manager");
 const { RenewingManager } = require("./services/renewing-system");
 const fullPage = require("./browser/full-page.js");
 const { FailoverController } = require("./browser/browser-failover.js");
@@ -159,7 +160,7 @@ const CFG = Object.freeze({
   maxSrcsetCandidates: numberEnv("MAX_SRCSET_CANDIDATES", 100, 10, 500),
   browserMaxActiveFetches: Math.min(numberEnv("BROWSER_MAX_ACTIVE_FETCHES", P.browserMaxActiveFetches, 1, 64), P.browserMaxActiveFetches),
   browserPerHostConcurrency: numberEnv("BROWSER_PER_HOST_CONCURRENCY", 8, 1, 32),
-  browserEnabled: boolEnv("BROWSER_ENABLED", true),
+  browserEnabled: boolEnv("VEYRA_CHROMIUM_ENABLED", boolEnv("BROWSER_ENABLED", false)),
   browserHeadless: boolEnv("BROWSER_HEADLESS", true),
   maxBrowserSessions: Math.min(numberEnv("MAX_BROWSER_SESSIONS", P.browserSessions, 1, 16), P.browserSessions),
   maxBrowserPages: Math.min(numberEnv("MAX_BROWSER_PAGES", P.browserPages, 1, 32), P.browserPages),
@@ -1372,6 +1373,19 @@ const webSearch = createWebSearch({
   env: process.env,
   log: (level, source, message) => serverLog(level, source, message)
 });
+
+const acquisitionManager = new AcquisitionManager({
+  assertPublicUrl,
+  userAgent: CFG.userAgent,
+  timeoutMs: CFG.requestTimeoutMs,
+  maxBytes: CFG.maxProxyTextBytes,
+  maxRedirects: CFG.maxRedirects,
+  maxRetries: CFG.maxRetries,
+  perHostConcurrency: CFG.perHostConcurrency,
+  cacheTtlMs: CFG.mongoCacheTtlMs,
+  cacheMax: CFG.maxProxyCacheEntries,
+});
+app.get("/api/acquisition/status", (req, res) => res.json({ ok: true, chromiumEnabled: CFG.browserEnabled, ...acquisitionManager.report() }));
 
 function cacheGet(map, key, ttl) {
   const item = map.get(key);
@@ -4259,7 +4273,7 @@ function queueNeuralIndexFindings(query, sources = []) {
   }).catch(e => serverLog("warn", "SEARCH", `AI finding index crawl failed: ${e.message}`));
   while (aiIndexRuns.size > 1000) aiIndexRuns.delete(aiIndexRuns.keys().next().value);
 }
-const aiAnswerEngine = new AIAnswerEngine();
+const aiAnswerEngine = new AIAnswerEngine({ acquisitionManager });
 async function persistAIObservation(query, results, answer) {
   if (!mongoStore.enabled) return;
   const id = `ai_${Date.now().toString(36)}_${crypto.randomBytes(6).toString("hex")}`;
@@ -4276,8 +4290,13 @@ async function persistAIObservation(query, results, answer) {
 }
 app.post('/api/search/answer', async (req, res) => {
   try {
-    const { query, results } = req.body;
+    const { query } = req.body;
+    let { results } = req.body;
     if (!query) return res.json({ hasAnswer: false, reason: 'No query provided' });
+    if (!Array.isArray(results) || !results.length) {
+      const discovered = await acquisitionManager.searchFirst(String(query).slice(0, CFG.maxSearchQueryChars), (q, opts) => webSearch.search(q, opts), { limit: CFG.maxSearchResults });
+      results = discovered.pages.map(page => ({ url: page.url, title: page.title, snippet: page.text.slice(0, 600) }));
+    }
     const answer = await aiAnswerEngine.answer(query, results || []);
     void persistAIObservation(query, results || [], answer).catch(e => serverLog("warn", "AI", `AI observation persistence failed: ${e.message}`));
     if (answer.hasAnswer) queueNeuralIndexFindings(query, answer.sources || []);

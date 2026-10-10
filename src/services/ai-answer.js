@@ -89,6 +89,7 @@ class AIAnswerEngine {
     this.model = opts.model || process.env.AI_ANSWER_MODEL || "gpt-5-mini";
     this.llmTimeoutMs = opts.llmTimeoutMs || Number(process.env.AI_ANSWER_LLM_TIMEOUT_MS || 18000);
     this.allowExtractiveFallback = opts.allowExtractiveFallback ?? /^(1|true)$/i.test(String(process.env.AI_ANSWER_ALLOW_EXTRACTIVE_FALLBACK || ""));
+    this.acquisitionManager = opts.acquisitionManager || null;
   }
   async answer(query, searchResults = []) {
     const started = Date.now(), q = cleanText(query, 600);
@@ -136,7 +137,13 @@ class AIAnswerEngine {
   }
   extractSubject(q) { return String(q).replace(/^what\s+(is|are|was|were)\s+/i, "").replace(/^what\s+does\s+/i, "").replace(/\s+mean\??$/i, "").replace(/^what's\s+/i, "").replace(/^define\s+/i, "").replace(/^meaning\s+of\s+/i, "").replace(/\s+(meaning|definition)\??$/i, "").trim() || q; }
   async fetchContents(results) { return (await Promise.all(results.map(async r => { try { const content = await this.fetchPageContent(r.url); return content?.text?.length >= 80 ? { ...content, url: r.url, title: r.title || content.title, snippet: r.snippet, rank: r.rank, sourceIdentity: r.sourceIdentity } : null; } catch { return null; } }))).filter(Boolean); }
-  fetchPageContent(url) { return new Promise((resolve, reject) => { const u = new URL(url), lib = u.protocol === "https:" ? https : http; const req = lib.get(url, { headers: { "User-Agent": this.userAgent, Accept: "text/html,application/xhtml+xml,text/plain;q=0.8", "Accept-Encoding": "identity" }, timeout: this.timeoutMs }, res => { if (res.statusCode < 200 || res.statusCode >= 300) { res.resume(); reject(new Error(`HTTP ${res.statusCode}`)); return; } let data = "", done = false; res.setEncoding("utf8"); res.on("data", chunk => { if (done) return; data += chunk; if (data.length >= this.maxContentBytes) { done = true; res.destroy(); resolve(this.parseContent(data, url)); } }); res.on("end", () => { if (!done) resolve(this.parseContent(data, url)); }); res.on("error", reject); }); req.on("error", reject); req.on("timeout", () => req.destroy(new Error("Timeout"))); }); }
+  fetchPageContent(url) {
+    if (this.acquisitionManager) {
+      return this.acquisitionManager.fetch(url, { engine: "answer", maxBytes: this.maxContentBytes, timeoutMs: this.timeoutMs })
+        .then(result => this.parseContent(result.body, result.finalUrl || url));
+    }
+    return new Promise((resolve, reject) => { const u = new URL(url), lib = u.protocol === "https:" ? https : http; const req = lib.get(url, { headers: { "User-Agent": this.userAgent, Accept: "text/html,application/xhtml+xml,text/plain;q=0.8", "Accept-Encoding": "identity" }, timeout: this.timeoutMs }, res => { if (res.statusCode < 200 || res.statusCode >= 300) { res.resume(); reject(new Error(`HTTP ${res.statusCode}`)); return; } let data = "", done = false; res.setEncoding("utf8"); res.on("data", chunk => { if (done) return; data += chunk; if (data.length >= this.maxContentBytes) { done = true; res.destroy(); resolve(this.parseContent(data, url)); } }); res.on("end", () => { if (!done) resolve(this.parseContent(data, url)); }); res.on("error", reject); }); req.on("error", reject); req.on("timeout", () => req.destroy(new Error("Timeout"))); });
+  }
   parseContent(html, url) { return extractReadable(html, url); }
   buildEvidence(query, intent, contents, results) {
     const qTerms = terms(query), sTerms = terms(intent.subject || query), candidates = [...contents, ...results.filter(r => !contents.some(c => c.url === r.url) && r.snippet).map(r => ({ ...r, sentences: sentences(r.snippet), text: r.snippet, extractionQuality: 0.35 }))];

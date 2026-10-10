@@ -1,4 +1,14 @@
 
+## Acquisition defaults
+
+Veyra uses the shared `AcquisitionManager` for bounded direct HTTP retrieval, conditional validators, response caching, robots policy, search-first discovery, structured document parsing, and sitemap discovery. Chromium is retained for browser sessions but is **disabled by default**:
+
+```bash
+VEYRA_CHROMIUM_ENABLED=false
+```
+
+Set `VEYRA_CHROMIUM_ENABLED=true` only when browser rendering is explicitly required and Chromium is installed in the runtime image. The normal crawler, search, and answer paths do not launch or download Chromium. Operational status is available at `GET /api/acquisition/status`.
+
 ## 8.17.1 compatibility hardening
 
 - API proxy accepts `OPTIONS` in addition to the existing browser methods.
