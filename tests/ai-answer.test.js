@@ -172,7 +172,9 @@ assert.ok(Math.abs(restoredQualityLearner.predict(goodAnswerFeatures) - qualityL
   assert.equal(groqBody.model, "openai/gpt-oss-20b", "auto-selection should ignore inactive and non-chat models");
   assert.equal(groqBody.max_completion_tokens, 4000, "Groq should use its current max_completion_tokens field");
   assert.equal(groqBody.max_tokens, undefined);
-  assert.equal(groqBody.response_format, undefined);
+  assert.equal(groqBody.response_format.type, "json_schema", "Groq GPT-OSS should use its documented strict structured-output mode");
+  assert.equal(groqBody.response_format.json_schema.strict, true);
+  assert.equal(groqBody.include_reasoning, false, "GPT-OSS reasoning should not be mixed into the answer payload");
   assert.equal(groqEngine.report().model, "openai/gpt-oss-20b");
   const sparseEvidence = [
     { id: "S1", sourceIdentity: "roblox.com", title: "Roblox", url: "https://www.roblox.com/", matched: ["Roblox is the ultimate virtual universe that lets you create, share experiences with friends, and be anything you can imagine."], verificationSentences: ["Roblox is the ultimate virtual universe that lets you create, share experiences with friends, and be anything you can imagine."], documentText: "Roblox is the ultimate virtual universe that lets you create, share experiences with friends, and be anything you can imagine. Join a global community." },
@@ -189,11 +191,21 @@ assert.ok(Math.abs(restoredQualityLearner.predict(goodAnswerFeatures) - qualityL
   const sparseEngine = new AIAnswerEngine();
   const sparseResult = await sparseEngine.synthesizeWithLLM("Roblox", { type: "explore" }, sparseEvidence);
   assert.ok(sparseResult, "short grounded summaries should be accepted when evidence consists of search snippets");
-  assert.match(sparseRequest.messages[0].content, /1-3 sentences and 20-80 words/i, "sparse evidence should not be forced into a long overview");
+  assert.match(sparseRequest.messages[0].content, /1-3 sentences and 10-80 words/i, "sparse evidence should not be forced into a long overview");
   assert.match(sparseRequest.messages[0].content, /at least 2 independent sources/i, "sparse summaries should still use independent evidence");
   assert.deepEqual(sparseResult.sourceIds, ["S1", "S2", "S3"], "citations can supply source IDs when a compatible model omits optional JSON fields");
   assert.deepEqual(sparseResult.keyPoints, []);
   assert.equal(sparseEngine.verifyAnswer(sparseResult.answer, sparseEvidence).unsupported, 0, "the accepted short summary must still pass the factual grounding verifier");
+  clearAIEnv();
+  process.env.GROQ_API_KEY = "offline-groq-unauthorized-key";
+  global.fetch = async url => String(url) === "https://api.groq.com/openai/v1/models"
+    ? { ok: true, json: async () => ({ data: [{ id: "openai/gpt-oss-120b", active: true }] }) }
+    : { ok: false, status: 401 };
+  const rejectedGroq = await new AIAnswerEngine().answer("Roblox", sparseEvidence.map(source => ({ url: source.url, title: source.title, contentText: source.documentText })));
+  assert.equal(rejectedGroq.code, "SYNTHESIS_UNVERIFIED");
+  assert.equal(rejectedGroq.diagnosticCode, "http_401", "provider HTTP failures should be distinguishable from grounding rejection");
+  assert.match(rejectedGroq.reason, /HTTP 401/i);
+  assert.doesNotMatch(JSON.stringify(rejectedGroq), /offline-groq-unauthorized-key/, "failure diagnostics must never expose API-key values");
   global.fetch = savedFetch;
   restoreAIEnv();
 
