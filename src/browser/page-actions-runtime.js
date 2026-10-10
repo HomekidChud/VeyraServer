@@ -22,9 +22,18 @@ function pageActionsRuntime() {
       const response=await nativeFetch(endpoint,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url:virtualUrl})});
       let payload={};try{payload=await response.json()}catch{}
       if(!response.ok||!payload.ok)throw new Error(payload.error||'Source capture failed.');
-      const sourcePageUrl=new URL(payload.webUrl,origin).href;
-      emit('page.view-source',sourcePageUrl,{sourceUri:payload.schemeUrl,sourceTarget:virtualUrl});
+      emit('document-navigation',payload.schemeUrl,{sourceUri:payload.schemeUrl,sourceTarget:virtualUrl});
     }catch(error){veyraToast('View source failed: '+String(error&&error.message||error).slice(0,180))}
+  }
+  function veyraInspectPanel(el){
+    try{
+      const root=veyraEnsureActionHost();const previous=root.querySelector('.inspect-panel');if(previous)previous.remove();
+      const panel=document.createElement('section');panel.className='menu inspect-panel';panel.setAttribute('role','dialog');panel.setAttribute('aria-label','Veyra element inspector');panel.style.cssText='position:fixed;left:auto;right:12px;top:12px;width:min(440px,calc(100vw - 24px));max-height:calc(100vh - 24px);';
+      const heading=document.createElement('div');heading.style.cssText='font-weight:700;padding:8px 10px';heading.textContent='Veyra element inspector';panel.appendChild(heading);
+      const details=inspectData(el)||{};for(const [label,value] of [['Element',details.path||details.tag||'unknown'],['Text',String(el.innerText||el.textContent||'').trim().slice(0,1200)],['Outer HTML',String(details.outerHTML||el.outerHTML||'').slice(0,5000)],['Computed styles',JSON.stringify(details.styles||{},null,2)]]){const title=document.createElement('div');title.style.cssText='padding:6px 10px 2px;color:#9eb2ce;font-size:12px';title.textContent=label;const pre=document.createElement('pre');pre.style.cssText='white-space:pre-wrap;overflow-wrap:anywhere;max-height:180px;overflow:auto;margin:0 10px 6px;padding:8px;background:#0b1119;border-radius:6px;font:11px/1.45 ui-monospace,monospace';pre.textContent=value;panel.append(title,pre)}
+      const actions=document.createElement('div');actions.style.cssText='display:flex;gap:6px;padding:8px;flex-wrap:wrap';const add=(label,fn)=>{const button=document.createElement('button');button.type='button';button.textContent=label;button.addEventListener('click',fn);actions.appendChild(button)};add('Copy HTML',async()=>veyraToast(await veyraCopyText(details.outerHTML||el.outerHTML)?'Element HTML copied':'Could not copy HTML'));add('Copy selector',async()=>veyraToast(await veyraCopyText(details.path||'')?'Element selector copied':'Could not copy selector'));add('Close',()=>panel.remove());panel.appendChild(actions);root.appendChild(panel);el.scrollIntoView({block:'nearest',inline:'nearest'});try{el.style.outline='2px solid #77aaff';setTimeout(()=>el.style.removeProperty('outline'),3500)}catch{};
+      inspectSelected=el;inspectEmit('veyra:inspect-select',el);topPost({type:'veyra:inspect-state',enabled:false,sessionId:SESSION_ID,pageUrl:virtualUrl});
+    }catch(error){veyraToast('Inspect element failed: '+String(error&&error.message||error))}
   }
   function veyraActionElement(target){if(target&&target.nodeType===3)target=target.parentElement;return target instanceof Element?target:null}
   function veyraElementUrl(el,selector,attrs){try{const node=el&&el.closest?el.closest(selector):null;if(!node)return '';let raw='';for(const attr of attrs){raw=node[attr]||node.getAttribute(attr)||'';if(raw)break}return raw?canonicalizeMaybeProxy(raw):''}catch{return ''}}
@@ -32,18 +41,18 @@ function pageActionsRuntime() {
     if(!rootProxiedFrame())return;const el=veyraActionElement(target);if(!el)return;veyraActionOpenedAt=Date.now();veyraCloseActionMenu();const root=veyraEnsureActionHost();
     const selected=String(window.getSelection&&window.getSelection()||'').trim();
     const link=veyraElementUrl(el,'a[href],area[href]',['href']);
-    const image=veyraElementUrl(el,'img,source',['currentSrc','src','srcset']);
+    const image=veyraElementUrl(el,'img,source',['currentSrc','src']);
     const media=veyraElementUrl(el,'video,audio,source',['currentSrc','src']);
     const menu=document.createElement('div');menu.className='menu';menu.setAttribute('role','menu');menu.setAttribute('aria-label','Page actions');menu.style.left=Math.max(8,Math.min(Number(x)||8,innerWidth-250))+'px';menu.style.top=Math.max(8,Math.min(Number(y)||8,innerHeight-420))+'px';
     function item(label,run){const button=document.createElement('button');button.type='button';button.setAttribute('role','menuitem');button.textContent=label;button.addEventListener('click',async event=>{event.preventDefault();event.stopPropagation();veyraCloseActionMenu();try{await run()}catch(error){veyraToast(String(error&&error.message||error))}});menu.appendChild(button)}
     function divider(){const line=document.createElement('div');line.className='group';menu.appendChild(line)}
     if(selected)item('Copy selection',async()=>veyraToast(await veyraCopyText(selected)?'Selection copied':'Could not copy selection'));
-    if(link){item('Open link',()=>emit('contextmenu.open-link',link));item('Open link in new tab',()=>topPost({type:'veyra:open',url:link,sessionId:SESSION_ID}));item('Copy link',async()=>veyraToast(await veyraCopyText(link)?'Link copied':'Could not copy link'));divider()}
+    if(link){item('Open link',()=>emit('document-navigation',link));item('Open link in new tab',()=>topPost({type:'veyra:open',url:link,sessionId:SESSION_ID}));item('Copy link',async()=>veyraToast(await veyraCopyText(link)?'Link copied':'Could not copy link'));divider()}
     if(image){item('Open image in new tab',()=>topPost({type:'veyra:open',url:image,sessionId:SESSION_ID}));item('Copy image address',async()=>veyraToast(await veyraCopyText(image)?'Image address copied':'Could not copy image address'));divider()}
     if(media){item('Play / pause media',()=>{const node=el.closest('video,audio');if(node){if(node.paused)void node.play();else node.pause()}});item('Copy media address',async()=>veyraToast(await veyraCopyText(media)?'Media address copied':'Could not copy media address'));divider()}
     item('View page source  ·  Ctrl+U',veyraViewPageSource);
-    item('Inspect element',()=>{inspectSelected=el;inspectEmit('veyra:inspect-select',el);topPost({type:'veyra:inspect-state',enabled:false,sessionId:SESSION_ID,pageUrl:virtualUrl})});
-    item('Select all',()=>{try{document.execCommand('selectAll')}catch{}});item('Reload page',()=>emit('contextmenu.reload',virtualUrl));item('Back',()=>history.back());item('Forward',()=>history.forward());item('Print',()=>window.print());
+    item('Inspect element',()=>veyraInspectPanel(el));
+    item('Select all',()=>{try{const selection=window.getSelection(),range=document.createRange();range.selectNodeContents(document.body);selection.removeAllRanges();selection.addRange(range)}catch{try{document.execCommand('selectAll')}catch{}}});item('Reload page',()=>emit('document-navigation',virtualUrl,{reload:true}));item('Back',()=>history.back());item('Forward',()=>history.forward());item('Print',()=>window.print());
     root.appendChild(menu);veyraActionMenu=menu;requestAnimationFrame(()=>{const rect=menu.getBoundingClientRect();menu.style.left=Math.max(8,Math.min(Number(x)||8,innerWidth-rect.width-8))+'px';menu.style.top=Math.max(8,Math.min(Number(y)||8,innerHeight-rect.height-8))+'px'});
   }
   document.addEventListener('contextmenu',function(event){if(!rootProxiedFrame()||veyraEditingTarget(event.target))return;event.preventDefault();event.stopPropagation();veyraContextMenu(event.clientX,event.clientY,event.target)},true);

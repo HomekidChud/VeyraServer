@@ -37,6 +37,8 @@ The operations console now displays provider health and acquisition metrics thro
 
 The proxied-page runtime now maps `Ctrl+U`/`Cmd+U` to capture and open the current page source. Desktop right-click and mobile long-press show a Veyra page-actions menu (selection/link/media, source, inspect, select-all, reload/history and print). It is a page-level Veyra menu rather than a replica of browser-native chrome or full DevTools; the inspect action uses existing Veyra element metadata.
 
+The follow-up repair routes menu navigation through the existing Veyra browser message path and opens source with its `veyra://view_source/...` URI instead of displaying a Render hostname. Inspect Element opens an in-page details panel. The source viewer and console now display inline Veyra marks with a verified badge.
+
 The new `tests/source-view.test.js` covers route validation, tampering, content type, private-host rejection, source escaping, console UI scripts and the injected keyboard/touch runtime. The full suite passed on 2026-10-10 with 54 JavaScript files validated.
 
 ## Validation

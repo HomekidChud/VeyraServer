@@ -1,7 +1,8 @@
 "use strict";
 const assert = require("assert");
 const { Script } = require("vm");
-const { createSourceViewerStore, parseSourceScheme, sourcePage } = require("../src/services/console-ui");
+const { createSourceViewerStore, parseSourceScheme, sourcePage, consolePage } = require("../src/services/console-ui");
+const { pageActionsRuntime } = require("../src/browser/page-actions-runtime");
 
 (async () => {
   const store = createSourceViewerStore({ maxEntries: 2, maxBytes: 64, ttlMs: 25 });
@@ -20,6 +21,12 @@ const { createSourceViewerStore, parseSourceScheme, sourcePage } = require("../s
   new Script(sourceScript);
   assert.equal(html.includes("</script><script>alert('owned')"), false, "captured source must not escape the inline-script context");
   assert.equal(html.includes("\\u003c/script"), true, "source must remain encoded in the inert document");
+  assert.match(html, /VEYRA VERIFIED/);
+  assert.match(html, /veyra:\/\/view_source\//);
+  assert.match(html, /brandmark/);
+  const consoleMarkup = consolePage();
+  assert.match(consoleMarkup, /VEYRA VERIFIED/);
+  assert.match(consoleMarkup, /<svg/);
   assert.equal(store.get(first.id, first.link), null, "aggregate retention budget should evict the oldest snapshot");
   const expiryStore = createSourceViewerStore({ ttlMs: 5 });
   const expiring = expiryStore.create({ url: "https://example.test/short-lived", text: "temporary" });
@@ -38,6 +45,11 @@ const { createSourceViewerStore, parseSourceScheme, sourcePage } = require("../s
   new Script(pageRuntime);
   for (const capability of ["contextmenu", "touchstart", "View page source  ·  Ctrl+U", "Inspect element"]) assert.ok(pageRuntime.includes(capability), `missing page action: ${capability}`);
   assert.ok(pageRuntime.includes("key!=='u'"), "Ctrl+U should be handled locally inside the page frame");
+  assert.ok(pageRuntime.includes("emit('document-navigation',payload.schemeUrl"), "source view should navigate with the custom Veyra URI");
+  assert.ok(pageRuntime.includes("emit('document-navigation',link)"), "open-link should use the browser's recognized navigation event");
+  assert.ok(pageRuntime.includes("emit('document-navigation',virtualUrl,{reload:true})"), "reload should use the recognized navigation event");
+  assert.ok(pageRuntime.includes("veyraInspectPanel(el)"), "Inspect Element should open the built-in inspector instead of relying only on an external listener");
+  assert.equal(pageActionsRuntime().includes("contextmenu.open-link"), false, "menu must not emit unsupported custom action events");
   let fetches = 0;
   let nextResponse = { ok: true, status: 200, contentType: "text/html; charset=utf-8", body: Buffer.from("<!doctype html><html><body><script>alert('owned')</script><h1>Fixture</h1></body></html>"), finalUrl: "https://fixture-source.test/page" };
   app.locals.veyraSourceAssertPublic = async url => {
