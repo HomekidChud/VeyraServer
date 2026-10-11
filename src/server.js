@@ -1409,7 +1409,7 @@ const acquisitionManager = new AcquisitionManager({
   cacheMax: CFG.maxProxyCacheEntries,
   persistence: mongoStore,
 });
-app.get("/api/acquisition/status", (req, res) => res.json({ ok: true, chromiumEnabled: CFG.browserEnabled, ...acquisitionManager.report() }));
+app.get("/api/acquisition/status", (req, res) => res.json({ ok: true, ...acquisitionManager.report(), chromiumEnabled: CFG.browserEnabled }));
 
 const MAX_VIEW_SOURCE_BYTES = 1024 * 1024;
 function viewSourceUrlHasSecrets(value) {
