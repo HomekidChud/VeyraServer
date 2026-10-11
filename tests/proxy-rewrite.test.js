@@ -48,6 +48,24 @@ assert.match(inlineGeoFs, /\/api\/resource\?url=https%3A%2F%2Fmps\.geo-fs\.com/)
 assert.match(inlineGeoFs, /\/api\/resource\?url=https%3A%2F%2Fdata\.geo-fs\.com%2Fosm%2F\{z\}%2F\{x\}%2F\{y\}\.png/);
 assert.doesNotMatch(inlineGeoFs, /data\.geo-fs\.com%2Fosm%2F%7Bz%7D/);
 
+// Regression: OSM tile templates (e.g. https://data.geo-fs.com/osm/{z}/{x}/{y}.png)
+// must keep the literal {z}/{x}/{y} braces in the /api/resource?url= query. The
+// browser's `new URL()` normalizes braces in the path to %7B, and if the runtime
+// then re-encodes the URL with encodeURIComponent(), the result is %257B — a
+// double-encoding that breaks tile substitution (tile requests fail with
+// /osm/%7Bz%7D/%7Bx%7D/%7By%7D.png 404s).
+// The runtime proxy() helper must un-encode the braces before building the
+// /api/resource?url=... query, and after encodeURIComponent, restore literal braces.
+{
+  const osmHtml = rewriteHtml('<html><head><script>geofs.osmTileProvider = "https://data.geo-fs.com/osm/{z}/{x}/{y}.png";</script></head></html>', 'https://www.geo-fs.com/geofs.php', 'osm-tpl');
+  const match = osmHtml.match(/osmTileProvider = "([^"]+)"/);
+  assert.ok(match, 'osmTileProvider was not rewritten');
+  const rewritten = match[1];
+  assert.match(rewritten, /\/api\/resource\?url=/);
+  assert.match(rewritten, /osm%2F\{z\}%2F\{x\}%2F\{y\}\.png/, 'braces must stay literal in the /api/resource query');
+  assert.doesNotMatch(rewritten, /%257B/, 'double-encoded braces (%257B) must not appear');
+}
+
 // Regression: the rewritten Cesium <script src> ends with "Cesium.js" followed by
 // the proxy's own query params, so Cesium's /((?:.*\/)|^)Cesium\.js(?:\?|#|$)/
 // regex no longer matches its own <script src>. buildModuleUrl then falls back

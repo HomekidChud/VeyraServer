@@ -2086,7 +2086,7 @@ function injectRuntime(html, original, sid = "") {
   function toVirtual(raw){if(/^[?#]/.test(raw))return new URL(raw,virtualUrl);const u=new URL(raw,location.href);return ownOrigin(u.origin)?fixOwn(u):u}
   function resolve(v){try{const raw=unwrap(realUrl(v));return (raw===''?new URL(virtualUrl):toVirtual(raw)).href}catch{return String(v||'')}}
   function shouldProxy(v){try{const u=new URL(unwrap(v));return /^https?:$/.test(u.protocol)}catch{return false}}
-  function proxy(kind,u){const prefix=API_ORIGIN || location.origin;const base=prefix+(kind==='view'?'/api/view?url=':'/api/resource?url=')+encodeURIComponent(u);const from=encodeURIComponent(new URL(virtualUrl).href);return kind==='view'?base+'&sid='+encodeURIComponent(SESSION_ID):base+'&from='+from+'&sid='+encodeURIComponent(SESSION_ID)}
+  function proxy(kind,u){const prefix=API_ORIGIN || location.origin;const encodedTarget=String(u||'').replace(/%7B/g,'{').replace(/%7D/g,'}');const base=prefix+(kind==='view'?'/api/view?url=':'/api/resource?url=')+encodeURIComponent(encodedTarget).replace(/%257B/g,'{').replace(/%257D/g,'}').replace(/%7B/g,'{').replace(/%7D/g,'}');const from=encodeURIComponent(new URL(virtualUrl).href);return kind==='view'?base+'&sid='+encodeURIComponent(SESSION_ID):base+'&from='+from+'&sid='+encodeURIComponent(SESSION_ID)}
   function topPost(msg){try{window.top.postMessage(msg,'*')}catch{}}
   function emit(source,url,extra){if(!url)return;topPost({type:'veyra:navigate',url,source,sessionId:SESSION_ID,...extra})}
   let netSeq=0;
