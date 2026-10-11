@@ -34,8 +34,7 @@ const fullPage = require("./browser/full-page.js");
 const { FailoverController } = require("./browser/browser-failover.js");
 const { SnapshotStore } = require("./browser/snapshot-store.js");
 const { createSourceViewerStore, parseSourceScheme, sourcePage, consolePage: renderConsolePage } = require("./services/console-ui");
-
-
+const httpReader = require("./services/http-reader");
 const IS_THREAD_WORKER = !isMainThread && process.env.VEYRA_THREAD_WORKER === "1";
 const { fetch: undiciFetch, Agent: UndiciAgent } = require("undici");
 const veyraConfigModule = require("./config");
@@ -1463,6 +1462,121 @@ app.get("/view_source/:sourceId/:link", (req, res) => {
     "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
     "Content-Security-Policy": `default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; img-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors ${sourceViewerFrameAncestors()}`
   }).type("html").send(sourcePage(entry));
+});
+
+const MAX_HTTP_READER_BYTES = Math.min(CFG.maxProxyTextBytes || 4 * 1024 * 1024, 4 * 1024 * 1024);
+function httpReaderError(error) {
+  const code = String(error?.code || "HTTP_READER_FAILED").toUpperCase();
+  const known = {
+    INVALID_URL: [400, "A valid public HTTP(S) URL is required."],
+    URL_TOO_LONG: [400, "Reader URLs are limited to 2,048 characters."],
+    SENSITIVE_URL: [400, "URLs containing credentials or sensitive query parameters cannot be scraped."],
+    ROBOTS_DISALLOWED: [403, "The site's robots.txt disallows crawler extraction of this URL."],
+    SSRF_BLOCKED: [403, "The target did not pass public-address safety checks."],
+    PRIVATE_ADDRESS: [403, "The target did not pass public-address safety checks."],
+    CONTENT_TYPE_UNSUPPORTED: [415, "Only public text and HTML documents can be extracted."],
+    RESPONSE_TOO_LARGE: [413, "The page exceeds the HTTP reader's bounded response size."],
+    UPSTREAM_HTTP_ERROR: [502, "The site did not return a successful page response."],
+    FETCH_TIMEOUT: [504, "The site did not respond before the reader timeout."],
+    YOUTUBE_UNAVAILABLE: [502, "YouTube's public metadata endpoint is temporarily unavailable."],
+  };
+  const [status, message] = known[code] || [502, "The page could not be extracted over HTTP."];
+  return { status, code, message };
+}
+function httpReaderRequestOrigin(req) {
+  try { return new URL(req.originalUrl || "/", `${req.protocol}://${req.get("host")}`).origin; } catch { return ""; }
+}
+async function acquireHttpReaderPayload(target, req) {
+  const assertPublic = app.locals.veyraReaderAssertPublic || acquisitionManager.assertPublicUrl;
+  await assertPublic(target);
+  const parsedVideo = youtubeCompat.parseYoutubeUrl(target);
+  if (parsedVideo) {
+    const check = await youtubeCompat.checkEmbeddable(parsedVideo.videoId, app.locals.veyraYoutubeFetch || fetchOfficialJson);
+    const message = check.ok ? "" : check.code === "YOUTUBE_EMBED_DISABLED"
+      ? "This video is not publicly embeddable; Veyra will not proxy or bypass the official player restriction."
+      : "YouTube's public metadata endpoint is unavailable right now.";
+    const embedUrl = check.ok ? youtubeCompat.buildEmbedUrl(parsedVideo, httpReaderRequestOrigin(req)) : "";
+    return httpReader.scrapePayload({
+      requestedUrl: target, finalUrl: target,
+      page: { title: check.title || "YouTube video", text: "", links: [], headings: [], extractionStatus: check.ok ? "official-embed" : check.code },
+      response: { status: 200, contentType: "application/json" },
+      youtubeVideo: check.ok ? check : null, embedUrl, message,
+    });
+  }
+
+  const fetchReader = app.locals.veyraReaderFetch || ((url, options) => acquisitionManager.fetch(url, options));
+  const response = await fetchReader(target, {
+    engine: "http-reader", timeoutMs: Math.min(CFG.requestTimeoutMs || 12000, 12000),
+    maxBytes: MAX_HTTP_READER_BYTES, retries: 0,
+    accept: "text/html,application/xhtml+xml,text/plain,application/json,application/xml,text/xml",
+  });
+  if (!response || Number(response.status) >= 400) throw Object.assign(new Error("Upstream HTTP request failed."), { code: "UPSTREAM_HTTP_ERROR" });
+  const finalUrl = normalizeUrl(response.finalUrl || target);
+  if (!finalUrl || finalUrl.length > 2048) throw Object.assign(new Error("Invalid final URL."), { code: "URL_TOO_LONG" });
+  if (viewSourceUrlHasSecrets(finalUrl)) throw Object.assign(new Error("Sensitive final URL."), { code: "SENSITIVE_URL" });
+  await assertPublic(finalUrl);
+  const contentType = String(response.contentType || "text/html; charset=utf-8").toLowerCase();
+  if (!/(?:text\/(?:html|plain|xml)|application\/(?:xhtml\+xml|json|xml))(?:\s*;|$)/i.test(contentType)) {
+    throw Object.assign(new Error("Unsupported content type."), { code: "CONTENT_TYPE_UNSUPPORTED" });
+  }
+  const body = Buffer.isBuffer(response.body) ? response.body : Buffer.from(String(response.body || ""), "utf8");
+  if (body.length > MAX_HTTP_READER_BYTES) throw Object.assign(new Error("Response exceeds reader limit."), { code: "RESPONSE_TOO_LARGE" });
+  const htmlDocument = /(?:text\/html|application\/xhtml\+xml)/i.test(contentType);
+  const page = htmlDocument
+    ? acquisitionManager.parseDocument(body, finalUrl)
+    : { url: finalUrl, canonical: finalUrl, title: finalUrl, description: "", author: null, publishedAt: null, language: null, headings: [], text: body.toString("utf8").slice(0, httpReader.MAX_READER_TEXT_CHARS), links: [], feedLinks: [], extractionStatus: body.length ? "extracted" : "empty" };
+  const youtubeVideos = youtubeCompat.isYoutubeUrl(finalUrl) && htmlDocument && !["challenge", "consent"].includes(page.extractionStatus)
+    ? httpReader.youtubeItemsFromHtml(body.toString("utf8")) : [];
+  let message = "";
+  if (page.extractionStatus === "consent") message = "The site returned a consent page. Veyra will not bypass it.";
+  else if (page.extractionStatus === "challenge") message = "The site returned a security or anti-bot challenge. Veyra will not bypass it.";
+  else if (youtubeCompat.isYoutubeUrl(finalUrl) && !youtubeVideos.length && !page.text) message = "YouTube did not expose a static feed in this response. Its interactive home/search experience needs JavaScript; use the official site or a public video link.";
+  return httpReader.scrapePayload({ requestedUrl: target, finalUrl, page, response, youtubeVideos, message });
+}
+function renderHttpReaderError(target, error) {
+  const failure = httpReaderError(error);
+  return httpReader.scrapePayload({
+    requestedUrl: target, finalUrl: target,
+    page: { title: "HTTP reader unavailable", text: "", links: [], headings: [], extractionStatus: failure.code },
+    response: { status: failure.status, contentType: "text/html" }, message: failure.message,
+  });
+}
+function setHttpReaderHeaders(res, nonce) {
+  res.set({
+    "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff", "X-Robots-Tag": "noindex, nofollow",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Content-Security-Policy": `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; img-src https://i.ytimg.com https://yt3.ggpht.com data:; frame-src https://www.youtube-nocookie.com; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors ${sourceViewerFrameAncestors()}`,
+  });
+}
+app.get("/api/scrape", async (req, res) => {
+  const target = normalizeUrl(String(req.query.url || ""));
+  if (!target) return res.status(400).json({ ok: false, code: "INVALID_URL", error: "A valid public HTTP(S) URL is required." });
+  if (target.length > 2048) return res.status(400).json({ ok: false, code: "URL_TOO_LONG", error: "Reader URLs are limited to 2,048 characters." });
+  if (viewSourceUrlHasSecrets(target)) return res.status(400).json({ ok: false, code: "SENSITIVE_URL", error: "URLs containing credentials or sensitive query parameters cannot be scraped." });
+  try {
+    const payload = await acquireHttpReaderPayload(target, req);
+    return res.set({ "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff", "X-Robots-Tag": "noindex, nofollow" }).json(payload);
+  } catch (error) {
+    const failure = httpReaderError(error);
+    return res.status(failure.status).json({ ok: false, code: failure.code, error: failure.message });
+  }
+});
+app.get("/api/reader", async (req, res) => {
+  const target = normalizeUrl(String(req.query.url || ""));
+  if (!target || target.length > 2048 || viewSourceUrlHasSecrets(target)) {
+    const error = Object.assign(new Error("Invalid or sensitive URL."), { code: !target ? "INVALID_URL" : target.length > 2048 ? "URL_TOO_LONG" : "SENSITIVE_URL" });
+    const nonce = crypto.randomBytes(18).toString("base64");
+    const rendered = httpReader.renderReaderHtml(renderHttpReaderError("", error), { nonce });
+    setHttpReaderHeaders(res, nonce);
+    return res.status(200).type("html").send(rendered.html);
+  }
+  let payload;
+  try { payload = await acquireHttpReaderPayload(target, req); }
+  catch (error) { payload = renderHttpReaderError(target, error); }
+  const nonce = crypto.randomBytes(18).toString("base64");
+  const rendered = httpReader.renderReaderHtml(payload, { sessionId: normalizeSessionId(req.query.sid) || "", nonce });
+  setHttpReaderHeaders(res, nonce);
+  return res.status(200).type("html").send(rendered.html);
 });
 
 function cacheGet(map, key, ttl) {
