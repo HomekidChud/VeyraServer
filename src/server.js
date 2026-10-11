@@ -121,9 +121,11 @@ const CFG = Object.freeze({
   // YouTube's own bundles do not need Veyra URL rewriting: the injected
   // runtime already intercepts fetch/XHR and handles relative-resource fallback.
   youtubeSkipStaticJsRewrite: boolEnv("YT_SKIP_STATIC_JS_REWRITE", true),
-  // Public static bundles can be loaded from YouTube's CDN directly instead
-  // of waiting for Render to download and re-serve multi-megabyte assets.
-  youtubeDirectStaticAssets: boolEnv("YT_DIRECT_STATIC_ASSETS", true),
+  // 8.28.22: the cross-origin 302 sent the browser off to YouTube's CDN,
+  // where the fast-proxy iframe could not follow it. Keep YouTube's bundles
+  // inside the proxy so they load in-frame. Only enable the direct path
+  // when the caller is already the same origin as YouTube (native tab).
+  youtubeDirectStaticAssets: boolEnv("YT_DIRECT_STATIC_ASSETS", false),
   processRole: enumEnv("PROCESS_ROLE", "web", ["web", "worker", "all"]),
   
   
@@ -5179,7 +5181,18 @@ async function proxyRequest(req, res, mode) {
     !!req.get("Range") || /video|audio/i.test(accept) || /googlevideo\.com/i.test(canonical) || /videoplayback/i.test(canonical)
   );
   if (!safeMethod(method)) return respondError(res, 405, "Unsupported proxy method.", "PROXY_METHOD_NOT_ALLOWED");
-  if (mode === "resource" && !download && (method === "GET" || method === "HEAD") && isDirectYoutubeStaticUrl(canonical)) {
+  // The 302 redirect is only safe for native-tab requests (same-origin). In
+  // the fast-proxy iframe a cross-origin redirect to YouTube's CDN is blocked
+  // by the browser, leaving scripts at HTTP 0 and the page stuck on its
+  // skeleton. Only emit the redirect when Veyra is not the Referer origin.
+  const refererOrigin = (() => { try { const r = String(req.get("Referer") || ""); return r ? new URL(r).origin : ""; } catch { return ""; } })();
+  if (mode === "resource" && !download && (method === "GET" || method === "HEAD") && isDirectYoutubeStaticUrl(canonical) && refererOrigin && refererOrigin === new URL(canonical).origin) {
+    res.setHeader("location", canonical);
+    res.setHeader("cache-control", "public, max-age=300");
+    res.setHeader("x-veyra-direct-asset", "youtube-cdn");
+    return res.status(302).end();
+  }
+  if (mode === "resource" && !download && (method === "GET" || method === "HEAD") && isDirectYoutubeStaticUrl(canonical) && CFG.youtubeDirectStaticAssets) {
     res.setHeader("location", canonical);
     res.setHeader("cache-control", "public, max-age=300");
     res.setHeader("x-veyra-direct-asset", "youtube-cdn");
@@ -5283,7 +5296,11 @@ async function proxyRequest(req, res, mode) {
     res.setHeader("X-Veyra-Canonical-URL", canonical);
     return res.status(200).type("html").send(challengeFallbackHtml(canonical, challenge, sid));
   }
-  if (mode === "resource" && !download && result.status >= 200 && result.status < 300 && shouldDirectYoutubeStaticAsset(result.finalUrl || canonical, result.contentType)) {
+  // Same safety fix as the early 302: only redirect when the Referer origin
+  // matches YouTube itself (native tab). Fast-proxy iframes must receive the
+  // bundle inline so cross-origin redirects are not blocked.
+  const ytDirectRefererOk = (() => { try { const r = String(req.get("Referer") || ""); return r ? new URL(r).origin === new URL(result.finalUrl || canonical).origin : false; } catch { return false; } })();
+  if (mode === "resource" && !download && result.status >= 200 && result.status < 300 && shouldDirectYoutubeStaticAsset(result.finalUrl || canonical, result.contentType) && ytDirectRefererOk) {
     res.setHeader("location", result.finalUrl || canonical);
     res.setHeader("cache-control", "public, max-age=300");
     res.setHeader("x-veyra-direct-asset", "youtube-cdn");

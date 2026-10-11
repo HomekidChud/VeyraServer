@@ -37,8 +37,12 @@ services:
         value: "true"
       - key: YT_SKIP_STATIC_JS_REWRITE
         value: "true"
+      # 8.28.22: sending 302s for YouTube's CDN bundles is blocked by the
+      # cross-origin iframe in the fast proxy, which leaves the page on its
+      # skeleton and never upgrades polymer custom elements. Serve them
+      # through the proxy so they load in-frame.
       - key: YT_DIRECT_STATIC_ASSETS
-        value: "true"
+        value: "false"
       - key: YT_MAX_HEIGHT
         value: "360"
       # Five minutes gives the mobile page enough time to initialize and
