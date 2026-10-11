@@ -4003,7 +4003,14 @@ function validateExtensionPackage(pkg) {
   const matches = pkg.matches == null ? [] : Array.isArray(pkg.matches) ? pkg.matches.map(String).slice(0, 30) : [];
   if (matches.some(x => x.length > 120 || /[\r\n]/.test(x))) throw new Error("Invalid extension match pattern.");
   const integrity = crypto.createHash("sha256").update(JSON.stringify({ id, version: String(pkg.version || "1.0.0"), matches, css })).digest("hex");
-  return { schema: "veyra-extension/v1", id, name, version: String(pkg.version || "1.0.0").slice(0, 20), description: String(pkg.description || "").slice(0, 300), author: String(pkg.author || "").slice(0, 100), publisher: String(pkg.publisher || "").slice(0, 100), permissions: ["styles"], matches, files: { "style.css": css }, published: !!pkg.published, verified: true, integrity };
+  return { schema: "veyra-extension/v1", id, name, version: String(pkg.version || "1.0.0").slice(0, 20), description: String(pkg.description || "").slice(0, 300), author: String(pkg.author || "").slice(0, 100), publisher: String(pkg.publisher || "").slice(0, 100), permissions: ["styles"], matches, files: { "style.css": css }, published: !!pkg.published, verified: true, integrity,
+    // Preserve the store catalog metadata (category, tags, rating, install
+    // count, updated date) that the frontend uses to group the store list.
+    category: String(pkg.category || "other").slice(0, 40),
+    tags: Array.isArray(pkg.tags) ? pkg.tags.map(String).slice(0, 8) : [],
+    rating: Number(pkg.rating) >= 0 && Number(pkg.rating) <= 5 ? Number(pkg.rating) : 0,
+    installs: Number(pkg.installs) >= 0 ? Number(pkg.installs) : 0,
+    updated: String(pkg.updated || "").slice(0, 20) };
 }
 function readExtensionStore() {
   let raw = []; try { raw = JSON.parse(fs.readFileSync(EXT_STORE_FILE, "utf8")); } catch { raw = []; }
