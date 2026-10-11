@@ -164,7 +164,10 @@ const CFG = Object.freeze({
   maxSrcsetCandidates: numberEnv("MAX_SRCSET_CANDIDATES", 100, 10, 500),
   browserMaxActiveFetches: Math.min(numberEnv("BROWSER_MAX_ACTIVE_FETCHES", P.browserMaxActiveFetches, 1, 64), P.browserMaxActiveFetches),
   browserPerHostConcurrency: numberEnv("BROWSER_PER_HOST_CONCURRENCY", 8, 1, 32),
-  browserEnabled: boolEnv("VEYRA_CHROMIUM_ENABLED", boolEnv("BROWSER_ENABLED", false)),
+  // The free plan is intentionally proxy-only. Keep this server-side gate so
+  // a stale dashboard env var cannot turn on Chromium until the instance is
+  // moved to a larger plan.
+  browserEnabled: VEYRA_CONFIG.plan.key !== "free" && boolEnv("VEYRA_CHROMIUM_ENABLED", boolEnv("BROWSER_ENABLED", false)),
   browserHeadless: boolEnv("BROWSER_HEADLESS", true),
   maxBrowserSessions: Math.min(numberEnv("MAX_BROWSER_SESSIONS", P.browserSessions, 1, 16), P.browserSessions),
   maxBrowserPages: Math.min(numberEnv("MAX_BROWSER_PAGES", P.browserPages, 1, 32), P.browserPages),
@@ -972,8 +975,17 @@ function normalizeUrl(value, base) {
     const u = new URL(raw, base);
     if (!['http:', 'https:'].includes(u.protocol)) return null;
     if (u.username || u.password) return null;
+    canonicalizeGeoFsHost(u);
     return normalizedSearch(u.href);
   } catch { return null; }
+}
+function canonicalizeGeoFsHost(url) {
+  // GeoFS publishes the playable site at www.geo-fs.com. The commonly typed
+  // geofs.com alias has an invalid certificate at the edge, so following it
+  // from the proxy fails before HTTP redirect handling can run.
+  const host = String(url?.hostname || "").toLowerCase();
+  if (host === "geofs.com" || host === "www.geofs.com") url.hostname = "www.geo-fs.com";
+  return url;
 }
 function resolveNavigation(value, documentUrl) {
   if (value == null) return null;
@@ -983,6 +995,7 @@ function resolveNavigation(value, documentUrl) {
     const u = new URL(raw, documentUrl);
     if (!['http:', 'https:'].includes(u.protocol)) return null;
     if (u.username || u.password) return null;
+    canonicalizeGeoFsHost(u);
     return u.href;
   } catch { return null; }
 }
@@ -2250,7 +2263,9 @@ function rewriteHtml(html, base, sid = "") {
   // data-deferredsrc or a loader-specific dest attribute. Those URLs bypass
   // the normal script[src] rewrite and otherwise resolve against Veyra's own
   // /api/view document instead of the website.
-  $("script[data-deferredsrc]").each((_, el) => {
+  // GeoFS uses data-deferredsrc on both scripts and lazy images. Rewrite the
+  // whole attribute family or image URLs resolve against Veyra's origin.
+  $("[data-deferredsrc]").each((_, el) => {
     const raw = $(el).attr("data-deferredsrc"); const u = resolveResource(raw, effectiveBase);
     if (u) $(el).attr("data-deferredsrc", makeResourceUrl(u, effectiveBase, sid));
   });
