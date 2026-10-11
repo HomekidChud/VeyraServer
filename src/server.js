@@ -37,6 +37,8 @@ const { createSourceViewerStore, parseSourceScheme, sourcePage, consolePage: ren
 const httpReader = require("./services/http-reader");
 const IS_THREAD_WORKER = !isMainThread && process.env.VEYRA_THREAD_WORKER === "1";
 const { fetch: undiciFetch, Agent: UndiciAgent } = require("undici");
+const https = require("node:https");
+const { isGoogleAccountsUrl, requestGoogleAccounts } = require("./network/google-accounts-transport");
 const veyraConfigModule = require("./config");
 
 
@@ -360,6 +362,7 @@ const DIRECT_HTTP_AGENT = new UndiciAgent({
   connections: 24,
   pipelining: 1
 });
+const GOOGLE_ACCOUNTS_HTTPS_AGENT = new https.Agent({ keepAlive: true, maxSockets: 16, lookup: createPublicSocketLookup() });
 
 const shield = createShield(process.env, { lean: CFG.leanMode, log: (level, source, message) => setImmediate(() => serverLog(level, source, message)) });
 app.set("trust proxy", true);
@@ -1299,14 +1302,11 @@ async function fetchBuffer(url, opts = {}) {
         }
         const directMode = !suppliedDispatcher && !vpnEnabledForRequest;
         const dispatcher = suppliedDispatcher || (directMode ? DIRECT_HTTP_AGENT : undefined);
-        const response = await undiciFetch(current, {
-          method,
-          headers: reqHeaders,
-          redirect: "manual",
-          signal: controller.signal,
-          body: opts.body && method !== "GET" && method !== "HEAD" ? opts.body : undefined,
-          ...(dispatcher ? { dispatcher } : {})
-        });
+        // The same public Google Accounts URL is rejected by Undici but returns its normal redirect via Node HTTPS; scope this fallback to direct traffic so VPN/custom dispatchers are never bypassed.
+        const requestBody = opts.body && method !== "GET" && method !== "HEAD" ? opts.body : undefined;
+        const response = directMode && isGoogleAccountsUrl(current)
+          ? await requestGoogleAccounts(current, { method, headers: reqHeaders, body: requestBody, agent: GOOGLE_ACCOUNTS_HTTPS_AGENT, signal: controller.signal })
+          : await undiciFetch(current, { method, headers: reqHeaders, redirect: "manual", signal: controller.signal, body: requestBody, ...(dispatcher ? { dispatcher } : {}) });
         if (sessionId) storeSetCookies(sessionId, current, response);
         clearTimeout(timer);
         if (upstreamSignal) upstreamSignal.removeEventListener("abort", onAbort);
@@ -6533,6 +6533,7 @@ function startVeyraServer() {
         workerPool?.close(),
         browserEngine.shedIdle(0).then(() => browserEngine.browser?.close()),
         DIRECT_HTTP_AGENT.close(),
+        GOOGLE_ACCOUNTS_HTTPS_AGENT.destroy(),
         mongoStore.close()
       ]);
       process.exit(0);
