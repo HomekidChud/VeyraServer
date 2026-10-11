@@ -4971,6 +4971,14 @@ function extractWarmUrls(html, base, sid) {
   const add = (raw, priority = 20, type = "asset") => {
     const u = resolveResource(raw, base);
     if (!u) return;
+    // Reject URLs that are still un-substituted templates ({z}/{x}/{y} or
+    // {name} placeholders). These are not real resource addresses — the page
+    // substitutes them at runtime. Both the critical <link rel=preload> path
+    // and the server-side speculative warm path call extractWarmUrls, so this
+    // guard covers both. `resolveResource()` has already run the URL through
+    // `new URL()` which percent-encodes braces in a path, so match both the
+    // literal {z} and the %7Bz%7D form.
+    if (/\{[a-zA-Z][a-zA-Z0-9_]*\}|%7B[a-zA-Z][a-zA-Z0-9_]*%7D/i.test(u)) return;
     const safeType = warmTypeForUrl(u, type);
     const current = out.get(u);
     if (!current || priority > current.priority) out.set(u, { url: u, priority, type: safeType });
