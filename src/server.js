@@ -3090,16 +3090,16 @@ async function processItem(job, item) {
       if (signals.heavy && canRenderHtmlWithBrowser(job)) {
         const rendered = await renderHtmlWithBrowser(job, resource.url, text);
         if (rendered) {
-          jobLog(job, "info", `Rendered JS-heavy page with real browser engine (${rendered.textLen} chars of DOM text vs ${bodyLenOf(text)} in raw HTML): ${item.url}`);
-          // Index the RENDERED page (real visible text) but keep the raw fetch metadata.
-          indexDocument(resource.url, rendered.html);
-          await discoverContent(job, "html", rendered.html, resource.url, r.contentType);
+          jobLog(job, "info", `Rendered JS-heavy page with real browser engine (${rendered.textLen} chars of DOM text vs ${rendered.rawTextLen} in raw HTML, ${rendered.renderMs}ms): ${item.url}`);
+          // Use the browser's final URL (after redirects) as the canonical page for indexing/discovery.
+          const finalResourceUrl = sameOrigin(rendered.finalUrl || resource.url, resource.url) ? rendered.finalUrl : resource.url;
+          // discoverContent indexes HTML internally — pass the rendered body through it exactly once.
+          await discoverContent(job, "html", rendered.html, finalResourceUrl, r.contentType);
           job.counts.renderedHtmlPages += 1;
-          // Do NOT re-run indexDocument below — we already did it with the rendered body.
           job.counts.bytesStored += Math.min(rendered.html.length, CFG.maxTextBytesPerResource);
           return; // skip the raw-HTML path below.
         } else {
-          jobLog(job, "warn", `Browser render failed for JS-heavy page; falling back to raw HTML: ${item.url}`);
+          jobLog(job, "debug", `Browser render unavailable/failed for JS-heavy page; falling back to raw HTML: ${item.url}`);
         }
       }
       await discoverContent(job, "html", text, resource.url, r.contentType);
@@ -3143,9 +3143,10 @@ async function processItem(job, item) {
     jobLog(job, status === 429 ? "warn" : (noisyError ? "error" : "debug"), `Fetch failed ${item.url} — ${e.name || "Error"}: ${e.message}`, { retryClass: statusRetryClass(status), type: item.type, source: item.source || null });
   } finally { job.processed += 1; }
 }
-function bodyLenOf(text) { return String(text || "").length; }
 /** Crawler upgrade: render a JS-heavy HTML page in a real Chromium session so we index actual DOM text. */
 function canRenderHtmlWithBrowser(job) {
+  // Test-injectable gate so a controlled test can force-enable without a real Chromium.
+  try { if (app.locals && app.locals.veyraCrawlRenderHtml) return true; } catch {}
   if (!browserEngine) return false;
   try { if (browserEngine.cfg?.browserEnabled === false) return false; } catch {}
   if (job.pageAccelerator && CFG.leanMode) return false; // lean+accelerator: don't pay the render cost.
@@ -3161,28 +3162,43 @@ function canRenderHtmlWithBrowser(job) {
   return CFG.browserEnabled === true;
 }
 async function renderHtmlWithBrowser(job, url, rawHtml) {
+  if (job.stopRequested) return null;
+  // Test-injectable render path: replace the real browser engine with a mock.
+  const injectedRender = (typeof app !== "undefined" && app.locals && app.locals.veyraCrawlRenderHtml) || null;
+  if (injectedRender) return injectedRender(job, url, rawHtml);
   if (!browserEngine) return null;
+  if (job.stopRequested) return null;
   const startedAt = Date.now();
   const tabId = `crawl-${job.id}-${Date.now()}`;
   let sid = null;
   try {
     const created = await browserEngine.create(tabId, url, job.id, null, { fastStart: true });
-    sid = created?.id || created?.session?.id || null;
+    sid = created?.id || null;
     if (!sid) return null;
+    // Never index a verification or error page as the page's real content.
+    if (created?.verification || (created?.status && !["NORMAL", "LOADING"].includes(created.status))) return null;
+    if (created?.error) return null;
     const rendered = await browserEngine.renderedContent(sid, 8000);
     const html = String(rendered?.html || "");
-    if (!html || html.length < rawHtml.length * 0.1) return null; // rendered DOM shouldn't be smaller than the shell
-    const $ = require("cheerio").load(html, { decodeEntities: false });
-    $("script,style,noscript,template").remove();
-    const visibleText = String($("body").text() || "").replace(/\s+/g, " ").trim();
-    if (visibleText.length < 100) return null;
-    return { html, textLen: visibleText.length, renderMs: Date.now() - startedAt, finalUrl: rendered.url, title: rendered.title };
+    const rawVisibleText = visibleTextOfHtml(rawHtml);
+    const renderedVisibleText = visibleTextOfHtml(html);
+    // Only use the render if JS actually added meaningful visible content beyond the raw shell.
+    if (renderedVisibleText.length <= rawVisibleText.length + 100) return null;
+    return {
+      html, textLen: renderedVisibleText.length, rawTextLen: rawVisibleText.length,
+      renderMs: Date.now() - startedAt, finalUrl: rendered.url, title: rendered.title,
+    };
   } catch (e) {
     jobLog(job, "debug", `Browser render for ${url} errored: ${e?.message}`);
     return null;
   } finally {
     if (sid) { try { await browserEngine.stop(sid); } catch {} }
   }
+}
+function visibleTextOfHtml(html) {
+  const $ = require("cheerio").load(String(html || ""), { decodeEntities: false });
+  $("script,style,noscript,template").remove();
+  return String($("body").text() || "").replace(/\s+/g, " ").trim();
 }
 class CooperativeRobotPool {
   constructor(job) {
