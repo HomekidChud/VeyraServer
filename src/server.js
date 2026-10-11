@@ -1009,7 +1009,13 @@ function makeViewUrl(url, sid = "") {
   return sid ? `${q}&sid=${encodeURIComponent(sid)}` : q;
 }
 function makeResourceUrl(url, referrer = "", sid = "") {
-  const q = `/api/resource?url=${encodeURIComponent(url)}`;
+  // Cesium replaces {z}/{x}/{y} after receiving a URL template. Keep those
+  // tokens literal in the proxy query; encoding them as %7B...%7D makes the
+  // replacement pass miss them and requests the literal placeholder path.
+  const encodedTarget = encodeURIComponent(url)
+    .replace(/%257B/g, "{").replace(/%257D/g, "}")
+    .replace(/%7B/g, "{").replace(/%7D/g, "}");
+  const q = `/api/resource?url=${encodedTarget}`;
   const parts = [];
   try { const r = new URL(referrer); parts.push(`from=${encodeURIComponent(r.href)}`); } catch {}
   if (sid) parts.push(`sid=${encodeURIComponent(sid)}`);
@@ -2000,7 +2006,18 @@ function rewriteJsText(text, base, sid = "") {
   }
   out = out.replace(/(["'`])(https?:\/\/[^"'`\s]+)\1/g, (m, quote, value) => {
     const u = resolveResource(value, base);
-    try { return u && new URL(u).origin === new URL(base).origin ? `${quote}${makeResourceUrl(u, base, sid)}${quote}` : m; } catch { return m; }
+    try {
+      if (!u) return m;
+      const target = new URL(u), source = new URL(base);
+      // GeoFS keeps terrain, imagery, weather, and multiplayer APIs on
+      // separate geo-fs.com subdomains. Image/Cesium loaders do not pass
+      // through fetch/XHR, so keep these URLs same-origin in the bundle.
+      const geoFsFamily = /(^|\.)geo-fs\.com$/i;
+      if (target.origin === source.origin || (geoFsFamily.test(source.hostname) && geoFsFamily.test(target.hostname))) {
+        return `${quote}${makeResourceUrl(u, base, sid)}${quote}`;
+      }
+    } catch {}
+    return m;
   });
   return out;
 }
@@ -2209,6 +2226,16 @@ function restoreInlineScriptBlocks(html, originals) {
   for (const item of originals || []) out = out.split(item.token).join(item.body);
   return out;
 }
+function restoreAndRewriteInlineScriptBlocks(html, originals, base, sid = "") {
+  let out = String(html || "");
+  let isGeoFs = false;
+  try { isGeoFs = /(^|\.)geo-fs\.com$/i.test(new URL(base).hostname); } catch {}
+  for (const item of originals || []) {
+    const body = isGeoFs ? rewriteJsText(item.body, base, sid) : item.body;
+    out = out.split(item.token).join(body);
+  }
+  return out;
+}
 function rewriteHtml(html, base, sid = "") {
   const protectedScripts = protectInlineScriptBlocks(html);
   const $ = cheerio.load(protectedScripts.html, { decodeEntities: false });
@@ -2312,7 +2339,7 @@ function rewriteHtml(html, base, sid = "") {
     if (preloadMarkup) $("head").first().prepend(preloadMarkup);
   }
 
-  return injectRuntime(restoreInlineScriptBlocks($.html(), protectedScripts.originals), base, sid);
+  return injectRuntime(restoreAndRewriteInlineScriptBlocks($.html(), protectedScripts.originals, effectiveBase, sid), base, sid);
 }
 
 const SEARCH_STOP_WORDS = new Set([

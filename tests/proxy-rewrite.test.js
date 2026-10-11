@@ -30,5 +30,16 @@ assert.doesNotMatch(out, /dest="js\/Cesium\/build\/Cesium\.js/);
 assert.doesNotMatch(out, /api\/resource\?url=https%3A%2F%2Fwww\.geo-fs\.com\/api\/resource/);
 const alias = rewriteHtml('<html><body><img src="/images/icons/favicon.ico"></body></html>', 'https://geofs.com/geofs.php', 'proxy-alias');
 assert.match(alias, /https%3A%2F%2Fwww\.geo-fs\.com%2Fimages%2Ficons%2Ffavicon\.ico/);
+const inlineGeoFs = rewriteHtml(`<html><head><script>
+  geofs.srtmServer = "https://data.geo-fs.com/srtm/";
+  geofs.weatherServer = "https://weather.geo-fs.com/";
+  geofs.multiplayerHost = "https://mps.geo-fs.com";
+  geofs.osmTileProvider = "https://data.geo-fs.com/osm/{z}/{x}/{y}.png";
+</script></head></html>`, 'https://www.geo-fs.com/geofs.php?v=3.9', 'inline-geofs');
+assert.match(inlineGeoFs, /\/api\/resource\?url=https%3A%2F%2Fdata\.geo-fs\.com%2Fsrtm%2F/);
+assert.match(inlineGeoFs, /\/api\/resource\?url=https%3A%2F%2Fweather\.geo-fs\.com%2F/);
+assert.match(inlineGeoFs, /\/api\/resource\?url=https%3A%2F%2Fmps\.geo-fs\.com/);
+assert.match(inlineGeoFs, /\/api\/resource\?url=https%3A%2F%2Fdata\.geo-fs\.com%2Fosm%2F\{z\}%2F\{x\}%2F\{y\}\.png/);
+assert.doesNotMatch(inlineGeoFs, /data\.geo-fs\.com%2Fosm%2F%7Bz%7D/);
 
 console.log('Proxy rewrite regression tests passed');
