@@ -5186,13 +5186,8 @@ async function proxyRequest(req, res, mode) {
   // by the browser, leaving scripts at HTTP 0 and the page stuck on its
   // skeleton. Only emit the redirect when Veyra is not the Referer origin.
   const refererOrigin = (() => { try { const r = String(req.get("Referer") || ""); return r ? new URL(r).origin : ""; } catch { return ""; } })();
-  if (mode === "resource" && !download && (method === "GET" || method === "HEAD") && isDirectYoutubeStaticUrl(canonical) && refererOrigin && refererOrigin === new URL(canonical).origin) {
-    res.setHeader("location", canonical);
-    res.setHeader("cache-control", "public, max-age=300");
-    res.setHeader("x-veyra-direct-asset", "youtube-cdn");
-    return res.status(302).end();
-  }
-  if (mode === "resource" && !download && (method === "GET" || method === "HEAD") && isDirectYoutubeStaticUrl(canonical) && CFG.youtubeDirectStaticAssets) {
+  const ytDirectRefererOk = refererOrigin && refererOrigin === (() => { try { return new URL(canonical).origin; } catch { return ""; } })();
+  if (mode === "resource" && !download && (method === "GET" || method === "HEAD") && isDirectYoutubeStaticUrl(canonical) && ytDirectRefererOk) {
     res.setHeader("location", canonical);
     res.setHeader("cache-control", "public, max-age=300");
     res.setHeader("x-veyra-direct-asset", "youtube-cdn");
