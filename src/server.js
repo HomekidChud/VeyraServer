@@ -1666,7 +1666,9 @@ async function fetchCached(url, opts = {}) {
       }
       return { ...cachedEntry.response, cacheHit: true, stale: true, cacheAgeMs: cacheAge };
     }
-    const result = await fetchBuffer(url, { ...opts, cached: cachedEntry && method === "GET" ? cachedEntry : null });
+    // Local injection point for tests: mock the upstream fetch without touching network.
+    const upstreamFetchBuffer = app.locals.veyraProxyFetchBuffer || null;
+    const result = upstreamFetchBuffer ? await upstreamFetchBuffer(url, { ...opts, cached: cachedEntry && method === "GET" ? cachedEntry : null }) : await fetchBuffer(url, { ...opts, cached: cachedEntry && method === "GET" ? cachedEntry : null });
     if (!opts.noCache && method === "GET") {
       const noStore = /no-store/i.test(result.cacheControl || "");
       const bodyBytes = Buffer.byteLength(result.body || Buffer.alloc(0));
@@ -2909,7 +2911,7 @@ function createJob(root, options = {}) {
     crawlOrigins: new Set([new URL(root).origin]),
     hostPolicy: new Map(),
     robots: null, robotsReady: false, sitemaps: new Set(), challengeHosts: new Set(), hostActive: new Map(), hostCooldowns: new Map(), hostLastRequested: new Map(), hostFailures: new Map(), hostDelayMs: 0, stopReason: null, backgroundPaused: false,
-    counts: { htmlPages: 0, css: 0, js: 0, data: 0, assets: 0, links: 0, bytesScanned: 0, bytesStored: 0, bytesDiscarded: 0, requestCount: 0, retries: 0, challenges: 0, errors: 0 },
+    counts: { htmlPages: 0, renderedHtmlPages: 0, css: 0, js: 0, data: 0, assets: 0, links: 0, bytesScanned: 0, bytesStored: 0, bytesDiscarded: 0, requestCount: 0, retries: 0, challenges: 0, errors: 0 },
     controller: new AbortController(),
     dnsCache: new Map(),
     robotPool: null,
@@ -3079,7 +3081,28 @@ async function processItem(job, item) {
     const link = job.links.find(x => x.url === item.url || x.url === resource.url); if (link) { link.captured = true; link.redirectChain = resource.redirectChain; link.url = resource.url; }
     job.hostFailures.set(host, 0); job.hostCooldowns.delete(host); noteHostSuccess(job, host);
     if (type === "html") {
-      job.counts.htmlPages += 1; await discoverContent(job, "html", text, resource.url, r.contentType);
+      job.counts.htmlPages += 1;
+      // Crawler upgrade (8.20.0): JS-heavy pages have an empty HTML shell — everything
+      // is rendered client-side after fetch. When the real browser engine is available,
+      // render the page in Chromium so the search index gets the real DOM text and
+      // link discovery sees the actual navigation graph, not the raw un-executed source.
+      const signals = browserCapabilitySignals(text, { "content-type": r.contentType });
+      if (signals.heavy && canRenderHtmlWithBrowser(job)) {
+        const rendered = await renderHtmlWithBrowser(job, resource.url, text);
+        if (rendered) {
+          jobLog(job, "info", `Rendered JS-heavy page with real browser engine (${rendered.textLen} chars of DOM text vs ${bodyLenOf(text)} in raw HTML): ${item.url}`);
+          // Index the RENDERED page (real visible text) but keep the raw fetch metadata.
+          indexDocument(resource.url, rendered.html);
+          await discoverContent(job, "html", rendered.html, resource.url, r.contentType);
+          job.counts.renderedHtmlPages += 1;
+          // Do NOT re-run indexDocument below — we already did it with the rendered body.
+          job.counts.bytesStored += Math.min(rendered.html.length, CFG.maxTextBytesPerResource);
+          return; // skip the raw-HTML path below.
+        } else {
+          jobLog(job, "warn", `Browser render failed for JS-heavy page; falling back to raw HTML: ${item.url}`);
+        }
+      }
+      await discoverContent(job, "html", text, resource.url, r.contentType);
       job.counts.bytesStored += Math.min(r.bytes, CFG.maxTextBytesPerResource);
     } else if (type === "css") {
       job.counts.css += 1; await discoverContent(job, "css", text, resource.url, r.contentType);
@@ -3119,6 +3142,47 @@ async function processItem(job, item) {
     const noisyError = item.type === "html" || status >= 500 || status === 429;
     jobLog(job, status === 429 ? "warn" : (noisyError ? "error" : "debug"), `Fetch failed ${item.url} — ${e.name || "Error"}: ${e.message}`, { retryClass: statusRetryClass(status), type: item.type, source: item.source || null });
   } finally { job.processed += 1; }
+}
+function bodyLenOf(text) { return String(text || "").length; }
+/** Crawler upgrade: render a JS-heavy HTML page in a real Chromium session so we index actual DOM text. */
+function canRenderHtmlWithBrowser(job) {
+  if (!browserEngine) return false;
+  try { if (browserEngine.cfg?.browserEnabled === false) return false; } catch {}
+  if (job.pageAccelerator && CFG.leanMode) return false; // lean+accelerator: don't pay the render cost.
+  // only when the engine is actually ready
+  try {
+    const st = browserEngine.status?.();
+    if (st && typeof st.sessions === "number" && st.sessions > 0) return true;
+  } catch {}
+  // fall back to: browserEnabled is set AND browser engine has any sessions or is startable
+  try {
+    if (browserEngine.browser || browserEngine.startPromise) return true;
+  } catch {}
+  return CFG.browserEnabled === true;
+}
+async function renderHtmlWithBrowser(job, url, rawHtml) {
+  if (!browserEngine) return null;
+  const startedAt = Date.now();
+  const tabId = `crawl-${job.id}-${Date.now()}`;
+  let sid = null;
+  try {
+    const created = await browserEngine.create(tabId, url, job.id, null, { fastStart: true });
+    sid = created?.id || created?.session?.id || null;
+    if (!sid) return null;
+    const rendered = await browserEngine.renderedContent(sid, 8000);
+    const html = String(rendered?.html || "");
+    if (!html || html.length < rawHtml.length * 0.1) return null; // rendered DOM shouldn't be smaller than the shell
+    const $ = require("cheerio").load(html, { decodeEntities: false });
+    $("script,style,noscript,template").remove();
+    const visibleText = String($("body").text() || "").replace(/\s+/g, " ").trim();
+    if (visibleText.length < 100) return null;
+    return { html, textLen: visibleText.length, renderMs: Date.now() - startedAt, finalUrl: rendered.url, title: rendered.title };
+  } catch (e) {
+    jobLog(job, "debug", `Browser render for ${url} errored: ${e?.message}`);
+    return null;
+  } finally {
+    if (sid) { try { await browserEngine.stop(sid); } catch {} }
+  }
 }
 class CooperativeRobotPool {
   constructor(job) {
@@ -6428,4 +6492,4 @@ const __workerOps = {
   discover: (text, kind, base, contentType) => collectDiscovery(text, kind, base, contentType)
 };
 
-module.exports = { app, mongoStore, mergeStrayProxyParams, detectChallenge, CFG, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions, normalizeOpenEngineMode, shouldStartCrawlerForEngineMode, startVeyraServer, cacheSafeUrl, cacheSafeResponse };
+module.exports = { app, mongoStore, mergeStrayProxyParams, detectChallenge, CFG, browserCapabilitySignals, canRenderHtmlWithBrowser, renderHtmlWithBrowser, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions, normalizeOpenEngineMode, shouldStartCrawlerForEngineMode, startVeyraServer, cacheSafeUrl, cacheSafeResponse };

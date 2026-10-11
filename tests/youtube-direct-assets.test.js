@@ -2,94 +2,101 @@
 /**
  * 8.20.0 regression — YouTube CDN bundles must never 302 out of the fast proxy.
  *
- * The old `youtubeDirectStaticAssets` optimization sent a Location header for
- * `youtube.com/s/...` and `youtube.com/player/...` assets. In the fast-proxy
- * iframe those cross-origin redirects are blocked by the browser, leaving
- * scripts at HTTP status 0 and the page stuck on its skeleton forever
- * (custom elements never upgrade).
- *
- * This is a behavioral test: with the flag explicitly enabled AND a Veyra
- * (non-YouTube-origin) Referer, the proxy must NOT return the 302. It must
- * fetch and serve the body inline.
+ * This is a BEHAVIORAL test: it starts the real express app with
+ * YT_DIRECT_STATIC_ASSETS=true (the old, broken config) and drives
+ * /api/resource with a Veyra-origin Referer. The route must NOT emit the
+ * cross-origin 302 — it must serve the upstream body inline — because in the
+ * fast-proxy iframe that redirect is refused by the browser, leaving scripts
+ * at HTTP 0 and the page stuck on YouTube's skeleton.
  */
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
-const path = require("path");
+const path = require("node:path");
 
-const source = fs.readFileSync(path.join(__dirname, "..", "src", "server.js"), "utf8");
+// Same local/side-effect-free setup as the other route tests.
+for (const name of ["AI_API_KEY", "AI_API_BASE_URL", "OPENAI_API_KEY", "BRAVE_SEARCH_API_KEY", "BING_SEARCH_API_KEY", "GOOGLE_SEARCH_API_KEY", "MONGODB_URI"]) delete process.env[name];
+process.env.VEYRA_CHROMIUM_ENABLED = "false";
+// Explicitly turn ON the old optimization to prove the Referer guard wins.
+process.env.YT_DIRECT_STATIC_ASSETS = "true";
 
-// 1. The code default must be off so iframe-based fast-proxy loads always get the body.
-assert.match(
-  source,
-  /youtubeDirectStaticAssets:\s*boolEnv\("YT_DIRECT_STATIC_ASSETS",\s*false\)/,
-  "YT_DIRECT_STATIC_ASSETS default must be false — redirecting the iframe to YouTube's CDN leaves scripts at HTTP 0."
-);
+const { app, mongoStore, CFG } = require("../src/server");
 
-// 2. Every x-veyra-direct-asset header write must be paired with a 302 redirect
-//    and the 302 must be guarded by a same-origin Referer check. Locate each
-//    header write and inspect the surrounding lines for both the 302 call and
-//    the guard, and confirm no unguarded `CFG.youtubeDirectStaticAssets`
-//    predicate can bypass it.
-const lines = source.split("\n");
-const directAssetLineIdx = lines
-  .map((line, i) => (line.includes('"x-veyra-direct-asset"') ? i : -1))
-  .filter(i => i !== -1);
-assert.ok(directAssetLineIdx.length > 0, "expected at least one x-veyra-direct-asset header write to exist");
-for (const i of directAssetLineIdx) {
-  const window = lines.slice(Math.max(0, i - 14), i + 4).join("\n");
-  assert.ok(
-    /status\(302\)\.end\(\)/.test(window),
-    "the x-veyra-direct-asset header write at line " + i + " must be paired with a 302 redirect."
-  );
-  assert.ok(
-    /ytDirectRefererOk/.test(window),
-    "the YouTube direct-asset 302 near line " + i + " must be guarded by ytDirectRefererOk (same-origin Referer) so iframe loads get the bundle inline."
-  );
-}
+(async () => {
+  assert.equal(CFG.youtubeDirectStaticAssets, true, "the flag should be force-enabled for this test to exercise the guard");
+  mongoStore.enabled = false;
+  mongoStore.uri = "";
 
-// 3. Behavioral: launch the real proxyRequest path with the flag ON and a
-//    Veyra-origin Referer, and verify it does NOT emit the 302.
-//    Do this by stubbing express's res object and exercising the code via a
-//    small harness that mimics an in-flight /api/resource call.
-const express = require("express");
-const app = express();
+  // Mock the upstream fetch (no real YouTube traffic) — return a small
+  // fake JS bundle body that matches what YouTube's CDN serves.
+  const upstreamCalls = [];
+  app.locals.veyraProxyFetchBuffer = async (url, opts) => {
+    upstreamCalls.push({ url, method: String(opts.method || "GET").toUpperCase() });
+    return {
+      ok: true,
+      status: 200,
+      contentType: "text/javascript; charset=UTF-8",
+      body: Buffer.from("// youtube fake bundle\nconsole.log('ytd-upgrade')\n"),
+      finalUrl: url,
+      cacheControl: "public, max-age=300",
+      contentLength: "38",
+      redirectChain: [],
+      truncated: false,
+      tooLarge: false,
+      setCookieHeader: null,
+      etag: null,
+      lastModified: null,
+    };
+  };
 
-// Import the server module. This is a heavyweight require (spawns listeners
-// on a default port), so we rely on VEYRA-free default and check the exported
-// `mergeStrayProxyParams` etc. are present and then simulate directly.
-const server = require("../src/server.js");
+  const server = app.listen(0, "127.0.0.1");
+  try {
+    await new Promise((resolve, reject) => { server.once("listening", resolve); server.once("error", reject); });
+    const base = `http://127.0.0.1:${server.address().port}`;
 
-// Rather than drive an HTTP request through the running server (which would
-// hit real YouTube), verify the guard predicate logic itself with a mock.
-// Extract the relevant source fragment and check the branch is unreachable
-// when CFG.youtubeDirectStaticAssets is false OR when refererOrigin !== target.
-const early302Site = lines
-  .map((_, i) => i)
-  .filter(i => lines[i].includes("x-veyra-direct-asset") && /302/.test(lines.slice(i, i + 4).join("")));
-assert.ok(early302Site.length >= 2, "expected both early and post-fetch 302 sites to exist");
+    // 1. YouTube static bundle with a VEYRA-origin Referer (fast-proxy iframe case)
+    const resourceUrl = `${base}/api/resource?url=${encodeURIComponent("https://www.youtube.com/s/desktop/0a4db377/jsbin/webcomponents-sd.vflset/webcomponents-sd.js")}&from=${encodeURIComponent("https://www.youtube.com/")}&sid=regression-sid`;
+    const r1 = await fetch(resourceUrl, { redirect: "manual", headers: { "Referer": `${base}/api/view?url=https%3A%2F%2Fwww.youtube.com` } });
+    const t1 = await r1.text();
+    assert.equal(r1.status, 200, `YouTube static bundle must be served inline (HTTP 200), got ${r1.status}`);
+    assert.ok(!r1.headers.get("location"), "no cross-origin Location header should be set");
+    assert.ok(!/x-veyra-direct-asset/i.test(Array.from(r1.headers.keys()).join(",")), "no x-veyra-direct-asset header should be emitted");
+    assert.ok(/youtube fake bundle/.test(t1), "the upstream JS body should be served to the caller");
+    assert.equal(upstreamCalls.length, 1, "the upstream fetch should have been used exactly once");
+    assert.ok(/webcomponents-sd\.js/.test(upstreamCalls[0].url), "the upstream fetch should target the real bundle URL");
 
-// Find the proxyRequest function body and check the CFG check is NOT the only
-// guard on either 302 path (i.e., there is no way to bypass ytDirectRefererOk
-// by merely enabling the flag).
-const proxyRequestStart = source.indexOf("async function proxyRequest(");
-assert.ok(proxyRequestStart > 0, "proxyRequest function not found");
-const proxyRequestBody = source.slice(proxyRequestStart, source.indexOf("app.get(\"/api/view\"", proxyRequestStart));
-// Remove any `CFG.youtubeDirectStaticAssets` predicates that gate a 302 without
-// the Referer guard in the same condition.
-const unguarded = proxyRequestBody.match(
-  /if \([^)]*CFG\.youtubeDirectStaticAssets[^)]*\)\s*\{\s*[^}]*x-veyra-direct-asset[^}]*302/s
-);
-assert.ok(
-  !unguarded,
-  "a 302 direct-asset branch is gated ONLY by CFG.youtubeDirectStaticAssets and bypasses the same-origin Referer check. Remove that branch or combine it with ytDirectRefererOk."
-);
+    // 2. A second request for the same bundle with a YOUTUBE-ORIGIN Referer
+    //    (native-tab case) IS permitted to 302 when the Referer origin matches
+    //    the target — that is the safe same-origin case the guard allows.
+    const r2 = await fetch(resourceUrl, { redirect: "manual", headers: { "Referer": "https://www.youtube.com/" } });
+    if (CFG.youtubeDirectStaticAssets) {
+      assert.equal(r2.status, 302, "the same-origin Referer case is permitted to emit the direct-asset 302 when the flag is on");
+      assert.ok(r2.headers.get("location")?.includes("youtube.com"), "the 302 Location should point at YouTube");
+    } else {
+      assert.equal(r2.status, 200, "with the flag off, the same-origin Referer case should serve inline");
+    }
 
-// 4. render.yaml must ship the same default for the deployed Render instance.
-const render = fs.readFileSync(path.join(__dirname, "..", "render.yaml"), "utf8");
-assert.match(
-  render,
-  /YT_DIRECT_STATIC_ASSETS\s*\n\s*value:\s*"false"/,
-  "render.yaml must set YT_DIRECT_STATIC_ASSETS=false so the deployed fast proxy serves YouTube bundles inline."
-);
+    // 3. The code default must remain off so iframe-based fast-proxy loads always get the body.
+    const source = fs.readFileSync(path.join(__dirname, "..", "src", "server.js"), "utf8");
+    assert.match(
+      source,
+      /youtubeDirectStaticAssets:\s*boolEnv\("YT_DIRECT_STATIC_ASSETS",\s*false\)/,
+      "YT_DIRECT_STATIC_ASSETS default must be false in code so iframe loads get the bundle inline."
+    );
+    assert.ok(
+      !/if \([^)]*CFG\.youtubeDirectStaticAssets[^)]*\)\s*\{\s*[^}]*x-veyra-direct-asset[^}]*302/s.test(source),
+      "no 302 branch may be gated ONLY by CFG.youtubeDirectStaticAssets — every direct-asset 302 must also pass the same-origin Referer guard."
+    );
 
-console.log("VeyraServer YouTube direct-asset guard checks passed");
+    // 4. render.yaml must ship the same default for the deployed Render instance.
+    const render = fs.readFileSync(path.join(__dirname, "..", "render.yaml"), "utf8");
+    assert.match(
+      render,
+      /YT_DIRECT_STATIC_ASSETS\s*\n\s*value:\s*"false"/,
+      "render.yaml must set YT_DIRECT_STATIC_ASSETS=false so the deployed fast proxy serves YouTube bundles inline."
+    );
+
+    console.log("VeyraServer YouTube direct-asset behavioral checks passed");
+  } finally {
+    server.close();
+  }
+})().catch(e => { console.error(String(e.stack || e.message).slice(0, 600)); process.exit(1); });
