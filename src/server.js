@@ -2014,6 +2014,18 @@ function rewriteJsText(text, base, sid = "") {
       // through fetch/XHR, so keep these URLs same-origin in the bundle.
       const geoFsFamily = /(^|\.)geo-fs\.com$/i;
       if (target.origin === source.origin || (geoFsFamily.test(source.hostname) && geoFsFamily.test(target.hostname))) {
+        // EXCEPTION: URLs that Cesium's Resource will use as a *base* for
+        // tile templates. When the template has a query string (like the
+        // terrain template "{z}/{x}/{y}.terrain?v={version}"), Cesium's
+        // getDerivedResource REPLACES the whole query — dropping the proxy's
+        // url/from/sid parameters and producing 404s at
+        // /api/resource/<z>/<x>/<y>.terrain. Keep these absolute and let
+        // the runtime fetch/XHR patch wrap each tile request instead.
+        const idx = out.indexOf(m);
+        const before = out.slice(Math.max(0, idx - 120), idx);
+        if (/\bgeofs\.(?:srtmServer|dataServer|blackMarbleServer|landuseServer|buildingServer|treeServer|objectServer|aircraftServer|runwayServer)\s*=\s*$/.test(before)) {
+          return m;
+        }
         return `${quote}${makeResourceUrl(u, base, sid)}${quote}`;
       }
     } catch {}
@@ -2282,7 +2294,23 @@ function rewriteHtml(html, base, sid = "") {
     if (rel.includes("canonical")) return;
     const raw = $(el).attr("href"); const u = resolveResource(raw, effectiveBase); if (u) { $(el).attr("href", makeResourceUrl(u, effectiveBase, sid)); $(el).removeAttr("crossorigin"); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); }
   });
-  $("script[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), effectiveBase); if (u) { $(el).attr("src", makeResourceUrl(u, effectiveBase, sid)); $(el).removeAttr("crossorigin"); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); } });
+  $("script[src]").each((_, el) => {
+    const rawSrc = $(el).attr("src");
+    const u = resolveResource(rawSrc, effectiveBase);
+    if (!u) return;
+    // CesiumJS builds its Assets/ base from the last <script> whose src ends
+    // in "Cesium.js". Once rewritten to /api/resource?url=..., that src no
+    // longer matches the regex, so buildModuleUrl falls back to
+    // location.origin + "/" + undefined. Set CESIUM_BASE_URL to the real
+    // script's parent path before Cesium loads so the proxy URL never leaks
+    // into the path.
+    if (/Cesium\.js(?:\?|#|$)/i.test(String(rawSrc || ""))) {
+      try { const cesiumBase = new URL(".", u).href; $(`<script>window.CESIUM_BASE_URL = ${JSON.stringify(cesiumBase)};</script>`).insertBefore(el); } catch {}
+    }
+    $(el).attr("src", makeResourceUrl(u, effectiveBase, sid));
+    $(el).removeAttr("crossorigin");
+    if ($(el).attr("integrity")) $(el).removeAttr("integrity");
+  });
   for (const tag of ["img", "source", "audio", "input", "embed"]) {
     $(`${tag}[src]`).each((_, el) => { const u = resolveResource($(el).attr("src"), effectiveBase); if (u) $(el).attr("src", makeResourceUrl(u, effectiveBase, sid)); });
   }
@@ -2294,11 +2322,21 @@ function rewriteHtml(html, base, sid = "") {
   // whole attribute family or image URLs resolve against Veyra's origin.
   $("[data-deferredsrc]").each((_, el) => {
     const raw = $(el).attr("data-deferredsrc"); const u = resolveResource(raw, effectiveBase);
-    if (u) $(el).attr("data-deferredsrc", makeResourceUrl(u, effectiveBase, sid));
+    if (!u) return;
+    // Same CESIUM_BASE_URL treatment for deferred-loaded Cesium scripts.
+    if (/Cesium\.js(?:\?|#|$)/i.test(String(raw || ""))) {
+      try { const cesiumBase = new URL(".", u).href; $(`<script>window.CESIUM_BASE_URL = ${JSON.stringify(cesiumBase)};</script>`).insertBefore(el); } catch {}
+    }
+    $(el).attr("data-deferredsrc", makeResourceUrl(u, effectiveBase, sid));
   });
   $("script[dest]").each((_, el) => {
     const raw = $(el).attr("dest"); const u = resolveResource(raw, effectiveBase);
-    if (u) $(el).attr("dest", makeResourceUrl(u, effectiveBase, sid));
+    if (!u) return;
+    // Same CESIUM_BASE_URL treatment for dest-loaded Cesium scripts.
+    if (/Cesium\.js(?:\?|#|$)/i.test(String(raw || ""))) {
+      try { const cesiumBase = new URL(".", u).href; $(`<script>window.CESIUM_BASE_URL = ${JSON.stringify(cesiumBase)};</script>`).insertBefore(el); } catch {}
+    }
+    $(el).attr("dest", makeResourceUrl(u, effectiveBase, sid));
   });
   $("video[poster]").each((_, el) => { const u = resolveResource($(el).attr("poster"), effectiveBase); if (u) $(el).attr("poster", makeResourceUrl(u, effectiveBase, sid)); });
   $("track[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), effectiveBase); if (u) $(el).attr("src", makeResourceUrl(u, effectiveBase, sid)); });

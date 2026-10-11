@@ -36,10 +36,36 @@ const inlineGeoFs = rewriteHtml(`<html><head><script>
   geofs.multiplayerHost = "https://mps.geo-fs.com";
   geofs.osmTileProvider = "https://data.geo-fs.com/osm/{z}/{x}/{y}.png";
 </script></head></html>`, 'https://www.geo-fs.com/geofs.php?v=3.9', 'inline-geofs');
-assert.match(inlineGeoFs, /\/api\/resource\?url=https%3A%2F%2Fdata\.geo-fs\.com%2Fsrtm%2F/);
+// srtmServer (used by Cesium's CesiumTerrainProvider as a *base* for tile
+// templates with a "?v=" query) must STAY ABSOLUTE. The runtime fetch/XHR
+// patch wraps each tile request. Rewriting it to /api/resource?url=... makes
+// Cesium's getDerivedResource replace the whole query string and produce
+// 404s at /api/resource/<z>/<x>/<y>.terrain.
+assert.match(inlineGeoFs, /geofs\.srtmServer\s*=\s*"https:\/\/data\.geo-fs\.com\/srtm\/"/);
+assert.doesNotMatch(inlineGeoFs, /srtmServer[^;]*\/api\/resource\?url=/);
 assert.match(inlineGeoFs, /\/api\/resource\?url=https%3A%2F%2Fweather\.geo-fs\.com%2F/);
 assert.match(inlineGeoFs, /\/api\/resource\?url=https%3A%2F%2Fmps\.geo-fs\.com/);
 assert.match(inlineGeoFs, /\/api\/resource\?url=https%3A%2F%2Fdata\.geo-fs\.com%2Fosm%2F\{z\}%2F\{x\}%2F\{y\}\.png/);
 assert.doesNotMatch(inlineGeoFs, /data\.geo-fs\.com%2Fosm%2F%7Bz%7D/);
+
+// Regression: the rewritten Cesium <script src> ends with "Cesium.js" followed by
+// the proxy's own query params, so Cesium's /((?:.*\/)|^)Cesium\.js(?:\?|#|$)/
+// regex no longer matches its own <script src>. buildModuleUrl then falls back
+// to location.origin + "/" + undefined and requests Assets/... become 404s
+// (/undefined/Assets/approximateTerrainHeights.json).
+// The fix injects <script>window.CESIUM_BASE_URL = "...";</script> before any
+// Cesium.js script so buildModuleUrl uses a real upstream base.
+{
+  const out2 = rewriteHtml(html, 'https://www.geo-fs.com/geofs.php', 'cesium-base');
+  // Verify CESIUM_BASE_URL is injected for the dest-based Cesium.js script
+  // and points at the real parent directory of Cesium.js.
+  assert.match(out2, /window\.CESIUM_BASE_URL\s*=\s*"https:\/\/www\.geo-fs\.com\/js\/Cesium\/build\/"/);
+  assert.match(out2, /window\.CESIUM_BASE_URL\s*=\s*"https:\/\/www\.geo-fs\.com\/projects\/CESIUM\/Build\/Cesium\/"/);
+}
+// Do NOT inject CESIUM_BASE_URL on pages that don't load Cesium.js.
+{
+  const nonCesium = rewriteHtml('<html><body><script src="https://example.com/app.js"></script></body></html>', 'https://example.com/', 'no-cesium');
+  assert.doesNotMatch(nonCesium, /window\.CESIUM_BASE_URL/);
+}
 
 console.log('Proxy rewrite regression tests passed');
