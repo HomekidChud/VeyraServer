@@ -5338,9 +5338,15 @@ async function proxyRequest(req, res, mode) {
     // cannot change that decision and only doubles queue pressure.
     const signedYoutubeMedia = mediaRequest && /(?:googlevideo\.com|videoplayback)/i.test(canonical);
     const retries = signedYoutubeMedia ? 0 : (mediaRequest ? 1 : (looksLikeApiResource(canonical, accept, method) || isNextRsc ? CFG.proxyApiRetries : CFG.maxRetries));
-    const requestUserAgent = req.get("User-Agent") ? String(req.get("User-Agent")).slice(0, 2000) : "";
+    const requestUserAgent = (req.get("User-Agent") ? String(req.get("User-Agent")).slice(0, 2000) : "");
+    // m.youtube.com must be fetched with a mobile UA. Otherwise YouTube serves the
+    // desktop build, its client JS sees the mobile URL + desktop build mismatch and
+    // appends ?app=desktop&themeRefresh=1, Veyra's virtualPageUrl pins the URL back to
+    // m.youtube.com, and the page reloads forever on its skeleton.
+    const mobileYoutubeRequest = (() => { try { return /^m\.youtube\.com$/i.test(new URL(canonical).hostname); } catch { return false; } })();
+    const effectiveUserAgent = mobileYoutubeRequest ? "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36" : requestUserAgent;
     const hasAuthorization = !!req.get("Authorization");
-    const result = await browserScheduler.request(browserKey, () => fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, requestId: req.veyraRequestId, userAgent: requestUserAgent || undefined, limit: requestLimit, retries, limitForContentType, noCache: method !== "GET" || mediaRequest || hasAuthorization || isNextRsc, timeout: mediaRequest ? CFG.mediaRequestTimeoutMs : CFG.requestTimeoutMs, bodyTimeoutMs: mediaRequest ? CFG.mediaBodyTimeoutMs : CFG.bodyTimeoutMs, streamOversize: mode === "resource" }), { priority: browserPriority + (mediaRequest ? 30 : 0), host: hostOf(canonical), url: canonical });
+    const result = await browserScheduler.request(browserKey, () => fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, requestId: req.veyraRequestId, userAgent: effectiveUserAgent || undefined, limit: requestLimit, retries, limitForContentType, noCache: method !== "GET" || mediaRequest || hasAuthorization || isNextRsc, timeout: mediaRequest ? CFG.mediaRequestTimeoutMs : CFG.requestTimeoutMs, bodyTimeoutMs: mediaRequest ? CFG.mediaBodyTimeoutMs : CFG.bodyTimeoutMs, streamOversize: mode === "resource" }), { priority: browserPriority + (mediaRequest ? 30 : 0), host: hostOf(canonical), url: canonical });
   
   
   
