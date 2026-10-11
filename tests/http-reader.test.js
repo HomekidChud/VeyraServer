@@ -71,12 +71,14 @@ assert.equal(linkRows(["https://safe.fixture.test/ok", "https://safe.fixture.tes
     assert.match(readerResponse.headers.get("x-content-type-options"), /nosniff/i);
 
     const videoUrl = "https://www.youtube.com/watch?v=abcDEF12345";
-    const videoResponse = await fetch(`${base}/api/scrape?url=${encodeURIComponent(videoUrl)}`);
+    const videoResponse = await fetch(`${base}/api/scrape?url=${encodeURIComponent(videoUrl)}`, { headers: { host: "attacker.example" } });
     const video = await videoResponse.json();
     assert.equal(videoResponse.status, 200);
     assert.equal(video.title, "Public video");
     assert.equal(video.youtubeVideo.authorName, "Fixture channel");
     assert.match(video.embedUrl, /^https:\/\/www\.youtube-nocookie\.com\/embed\/abcDEF12345/);
+    assert.notEqual(new URL(video.embedUrl).searchParams.get("origin"), "http://attacker.example", "embed origin must not trust a caller-supplied Host header");
+    assert.notEqual(new URL(video.embedUrl).searchParams.get("origin"), "https://attacker.example");
     assert.equal(video.fetchDurationMs, 0, "oEmbed route must not invoke server-side page rendering");
     const videoReaderResponse = await fetch(`${base}/api/reader?url=${encodeURIComponent(videoUrl)}`);
     const videoReaderHtml = await videoReaderResponse.text();

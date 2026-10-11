@@ -1484,7 +1484,17 @@ function httpReaderError(error) {
   return { status, code, message };
 }
 function httpReaderRequestOrigin(req) {
-  try { return new URL(req.originalUrl || "/", `${req.protocol}://${req.get("host")}`).origin; } catch { return ""; }
+  for (const raw of [CFG.publicApiOrigin, process.env.RENDER_EXTERNAL_URL]) {
+    try {
+      const candidate = new URL(String(raw || ""));
+      if (/^https?:$/.test(candidate.protocol) && candidate.hostname) return candidate.origin;
+    } catch {}
+  }
+  try {
+    const candidate = new URL(`${req.protocol}://${req.get("host")}`);
+    if (["localhost", "127.0.0.1", "::1"].includes(candidate.hostname)) return candidate.origin;
+  } catch {}
+  return "";
 }
 async function acquireHttpReaderPayload(target, req) {
   const assertPublic = app.locals.veyraReaderAssertPublic || acquisitionManager.assertPublicUrl;
