@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const cheerio = require("cheerio");
+const { parse: parseModuleImports } = require("es-module-lexer/js");
 const crypto = require("crypto");
 const dns = require("dns").promises;
 const net = require("net");
@@ -1024,6 +1025,10 @@ function makeResourceUrl(url, referrer = "", sid = "") {
   if (sid) parts.push(`sid=${encodeURIComponent(sid)}`);
   return parts.length ? `${q}&${parts.join("&")}` : q;
 }
+function makeModuleResourceUrl(url, sid = "") {
+  // One module URL per session, regardless of which parent imported it.
+  return makeResourceUrl(url, new URL(url).origin + "/", sid);
+}
 function typeFor(url, hint = "") {
   const p = String(url).toLowerCase().split("?")[0];
   const h = String(hint || "").toLowerCase();
@@ -1987,22 +1992,23 @@ function rewriteCssText(text, base, sid = "") {
   });
 }
 function rewriteJsText(text, base, sid = "") {
-  const patterns = [
-    
-    
-    
-    /(\bimport\s*\(\s*)(["'`])([^"'`$]+)\2(?=\s*[,)])/g,
-    /(\bimport\s+(?:[^'"`;()]*?\s+from\s+)?|\bexport\s+[^'"`;()]*?\s+from\s+)(["'])([^"']+)\2(?=\s*(?:;|$|\n|\r|assert\b|with\b))/gm
-  ];
   let out = String(text || "");
   
   
-  out = out.replace(/navigator\.serviceWorker\.register\s*\(/g, 'navigator.serviceWorker.register=function(){return Promise.reject(new Error("Service workers are not available in Veyra proxy mode."))};navigator.serviceWorker.register(');
-  for (const re of patterns) {
-    out = out.replace(re, (m, prefix, quote, spec) => {
-      const u = resolveResource(spec, base);
-      return u ? `${prefix}${quote}${makeResourceUrl(u, base, sid)}${quote}` : m;
-    });
+  // injectRuntime installs the policy once. Never insert a statement into
+  // a call expression: register() often appears inside return/await/Promise.all.
+  try {
+    const imports = parseModuleImports(out)[0];
+    for (const item of [...imports].reverse()) {
+      if (!["static", "dynamic"].includes(item.type) || !item.specifier || item.typeOnly) continue;
+      if (!/^(?:\.{1,2}\/|\/|https?:\/\/)/i.test(item.specifier)) continue; // Preserve import-map aliases.
+      const u = resolveResource(item.specifier, base);
+      if (!u) continue;
+      const replacement = makeModuleResourceUrl(u, sid);
+      out = out.slice(0, item.start) + (item.type === "dynamic" ? JSON.stringify(replacement) : replacement) + out.slice(item.end);
+    }
+  } catch {
+    // Preserve invalid/unsupported source rather than regex-editing strings.
   }
   out = out.replace(/(["'`])(https?:\/\/[^"'`\s]+)\1/g, (m, quote, value) => {
     const u = resolveResource(value, base);
@@ -2292,7 +2298,7 @@ function rewriteHtml(html, base, sid = "") {
   $("link[href]").each((_, el) => {
     const rel = String($(el).attr("rel") || "").toLowerCase();
     if (rel.includes("canonical")) return;
-    const raw = $(el).attr("href"); const u = resolveResource(raw, effectiveBase); if (u) { $(el).attr("href", makeResourceUrl(u, effectiveBase, sid)); $(el).removeAttr("crossorigin"); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); }
+    const raw = $(el).attr("href"); const u = resolveResource(raw, effectiveBase); if (u) { $(el).attr("href", rel.includes("modulepreload") ? makeModuleResourceUrl(u, sid) : makeResourceUrl(u, effectiveBase, sid)); $(el).removeAttr("crossorigin"); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); }
   });
   $("script[src]").each((_, el) => {
     const rawSrc = $(el).attr("src");
@@ -2307,7 +2313,7 @@ function rewriteHtml(html, base, sid = "") {
     if (/Cesium\.js(?:\?|#|$)/i.test(String(rawSrc || ""))) {
       try { const cesiumBase = new URL(".", u).href; $(`<script>window.CESIUM_BASE_URL = ${JSON.stringify(cesiumBase)};</script>`).insertBefore(el); } catch {}
     }
-    $(el).attr("src", makeResourceUrl(u, effectiveBase, sid));
+    $(el).attr("src", $(el).attr("type") === "module" ? makeModuleResourceUrl(u, sid) : makeResourceUrl(u, effectiveBase, sid));
     $(el).removeAttr("crossorigin");
     if ($(el).attr("integrity")) $(el).removeAttr("integrity");
   });
@@ -6248,50 +6254,60 @@ let internetManager = new InternetConnectionManager();
 
 
 app.get("/api/cast/stats", (req, res) => res.json(castServer ? castServer.getStats() : { error: "Cast server not available" }));
-app.get("/api/cast/sessions", (req, res) => res.json(castServer ? castServer.listSessions() : { error: "Cast server not available" }));
+app.get("/api/cast/sessions", (req, res) => res.json(castServer ? castServer.getStats() : { error: "Cast server not available" }));
+const castCapability = role => (req, res, next) => {
+  if (!castServer) return res.status(503).json({ error: "Cast server not available" });
+  const token = String(req.headers.authorization || "").replace(/^Bearer /i, "");
+  const valid = role === "browser" ? castServer.authorizeBrowser(req.params.sessionId, token)
+    : castServer.authorizeDevice(req.params.deviceId, token);
+  if (!valid) return res.status(403).json({ ok: false, error: "Invalid cast capability" });
+  res.setHeader("Cache-Control", "no-store");
+  next();
+};
 app.post("/api/cast/create", (req, res) => {
   if (!castServer) return res.status(503).json({ error: "Cast server not available" });
-  const session = castServer.createSessionViaPoll();
-  res.json({ ok: true, sessionId: session.id, pairingCode: session.pairingCode, qrPayload: castServer.buildQrPayload(session.id, session.pairingCode), qrUrl: castServer.buildQrUrl(session.id, session.pairingCode) });
+  let session;
+  try { session = castServer.createSessionViaPoll(); }
+  catch (e) { return res.status(503).json({ ok: false, error: e.message }); }
+  res.setHeader("Cache-Control", "no-store");
+  res.json({ ok: true, sessionId: session.id, browserToken: session.browserToken, pairingCode: session.pairingCode, qrPayload: castServer.buildQrPayload(session.id, session.pairingCode), qrUrl: castServer.buildQrUrl(session.id, session.pairingCode) });
 });
-app.get("/api/cast/poll/:sessionId", (req, res) => {
+app.get("/api/cast/poll/:sessionId", castCapability("browser"), (req, res) => {
   if (!castServer) return res.status(503).json({ error: "Cast server not available" });
   const msgs = castServer.pollSession(req.params.sessionId);
   res.json({ ok: true, messages: msgs });
 });
 app.post("/api/cast/push/:sessionId", (req, res) => {
-  if (!castServer) return res.status(503).json({ error: "Cast server not available" });
-  castServer.pushToPoll(req.params.sessionId, req.body);
-  res.json({ ok: true });
+  res.status(410).json({ ok: false, error: "Use authenticated /api/cast/device/push/:deviceId" });
 });
-app.post("/api/cast/send/:sessionId", (req, res) => {
+app.post("/api/cast/send/:sessionId", castCapability("browser"), (req, res) => {
   if (!castServer) return res.status(503).json({ error: "Cast server not available" });
   const result = castServer.sendToDevice(req.params.sessionId, req.body || {});
   if (!result.ok) return res.status(404).json(result);
   res.json(result);
 });
-app.post("/api/cast/close/:sessionId", (req, res) => {
+app.post("/api/cast/close/:sessionId", castCapability("browser"), (req, res) => {
   if (!castServer) return res.status(503).json({ error: "Cast server not available" });
   res.json(castServer.closeSession(req.params.sessionId, String(req.body?.reason || "client_closed")));
 });
 
 app.post("/api/cast/device/join", (req, res) => {
   if (!castServer) return res.status(503).json({ error: "Cast server not available" });
-  const { sessionId, code, deviceId, name, type, connection } = req.body || {};
-  const result = castServer.joinDeviceViaPoll(sessionId, code, deviceId, { name, type, connectionType: connection });
+  const { sessionId, code, deviceId, name, type, connection, connectionType, networkStrength } = req.body || {};
+  const result = castServer.joinDeviceViaPoll(sessionId, code, deviceId, { name, type, connectionType: connectionType || connection, networkStrength });
   if (!result.ok) return res.status(400).json(result);
   res.json(result);
 });
-app.get("/api/cast/device/poll/:deviceId", (req, res) => {
+app.get("/api/cast/device/poll/:deviceId", castCapability("device"), (req, res) => {
   if (!castServer) return res.status(503).json({ error: "Cast server not available" });
   const result = castServer.pollDevice(req.params.deviceId);
   if (!result.ok) return res.status(404).json(result);
   res.json(result);
 });
-app.post("/api/cast/device/push/:deviceId", (req, res) => {
+app.post("/api/cast/device/push/:deviceId", castCapability("device"), (req, res) => {
   if (!castServer) return res.status(503).json({ error: "Cast server not available" });
-  castServer.pushToDevicePoll(req.params.deviceId, req.body);
-  res.json({ ok: true });
+  const result = castServer.receiveDeviceMessage(req.params.deviceId, req.body);
+  res.status(result.ok ? 200 : 400).json(result);
 });
 
 

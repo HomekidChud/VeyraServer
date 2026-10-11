@@ -5,6 +5,8 @@
   "description": "Veyra Browser API, adaptive proxy/browser engine, page resource acceleration, search service, and diagnostics.",
   "main": "src/server.js",
   "scripts": {
+    "test:cast": "node tests/cast-transport.test.js && node tests/cast-http.test.js",
+    "test:script-expressions": "node tests/script-expression.test.js",
     "start": "node src/server.js",
     "prestart": "node scripts/ensure-browser.js",
     "build": "node scripts/install-wireproxy.js",
@@ -13,7 +15,7 @@
     "dev": "node --watch src/server.js",
     "config": "node src/config/index.js",
     "check": "node scripts/verify-source.js",
-    "test": "npm run check && node tests/auth.test.js && node tests/ai-answer.test.js && node tests/neural-crawler.test.js && node tests/proxy-rewrite.test.js && node tests/acquisition-manager.test.js && node tests/google-accounts-transport.test.js && node tests/browser-status.test.js && node tests/youtube.test.js && node tests/youtube-direct-assets.test.js && node tests/crawler-js-heavy-render.test.js && node tests/websearch.test.js && node tests/search-route.test.js && node tests/source-view.test.js && node tests/http-reader.test.js && node tests/network-diagnostics.test.js",
+    "test": "npm run check && node tests/auth.test.js && node tests/ai-answer.test.js && node tests/neural-crawler.test.js && node tests/proxy-rewrite.test.js && node tests/acquisition-manager.test.js && node tests/google-accounts-transport.test.js && node tests/browser-status.test.js && node tests/youtube.test.js && node tests/youtube-direct-assets.test.js && node tests/crawler-js-heavy-render.test.js && node tests/websearch.test.js && node tests/search-route.test.js && node tests/source-view.test.js && node tests/http-reader.test.js && node tests/network-diagnostics.test.js && node tests/script-expression.test.js && node tests/module-identity.test.js && npm run test:cast",
     "test:legacy": "node tests/legacy/fixed-bugs.js && node tests/legacy/vpn-fixes.js"
   },
   "engines": {
@@ -22,10 +24,11 @@
   "dependencies": {
     "cheerio": "^1.1.2",
     "cors": "^2.8.5",
+    "es-module-lexer": "^3.0.3",
     "express": "^5.1.0",
+    "mongodb": "^6.20.0",
     "playwright": "^1.55.0",
     "undici": "^6.29.0",
-    "mongodb": "^6.20.0",
     "ws": "^8.18.0"
   }
 }
