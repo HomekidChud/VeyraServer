@@ -33,6 +33,8 @@ If direct Google pages are required, use a legitimate residential or mobile egre
 
 For a recent end-to-end GeoFS debugging session (Cesium base-URL and terrain-tile 404s through the proxy) see
 [`docs/GEOFS_DEBUG_REPORT.md`](docs/GEOFS_DEBUG_REPORT.md).
+For a follow-up live session (OSM tile-template double-encoding fix, session time-limit config mismatch, third-party findings) see
+[`docs/DEBUG_SESSION_2026-10-11_B.md`](docs/DEBUG_SESSION_2026-10-11_B.md).
 
 Run `npm test` for deterministic regressions, including controlled local Express tests for `/api/search/web`, `/api/search/answer`, and `/api/youtube/resolve`, with external providers, LLM calls, Chromium and Mongo writes disabled. Tests include prompt-injection-in-source coverage and deadline-aware early cancellation. The ranker fixture contains relevant, irrelevant, duplicate and misleading-snippet cases and reports Precision@2 for that fixed fixture only—not production quality. `npm run benchmark:search` compares baseline versus upgraded orchestration using a fixed mock provider delay; it measures scheduling behavior only, not real network speed. `npm run diagnostics:network -- --route=direct` makes one bounded request to each configured public diagnostic endpoint (IPv4/IPv6 address services, Google/Bing/DuckDuckGo) and prints DNS, TLS/HTTP, parsing and block classifications; it does **not** classify the egress as residential. Use `--route=proxy` only when an authorized proxy is configured. The command does not retry or bypass challenges. No diagnostic command writes cookies or authorization headers to its report.
 
