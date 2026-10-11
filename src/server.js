@@ -3808,6 +3808,7 @@ app.post('/api/browser/capability', async (req, res) => {
   const raw = normalizeUrl(String(req.body?.url || ''));
   if (!raw) return respondError(res, 400, 'Invalid URL.', 'INVALID_URL');
   const proxySessionId = String(req.body?.proxySessionId || req.body?.sessionId || "");
+  const youtubeHome = youtubeCompat.isYoutubeHomePage(raw);
 
   
   
@@ -3842,7 +3843,7 @@ app.post('/api/browser/capability', async (req, res) => {
     
     
     const lean = CFG.leanMode && !CFG.leanAutoBrowser;
-    const forceBrowser = hostNeedsRealBrowser(result.finalUrl || raw) || signals.gameOrRemoteBrowser;
+    const forceBrowser = hostNeedsRealBrowser(result.finalUrl || raw) || signals.gameOrRemoteBrowser || youtubeHome;
     
     
     
@@ -3860,7 +3861,7 @@ app.post('/api/browser/capability', async (req, res) => {
     res.json({ ok: true, url: result.finalUrl || raw, mode, lean: CFG.leanMode, challenge: challenge ? challenge.type : null, forceBrowser: !!forceBrowser, signals, fullPage: signals.fullPage, status: result.status, contentType: result.contentType, failover: failoverInfo, snapshot: hasSnapshot });
   } catch (e) {
     
-    const forceBrowser = hostNeedsRealBrowser(raw);
+    const forceBrowser = hostNeedsRealBrowser(raw) || youtubeHome;
     res.json({ ok: true, url: raw, mode: forceBrowser ? 'BROWSER_ENGINE' : (CFG.leanMode ? 'ACCELERATED_PROXY' : 'BROWSER_ENGINE'), lean: CFG.leanMode, forceBrowser, reason: 'capability_probe_failed', error: e.message });
   }
 });

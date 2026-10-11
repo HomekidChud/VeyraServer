@@ -1,6 +1,6 @@
 "use strict";
 const assert = require("assert");
-const { parseYoutubeUrl, buildEmbedUrl, checkEmbeddable, isYoutubeUrl } = require("../src/browser/youtube");
+const { parseYoutubeUrl, buildEmbedUrl, checkEmbeddable, isYoutubeUrl, isYoutubeHomePage } = require("../src/browser/youtube");
 
 (async () => {
   const cases = [
@@ -24,6 +24,11 @@ const { parseYoutubeUrl, buildEmbedUrl, checkEmbeddable, isYoutubeUrl } = requir
   assert.equal(parseYoutubeUrl("https://youtube.com/watch?v=bad"), null);
   assert.equal(isYoutubeUrl("https://youtube.com.evil.example/watch?v=dQw4w9WgXcQ"), false);
   assert.equal(parseYoutubeUrl("https://youtube.com.evil.example/watch?v=dQw4w9WgXcQ"), null);
+  assert.equal(isYoutubeHomePage("https://www.youtube.com/"), true);
+  assert.equal(isYoutubeHomePage("https://m.youtube.com/?app=desktop"), true);
+  assert.equal(isYoutubeHomePage("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), false);
+  assert.equal(isYoutubeHomePage("https://www.youtube.com/results?search_query=tests"), false);
+  assert.equal(isYoutubeHomePage("https://youtube.com.evil.example/"), false);
   const ok = await checkEmbeddable("dQw4w9WgXcQ", async () => ({ status: 200, json: async () => ({ title: "Test video", author_name: "Test channel", thumbnail_url: "https://img.youtube.com/vi/dQw4w9WgXcQ/0.jpg" }) }));
   assert.equal(ok.ok, true);
   const blocked = await checkEmbeddable("dQw4w9WgXcQ", async () => ({ status: 403 }));
