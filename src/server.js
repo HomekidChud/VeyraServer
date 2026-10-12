@@ -3948,7 +3948,10 @@ app.post('/api/browser/capability', async (req, res) => {
     // When the browser engine is disabled, never fall back to BROWSER_ENGINE;
     // the client would wait for a Chromium session that will never start.
     const forceBrowser = CFG.browserEnabled === true && (hostNeedsRealBrowser(raw) || youtubeHome);
-    res.json({ ok: true, url: raw, mode: forceBrowser ? 'BROWSER_ENGINE' : (CFG.leanMode ? 'ACCELERATED_PROXY' : 'BROWSER_ENGINE'), lean: CFG.leanMode, forceBrowser, reason: 'capability_probe_failed', error: e.message });
+    // When Chromium is disabled, fall back to ACCELERATED_PROXY regardless of
+    // lean mode — the browser engine is not running on this server.
+    const mode = forceBrowser ? 'BROWSER_ENGINE' : (CFG.browserEnabled !== true ? 'ACCELERATED_PROXY' : (CFG.leanMode ? 'ACCELERATED_PROXY' : 'BROWSER_ENGINE'));
+    res.json({ ok: true, url: raw, mode, lean: CFG.leanMode, forceBrowser, reason: 'capability_probe_failed', error: e.message });
   }
 });
 
