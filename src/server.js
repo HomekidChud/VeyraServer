@@ -3923,15 +3923,20 @@ app.post('/api/browser/capability', async (req, res) => {
     
     
     const lean = CFG.leanMode && !CFG.leanAutoBrowser;
-    const forceBrowser = hostNeedsRealBrowser(result.finalUrl || raw) || signals.gameOrRemoteBrowser || youtubeHome;
+    // When the browser engine is disabled (free plan / lean mode), never tell
+    // the client to use the browser engine — it does not exist. Fall back to
+    // FAST_PROXY so the fast proxy iframe is used directly instead of waiting
+    // for a Chromium session that will never start.
+    const browserAvailable = CFG.browserEnabled === true;
+    const forceBrowser = browserAvailable && (hostNeedsRealBrowser(result.finalUrl || raw) || signals.gameOrRemoteBrowser || youtubeHome);
     
     
     
     
     signals.fullPage = fullPage.hasFullPageState(result.body?.toString('utf8') || '');
     let mode = 'FAST_PROXY';
-    if (challenge || forceBrowser) mode = 'BROWSER_ENGINE';
-    else if (signals.heavy) mode = (lean || signals.fullPage) ? 'ACCELERATED_PROXY' : 'BROWSER_ENGINE';
+    if (browserAvailable && (challenge || forceBrowser)) mode = 'BROWSER_ENGINE';
+    else if (signals.heavy) mode = (lean || signals.fullPage || !browserAvailable) ? 'ACCELERATED_PROXY' : 'BROWSER_ENGINE';
     
     const failoverInfo = failoverController ? failoverController.breakerStatus(proxySessionId) : null;
     if (mode === 'BROWSER_ENGINE' && failoverInfo && failoverInfo.state === 'open') {
@@ -3940,8 +3945,9 @@ app.post('/api/browser/capability', async (req, res) => {
     const hasSnapshot = snapshotStore ? await snapshotStore.has(proxySessionId, result.finalUrl || raw) : false;
     res.json({ ok: true, url: result.finalUrl || raw, mode, lean: CFG.leanMode, challenge: challenge ? challenge.type : null, forceBrowser: !!forceBrowser, signals, fullPage: signals.fullPage, status: result.status, contentType: result.contentType, failover: failoverInfo, snapshot: hasSnapshot });
   } catch (e) {
-    
-    const forceBrowser = hostNeedsRealBrowser(raw) || youtubeHome;
+    // When the browser engine is disabled, never fall back to BROWSER_ENGINE;
+    // the client would wait for a Chromium session that will never start.
+    const forceBrowser = CFG.browserEnabled === true && (hostNeedsRealBrowser(raw) || youtubeHome);
     res.json({ ok: true, url: raw, mode: forceBrowser ? 'BROWSER_ENGINE' : (CFG.leanMode ? 'ACCELERATED_PROXY' : 'BROWSER_ENGINE'), lean: CFG.leanMode, forceBrowser, reason: 'capability_probe_failed', error: e.message });
   }
 });
