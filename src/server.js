@@ -2,6 +2,9 @@ const express = require("express");
 const cors = require("cors");
 const cheerio = require("cheerio");
 const { parse: parseModuleImports } = require("es-module-lexer/js");
+const { rewriteLocationReads } = require("./proxy-location");
+const { parsedCookie, scriptCookies, cookieCapability, authorizeCookieCapability, setScriptCookie } = require("./proxy-cookies");
+const { verifyIntegrity } = require("./proxy-integrity");
 const crypto = require("crypto");
 const dns = require("dns").promises;
 const net = require("net");
@@ -1128,28 +1131,14 @@ function storeSetCookies(sessionId, url, response) {
   if (!sessionId || typeof response?.headers?.getSetCookie !== "function") return;
   const values = response.headers.getSetCookie();
   if (!values?.length) return;
-  const session = sessionRecord(sessionId), u = new URL(url);
+  const session = sessionRecord(sessionId);
   for (const raw of values.slice(0, 50)) {
-    const parts = String(raw).split(";").map(x => x.trim());
-    const pair = parts.shift();
-    const eq = pair?.indexOf("=");
-    if (eq <= 0) continue;
-    const name = pair.slice(0, eq).trim(), value = pair.slice(eq + 1).trim();
-    if (!name || name.length > 128) continue;
-    const cookie = { name, value, domain: u.hostname.toLowerCase(), path: "/", secure: false, expiresAt: 0, hostOnly: true };
-    for (const attr of parts) {
-      const i = attr.indexOf("=");
-      const k = (i >= 0 ? attr.slice(0, i) : attr).trim().toLowerCase();
-      const v = i >= 0 ? attr.slice(i + 1).trim() : "";
-      if (k === "domain" && v) { cookie.domain = v.toLowerCase(); cookie.hostOnly = false; }
-      else if (k === "path" && v.startsWith("/")) cookie.path = v.slice(0, 256);
-      else if (k === "secure") cookie.secure = true;
-      else if (k === "max-age") { const n = Number(v); if (Number.isFinite(n)) cookie.expiresAt = Date.now() + Math.max(0, n) * 1000; }
-      else if (k === "expires") { const t = Date.parse(v); if (Number.isFinite(t)) cookie.expiresAt = t; }
-    }
-    const key = `${cookie.domain}|${cookie.path}|${cookie.name}`;
-    if (cookie.expiresAt && cookie.expiresAt <= Date.now()) session.cookies.delete(key);
-    else session.cookies.set(key, cookie);
+    try {
+      const cookie = parsedCookie(String(raw), url, true);
+      const key = `${cookie.domain}|${cookie.path}|${cookie.name}`;
+      if (cookie.expiresAt && cookie.expiresAt <= Date.now()) session.cookies.delete(key);
+      else session.cookies.set(key, cookie);
+    } catch {}
   }
   while (session.cookies.size > CFG.maxSessionCookies) {
     const oldest = session.cookies.keys().next().value;
@@ -1161,7 +1150,7 @@ function storeSetCookies(sessionId, url, response) {
 function cookieHeader(sessionId, url) {
   if (!sessionId) return "";
   const session = sessionRecord(sessionId), u = new URL(url), pairs = [];
-  for (const [key, cookie] of [...session.cookies.entries()]) {
+  for (const [key, cookie] of [...session.cookies.entries()].sort((a, b) => b[1].path.length - a[1].path.length)) {
     if (cookie.expiresAt && cookie.expiresAt <= Date.now()) { session.cookies.delete(key); continue; }
     if (cookie.secure && u.protocol !== "https:") continue;
     if (cookie.hostOnly ? cookie.domain !== u.hostname.toLowerCase() : !cookieDomainMatches(u.hostname, cookie.domain)) continue;
@@ -1992,7 +1981,7 @@ function rewriteCssText(text, base, sid = "") {
   });
 }
 function rewriteJsText(text, base, sid = "") {
-  let out = String(text || "");
+  let out = rewriteLocationReads(String(text || ""), base);
   
   
   // injectRuntime installs the policy once. Never insert a statement into
@@ -2010,7 +1999,12 @@ function rewriteJsText(text, base, sid = "") {
   } catch {
     // Preserve invalid/unsupported source rather than regex-editing strings.
   }
-  out = out.replace(/(["'`])(https?:\/\/[^"'`\s]+)\1/g, (m, quote, value) => {
+  // Do not wrap arbitrary URL strings. Webpack concatenates filenames onto
+  // publicPath; wrapping the directory first puts the filename into ?sid=.
+  // Retain the older, separately tested GeoFS-specific compatibility path.
+  let isGeoFs = false;
+  try { isGeoFs = /(^|\.)geo-fs\.com$/i.test(new URL(base).hostname); } catch {}
+  if (isGeoFs) out = out.replace(/(["'`])(https?:\/\/[^"'`\s]+)\1/g, (m, quote, value) => {
     const u = resolveResource(value, base);
     try {
       if (!u) return m;
@@ -2053,6 +2047,10 @@ function injectRuntime(html, original, sid = "") {
   const CANONICAL=${JSON.stringify(original)};
   const SESSION_ID=${JSON.stringify(sid)};
   const API_ORIGIN=${JSON.stringify(process.env.PUBLIC_API_ORIGIN || "")};
+  const COOKIE_CONTEXT=/*__VEYRA_COOKIE_CONTEXT__*/null;
+  const nativeCookieDescriptor=Object.getOwnPropertyDescriptor(Document.prototype,'cookie');
+  const nativeCookieFetch=window.fetch&&window.fetch.bind(window);
+  let cookiePending=Promise.resolve();
   let virtualUrl=CANONICAL;
   window.__VEYRA_PAGE_URL__=CANONICAL;
   window.__VEYRA_PROXY__=true;
@@ -2089,7 +2087,7 @@ function injectRuntime(html, original, sid = "") {
   // a data: Request with a spoofed own 'url' getter to replay a cached response.
   const reqUrlGet=(()=>{try{return Object.getOwnPropertyDescriptor(Request.prototype,'url').get}catch{return null}})();
   function realUrl(v){if(v==null)return '';if(typeof v==='string')return v;try{if(reqUrlGet&&typeof Request!=='undefined'&&v instanceof Request)return reqUrlGet.call(v)}catch{}if(typeof v.url==='string')return v.url;if(typeof v.href==='string')return v.href;return String(v)}
-  function toVirtual(raw){if(/^[?#]/.test(raw))return new URL(raw,virtualUrl);const u=new URL(raw,location.href);return ownOrigin(u.origin)?fixOwn(u):u}
+  function toVirtual(raw){const u=new URL(raw,virtualUrl);return ownOrigin(u.origin)?fixOwn(u):u}
   function resolve(v){try{const raw=unwrap(realUrl(v));return (raw===''?new URL(virtualUrl):toVirtual(raw)).href}catch{return String(v||'')}}
   function shouldProxy(v){try{const u=new URL(unwrap(v));return /^https?:$/.test(u.protocol)}catch{return false}}
   function proxy(kind,u){const prefix=API_ORIGIN || location.origin;const base=prefix+(kind==='view'?'/api/view?url=':'/api/resource?url=')+encodeURIComponent(u);const from=encodeURIComponent(new URL(virtualUrl).href);return kind==='view'?base+'&sid='+encodeURIComponent(SESSION_ID):base+'&from='+from+'&sid='+encodeURIComponent(SESSION_ID)}
@@ -2104,7 +2102,83 @@ function injectRuntime(html, original, sid = "") {
   const HP=(typeof History!=='undefined'&&History.prototype)||null;
   const nativeReplaceState=HP?HP.replaceState:history.replaceState;
   function rootProxiedFrame(){try{return window.parent===window||!window.parent.__VEYRA_PROXY__}catch{return true}}
-  function remember(next){virtualUrl=next;window.__VEYRA_PAGE_URL__=next;if(rootProxiedFrame())try{document.cookie='veyra_ctx='+encodeURIComponent(next)+'|'+encodeURIComponent(SESSION_ID)+';path=/;max-age=3600;'+(location.protocol==='https:'?'SameSite=None;Secure;Partitioned':'SameSite=Lax')}catch{}}
+  function remember(next){virtualUrl=next;window.__VEYRA_PAGE_URL__=next;if(rootProxiedFrame())try{nativeCookieDescriptor?.set?.call(document,'veyra_ctx='+encodeURIComponent(next)+'|'+encodeURIComponent(SESSION_ID)+';path=/;max-age=3600;'+(location.protocol==='https:'?'SameSite=None;Secure;Partitioned':'SameSite=Lax'))}catch{}}
+  if(COOKIE_CONTEXT&&nativeCookieDescriptor?.configurable&&nativeCookieFetch){
+    const localCookies=new Map((COOKIE_CONTEXT.cookies||[]).map(c=>[c.domain+'|'+c.path+'|'+c.name,c]));
+    const cookieVersions=new Map();
+    COOKIE_CONTEXT.revision=0;
+    window.__veyraSyncScriptCookies=(context,revision)=>{if(context.token)COOKIE_CONTEXT.token=context.token;if(revision!==COOKIE_CONTEXT.revision)return;localCookies.clear();for(const c of context.cookies||[])localCookies.set(c.domain+'|'+c.path+'|'+c.name,c)};
+    function visibleCookie(c){const u=new URL(virtualUrl),d=String(c.domain).replace(/^[.]/,'');return !c.httpOnly&&(!c.expiresAt||c.expiresAt>Date.now())&&(!c.secure||u.protocol==='https:')&&(c.hostOnly?u.hostname===d:u.hostname===d||u.hostname.endsWith('.'+d))&&(u.pathname===c.path||u.pathname.startsWith(c.path.endsWith('/')?c.path:c.path+'/'))}
+    function writeCookie(raw){
+      raw=String(raw);if(raw.length>4096)return;
+      const bits=raw.split(';'),pair=bits.shift(),at=pair.indexOf('=');if(at<1)return;
+      const u=new URL(virtualUrl),cookieUrl=virtualUrl,c={name:pair.slice(0,at).trim(),value:pair.slice(at+1).trim(),domain:u.hostname,path:u.pathname.slice(0,u.pathname.lastIndexOf('/'))||'/',hostOnly:true,secure:false,expiresAt:0};
+      for(const part of bits){const i=part.indexOf('='),name=(i<0?part:part.slice(0,i)).trim().toLowerCase(),value=i<0?'':part.slice(i+1).trim();if(name==='httponly')return;if(name==='domain'){c.domain=value.toLowerCase().replace(/^[.]/,'');c.hostOnly=false}if(name==='path'&&value.startsWith('/'))c.path=value;if(name==='secure')c.secure=true;if(name==='max-age'&&Number.isFinite(Number(value)))c.expiresAt=Date.now()+Math.max(0,Number(value))*1000;if(name==='expires'&&Number.isFinite(Date.parse(value)))c.expiresAt=Date.parse(value)}
+      if(!c.name||c.domain!==u.hostname&&!u.hostname.endsWith('.'+c.domain)||c.secure&&u.protocol!=='https:')return;
+      const version=++COOKIE_CONTEXT.revision;
+      const key=c.domain+'|'+c.path+'|'+c.name,previous=localCookies.get(key);
+      cookieVersions.set(key,version);
+      if(c.expiresAt&&c.expiresAt<=Date.now())localCookies.delete(key);else localCookies.set(key,c);
+      cookiePending=cookiePending.then(()=>nativeCookieFetch((API_ORIGIN||location.origin)+'/api/session/'+encodeURIComponent(SESSION_ID)+'/script-cookie',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({url:cookieUrl,cookie:raw,token:COOKIE_CONTEXT.token})})).then(async r=>{if(!r.ok)throw new Error('Script cookie write rejected');const body=await r.json();if(cookieVersions.get(key)===version){localCookies.delete(key);if(!body.cookie.expiresAt||body.cookie.expiresAt>Date.now())localCookies.set(body.cookie.domain+'|'+body.cookie.path+'|'+body.cookie.name,body.cookie)}}).catch(()=>{if(cookieVersions.get(key)===version){if(previous)localCookies.set(key,previous);else localCookies.delete(key)}});
+    }
+    Object.defineProperty(Document.prototype,'cookie',{configurable:true,enumerable:nativeCookieDescriptor.enumerable,get(){return this===document?[...localCookies.values()].filter(visibleCookie).sort((a,b)=>b.path.length-a.path.length).map(c=>c.name+'='+c.value).join('; '):nativeCookieDescriptor.get.call(this)},set(raw){if(this===document)writeCookie(raw);else nativeCookieDescriptor.set.call(this,raw)}});
+  }
+  // Browser security still uses the real proxy origin. This facade only gives
+  // page code its upstream URL and routes writes back through Veyra.
+  const nativeLocation=window.location;
+  function navigateVirtual(value,replace){const next=canonicalizeMaybeProxy(value);if(!next)return;if(!rootProxiedFrame()){emit(replace?'location.replace':'location.assign',next);return}nativeLocation[replace?'replace':'assign'](proxy('view',next))}
+  const virtualLocation=new Proxy(Object.create(Location.prototype),{
+    get(_target,key){
+      if(key===Symbol.toPrimitive||key==='toString'||key==='valueOf')return ()=>virtualUrl;
+      if(key===Symbol.toStringTag)return 'Location';
+      if(['href','origin','protocol','host','hostname','port','pathname','search','hash'].includes(key))return new URL(virtualUrl)[key];
+      if(key==='assign')return value=>navigateVirtual(value,false);
+      if(key==='replace')return value=>navigateVirtual(value,true);
+      if(key==='reload')return ()=>nativeLocation.reload();
+      if(key==='ancestorOrigins')return nativeLocation.ancestorOrigins;
+      const value=nativeLocation[key];return typeof value==='function'?value.bind(nativeLocation):value;
+    },
+    set(_target,key,value){
+      if(key==='href'){navigateVirtual(value,false);return true}
+      if(['protocol','host','hostname','port','pathname','search','hash'].includes(key)){
+        const next=new URL(virtualUrl);next[key]=value;
+        if(key==='hash'){remember(next.href);nativeLocation.hash=next.hash;return true}
+        navigateVirtual(next.href,false);return true;
+      }
+      return false;
+    }
+  });
+  window.__VEYRA_LOCATION__=virtualLocation;
+  window.__VEYRA_GET_LOCATION__=(object,optional)=>optional&&object==null?undefined:object===window||object===document?virtualLocation:object.location;
+  try{for(const key of ['URL','documentURI']){const d=Object.getOwnPropertyDescriptor(Document.prototype,key);if(d&&d.configurable)Object.defineProperty(Document.prototype,key,{...d,get(){return this===document?virtualUrl:d.get.call(this)}})}}catch{}
+  function isRuntimeUrl(raw){try{const u=new URL(raw,location.href);return ownOrigin(u.origin)&&/^[/]api[/](?:view|resource|download|devtools|browser|session|cast)(?:[/]|[?]|$)/.test(u.pathname)}catch{return false}}
+  function dynamicDestination(element,attribute,value){
+    const raw=String(value||'');if(!raw||/^(?:data:|blob:|javascript:|about:|#)/i.test(raw))return raw;
+    const internal=isRuntimeUrl(raw);
+    if(internal){try{const u=new URL(raw,location.href);if(u.pathname==='/api/resource'&&/^(?:SCRIPT|LINK)$/.test(element.tagName)){if(element.integrity)u.searchParams.set('integrity',element.integrity);else u.searchParams.delete('integrity');return u.href}}catch{}return raw}
+    const target=resolve(raw);if(!shouldProxy(target))return raw;
+    const tag=String(element.tagName||'').toLowerCase();
+    if((tag==='a'||tag==='area'||tag==='iframe')&&attribute==='href'||tag==='iframe'&&attribute==='src')return proxy('view',target);
+    let destination=proxy('resource',target);
+    if((tag==='script'||tag==='link')&&element.integrity){const u=new URL(destination);u.searchParams.set('integrity',element.integrity);destination=u.href}
+    if(tag==='script'&&element.type==='module'||tag==='link'&&String(element.rel).toLowerCase()==='modulepreload'){
+      const u=new URL(destination);u.searchParams.set('from',new URL(target).origin+'/');destination=u.href;
+    }
+    return destination;
+  }
+  const nativeGetAttribute=Element.prototype.getAttribute,nativeSetAttribute=Element.prototype.setAttribute;
+  function resourceAttribute(element,name){const tag=String(element.tagName||'').toLowerCase();return name==='src'&&/^(?:script|img|iframe|video|audio|source|track|input)$/.test(tag)||name==='href'&&/^(?:link|a|area)$/.test(tag)||name==='poster'&&tag==='video'}
+  function refreshIntegrity(element){const key=element.tagName==='SCRIPT'?'src':element.tagName==='LINK'?'href':null;if(!key)return;const raw=nativeGetAttribute.call(element,key);if(raw)nativeSetAttribute.call(element,key,dynamicDestination(element,key,raw))}
+  Element.prototype.setAttribute=function(name,value){const key=String(name).toLowerCase();const result=nativeSetAttribute.call(this,name,resourceAttribute(this,key)?dynamicDestination(this,key,value):value);if(key==='integrity')refreshIntegrity(this);return result};
+  const nativeRemoveAttribute=Element.prototype.removeAttribute;
+  Element.prototype.removeAttribute=function(name){const result=nativeRemoveAttribute.call(this,name);if(String(name).toLowerCase()==='integrity')refreshIntegrity(this);return result};
+  Element.prototype.getAttribute=function(name){const value=nativeGetAttribute.call(this,name);return value&&resourceAttribute(this,String(name).toLowerCase())&&isRuntimeUrl(value)&&/[?](?:.*&)?url=/.test(value)?unwrap(value):value};
+  for(const [Ctor,key] of [[HTMLScriptElement,'src'],[HTMLImageElement,'src'],[HTMLIFrameElement,'src'],[HTMLMediaElement,'src'],[HTMLSourceElement,'src'],[HTMLTrackElement,'src'],[HTMLLinkElement,'href'],[HTMLAnchorElement,'href'],[HTMLAreaElement,'href'],[HTMLVideoElement,'poster']]){
+    try{const descriptor=Object.getOwnPropertyDescriptor(Ctor.prototype,key);if(!descriptor?.configurable||!descriptor.set)continue;
+      Object.defineProperty(Ctor.prototype,key,{...descriptor,get(){return unwrap(descriptor.get.call(this))},set(value){return descriptor.set.call(this,dynamicDestination(this,key,value))}});
+    }catch{}
+  }
+  for(const Ctor of [HTMLScriptElement,HTMLLinkElement])try{const d=Object.getOwnPropertyDescriptor(Ctor.prototype,'integrity');if(d?.configurable&&d.set)Object.defineProperty(Ctor.prototype,'integrity',{...d,set(value){d.set.call(this,value);refreshIntegrity(this)}})}catch{}
   function proxyHistory(method,native){return function(state,title,url){
     let next=virtualUrl;try{if(url!=null)next=fixOwn(new URL(unwrap(String(url)),virtualUrl)).href}catch{}
     remember(next);
@@ -2129,12 +2203,43 @@ function injectRuntime(html, original, sid = "") {
   // Empty SPA shell detector (Roblox, browser.lol, etc.): if the main root stays
   // empty after scripts have had a chance to run, ask the parent to switch to Chromium.
   try{(function(){var fired=false;function check(){if(fired)return;try{var root=document.querySelector('#root,#app,#__next,[data-reactroot],#react-root');var body=document.body;var text=(body&&body.innerText||'').replace(/\\s+/g,' ').trim();var kids=body?body.children.length:0;var emptyRoot=root&&!(root.textContent||'').trim()&&root.children.length===0;var sparse=!text||text.length<40&&kids<4;if(emptyRoot||sparse){fired=true;topPost({type:'veyra:browser-required',reason:'empty-spa-shell',sessionId:SESSION_ID,pageUrl:virtualUrl})}}catch{}}setTimeout(check,2500);setTimeout(check,6000)})()}catch{}
-  const nativeFetch=window.fetch;if(nativeFetch)window.fetch=function(input,init){
+  const rawNativeFetch=window.fetch;
+  function syncScriptCookieResponse(response,revision){
+    if(!COOKIE_CONTEXT||!window.__veyraSyncScriptCookies)return;
+    try{const value=response.headers.get('x-veyra-script-cookies');if(value)window.__veyraSyncScriptCookies(JSON.parse(decodeURIComponent(value)),revision)}catch{}
+  }
+  const nativeFetch=rawNativeFetch&&function(input,init){
+    let options=init;
+    const revision=COOKIE_CONTEXT?.revision;
+    try{const u=new URL(realUrl(input),location.href);if(COOKIE_CONTEXT&&ownOrigin(u.origin)&&u.pathname==='/api/resource'){const h=new Headers(init&&init.headers||input&&input.headers||{});h.set('X-Veyra-Cookie-Capability',COOKIE_CONTEXT.token);options=Object.assign({},init||{},{headers:h})}}catch{}
+    return cookiePending.then(()=>rawNativeFetch.call(window,input,options)).then(response=>{syncScriptCookieResponse(response,revision);return response});
+  };
+  if(nativeFetch)window.fetch=function(input,init){
     const started=performance.now(); const method=String(init&&init.method||input&&input.method||'GET').toUpperCase(); const original=realUrl(input); let target=''; let reqX={initiator:'fetch'};try{reqX.requestHeaders=hdrObj(init&&init.headers||(typeof Request!=='undefined'&&input instanceof Request?input.headers:null));if(init&&typeof init.body==='string')reqX.requestBody=init.body.slice(0,20000)}catch{}
     try{target=resolve(input);if(shouldProxy(target)){const ok=r=>{net(method,target,r.status,performance.now()-started,r.ok,r,reqX);return r},bad=e=>{net(method,target,0,performance.now()-started,false,null,{...reqX,error:String(e&&e.message||e)});throw e};const dest=proxy('resource',target);if(typeof Request!=='undefined'&&input instanceof Request){const src=input;const hasBody=!/^(GET|HEAD)$/i.test(src.method)&&!(init&&'body' in init);return (hasBody?src.clone().arrayBuffer():Promise.resolve(undefined)).then(buf=>{const opts={method:src.method,headers:src.headers,credentials:src.credentials,cache:src.cache,redirect:src.redirect,integrity:src.integrity,signal:src.signal};if(buf&&buf.byteLength)opts.body=buf;if(src.keepalive&&!(buf&&buf.byteLength>60000))opts.keepalive=true;return nativeFetch(dest,Object.assign(opts,init||{}))}).then(ok,bad)}if(init&&init.body&&typeof ReadableStream!=='undefined'&&init.body instanceof ReadableStream){return new Response(init.body).arrayBuffer().then(buf=>{const o=Object.assign({},init,{body:buf});delete o.duplex;return nativeFetch(dest,o)}).then(ok,bad)}return nativeFetch(dest,init).then(ok,bad);}}catch{}
     return nativeFetch(input,init).then(r=>{net(method,target||original,r.status,performance.now()-started,r.ok,r,reqX);return r},e=>{net(method,target||original,0,performance.now()-started,false,null,{...reqX,error:String(e&&e.message||e)});throw e});
   };
-  try{const nativeXhrOpen=XMLHttpRequest.prototype.open,nativeXhrSend=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(method,url,...rest){this.__veyraMethod=method;this.__veyraTarget=resolve(url);this.__veyraStarted=0;return nativeXhrOpen.call(this,method,shouldProxy(this.__veyraTarget)?proxy('resource',this.__veyraTarget):url,...rest)};XMLHttpRequest.prototype.send=function(body){this.__veyraStarted=performance.now();const x=this;this.addEventListener('loadend',()=>net(x.__veyraMethod||'GET',x.__veyraTarget||'',x.status,performance.now()-x.__veyraStarted,x.status>=200&&x.status<400,x,{initiator:'xhr',requestHeaders:x.__veyraReqHeaders||{},requestBody:typeof body==='string'?body.slice(0,20000):undefined}),{once:true});return nativeXhrSend.call(this,body)};const nativeSetHeader=XMLHttpRequest.prototype.setRequestHeader;XMLHttpRequest.prototype.setRequestHeader=function(k,v){try{(this.__veyraReqHeaders||(this.__veyraReqHeaders={}))[String(k).toLowerCase()]=String(v).slice(0,2000)}catch{}return nativeSetHeader.call(this,k,v)}}catch{}
+  try{
+    const xp=XMLHttpRequest.prototype,nativeXhrOpen=xp.open,nativeXhrSend=xp.send,nativeXhrAbort=xp.abort,nativeSetHeader=xp.setRequestHeader;
+    xp.open=function(method,url,...rest){this.__veyraGeneration=(this.__veyraGeneration||0)+1;this.__veyraSending=false;this.__veyraAsync=rest[0]!==false;this.__veyraMethod=method;this.__veyraTarget=resolve(url);this.__veyraStarted=0;this.__veyraReqHeaders={};return nativeXhrOpen.call(this,method,shouldProxy(this.__veyraTarget)?proxy('resource',this.__veyraTarget):url,...rest)};
+    xp.abort=function(){this.__veyraGeneration=(this.__veyraGeneration||0)+1;this.__veyraSending=false;return nativeXhrAbort.call(this)};
+    xp.send=function(body){
+      if(this.readyState!==1||this.__veyraSending)throw new DOMException('XHR is not open or is already sending.','InvalidStateError');
+      this.__veyraSending=true;this.__veyraStarted=performance.now();
+      const x=this,generation=this.__veyraGeneration,revision=COOKIE_CONTEXT?.revision;
+      this.addEventListener('loadend',()=>{
+        if(generation!==x.__veyraGeneration)return;
+        x.__veyraSending=false;
+        syncScriptCookieResponse({headers:{get:key=>x.getResponseHeader(key)}},revision);
+        net(x.__veyraMethod||'GET',x.__veyraTarget||'',x.status,performance.now()-x.__veyraStarted,x.status>=200&&x.status<400,x,{initiator:'xhr',requestHeaders:x.__veyraReqHeaders||{},requestBody:typeof body==='string'?body.slice(0,20000):undefined});
+      },{once:true});
+      const send=()=>{if(generation!==x.__veyraGeneration||x.readyState!==1)return;try{if(COOKIE_CONTEXT&&shouldProxy(x.__veyraTarget))nativeSetHeader.call(x,'X-Veyra-Cookie-Capability',COOKIE_CONTEXT.token);return nativeXhrSend.call(x,body)}catch(e){x.__veyraSending=false;throw e}};
+      // Native synchronous XHR cannot await an HTTP cookie-write bridge.
+      if(!this.__veyraAsync||!COOKIE_CONTEXT)return send();
+      cookiePending.then(send).catch(e=>{console.warn('Veyra asynchronous XHR failed:',e.message);x.dispatchEvent(new ProgressEvent('error'));x.dispatchEvent(new ProgressEvent('loadend'))});
+    };
+    xp.setRequestHeader=function(k,v){if(this.__veyraSending)throw new DOMException('XHR is already sending.','InvalidStateError');try{(this.__veyraReqHeaders||(this.__veyraReqHeaders={}))[String(k).toLowerCase()]=String(v).slice(0,2000)}catch{}return nativeSetHeader.call(this,k,v)};
+  }catch{}
   try{const NativeEventSource=window.EventSource;if(NativeEventSource)window.EventSource=function(url,options){const target=resolve(url);return new NativeEventSource(shouldProxy(target)?proxy('resource',target):url,options)}}catch{}
   try{const nativeBeacon=navigator.sendBeacon&&navigator.sendBeacon.bind(navigator);if(nativeBeacon)navigator.sendBeacon=function(url,data){try{const target=resolve(url);if(shouldProxy(target)){let body=data;let type='text/plain;charset=UTF-8';if(typeof Blob!=='undefined'&&data instanceof Blob)type=data.type||type;void fetch(proxy('resource',target),{method:'POST',body,keepalive:true,headers:{'content-type':type}});return true}}catch{}return nativeBeacon(url,data)}}catch{}
   function submitTarget(form,submitter){try{return canonicalizeMaybeProxy((submitter&&submitter.getAttribute('data-veyra-formaction'))||(submitter&&submitter.getAttribute('formaction'))||form.getAttribute('data-veyra-action')||form.getAttribute('action')||virtualUrl)}catch{return null}}
@@ -2234,7 +2339,8 @@ function protectInlineScriptBlocks(html) {
   const originals = [];
   const tokenized = String(html || "").replace(/<script\b(?![^>]*\bsrc\s*=)[^>]*>([\s\S]*?)<\/script>/gi, (full, body) => {
     const token = `__VEYRA_INLINE_SCRIPT_${originals.length}_${crypto.randomBytes(6).toString("hex")}__`;
-    originals.push({ token, body: String(body) });
+    const type = (full.slice(0, full.indexOf(">") + 1).match(/\btype\s*=\s*["']([^"']+)["']/i)?.[1] || "").toLowerCase();
+    originals.push({ token, body: String(body), executable: !type || type === "module" || /(?:java|ecma)script/.test(type), module: type === "module" });
     return full.slice(0, full.indexOf(">") + 1) + token + "</script>";
   });
   return { html: tokenized, originals };
@@ -2249,7 +2355,8 @@ function restoreAndRewriteInlineScriptBlocks(html, originals, base, sid = "") {
   let isGeoFs = false;
   try { isGeoFs = /(^|\.)geo-fs\.com$/i.test(new URL(base).hostname); } catch {}
   for (const item of originals || []) {
-    const body = isGeoFs ? rewriteJsText(item.body, base, sid) : item.body;
+    const body = !item.executable ? item.body : isGeoFs || item.module
+      ? rewriteJsText(item.body, base, sid) : rewriteLocationReads(item.body, base);
     out = out.split(item.token).join(body);
   }
   return out;
@@ -2298,7 +2405,11 @@ function rewriteHtml(html, base, sid = "") {
   $("link[href]").each((_, el) => {
     const rel = String($(el).attr("rel") || "").toLowerCase();
     if (rel.includes("canonical")) return;
-    const raw = $(el).attr("href"); const u = resolveResource(raw, effectiveBase); if (u) { $(el).attr("href", rel.includes("modulepreload") ? makeModuleResourceUrl(u, sid) : makeResourceUrl(u, effectiveBase, sid)); $(el).removeAttr("crossorigin"); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); }
+    const raw = $(el).attr("href"); const u = resolveResource(raw, effectiveBase); if (u) {
+      let destination = rel.includes("modulepreload") ? makeModuleResourceUrl(u, sid) : makeResourceUrl(u, effectiveBase, sid);
+      if ($(el).attr("integrity")) destination += "&integrity=" + encodeURIComponent($(el).attr("integrity"));
+      $(el).attr("href", destination); $(el).removeAttr("crossorigin");
+    }
   });
   $("script[src]").each((_, el) => {
     const rawSrc = $(el).attr("src");
@@ -2313,9 +2424,10 @@ function rewriteHtml(html, base, sid = "") {
     if (/Cesium\.js(?:\?|#|$)/i.test(String(rawSrc || ""))) {
       try { const cesiumBase = new URL(".", u).href; $(`<script>window.CESIUM_BASE_URL = ${JSON.stringify(cesiumBase)};</script>`).insertBefore(el); } catch {}
     }
-    $(el).attr("src", $(el).attr("type") === "module" ? makeModuleResourceUrl(u, sid) : makeResourceUrl(u, effectiveBase, sid));
+    let destination = $(el).attr("type") === "module" ? makeModuleResourceUrl(u, sid) : makeResourceUrl(u, effectiveBase, sid);
+    if ($(el).attr("integrity")) destination += "&integrity=" + encodeURIComponent($(el).attr("integrity"));
+    $(el).attr("src", destination);
     $(el).removeAttr("crossorigin");
-    if ($(el).attr("integrity")) $(el).removeAttr("integrity");
   });
   for (const tag of ["img", "source", "audio", "input", "embed"]) {
     $(`${tag}[src]`).each((_, el) => { const u = resolveResource($(el).attr("src"), effectiveBase); if (u) $(el).attr("src", makeResourceUrl(u, effectiveBase, sid)); });
@@ -4213,6 +4325,23 @@ app.post('/api/session', (req, res) => {
   rec.incognito = req.body?.incognito === true;
   res.status(201).json({ ok: true, ...sessionInfo(sid, rec), user: user ? authStore.publicUser(user) : null });
 });
+app.post('/api/session/:sid/script-cookie', (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  const sid = String(req.params.sid), url = String(req.body?.url || "");
+  const rec = sessionManager.peek(sid);
+  if (!rec || sessionManager.checkLimit(sid))
+    return respondError(res, 410, "Session is missing or expired.", "SESSION_EXPIRED");
+  if (!authorizeCookieCapability(req.body?.token, sid, url))
+    return respondError(res, 403, "Cookie capability does not authorize this origin.", "COOKIE_SCOPE_DENIED");
+  try {
+    const cookie = setScriptCookie(rec, req.body?.cookie, url);
+    sessionManager.trimCookies(rec);
+    while (rec.cookies.size > CFG.maxSessionCookies) rec.cookies.delete(rec.cookies.keys().next().value);
+    return res.json({ ok: true, cookie });
+  } catch {
+    return respondError(res, 400, "Invalid or protected script cookie.", "SCRIPT_COOKIE_REJECTED");
+  }
+});
 app.get('/api/session/:sid', (req, res) => {
   const sid = String(req.params.sid);
   if (sessionManager.checkLimit(sid)) return res.json({ ok: true, sessionId: sid, active: false, expired: true, reason: "SESSION_EXPIRED" });
@@ -5132,6 +5261,14 @@ function forwardProxyBrowserHeaders(req, targetUrl, sourceUrl, mode, baseHeaders
     }
   } catch {}
   if (CFG.proxyForwardCompatHeaders) {
+    // Twitch's GraphQL client headers are not x-prefixed; silently dropping
+    // them turns otherwise valid anonymous API requests into HTTP 400.
+    if (new URL(targetUrl).hostname === "gql.twitch.tv") {
+      for (const name of ["client-id", "client-integrity", "client-session-id"]) {
+        const value = req.get(name);
+        if (value) out[name] = String(value).slice(0, 20000);
+      }
+    }
     
     
     
@@ -5371,6 +5508,9 @@ async function proxyRequest(req, res, mode) {
   const referrer = sourceUrl || "";
   const sourceOrigin = sourceUrl ? new URL(sourceUrl).origin : "";
   const sid = normalizeSessionId(req.query.sid);
+  const expectedIntegrity = mode === "resource" ? String(req.query.integrity || "") : "";
+  const cookieAuthorized = mode === "resource" && sourceOrigin === new URL(canonical).origin &&
+    authorizeCookieCapability(req.get("X-Veyra-Cookie-Capability"), sid, sourceUrl);
   if (sessionManager.checkLimit(sid)) return sendSessionExpired(req, res, mode, sid);
   
   
@@ -5438,12 +5578,14 @@ async function proxyRequest(req, res, mode) {
   
   
   const streamable = mode === "resource" || !/html|xhtml/i.test(String(result.contentType || ""));
-  if (result.tooLarge && streamable && CFG.proxyStreamOversize && !(download && result.bytes > CFG.maxDownloadBytes)) {
+  if (result.tooLarge && !expectedIntegrity && streamable && CFG.proxyStreamOversize && !(download && result.bytes > CFG.maxDownloadBytes)) {
     if (/javascript|ecmascript/i.test(result.contentType || "")) noteScriptDir(sid, result.finalUrl || canonical);
     return streamOversizeResponse(req, res, result, { canonical, method, headers, body, referrer, sid, download });
   }
   if (result.stream) result.stream.cancel();
   if (result.tooLarge || (download && result.bytes > CFG.maxDownloadBytes)) return respondError(res, 413, "The upstream response exceeds Veyra's safety limit.", "RESPONSE_TOO_LARGE");
+  if (expectedIntegrity && result.status >= 200 && result.status < 300 && !verifyIntegrity(result.body, expectedIntegrity))
+    return respondError(res, 502, "The upstream resource failed its declared integrity check.", "RESOURCE_INTEGRITY_MISMATCH");
   const responseCacheControl = String(result.cacheControl || "").toLowerCase();
   const responseVary = String(result.vary || "").toLowerCase();
   const requestHasAuth = !!req.get("Authorization");
@@ -5489,9 +5631,14 @@ async function proxyRequest(req, res, mode) {
       const enhanced = fullPage.enhanceFullPage(payload.toString("utf8"), pageUrl);
       if (enhanced.enhanced) { payload = Buffer.from(enhanced.html, "utf8"); fullPageEnhanced = true; }
       payload = Buffer.from(await rewriteOffThread("rewriteHtml", payload.toString("utf8"), [pageUrl, sid], rewriteHtml), "utf8");
+      const rec = sessionRecord(sid), cookieContext = {
+        cookies: scriptCookies(rec, pageUrl),
+        token: cookieCapability(sid, pageUrl, Math.min(Date.now() + 5 * 60 * 1000, sessionManager.expiresAt(rec) || Infinity)),
+      };
+      payload = Buffer.from(payload.toString("utf8").replace("/*__VEYRA_COOKIE_CONTEXT__*/null", JSON.stringify(cookieContext).replace(/</g, "\\u003c")), "utf8");
     }
-    else if (!download && mode === "resource" && result.contentType.toLowerCase().includes("text/css")) payload = Buffer.from(await rewriteOffThread("rewriteCss", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteCssText), "utf8");
-    else if (!download && mode === "resource" && /javascript|ecmascript/.test(result.contentType.toLowerCase()) && !shouldSkipYoutubeStaticJsRewrite(result.finalUrl || canonical, result.contentType)) payload = Buffer.from(await rewriteOffThread("rewriteJs", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteJsText), "utf8");
+    else if (!download && mode === "resource" && !expectedIntegrity && result.contentType.toLowerCase().includes("text/css")) payload = Buffer.from(await rewriteOffThread("rewriteCss", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteCssText), "utf8");
+    else if (!download && mode === "resource" && !expectedIntegrity && /javascript|ecmascript/.test(result.contentType.toLowerCase()) && !shouldSkipYoutubeStaticJsRewrite(result.finalUrl || canonical, result.contentType)) payload = Buffer.from(await rewriteOffThread("rewriteJs", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteJsText), "utf8");
     else if (!download && mode === "resource" && /mpegurl|dash\+xml/i.test(result.contentType.toLowerCase())) payload = Buffer.from(rewriteMediaManifest(payload.toString("utf8"), result.finalUrl || canonical, sid), "utf8");
   } catch (rewriteErr) {
     
@@ -5502,6 +5649,15 @@ async function proxyRequest(req, res, mode) {
     payload = result.body;
   }
   for (const [k,v] of Object.entries(upstreamHeaders)) if (v) res.setHeader(k, v);
+  if (cookieAuthorized && sourceOrigin === new URL(result.finalUrl || canonical).origin) {
+    const rec = sessionRecord(sid);
+    const snapshot = encodeURIComponent(JSON.stringify({
+      cookies: scriptCookies(rec, sourceUrl),
+      token: cookieCapability(sid, sourceUrl, Math.min(Date.now() + 5 * 60 * 1000, sessionManager.expiresAt(rec) || Infinity)),
+    }));
+    res.setHeader("Cache-Control", "no-store");
+    if (snapshot.length <= 12000) res.setHeader("X-Veyra-Script-Cookies", snapshot);
+  }
   const exposedCanonical = mode === "view" ? virtualPageUrl(canonical, result.finalUrl || canonical) : (result.finalUrl || canonical);
   res.setHeader("X-Veyra-Canonical-URL", exposedCanonical);
   res.setHeader("X-Veyra-Session-ID", sid);
@@ -6606,6 +6762,8 @@ if (require.main === module) startVeyraServer();
 
 
 const __workerOps = {
+  cookieHeader,
+  forwardProxyBrowserHeaders,
   rewriteHtml: (text, base, sid) => rewriteHtml(text, base, sid),
   rewriteCss: (text, base, sid) => rewriteCssText(text, base, sid),
   rewriteJs: (text, base, sid) => rewriteJsText(text, base, sid),

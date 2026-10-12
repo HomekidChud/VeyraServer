@@ -3,7 +3,7 @@
 
 VeyraServer provides the acquisition, proxy, browser-engine and casting services used by VeyraBrowser. The [October maintenance notes](docs/qa/2026-10-12.md) describe protocol changes, regression coverage, deployment order and known limitations; the detailed site evidence lives in the browser repository.
 
-Run `npm ci && npm test` for the full regression suite, including the new casting authorization/transport and JavaScript module-rewrite checks. Existing acquisition documentation and earlier test coverage are retained below.
+Run `npm ci && npm test` for the full regression suite, including casting authorization/transport, scope-aware location rewriting, cookie capabilities, SRI validation and Twitch client-header checks. `npm run test:proxy-browser` adds the real Chromium runtime fixture and requires Chromium to be installed. Existing acquisition documentation and earlier test coverage are retained below.
 
 ## Acquisition defaults
 
