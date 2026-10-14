@@ -27,6 +27,7 @@ const { NeuralCrawlerModel } = require("./services/neural-crawler");
 const { NeuralLearningWorker } = require("./services/neural-learning");
 const { ChallengeSolver } = require("./browser/challenge-solver");
 const { CastServer, InternetConnectionManager } = require("./network/cast-server");
+const { WsRelay } = require("./network/ws-relay");
 const { AIAnswerEngine } = require("./services/ai-answer");
 const { AcquisitionManager, rankSearchCandidates } = require("./services/acquisition-manager");
 const { RenewingManager } = require("./services/renewing-system");
@@ -2119,7 +2120,26 @@ function injectRuntime(html, original, sid = "") {
     if(LP&&LP.replace){const nativeReplace=LP.replace;LP.replace=function(next){const u=canonicalizeMaybeProxy(next);if(u){if(!rootProxiedFrame()){emit('location.replace',u);return;}return nativeReplace.call(this,proxy('view',u));}return nativeReplace.call(this,next)}}
   }catch{}
   try{navigator.serviceWorker&&navigator.serviceWorker.register&&(navigator.serviceWorker.register=function(){topPost({type:'veyra:browser-required',reason:'service-worker',sessionId:SESSION_ID,pageUrl:virtualUrl});return Promise.reject(new DOMException('This page requires browser service-worker support.','NotSupportedError'))})}catch{}
-  try{if(typeof WebSocket==='function'){const NativeWebSocket=WebSocket;window.WebSocket=function(url,protocols){try{const target=resolve(url);if(/^wss?:/i.test(String(target))){topPost({type:'veyra:browser-required',reason:'websocket',sessionId:SESSION_ID,pageUrl:virtualUrl,url:target})}}catch{};throw new Error('This page requires browser WebSocket support; switching to Chromium.');};window.WebSocket.prototype=NativeWebSocket.prototype}}catch{}
+  try{if(typeof WebSocket==='function'){const NativeWebSocket=WebSocket;function relayWsBase(){try{const o=API_ORIGIN||location.origin;return o.replace(/^http:/i,'ws:').replace(/^https:/i,'wss:')}catch(e){return ''}}
+    function ProxiedWebSocket(url,protocols){
+      try{
+        const target=resolve(url);
+        if(/^wss?:/i.test(String(target))){
+          // WebSocket relay: connect to the VeyraServer WS proxy with the session's
+          // exit (and its cookie jar), so real-time sites (games, chat) work in fast
+          // proxy mode. If the relay is unreachable the page still gets a real close.
+          const relayBase=relayWsBase();
+          if(relayBase){
+            const qs='url='+encodeURIComponent(target)+'&sid='+encodeURIComponent(SESSION_ID)+(virtualUrl?'&from='+encodeURIComponent(virtualUrl):'');
+            return protocols===undefined?new NativeWebSocket(relayBase+'/api/ws?'+qs):new NativeWebSocket(relayBase+'/api/ws?'+qs,protocols);
+          }
+        }
+      }catch(e){}
+      return protocols===undefined?new NativeWebSocket(url):new NativeWebSocket(url,protocols);
+    }
+    ProxiedWebSocket.prototype=NativeWebSocket.prototype;ProxiedWebSocket.CONNECTING=0;ProxiedWebSocket.OPEN=1;ProxiedWebSocket.CLOSING=2;ProxiedWebSocket.CLOSED=3;
+    try{Object.defineProperty(ProxiedWebSocket,'name',{value:'WebSocket'})}catch(e){}
+    window.WebSocket=ProxiedWebSocket;}}catch{}
   // Empty SPA shell detector (Roblox, browser.lol, etc.): if the main root stays
   // empty after scripts have had a chance to run, ask the parent to switch to Chromium.
   try{(function(){var fired=false;function check(){if(fired)return;try{var root=document.querySelector('#root,#app,#__next,[data-reactroot],#react-root');var body=document.body;var text=(body&&body.innerText||'').replace(/\\s+/g,' ').trim();var kids=body?body.children.length:0;var emptyRoot=root&&!(root.textContent||'').trim()&&root.children.length===0;var sparse=!text||text.length<40&&kids<4;if(emptyRoot||sparse){fired=true;topPost({type:'veyra:browser-required',reason:'empty-spa-shell',sessionId:SESSION_ID,pageUrl:virtualUrl})}}catch{}}setTimeout(check,2500);setTimeout(check,6000)})()}catch{}
@@ -6250,6 +6270,7 @@ app.get("/api/challenge/check", (req, res) => {
 
 
 let castServer = null;
+let wsRelay = null;
 
 
 
@@ -6560,6 +6581,24 @@ function startVeyraServer() {
         castServer = new CastServer(httpServer, (level, source, msg) => serverLog(level, source, msg), { frontendUrl: CFG.frontendUrl });
         serverLog("info", "CAST", `Cast server upgraded to ${castServer.useWebSocket ? "WebSocket" : "HTTP polling"} mode`);
       } catch (e) { serverLog("warn", "CAST", `Cast WebSocket upgrade kept polling mode: ${e.message}`); }
+      try {
+        // WebSocket relay for the fast proxy (poxel.io, games, chat) — proxied via
+        // the session's VPN exit and cookie jar, so real-time apps work without
+        // Chromium. Shares the same HTTP server as the cast server.
+        wsRelay = new WsRelay({
+          log: (level, source, msg) => serverLog(level, source, msg),
+          sessionManager: { checkLimit: sid => sessionManager.checkLimit(sid), touch: sid => sessionManager.touch(sid) },
+          vpnManager,
+          forwardHeaders: ({ sid, target }) => {
+            try {
+              const cookies = cookieHeader(sid, target);
+              return cookies ? { cookie: cookies } : {};
+            } catch { return {}; }
+          },
+        });
+        const attached = wsRelay.attach(httpServer);
+        serverLog("info", "WS-RELAY", `WebSocket relay ${attached ? "attached at /api/ws" : "unavailable (ws library missing)"}.`);
+      } catch (e) { serverLog("warn", "WS-RELAY", `WebSocket relay not attached: ${e.message}`); }
       });
       httpServer.once("error", err => {
         serverLog("error", "SYSTEM", `HTTP listener failed: ${err.stack || err}`);
