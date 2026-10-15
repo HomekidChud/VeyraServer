@@ -5,7 +5,7 @@
  * so real-time sites (multiplayer games, chat, live feeds) work in Fast proxy mode
  * without Chromium.
  *
- * Route: HTTP Upgrade on GET /api/ws?url=<encoded wss://...>&sid=<session>&from=<virtual page>
+ * Route: HTTP Upgrade on GET /ws/relay?url=<encoded wss://...>&sid=<session>&from=<virtual page>
  *
  * Design:
  *   1. The browser-facing wrapper in the fast-proxy HTML rewrite constructs a
@@ -34,7 +34,10 @@ const MAX_BUFFERED_BYTES = 32 * 1024 * 1024;      // 32 MiB total buffered per l
 const HANDSHAKE_TIMEOUT_MS = 15000;               // upstream handshake deadline
 const MAX_RELAY_SESSIONS = 256;                  // concurrent WS relays per Express process
 
-const RELAY_PATH = "/api/ws";
+// NOTE: Cloudflare's edge in front of Render rejects WebSocket upgrades to /api/*
+// with a bare 400 (verified empirically — /api/ws is blocked, /ws/cast works).
+// Keep this under /ws/, not /api/.
+const RELAY_PATH = "/ws/relay";
 
 function isPublicIp(addr) {
   const ip = String(addr || "");

@@ -2131,7 +2131,7 @@ function injectRuntime(html, original, sid = "") {
           const relayBase=relayWsBase();
           if(relayBase){
             const qs='url='+encodeURIComponent(target)+'&sid='+encodeURIComponent(SESSION_ID)+(virtualUrl?'&from='+encodeURIComponent(virtualUrl):'');
-            return protocols===undefined?new NativeWebSocket(relayBase+'/api/ws?'+qs):new NativeWebSocket(relayBase+'/api/ws?'+qs,protocols);
+            return protocols===undefined?new NativeWebSocket(relayBase+'/ws/relay?'+qs):new NativeWebSocket(relayBase+'/ws/relay?'+qs,protocols);
           }
         }
       }catch(e){}
@@ -6597,7 +6597,7 @@ function startVeyraServer() {
           },
         });
         const attached = wsRelay.attach(httpServer);
-        serverLog("info", "WS-RELAY", `WebSocket relay ${attached ? "attached at /api/ws" : "unavailable (ws library missing)"}.`);
+        serverLog("info", "WS-RELAY", `WebSocket relay ${attached ? "attached at /ws/relay" : "unavailable (ws library missing)"}.`);
       } catch (e) { serverLog("warn", "WS-RELAY", `WebSocket relay not attached: ${e.message}`); }
       });
       httpServer.once("error", err => {
