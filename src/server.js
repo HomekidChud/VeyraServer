@@ -30,6 +30,7 @@ const { AIAnswerEngine } = require("./services/ai-answer");
 const { ExtensionStoreSecurity, ExtensionSecurityError } = require("./services/extension-security");
 const { VeyraAssistant, AssistantFeedbackStore, AssistantError } = require("./services/veyra-assistant");
 const { AgentTrainingService } = require("./services/agent-training");
+const { agentTrainingPage } = require("./services/agent-training-page");
 const { RenewingManager } = require("./services/renewing-system");
 const fullPage = require("./browser/full-page.js");
 const { FailoverController } = require("./browser/browser-failover.js");
@@ -261,7 +262,7 @@ const CFG = Object.freeze({
   indexAiMaxPages: numberEnv("INDEX_AI_MAX_PAGES", 24, 1, 100),
   indexAiMaxDepth: numberEnv("INDEX_AI_MAX_DEPTH", 2, 0, 5),
   indexSnapshotEnabled: boolEnv("INDEX_SNAPSHOT_ENABLED", false),
-  indexSnapshotPath: process.env.INDEX_SNAPSHOT_PATH || "/tmp/veyra-search-index.json",
+  indexSnapshotPath: process.env.INDEX_SNAPSHOT_PATH || path.join(os.tmpdir(), "veyra-search-index.json"),
   processBrowserFallback: boolEnv("BROWSER_RENDER_FALLBACK", false),
   logLevel: enumEnv("SERVER_LOG_LEVEL", "info", ["error", "warn", "info", "debug"]),
   sortQueryParams: boolEnv("NORMALIZE_SORT_QUERY_PARAMS", false),
@@ -428,6 +429,9 @@ const agentTraining = new AgentTrainingService({
   tickMs: numberEnv("VEYRA_AGENT_TRAINING_TICK_MS", 350, 100, 5000),
   checkpointEverySteps: numberEnv("VEYRA_AGENT_TRAINING_CHECKPOINT_STEPS", 20, 1, 1000),
   maxMazeSize: numberEnv("VEYRA_AGENT_TRAINING_MAX_MAZE", 21, 9, 31),
+  maxSamplesPerEpisode: numberEnv("VEYRA_AGENT_TRAINING_SAMPLES_PER_EPISODE", 256, 0, 10000),
+  localEpisodeLimit: numberEnv("VEYRA_AGENT_TRAINING_LOCAL_EPISODES", 500, 1, 10000),
+  localLiveLogLimit: numberEnv("VEYRA_AGENT_TRAINING_LIVE_LOG_STEPS", 5000, 1, 100000),
   requireMongo: boolEnv("VEYRA_AGENT_TRAINING_REQUIRE_MONGO", String(process.env.VEYRA_ENV || "").toLowerCase() === "production"),
   enabled: boolEnv("VEYRA_AGENT_TRAINING_ENABLED", true),
   log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
@@ -806,7 +810,7 @@ function recordRewriteFailure(url, mode, err) {
   if (rewriteFailures.length > 100) rewriteFailures.splice(0, rewriteFailures.length - 100);
   serverLog("error", "PROXY", `HTML/CSS/JS rewrite failed for ${url} (${mode}): ${err?.message || err} — served the page unrewritten instead of failing the request.`);
 }
-const ROOT = path.join("/tmp", "veyra-browse-jobs");
+const ROOT = path.resolve(process.env.VEYRA_JOB_DIR || path.join(os.tmpdir(), "veyra-browse-jobs"));
 fs.mkdirSync(ROOT, { recursive: true });
 
 const sourceStore = {
@@ -4353,6 +4357,19 @@ app.post('/api/assistant/feedback', requireUser, (req, res) => {
   }
 });
 
+// The page shell contains no training data; its login form authenticates to the
+// existing API and sends a Bearer token to the still-admin-protected endpoints.
+app.get("/admin/agent-training", (req, res) => res.type("html").set("Cache-Control", "no-store").send(agentTrainingPage()));
+app.get("/api/admin/agent-training/live-log", requireAdmin, (req, res) => {
+  if (agentTraining.report().persistence.localLiveTrace === false) return respondError(res, 404, "Local live trace is disabled when MongoDB persistence is required.", "AGENT_TRAINING_TRACE_DISABLED");
+  try {
+    const trace = fs.readFileSync(agentTraining.liveTraceFile, "utf8");
+    res.set("Cache-Control", "no-store").attachment("live-training.jsonl").type("application/x-ndjson").send(trace);
+  } catch (error) {
+    if (error.code === "ENOENT") return respondError(res, 404, "No live trace has been written yet.", "AGENT_TRAINING_TRACE_EMPTY");
+    respondError(res, 500, "Could not read the local live trace.", "AGENT_TRAINING_TRACE_READ_FAILED");
+  }
+});
 app.get("/api/admin/agent-training", requireAdmin, (req, res) => res.json({ ok: true, training: agentTraining.report() }));
 app.post("/api/admin/agent-training/control", requireAdmin, async (req, res) => {
   const action = String(req.body?.action || "").toLowerCase();
