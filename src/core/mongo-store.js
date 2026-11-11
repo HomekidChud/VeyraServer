@@ -325,6 +325,14 @@ class MongoStore {
     this.stats.writes += 1;
     return this.withDb(async db => { const c = db.collection("platform_waitlist"); await c.deleteMany({}); if (rows.length) await c.insertMany(JSON.parse(JSON.stringify(rows))); });
   }
+  async loadGateState() {
+    return this.withDb(async db => { const doc = await db.collection("gate_state").findOne({ _id: "gate" }); return doc ? doc.state : null; });
+  }
+  async replaceGateState(state) {
+    if (!state || typeof state !== "object") return;
+    this.stats.writes += 1;
+    return this.withDb(async db => { await db.collection("gate_state").replaceOne({ _id: "gate" }, { _id: "gate", state: JSON.parse(JSON.stringify(state)) }, { upsert: true }); });
+  }
   status() { return { configured: !!this.uri, enabled: this.enabled, connected: this.connected, db: this.dbName, poolSize: this.maxPoolSize, cacheBodyMaxBytes: this.cacheBodyMaxBytes, cacheTtlMs: this.cacheTtlMs, retryAfter: this.retryAfter || null, disabledReason: this.disabledReason || null, stats: { ...this.stats } }; }
   async close() { this.connected = false; try { await this.client?.close(); } catch {} this.client = null; this.db = null; }
 }

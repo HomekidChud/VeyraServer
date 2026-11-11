@@ -42,6 +42,7 @@ class BrowserEngine {
     this.vpnManager = vpnManager;
     this.browser = null;
     this.playwright = null;
+    this.backend = 'local';
     this.sessions = new Map();
     this.startPromise = null;
     this.creatingSessions = 0;
@@ -77,6 +78,54 @@ class BrowserEngine {
     
   }
 
+  // Connect to an external Chromium host over the Chrome DevTools Protocol.
+  // Supports ws(s):// endpoints (Browserless, Browserbase, Steel, chrome
+  // --remote-debugging-port) and http(s):// endpoints that expose /json/version.
+  async connectRemote() {
+    const raw = String(this.cfg.browserBackendUrl || '').trim();
+    if (!raw) return null;
+    let endpoint = raw;
+    try {
+      if (/^https?:\/\//i.test(raw)) {
+        const info = await fetch(raw.replace(/\/$/, '') + '/json/version', { signal: AbortSignal.timeout(10 * 1000) });
+        if (!info.ok) throw new Error(`CDP discovery returned HTTP ${info.status}`);
+        const meta = await info.json();
+        const ws = meta.webSocketDebuggerUrl || meta.webSocketUrl || '';
+        if (!ws) throw new Error('CDP discovery response had no websocket endpoint');
+        endpoint = ws;
+      }
+    } catch (e) {
+      this.log('warn', 'BROWSER', `Remote Chromium discovery failed (${e.message}); falling back to local launch.`);
+      return null;
+    }
+    try {
+      const browser = await this.playwright.chromium.connectOverCDP(endpoint, {
+        timeout: Math.max(5 * 1000, Number(this.cfg.browserBackendConnectTimeoutMs) || 30 * 1000)
+      });
+      this.browser = browser;
+      this.backend = 'remote-cdp';
+      const disconnected = browser;
+      disconnected.on?.('disconnected', () => {
+        if (this.browser !== disconnected) return;
+        const lost = [...this.sessions.values()];
+        this.browser = null;
+        this.playwright = null;
+        this.sessions.clear();
+        for (const session of lost) {
+          session.status = 'ERROR';
+          session.error = 'Remote Chromium disconnected.';
+          if (this.onCrash) try { this.onCrash(session, 'browser_disconnect'); } catch {}
+        }
+        this.log('warn', 'BROWSER', `Remote Chromium disconnected; cleared ${lost.length} browser session(s).`);
+      });
+      this.log('info', 'BROWSER', 'Chromium engine connected to remote provider over CDP.');
+      return browser;
+    } catch (e) {
+      this.log('warn', 'BROWSER', `Remote Chromium connect failed (${e.message}); falling back to local launch.`);
+      return null;
+    }
+  }
+
   async ensureBrowser() {
     if (this.cfg.browserEnabled === false) {
       throw Object.assign(new Error('Chromium is disabled. Set VEYRA_CHROMIUM_ENABLED=true to opt in.'), { code: 'BROWSER_ENGINE_UNAVAILABLE' });
@@ -87,6 +136,14 @@ class BrowserEngine {
       try {
         if (this.cfg.playwrightBrowsersPath != null) process.env.PLAYWRIGHT_BROWSERS_PATH = String(this.cfg.playwrightBrowsersPath);
         this.playwright = require('playwright');
+        // Remote Chromium over CDP: run the browser OUTSIDE this server on a
+        // dedicated browser provider (Browserless, Browserbase, Steel, a
+        // self-hosted Chrome, ...). This keeps Render's CPU/RAM free for the
+        // proxy lane and makes the browser lane dramatically faster.
+        if (this.cfg.browserBackend === 'remote' && this.cfg.browserBackendUrl) {
+          const connected = await this.connectRemote();
+          if (connected) return connected;
+        }
         let executable = '';
         try { executable = this.playwright.chromium.executablePath(); } catch {}
         if (!executable || !fs.existsSync(executable)) {
@@ -621,6 +678,8 @@ class BrowserEngine {
     return {
       enabled: !!this.cfg.browserEnabled,
       available: !!this.browser,
+      backend: this.backend,
+      remoteConfigured: !!(this.cfg.browserBackend === 'remote' && this.cfg.browserBackendUrl),
       ...this.capacity(),
       sessionList: [...this.sessions.values()].map(s => ({
         id: s.id, tabId: s.tabId, proxySessionId: s.proxySessionId ? `${s.proxySessionId.slice(0, 6)}…` : null, url: safeUrl(s.page?.url()) || s.canonicalUrl,

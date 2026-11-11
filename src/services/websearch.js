@@ -39,6 +39,46 @@ function parseBingHtml(html) {
 function parseGoogleApi(json) { return (Array.isArray(json?.items) ? json.items : []).map(x => row(x.link, x.title, x.snippet, "google")).filter(Boolean); }
 function parseBraveApi(json) { return (Array.isArray(json?.web?.results) ? json.web.results : []).map(x => row(x.url, x.title, x.description || x.snippet, "brave")).filter(Boolean); }
 function parseBingApi(json) { return (Array.isArray(json?.webPages?.value) ? json.webPages.value : []).map(x => row(x.url, x.name || x.title, x.snippet, "bing")).filter(Boolean); }
+function parseMojeekHtml(html) {
+  const $ = cheerio.load(String(html || "")); const out = [];
+  $("ul.results-standard li, ul.results li").each((_, el) => {
+    const box = $(el); if (box.find(".ad, .advert").length) return;
+    const a = box.find("a.title, h2 a, a.ob").first();
+    const item = row(a.attr("href"), a.text(), box.find("p.s").first().text(), "mojeek");
+    if (item) out.push(item);
+  });
+  return out;
+}
+function parseEcosiaHtml(html) {
+  const $ = cheerio.load(String(html || "")); const out = [];
+  $("article.result, div.result, li.result").each((_, el) => {
+    const box = $(el); if (/ad|sponsor/i.test(box.attr("class") || "")) return;
+    const a = box.find("a.result__link, a[data-test-id='result-link'], h2 a, a.url").first();
+    const href = a.attr("href") || box.find("a").attr("href") || "";
+    const item = row(href, box.find("h2, .result__title").first().text() || a.text(), box.find(".result__snippet, .result-snippet, p").first().text(), "ecosia");
+    if (item) out.push(item);
+  });
+  return out;
+}
+function parseStartpageHtml(html) {
+  const $ = cheerio.load(String(html || "")); const out = [];
+  $("div.w-gl__result, article.result, li.result").each((_, el) => {
+    const box = $(el); if (box.find(".w-gl__advert, .ad").length) return;
+    const a = box.find("a.w-gl__result-title, h2 a, a.result-link").first();
+    const item = row(a.attr("href"), a.text(), box.find("p.w-gl__description, .description, p").first().text(), "startpage");
+    if (item) out.push(item);
+  });
+  return out;
+}
+function parseYahooHtml(html) {
+  const $ = cheerio.load(String(html || "")); const out = [];
+  $("ol#web ol li, #web li, div.algo, li .dd.algo").each((_, el) => {
+    const box = $(el); const a = box.find("h3 a, a.d-ib").first();
+    const item = row(a.attr("href"), a.text(), box.find("p, .compText").first().text(), "yahoo");
+    if (item) out.push(item);
+  });
+  return out;
+}
 function canonicalKey(url) {
   try { const u = new URL(url); if (u.username || u.password) return ""; u.hash = ""; for (const k of [...u.searchParams.keys()]) if (/^utm_/i.test(k) || /^(fbclid|gclid|mc_cid|mc_eid)$/i.test(k)) u.searchParams.delete(k); u.hostname = u.hostname.toLowerCase(); return u.pathname === "/" && !u.search ? u.origin : u.href; }
   catch { return ""; }
@@ -77,13 +117,13 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
   const googleCx = env.GOOGLE_SEARCH_CX || env.GOOGLE_CSE_ID || "";
   const braveKey = env.BRAVE_SEARCH_API_KEY || "";
   const bingKey = env.BING_SEARCH_API_KEY || "";
-  const order = String(env.WEB_SEARCH_ORDER || "brave,bing,duckduckgo,google").split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+  const order = String(env.WEB_SEARCH_ORDER || "brave,bing,duckduckgo,google,mojeek,ecosia,yahoo,startpage").split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
   const timeoutMs = Math.max(250, Math.min(30000, Number(env.WEB_SEARCH_PROVIDER_TIMEOUT_MS) || 8000));
-  const maxProviders = Math.max(1, Math.min(4, Number(env.WEB_SEARCH_MAX_PROVIDERS) || 3));
-  const parallelism = Math.max(1, Math.min(4, Number(env.WEB_SEARCH_CONCURRENCY) || 3));
+  const maxProviders = Math.max(1, Math.min(8, Number(env.WEB_SEARCH_MAX_PROVIDERS) || 6));
+  const parallelism = Math.max(1, Math.min(8, Number(env.WEB_SEARCH_CONCURRENCY) || 6));
   const overallDeadlineMs = Math.max(250, Math.min(60000, Number(env.WEB_SEARCH_DEADLINE_MS) || 12000));
   const earlyCancelWindowMs = Math.max(0, Math.min(5000, env.WEB_SEARCH_EARLY_CANCEL_WINDOW_MS == null ? 1000 : Number(env.WEB_SEARCH_EARLY_CANCEL_WINDOW_MS) || 0));
-  const earlyResultThreshold = Math.max(1, Math.min(100, Number(env.WEB_SEARCH_EARLY_RESULT_THRESHOLD) || 20));
+  const earlyResultThreshold = Math.max(1, Math.min(200, Number(env.WEB_SEARCH_EARLY_RESULT_THRESHOLD) || 40));
   const cacheTtlMs = Math.max(0, Math.min(600000, Number(env.WEB_SEARCH_CACHE_TTL_MS) || 30000));
   const cache = new Map(); const MAX_CACHE = 200; const cooldowns = new Map();
   const health = Object.create(null);
@@ -99,7 +139,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
     } },
     bing: { available: () => true, async run(q, { offset, lang, signal, limit }) {
       const u = new URL(bingKey ? "https://api.bing.microsoft.com/v7.0/search" : "https://www.bing.com/search"); u.searchParams.set("q", q);
-      const requestedLimit = Math.max(1, Math.min(50, Number(limit) || 20));
+      const requestedLimit = Math.max(1, Math.min(100, Number(limit) || 30));
       if (bingKey) { u.searchParams.set("count", String(requestedLimit)); u.searchParams.set("offset", String(offset || 0)); if (lang) u.searchParams.set("setLang", lang); }
       else {
         if (lang) u.searchParams.set("setlang", lang);
@@ -119,6 +159,26 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       }
       const r = await fetchText(u.href, { accept: bingKey ? "application/json" : "text/html", headers: bingKey ? { "Ocp-Apim-Subscription-Key": bingKey } : {}, signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Bing search request failed"), { status: r.status, retryAfterMs: r.retryAfterMs });
       const json = JSON.parse(r.text); return { results: parseBingApi(json), total: json?.webPages?.totalEstimatedMatches ?? null };
+    } },
+    mojeek: { available: () => true, async run(q, { offset, lang, signal }) {
+      const u = new URL("https://www.mojeek.com/search"); u.searchParams.set("q", q); u.searchParams.set("t", String(Math.min(50, 10 + (Number(offset) || 0)))); if (lang) u.searchParams.set("lb", lang);
+      const r = await fetchText(u.href, { accept: "text/html", signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Mojeek search request failed"), { status: r.status, retryAfterMs: r.retryAfterMs });
+      return { results: parseMojeekHtml(r.text), total: null };
+    } },
+    ecosia: { available: () => true, async run(q, { offset, lang, signal }) {
+      const u = new URL("https://www.ecosia.org/search"); u.searchParams.set("q", q); if (offset) u.searchParams.set("p", String(Math.floor(Number(offset) / 10) + 1)); if (lang) u.searchParams.set("hl", lang);
+      const r = await fetchText(u.href, { accept: "text/html", signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Ecosia search request failed"), { status: r.status, retryAfterMs: r.retryAfterMs });
+      return { results: parseEcosiaHtml(r.text), total: null };
+    } },
+    startpage: { available: () => true, async run(q, { offset, lang, signal }) {
+      const u = new URL("https://www.startpage.com/sp/search"); u.searchParams.set("query", q); if (offset) u.searchParams.set("page", String(Math.floor(Number(offset) / 10) + 1)); if (lang) u.searchParams.set("language", lang);
+      const r = await fetchText(u.href, { accept: "text/html", signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Startpage search request failed"), { status: r.status, retryAfterMs: r.retryAfterMs });
+      return { results: parseStartpageHtml(r.text), total: null };
+    } },
+    yahoo: { available: () => true, async run(q, { offset, lang, signal }) {
+      const u = new URL("https://search.yahoo.com/search"); u.searchParams.set("p", q); if (offset) u.searchParams.set("b", String((Math.floor(Number(offset) / 10) + 1) * 10 + 1)); if (lang) u.searchParams.set("vl", lang);
+      const r = await fetchText(u.href, { accept: "text/html", signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Yahoo search request failed"), { status: r.status, retryAfterMs: r.retryAfterMs });
+      return { results: parseYahooHtml(r.text), total: null };
     } },
     duckduckgo: { available: () => true, async run(q, { offset, lang, signal }) {
       const u = new URL("https://html.duckduckgo.com/html/"); u.searchParams.set("q", q); if (offset) u.searchParams.set("s", String(offset)); if (lang) u.searchParams.set("kl", lang === "en" ? "wt-wt" : `${lang}-${lang}`);
@@ -225,4 +285,4 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
   return { search, googleConfigured: () => configured("google"), order, providers: Object.keys(providers), diagnostics: () => ({ adaptiveOrdering: true, maxProviders, parallelism, overallDeadlineMs, providers: Object.fromEntries(Object.keys(providers).map(name => [name, healthSummary(name)])) }) };
 }
 
-module.exports = { createWebSearch, parseDuckDuckGoHtml, parseBingHtml, parseGoogleApi, parseBraveApi, parseBingApi, unwrapBing, unwrapDuckDuckGo, classifyGoogleResponse, canonicalKey };
+module.exports = { createWebSearch, parseDuckDuckGoHtml, parseBingHtml, parseMojeekHtml, parseEcosiaHtml, parseStartpageHtml, parseYahooHtml, parseGoogleApi, parseBraveApi, parseBingApi, unwrapBing, unwrapDuckDuckGo, classifyGoogleResponse, canonicalKey };

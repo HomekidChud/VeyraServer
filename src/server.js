@@ -17,6 +17,7 @@ const { installBrandRoutes, isReservedOriginPath, brandNotFoundHtml } = require(
 const VEYRA_VERSION = require("../package.json").version;
 const { SessionManager } = require("./core/session-manager");
 const { AuthStore } = require("./core/auth");
+const { AccessGate } = require("./core/access-gate");
 const { WorkerPool } = require("./core/worker-pool");
 const { MongoStore } = require("./core/mongo-store");
 const youtubeCompat = require("./browser/youtube");
@@ -104,6 +105,9 @@ const P = VEYRA_CONFIG.caps;
 
 
 const LEAN_MODE = boolEnv("VEYRA_LEAN_MODE", VEYRA_CONFIG.plan.key === "free");
+// When Chromium runs on an external provider the local plan caps no longer
+// apply — the remote host carries the CPU/RAM, so Veyra can drive more pages.
+const REMOTE_BROWSER = String(process.env.BROWSER_BACKEND || "local").trim().toLowerCase() === "remote";
 const MB = 1024 * 1024;
 const CFG = Object.freeze({
   leanMode: LEAN_MODE,
@@ -172,9 +176,9 @@ const CFG = Object.freeze({
   // moved to a larger plan.
   browserEnabled: VEYRA_CONFIG.plan.key !== "free" && boolEnv("VEYRA_CHROMIUM_ENABLED", boolEnv("BROWSER_ENABLED", false)),
   browserHeadless: boolEnv("BROWSER_HEADLESS", true),
-  maxBrowserSessions: Math.min(numberEnv("MAX_BROWSER_SESSIONS", P.browserSessions, 1, 16), P.browserSessions),
-  maxBrowserPages: Math.min(numberEnv("MAX_BROWSER_PAGES", P.browserPages, 1, 32), P.browserPages),
-  maxBrowserContexts: Math.min(numberEnv("MAX_BROWSER_CONTEXTS", P.browserContexts, 1, 16), P.browserContexts),
+  maxBrowserSessions: REMOTE_BROWSER ? Math.min(numberEnv("MAX_BROWSER_SESSIONS", Math.max(4, P.browserSessions), 1, 64), 64) : Math.min(numberEnv("MAX_BROWSER_SESSIONS", P.browserSessions, 1, 16), P.browserSessions),
+  maxBrowserPages: REMOTE_BROWSER ? Math.min(numberEnv("MAX_BROWSER_PAGES", Math.max(8, P.browserPages), 1, 64), 64) : Math.min(numberEnv("MAX_BROWSER_PAGES", P.browserPages, 1, 32), P.browserPages),
+  maxBrowserContexts: REMOTE_BROWSER ? Math.min(numberEnv("MAX_BROWSER_CONTEXTS", Math.max(8, P.browserContexts), 1, 64), 64) : Math.min(numberEnv("MAX_BROWSER_CONTEXTS", P.browserContexts, 1, 16), P.browserContexts),
   browserIdleTimeoutMs: numberEnv("BROWSER_IDLE_TIMEOUT_MS", LEAN_MODE ? 90000 : 300000, 10000, 86400000),
   browserSessionTtlMs: numberEnv("BROWSER_SESSION_TTL_MS", 1800000, 60000, 86400000),
   browserNavigationTimeoutMs: numberEnv("BROWSER_NAVIGATION_TIMEOUT_MS", LEAN_MODE ? 20000 : 30000, 5000, 120000),
@@ -183,6 +187,7 @@ const CFG = Object.freeze({
   browserEvictMinIdleMs: numberEnv("BROWSER_EVICT_MIN_IDLE_MS", 60000, 10000, 86400000),
   browserBackend: enumEnv("BROWSER_BACKEND", "local", ["local", "remote"]),
   browserBackendUrl: process.env.BROWSER_BACKEND_URL || "",
+  browserBackendConnectTimeoutMs: numberEnv("BROWSER_BACKEND_CONNECT_TIMEOUT_MS", 30000, 5000, 120000),
   dnsCacheTtlMs: numberEnv("DNS_CACHE_TTL_MS", 5000, 0, 60000),
   maxPendingQueue: Math.min(numberEnv("MAX_PENDING_QUEUE", P.maxPendingQueue, 50, 20000), P.maxPendingQueue),
   maxPages: Math.min(numberEnv("MAX_PAGES", P.maxPages, 1, 100000), P.maxPages),
@@ -214,13 +219,13 @@ const CFG = Object.freeze({
   maxClientLog: numberEnv("MAX_CLIENT_LOG", 500, 50, 5000),
   maxSearchQueryChars: numberEnv("MAX_SEARCH_QUERY_CHARS", 256, 32, 1000),
   maxSearchResults: numberEnv("MAX_SEARCH_RESULTS", 20, 1, 50),
-  maxProxyBodyBytes: numberEnv("MAX_PROXY_BODY_BYTES", 4 * 1024 * 1024, 64 * 1024, 32 * 1024 * 1024),
-  maxProxyTextBytes: numberEnv("MAX_PROXY_TEXT_BYTES", 8 * 1024 * 1024, 256 * 1024, 32 * 1024 * 1024),
-  maxProxyImageBytes: numberEnv("MAX_PROXY_IMAGE_BYTES", LEAN_MODE ? 2 * MB : 16 * 1024 * 1024, 256 * 1024, 64 * 1024 * 1024),
-  maxProxyMediaBytes: numberEnv("MAX_PROXY_MEDIA_BYTES", LEAN_MODE ? 4 * MB : 32 * 1024 * 1024, 512 * 1024, 128 * 1024 * 1024),
-  maxProxyOtherBytes: numberEnv("MAX_PROXY_OTHER_BYTES", LEAN_MODE ? 2 * MB : 16 * 1024 * 1024, 256 * 1024, 64 * 1024 * 1024),
+  maxProxyBodyBytes: numberEnv("MAX_PROXY_BODY_BYTES", 8 * 1024 * 1024, 64 * 1024, 256 * 1024 * 1024),
+  maxProxyTextBytes: numberEnv("MAX_PROXY_TEXT_BYTES", LEAN_MODE ? 8 * 1024 * 1024 : 16 * 1024 * 1024, 256 * 1024, 256 * 1024 * 1024),
+  maxProxyImageBytes: numberEnv("MAX_PROXY_IMAGE_BYTES", LEAN_MODE ? 4 * MB : 64 * 1024 * 1024, 256 * 1024, 512 * 1024 * 1024),
+  maxProxyMediaBytes: numberEnv("MAX_PROXY_MEDIA_BYTES", LEAN_MODE ? 16 * MB : 256 * 1024 * 1024, 512 * 1024, 2 * 1024 * 1024 * 1024),
+  maxProxyOtherBytes: numberEnv("MAX_PROXY_OTHER_BYTES", LEAN_MODE ? 8 * 1024 * 1024 : 64 * 1024 * 1024, 256 * 1024, 512 * 1024 * 1024),
   maxFormBodyBytes: numberEnv("MAX_FORM_BODY_BYTES", 1 * 1024 * 1024, 16 * 1024, 8 * 1024 * 1024),
-  maxDownloadBytes: numberEnv("MAX_DOWNLOAD_BYTES", 64 * 1024 * 1024, 256 * 1024, 256 * 1024 * 1024),
+  maxDownloadBytes: numberEnv("MAX_DOWNLOAD_BYTES", 512 * 1024 * 1024, 256 * 1024, 4 * 1024 * 1024 * 1024),
   maxCacheBodyBytes: Math.min(numberEnv("MAX_CACHE_BODY_BYTES", RESOURCE_PROFILE === "free" ? 1024 * 1024 : 4 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024), RESOURCE_PROFILE === "free" ? 1024 * 1024 : 4 * 1024 * 1024),
   proxySessionTtlMs: numberEnv("PROXY_SESSION_TTL_MS", 30 * 60 * 1000, 60 * 1000, 24 * 60 * 60 * 1000),
   maxProxySessions: numberEnv("MAX_PROXY_SESSIONS", P.maxProxySessions || 500, 10, 5000),
@@ -270,6 +275,7 @@ const CFG = Object.freeze({
   proxyForwardCompatHeaders: boolEnv("PROXY_FORWARD_COMPAT_HEADERS", true),
   proxyForwardClientHints: boolEnv("PROXY_FORWARD_CLIENT_HINTS", true),
   proxyStreamOversize: boolEnv("PROXY_STREAM_OVERSIZE", true),
+  proxyPassthroughBinary: boolEnv("PROXY_PASSTHROUGH_BINARY", true),
   proxyRelativeFallback: boolEnv("PROXY_RELATIVE_FALLBACK", true),
   proxyApiBodyBytes: numberEnv("PROXY_API_BODY_BYTES", 4 * 1024 * 1024, 64 * 1024, 32 * 1024 * 1024),
   proxyJsHeavyThreshold: numberEnv("PROXY_JS_HEAVY_THRESHOLD", 4, 1, 20),
@@ -324,6 +330,14 @@ const CFG = Object.freeze({
   browserWarmIdleMs: numberEnv("BROWSER_WARM_IDLE_MS", 15 * 60 * 1000, 0, 24 * 60 * 60 * 1000),
   devConfigApi: boolEnv("VEYRA_DEV_CONFIG_API", VEYRA_CONFIG.envName === "development"),
   adminToken: process.env.VEYRA_ADMIN_TOKEN || "",
+  gateEnabled: boolEnv("GATE_ENABLED", /^(production|prod)$/i.test(String(process.env.VEYRA_ENV || process.env.NODE_ENV || "").trim())),
+  gateRotateMs: numberEnv("GATE_ROTATE_MS", 10 * 60 * 1000, 60 * 1000, 24 * 60 * 60 * 1000),
+  gateGraceMs: numberEnv("GATE_GRACE_MS", 20 * 60 * 1000, 60 * 1000, 7 * 24 * 60 * 60 * 1000),
+  gateSessionTtlMs: numberEnv("GATE_SESSION_TTL_MS", 30 * 24 * 60 * 60 * 1000, 60 * 1000, 365 * 24 * 60 * 60 * 1000),
+  gateWaitlistOpen: boolEnv("GATE_WAITLIST_OPEN", true),
+  gateOwnerTokens: process.env.GATE_OWNER_TOKENS || "",
+  gateMaxSessions: numberEnv("GATE_MAX_SESSIONS", 20000, 10, 500000),
+  gateMaxWaitlist: numberEnv("GATE_MAX_WAITLIST", 100000, 10, 500000),
   plan: VEYRA_CONFIG.plan.key,
   vpnDefaultProfile: process.env.VPN_DEFAULT_PROFILE || "",
   vpnProxyServer: process.env.VPN_PROXY_SERVER || "",
@@ -369,6 +383,11 @@ const shield = createShield(process.env, { lean: CFG.leanMode, log: (level, sour
 app.set("trust proxy", true);
 app.disable("x-powered-by");
 app.use(shield.middleware);
+// Veyra Access Gate: everything behind an invite-only waitlist until the
+// request carries a valid gate session (cookie or X-Veyra-Gate header),
+// a current rotating invite token, or the admin token.
+let accessGate = null;
+app.use((req, res, next) => (accessGate ? accessGate.middleware()(req, res, next) : next()));
 installBrandRoutes(app, { frontendUrl: () => CFG.frontendUrl, version: VEYRA_VERSION, isPreviewBot: ua => shield.isPreviewBot(ua), hasProxiedReferer: req => !!proxiedPageFromReferer(req, { allowCookie: false }) });
 const allowedOrigins = CFG.frontendOrigins.includes("*") ? true : CFG.frontendOrigins;
 app.use(cors({
@@ -431,6 +450,19 @@ const authStore = new AuthStore({
   
   log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
 });
+
+// Access gate — invite-only front door for the whole service.
+accessGate = new AccessGate({
+  enabled: CFG.gateEnabled, dataDir: CFG.authDataDir,
+  rotateMs: CFG.gateRotateMs, graceMs: CFG.gateGraceMs, sessionTtlMs: CFG.gateSessionTtlMs,
+  waitlistOpen: CFG.gateWaitlistOpen, ownerTokens: CFG.gateOwnerTokens,
+  adminToken: CFG.adminToken, maxSessions: CFG.gateMaxSessions, maxWaitlist: CFG.gateMaxWaitlist,
+  frontendUrl: CFG.frontendUrl,
+  persistence: mongoStore,
+  log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
+});
+void accessGate.hydrateFromPersistence();
+setImmediate(() => serverLog("info", "GATE", `Access gate ${CFG.gateEnabled ? "ENABLED" : "disabled"}. Fetch the current invite link from GET /api/gate/admin/link with the admin token.`));
 
 class Semaphore {
   constructor(limit) { this.limit = Math.max(1, limit); this.active = 0; this.waiters = []; }
@@ -1222,7 +1254,15 @@ function oversizeStream(response, head, reader) {
     cancel() { if (taken) return; taken = true; try { (reader ? reader.cancel() : response.body?.cancel())?.catch?.(() => {}); } catch {} }
   };
 }
-async function readBodyLimited(response, limit, keepStream = false, bodyTimeoutMs = CFG.bodyTimeoutMs, signal = null) {
+async function readBodyLimited(response, limit, keepStream = false, bodyTimeoutMs = CFG.bodyTimeoutMs, signal = null, passthrough = false) {
+  // Fast-proxy passthrough: binary bodies (media, archives, wasm, ...) are
+  // piped to the client byte-for-byte without buffering the whole resource
+  // in memory first — every packet flows through as it arrives.
+  if (passthrough && response.body) {
+    try {
+      return { body: Buffer.alloc(0), bytes: 0, truncated: false, tooLarge: false, stream: oversizeStream(response, [], response.body.getReader()), passthrough: true };
+    } catch {}
+  }
   const len = Number(response.headers.get("content-length"));
   if (Number.isFinite(len) && len > limit) {
     if (keepStream && response.body) return { body: Buffer.alloc(0), bytes: len, truncated: true, tooLarge: true, stream: oversizeStream(response, [], null) };
@@ -1335,7 +1375,8 @@ async function fetchBuffer(url, opts = {}) {
         }
         const contentType = response.headers.get("content-type") || "";
         const bodyLimit = typeof opts.limitForContentType === "function" ? opts.limitForContentType(contentType, response.headers) : limit;
-        const body = await readBodyLimited(response, bodyLimit, !!opts.streamOversize, opts.bodyTimeoutMs ?? CFG.bodyTimeoutMs, upstreamSignal);
+        const passthroughBinary = !!opts.passthroughBinary && /^(?:video\/|audio\/|font\/|application\/(?:pdf|zip|x-7z-compressed|octet-stream|wasm|mpegurl|dash\+xml))/i.test(contentType);
+        const body = await readBodyLimited(response, bodyLimit, !!opts.streamOversize || passthroughBinary, opts.bodyTimeoutMs ?? CFG.bodyTimeoutMs, upstreamSignal, passthroughBinary);
         const upstreamEncoding = response.headers.get("content-encoding") || "";
         const headerLength = response.headers.get("content-length") || "";
         
@@ -1375,6 +1416,7 @@ async function fetchBuffer(url, opts = {}) {
           truncated: body.truncated,
           tooLarge: body.tooLarge,
           stream: body.stream || null,
+          passthrough: !!body.passthrough,
           body: body.body,
           redirectChain,
           retries: retriesUsed,
@@ -1663,7 +1705,7 @@ async function fetchCached(url, opts = {}) {
   const key = `${baseKey} | sid=${sid}`;
   const sharedKey = `proxy-cache:v2 ${method} ${normalized} | ua=${userAgentKey} | sid=*`;
   const isolatedRequest = !cacheSafeUrl(normalized) || !!opts.private || hasCredentialRequestHeaders(opts.headers);
-  const cacheReadAllowed = method === "GET" && !opts.noCache && !opts.streamOversize && !isolatedRequest;
+  const cacheReadAllowed = method === "GET" && !opts.noCache && !opts.streamOversize && !opts.passthroughBinary && !isolatedRequest;
   const canCoalesce = cacheReadAllowed;
   if (canCoalesce) { const existing = fetchInflight.get(key); if (existing) return existing; }
   const work = (async () => {
@@ -1689,7 +1731,7 @@ async function fetchCached(url, opts = {}) {
     // Local injection point for tests: mock the upstream fetch without touching network.
     const upstreamFetchBuffer = app.locals.veyraProxyFetchBuffer || null;
     const result = upstreamFetchBuffer ? await upstreamFetchBuffer(url, { ...opts, cached: cachedEntry && method === "GET" ? cachedEntry : null }) : await fetchBuffer(url, { ...opts, cached: cachedEntry && method === "GET" ? cachedEntry : null });
-    if (!opts.noCache && method === "GET") {
+    if (!opts.noCache && method === "GET" && !opts.passthroughBinary) {
       const noStore = /no-store/i.test(result.cacheControl || "");
       const bodyBytes = Buffer.byteLength(result.body || Buffer.alloc(0));
       const youtubeDocument = CFG.youtubeDocumentCache && /text\/html|application\/xhtml/i.test(String(result.contentType || "")) && isYoutubeHost(new URL(normalized).hostname) && !result.setCookieHeader && !cookieHeader(sid, normalized);
@@ -4310,6 +4352,80 @@ app.delete('/api/auth/me', requireUser, (req, res) => { try { authStore.remove(r
 app.post('/api/auth/logout', (req, res) => { const user = authStore.userFromRequest(req); if (user && req.body?.everywhere) authStore.logoutEverywhere(user); res.json({ ok: true }); });
 app.get('/api/auth/data', requireUser, (req, res) => res.json({ ok: true, data: authStore.getData(req.veyraUser), updatedAt: req.veyraUser.dataUpdatedAt || null }));
 app.put('/api/auth/data', requireUser, (req, res) => { try { res.json({ ok: true, ...authStore.setData(req.veyraUser, req.body?.data) }); } catch (e) { authFail(res, e); } });
+// ---------- Veyra Access Gate routes ----------
+function gateRedirectTarget(token) {
+  const base = String(CFG.frontendUrl || "/").replace(/\/$/, "");
+  const sep = base.includes("?") ? "&" : "?";
+  return base === "/" || base === "." ? `/?gate=${encodeURIComponent(token)}` : `${base}${sep}gate=${encodeURIComponent(token)}`;
+}
+app.get("/gate", (req, res) => res.status(403).type("html").send(accessGate.enabled ? accessGate.screenHtml() : "<!doctype html><title>Veyra</title>"));
+app.get("/gate/:token", (req, res) => {
+  if (!accessGate.enabled) return res.redirect("/");
+  const token = String(req.params.token || "");
+  if (!accessGate.validateEntryToken(token)) {
+    res.setHeader("X-Veyra-Gate", "invalid-token");
+    return res.status(403).type("html").send(accessGate.screenHtml().replace("<title>Veyra — Invite only</title>", "<title>Veyra — Link expired</title>").replace("<h1>Veyra is in early access</h1>", "<h1>This invite link has expired</h1>"));
+  }
+  const sessionToken = accessGate.createSession({ email: "invite-link", origin: "invite-link" });
+  res.setHeader("Set-Cookie", `${accessGate.cookieName}=${encodeURIComponent(sessionToken)}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=${Math.floor(accessGate.sessionTtlMs / 1000)}`);
+  res.redirect(gateRedirectTarget(sessionToken));
+});
+app.get("/api/gate/status", (req, res) => {
+  const session = accessGate.enabled ? accessGate.sessionFromRequest(req) : { email: "open" };
+  res.json({ ok: true, gated: accessGate.enabled, unlocked: !!session, waitlistOpen: accessGate.waitlistOpen, email: session ? session.email : null });
+});
+app.get("/api/gate/config", (req, res) => res.json({ ok: true, gated: accessGate.enabled, waitlistOpen: accessGate.waitlistOpen }));
+app.post("/api/gate/waitlist", (req, res) => {
+  const ip = clientIp(req);
+  if (accessGate.limited(`join:${ip}`, 10, 10 * 60 * 1000)) return respondError(res, 429, "Too many waitlist signups from this network. Try again later.", "GATE_RATE_LIMITED");
+  try {
+    const result = accessGate.joinWaitlist(req.body?.email);
+    if (result.alreadyJoined) return res.json({ ok: true, alreadyJoined: true, entry: result.entry });
+    res.status(201).json({ ok: true, entry: result.entry, message: "You're on the list." });
+  } catch (e) { authFail(res, e); }
+});
+app.post("/api/gate/unlock", (req, res) => {
+  const ip = clientIp(req);
+  if (accessGate.limited(`unlock:${ip}`, 20, 10 * 60 * 1000)) return respondError(res, 429, "Too many unlock attempts from this network. Try again later.", "GATE_RATE_LIMITED");
+  try {
+    const { email, sessionToken } = accessGate.unlockWithKey(req.body?.key);
+    res.setHeader("Set-Cookie", `${accessGate.cookieName}=${encodeURIComponent(sessionToken)}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=${Math.floor(accessGate.sessionTtlMs / 1000)}`);
+    res.json({ ok: true, token: sessionToken, email, redirect: gateRedirectTarget(sessionToken) });
+  } catch (e) { authFail(res, e); }
+});
+app.get("/api/gate/session", (req, res) => {
+  const session = accessGate.sessionFromRequest(req);
+  if (!session) return res.status(403).json({ ok: false, error: "Not unlocked.", code: "GATE_REQUIRED" });
+  res.json({ ok: true, email: session.email, createdAt: session.createdAt, expiresAt: new Date(session.expiresAt).toISOString() });
+});
+app.post("/api/gate/logout", (req, res) => {
+  const header = String(req.get("x-veyra-gate") || "");
+  const cookie = String(req.headers.cookie || "").match(new RegExp(`(?:^|;\s*)${accessGate.cookieName}=([^;]+)`));
+  accessGate.revokeSession(header || (cookie ? decodeURIComponent(cookie[1]) : ""));
+  res.setHeader("Set-Cookie", `${accessGate.cookieName}=; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=0`);
+  res.json({ ok: true });
+});
+app.get("/api/gate/admin/link", requireAdmin, (req, res) => {
+  const token = accessGate.currentToken();
+  const origin = `${req.protocol}://${req.get("host")}`;
+  res.json({ ok: true, link: `${origin}/gate/${token}`, token, history: accessGate.tokenHistory(), rotatesEveryMs: accessGate.rotateMs, graceMs: accessGate.graceMs, ownerLinks: [...accessGate.ownerTokens].map(t => `${origin}/gate/${t}`) });
+});
+app.post("/api/gate/admin/rotate", requireAdmin, (req, res) => {
+  const rotated = accessGate.rotate(true);
+  const origin = `${req.protocol}://${req.get("host")}`;
+  res.json({ ok: true, link: `${origin}/gate/${rotated.current}`, previousLinkStillValid: !!rotated.previous });
+});
+app.get("/api/gate/admin/report", requireAdmin, (req, res) => res.json({ ok: true, ...accessGate.report() }));
+app.get("/api/gate/admin/waitlist", requireAdmin, (req, res) => res.json({ ok: true, total: accessGate.waitlist.length, entries: accessGate.listWaitlist() }));
+app.post("/api/gate/admin/waitlist/:id/accept", requireAdmin, (req, res) => {
+  try {
+    const result = accessGate.acceptEntry(req.params.id);
+    if (result.alreadyAccepted) return res.json({ ok: true, alreadyAccepted: true, entry: result.entry });
+    res.json({ ok: true, entry: result.entry, accessKey: result.key, message: result.key ? "Share this key with the user — it is shown only once." : "" });
+  } catch (e) { authFail(res, e); }
+});
+app.post("/api/gate/admin/waitlist/:id/reject", requireAdmin, (req, res) => { try { const r = accessGate.rejectEntry(req.params.id); res.json({ ok: true, entry: r.entry }); } catch (e) { authFail(res, e); } });
+app.post("/api/gate/admin/waitlist/:id/reissue-key", requireAdmin, (req, res) => { try { const r = accessGate.reissueKey(req.params.id); res.json({ ok: true, entry: r.entry, accessKey: r.key }); } catch (e) { authFail(res, e); } });
 app.get('/api/auth/config', (req, res) => {
   const user = authStore.userFromRequest(req);
   const admin = !!(user && authStore.roleFor(user.email) === "admin");
@@ -5456,12 +5572,14 @@ async function proxyRequest(req, res, mode) {
     const mobileYoutubeRequest = (() => { try { return /^m\.youtube\.com$/i.test(new URL(canonical).hostname); } catch { return false; } })();
     const effectiveUserAgent = mobileYoutubeRequest ? "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36" : requestUserAgent;
     const hasAuthorization = !!req.get("Authorization");
-    const result = await browserScheduler.request(browserKey, () => fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, requestId: req.veyraRequestId, userAgent: effectiveUserAgent || undefined, limit: requestLimit, retries, limitForContentType, noCache: method !== "GET" || mediaRequest || hasAuthorization || isNextRsc, timeout: mediaRequest ? CFG.mediaRequestTimeoutMs : CFG.requestTimeoutMs, bodyTimeoutMs: mediaRequest ? CFG.mediaBodyTimeoutMs : CFG.bodyTimeoutMs, streamOversize: mode === "resource" }), { priority: browserPriority + (mediaRequest ? 30 : 0), host: hostOf(canonical), url: canonical });
+    const result = await browserScheduler.request(browserKey, () => fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, requestId: req.veyraRequestId, userAgent: effectiveUserAgent || undefined, limit: requestLimit, retries, limitForContentType, noCache: method !== "GET" || mediaRequest || hasAuthorization || isNextRsc, timeout: mediaRequest ? CFG.mediaRequestTimeoutMs : CFG.requestTimeoutMs, bodyTimeoutMs: mediaRequest ? CFG.mediaBodyTimeoutMs : CFG.bodyTimeoutMs, streamOversize: mode === "resource", passthroughBinary: mode === "resource" && !download && CFG.proxyPassthroughBinary }), { priority: browserPriority + (mediaRequest ? 30 : 0), host: hostOf(canonical), url: canonical });
   
   
   
   const streamable = mode === "resource" || !/html|xhtml/i.test(String(result.contentType || ""));
-  if (result.tooLarge && streamable && CFG.proxyStreamOversize && !(download && result.bytes > CFG.maxDownloadBytes)) {
+  // Stream binary resources straight through — no full-resource buffering.
+  const streamNow = result.stream && (result.tooLarge || result.passthrough) && streamable && CFG.proxyStreamOversize && !(download && result.bytes > CFG.maxDownloadBytes);
+  if (streamNow) {
     if (/javascript|ecmascript/i.test(result.contentType || "")) noteScriptDir(sid, result.finalUrl || canonical);
     return streamOversizeResponse(req, res, result, { canonical, method, headers, body, referrer, sid, download });
   }
@@ -6644,4 +6762,4 @@ const __workerOps = {
   discover: (text, kind, base, contentType) => collectDiscovery(text, kind, base, contentType)
 };
 
-module.exports = { app, mongoStore, mergeStrayProxyParams, detectChallenge, CFG, browserCapabilitySignals, canRenderHtmlWithBrowser, renderHtmlWithBrowser, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions, normalizeOpenEngineMode, shouldStartCrawlerForEngineMode, startVeyraServer, cacheSafeUrl, cacheSafeResponse };
+module.exports = { app, get accessGate() { return accessGate; }, mongoStore, mergeStrayProxyParams, detectChallenge, CFG, browserCapabilitySignals, canRenderHtmlWithBrowser, renderHtmlWithBrowser, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions, normalizeOpenEngineMode, shouldStartCrawlerForEngineMode, startVeyraServer, cacheSafeUrl, cacheSafeResponse };

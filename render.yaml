@@ -8,6 +8,44 @@ services:
     startCommand: npm start
     healthCheckPath: /health
     envVars:
+      # ---------- Veyra Access Gate (8.21.0) ----------
+      # The whole service is invite-only: everyone else sees the waitlist screen.
+      # Entry is via rotating invite links (/gate/<token>) or waitlist access keys.
+      - key: GATE_ENABLED
+        value: "true"
+      # How often the invite link rotates to a fresh random string.
+      - key: GATE_ROTATE_MS
+        value: "600000"
+      # How long previously shared links keep working after a rotation.
+      - key: GATE_GRACE_MS
+        value: "1200000"
+      # How long an unlocked device stays unlocked.
+      - key: GATE_SESSION_TTL_MS
+        value: "2592000000"
+      - key: GATE_WAITLIST_OPEN
+        value: "true"
+      # Owner's personal never-rotating entry tokens (comma separated). Set in dashboard.
+      - key: GATE_OWNER_TOKENS
+        sync: false
+      # ---------- Remote Chromium (8.21.0) ----------
+      # Run the browser lane on an external Chromium provider instead of this
+      # server: BROWSER_BACKEND=remote + BROWSER_BACKEND_URL=wss://... CDP
+      # endpoint (Browserless, Browserbase, Steel, or your own Chrome host).
+      # Dramatically faster and frees Render CPU/RAM for the proxy lane.
+      - key: BROWSER_BACKEND
+        value: "local"
+      - key: BROWSER_BACKEND_URL
+        sync: false
+      - key: BROWSER_BACKEND_CONNECT_TIMEOUT_MS
+        value: "30000"
+      # Remote caps: with the browser off-server the plan limits no longer bind.
+      - key: MAX_BROWSER_SESSIONS
+        value: "4"
+      - key: MAX_BROWSER_PAGES
+        value: "8"
+      - key: MAX_BROWSER_CONTEXTS
+        value: "8"
+      # ---------- Search: 6 providers fan out in parallel, up to 100 results ----------
       - key: VEYRA_FRONTEND_URL
         value: https://homekidchud.github.io/VeyraBrowser/
       - key: PLATFORM_URL
@@ -76,7 +114,13 @@ services:
       - key: GOOGLE_SEARCH_CX
         sync: false
       - key: WEB_SEARCH_ORDER
-        value: brave,bing,duckduckgo,google
+        value: brave,bing,duckduckgo,google,mojeek,ecosia,yahoo,startpage
+      - key: WEB_SEARCH_MAX_PROVIDERS
+        value: "6"
+      - key: WEB_SEARCH_CONCURRENCY
+        value: "6"
+      - key: WEB_SEARCH_EARLY_RESULT_THRESHOLD
+        value: "40"
       - key: MONGODB_DB
         value: veyra
       - key: MONGODB_MAX_POOL_SIZE
