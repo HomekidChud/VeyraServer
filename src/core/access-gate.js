@@ -237,7 +237,7 @@ class AccessGate {
     return { email: entry.email, sessionToken: this.createSession({ email: entry.email, origin: "access-key" }) };
   }
   publicEntry(x) {
-    return { id: x.id, email: x.email, status: x.status, position: this.waitlist.filter(w => w.status === "pending").indexOf(x) + 1 || null, createdAt: x.createdAt, acceptedAt: x.acceptedAt || null, keyIssuedAt: x.keyIssuedAt || null, hasKey: !!x.keyHash };
+    return { id: x.id, email: x.email, status: x.status, position: this.waitlist.filter(w => w.status === "pending").indexOf(x) + 1 || null, createdAt: x.createdAt, acceptedAt: x.acceptedAt || null, keyIssuedAt: x.keyIssuedAt || null, hasKey: !!x.keyHash, emailStatus: x.emailStatus || null, emailSentAt: x.emailSentAt || null };
   }
 
   /* ---------- middleware ---------- */

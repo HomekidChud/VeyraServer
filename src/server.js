@@ -4375,12 +4375,14 @@ app.get("/api/gate/status", (req, res) => {
   res.json({ ok: true, gated: accessGate.enabled, unlocked: !!session, waitlistOpen: accessGate.waitlistOpen, email: session ? session.email : null });
 });
 app.get("/api/gate/config", (req, res) => res.json({ ok: true, gated: accessGate.enabled, waitlistOpen: accessGate.waitlistOpen }));
-app.post("/api/gate/waitlist", (req, res) => {
+app.post("/api/gate/waitlist", async (req, res) => {
   const ip = clientIp(req);
   if (accessGate.limited(`join:${ip}`, 10, 10 * 60 * 1000)) return respondError(res, 429, "Too many waitlist signups from this network. Try again later.", "GATE_RATE_LIMITED");
   try {
     const result = accessGate.joinWaitlist(req.body?.email);
     if (result.alreadyJoined) return res.json({ ok: true, alreadyJoined: true, entry: result.entry });
+    // Best-effort confirmation email; the queue still works without Resend.
+    await sendGateWaitlistEmail(result.entry);
     res.status(201).json({ ok: true, entry: result.entry, message: "You're on the list." });
   } catch (e) { authFail(res, e); }
 });
@@ -4417,15 +4419,25 @@ app.post("/api/gate/admin/rotate", requireAdmin, (req, res) => {
 });
 app.get("/api/gate/admin/report", requireAdmin, (req, res) => res.json({ ok: true, ...accessGate.report() }));
 app.get("/api/gate/admin/waitlist", requireAdmin, (req, res) => res.json({ ok: true, total: accessGate.waitlist.length, entries: accessGate.listWaitlist() }));
-app.post("/api/gate/admin/waitlist/:id/accept", requireAdmin, (req, res) => {
+app.post("/api/gate/admin/waitlist/:id/accept", requireAdmin, async (req, res) => {
   try {
     const result = accessGate.acceptEntry(req.params.id);
     if (result.alreadyAccepted) return res.json({ ok: true, alreadyAccepted: true, entry: result.entry });
-    res.json({ ok: true, entry: result.entry, accessKey: result.key, message: result.key ? "Share this key with the user — it is shown only once." : "" });
+    // Email the access key to the user so the promise on the waitlist screen
+    // ("we will email you an access key") is kept. Best-effort: the key is
+    // still shown to the owner below when email delivery is not configured.
+    const email = result.key && result.entry?.email ? await sendGateKeyEmail(result.entry, result.key, "accepted") : null;
+    res.json({ ok: true, entry: result.entry, accessKey: result.key, email, message: result.key ? "Share this key with the user — it is shown only once." + (email?.sent ? " It has also been emailed to them." : "") : "" });
   } catch (e) { authFail(res, e); }
 });
 app.post("/api/gate/admin/waitlist/:id/reject", requireAdmin, (req, res) => { try { const r = accessGate.rejectEntry(req.params.id); res.json({ ok: true, entry: r.entry }); } catch (e) { authFail(res, e); } });
-app.post("/api/gate/admin/waitlist/:id/reissue-key", requireAdmin, (req, res) => { try { const r = accessGate.reissueKey(req.params.id); res.json({ ok: true, entry: r.entry, accessKey: r.key }); } catch (e) { authFail(res, e); } });
+app.post("/api/gate/admin/waitlist/:id/reissue-key", requireAdmin, async (req, res) => {
+  try {
+    const r = accessGate.reissueKey(req.params.id);
+    const email = r.key && r.entry?.email ? await sendGateKeyEmail(r.entry, r.key, "reissued") : null;
+    res.json({ ok: true, entry: r.entry, accessKey: r.key, email });
+  } catch (e) { authFail(res, e); }
+});
 app.get('/api/auth/config', (req, res) => {
   const user = authStore.userFromRequest(req);
   const admin = !!(user && authStore.roleFor(user.email) === "admin");
@@ -4465,6 +4477,40 @@ function readPlatformWaitlist() { try { const rows = JSON.parse(fs.readFileSync(
 function writePlatformWaitlist(rows) { fs.mkdirSync(path.dirname(PLATFORM_WAITLIST_FILE), { recursive: true }); const tmp = `${PLATFORM_WAITLIST_FILE}.tmp`; fs.writeFileSync(tmp, JSON.stringify(rows, null, 2)); fs.renameSync(tmp, PLATFORM_WAITLIST_FILE); if (mongoStore.enabled) void mongoStore.replacePlatformWaitlist(rows); }
 if (mongoStore.enabled) void mongoStore.loadPlatformWaitlist().then(rows => { const local = readPlatformWaitlist(); if (rows.length) writePlatformWaitlist(rows); else if (local.length) void mongoStore.replacePlatformWaitlist(local); }).catch(() => {});
 function publicWaitlistEntry(x) { return { id: x.id, email: x.email, name: x.name || "", plan: x.plan, status: x.status, position: x.position || null, createdAt: x.createdAt, acceptedAt: x.acceptedAt || null, emailStatus: x.emailStatus || "pending" }; }
+/* ---------- gate waitlist emails (Resend-compatible, best-effort) ---------- */
+function gateEmailAppUrl() {
+  return String(process.env.PLATFORM_URL || "https://homekidchud.github.io/VeyraBrowser").replace(/\/$/, "");
+}
+function recordGateEmailStatus(email, status, sent) {
+  try {
+    const entry = accessGate.waitlist.find(x => x.email === email);
+    if (!entry) return;
+    entry.emailStatus = status;
+    entry.emailSentAt = sent ? new Date().toISOString() : (entry.emailSentAt || null);
+    accessGate.save();
+  } catch {}
+}
+async function sendGateWaitlistEmail(entry) {
+  if (!entry?.email) return null;
+  const r = await sendPlatformEmail({
+    to: entry.email,
+    subject: "You're on the Veyra waitlist",
+    html: `<p>Hi there,</p><p>You're in the queue for Veyra early access. We'll email you an access key when a spot opens — no need to do anything else.</p><p><a href="${escapeHtml(gateEmailAppUrl())}">Veyra</a></p><p>— The Veyra team</p>`
+  });
+  recordGateEmailStatus(entry.email, r.status, r.sent);
+  return r;
+}
+async function sendGateKeyEmail(entry, key, reason) {
+  if (!entry?.email || !key) return null;
+  const reissued = reason === "reissued";
+  const r = await sendPlatformEmail({
+    to: entry.email,
+    subject: reissued ? "Your new Veyra access key" : "Your Veyra access key",
+    html: `<p>Hi there,</p><p>${reissued ? "Here is your new Veyra access key:" : "A spot just opened up — your Veyra access key is:"}</p><p><strong style="font-family:ui-monospace,monospace;font-size:16px">${escapeHtml(key)}</strong></p><p>Open <a href="${escapeHtml(gateEmailAppUrl())}">Veyra</a> and paste this key on the invite screen to unlock it. Keep the key private; it is linked to your email address.</p><p>— The Veyra team</p>`
+  });
+  recordGateEmailStatus(entry.email, r.status, r.sent);
+  return r;
+}
 async function sendPlatformEmail({ to, subject, html }) {
   const key = String(process.env.RESEND_API_KEY || "").trim(), from = String(process.env.PLATFORM_EMAIL_FROM || "").trim();
   if (!key || !from) { serverLog("info", "PLATFORM_EMAIL", `Email delivery not configured; would send ${subject} to ${to}`); return { sent: false, status: "not_configured" }; }
