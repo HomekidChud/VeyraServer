@@ -79,7 +79,7 @@ class SessionManager {
         err.code = "SESSION_EXPIRED"; err.status = 410;
         throw err;
       }
-      rec = { id: sid, createdAt: t, lastUsed: t, cookies: new Map(), vpnProfileId: null, browserSessions: new Set(), requests: 0, bytesOut: 0 };
+      rec = { id: sid, createdAt: t, lastUsed: t, cookies: new Map(), chromiumUaByHost: new Map(), vpnProfileId: null, browserSessions: new Set(), requests: 0, bytesOut: 0 };
       this.sessions.set(sid, rec);
       this.stats.created += 1;
       this.enforceCap();
@@ -196,7 +196,7 @@ class SessionManager {
 
   
   
-  importPlaywrightCookies(sid, cookies) {
+  importPlaywrightCookies(sid, cookies, userAgent = '') {
     if (!sid || !Array.isArray(cookies)) return;
     const rec = this.sessions.get(sid);
     if (!rec) return;
@@ -214,8 +214,36 @@ class SessionManager {
         httpOnly: !!c.httpOnly,
         sameSite: c.sameSite || 'Lax'
       });
+      // Remember which user-agent real Chromium used on this host. Security
+      // clearance cookies (cf_clearance & friends) are validated against the
+      // IP + user-agent that solved the check, so the fast proxy must replay
+      // the exact same UA for those hosts.
+      if (userAgent) {
+        const host = String(c.domain || '').replace(/^\./, '').toLowerCase();
+        if (host) rec.chromiumUaByHost.set(host, String(userAgent).slice(0, 500));
+      }
+    }
+    while (rec.chromiumUaByHost.size > 64) {
+      const oldest = rec.chromiumUaByHost.keys().next().value;
+      if (!oldest) break;
+      rec.chromiumUaByHost.delete(oldest);
     }
     this.trimCookies(rec);
+  }
+
+  // The user-agent real Chromium used when the user passed a security check
+  // on this host (empty when the session never verified there).
+  chromiumUaFor(sid, url) {
+    const rec = this.sessions.get(sid);
+    if (!rec || !rec.chromiumUaByHost?.size) return '';
+    try {
+      const host = new URL(url).hostname.toLowerCase();
+      for (const [domain, ua] of rec.chromiumUaByHost) {
+        const d = String(domain).toLowerCase();
+        if (host === d || host.endsWith(`.${d}`)) return ua;
+      }
+    } catch {}
+    return '';
   }
   
   exportPlaywrightCookies(sid) {

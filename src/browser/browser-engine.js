@@ -78,6 +78,40 @@ class BrowserEngine {
     
   }
 
+  // Export a Chromium session's cookies (and its exact user-agent) into the
+  // linked fast-proxy session. Called on navigation, on session close, and —
+  // critically — when a security verification clears: the clearance cookies
+  // the user just earned in real Chromium carry over to the fast proxy, and
+  // the proxy then sends the SAME user-agent the check was solved with.
+  async #exportSessionState(session) {
+    if (!this.onStorageState || !session?.proxySessionId) return;
+    try {
+      const state = await session.context.storageState();
+      const ua = await session.page.evaluate(() => navigator.userAgent).catch(() => '');
+      this.onStorageState(session.proxySessionId, state, ua || '');
+    } catch {}
+  }
+
+  // Re-check a session parked in VERIFICATION_REQUIRED. The fast-proxy UI
+  // polls GET /api/browser/session/:id; this lets the server notice the
+  // moment the user finishes the check (even when the page self-redirects
+  // with no further input events), flip the status back to NORMAL, and sync
+  // the freshly-earned cookies into the proxy session.
+  async refreshVerification(sid) {
+    const s = this.get(sid);
+    if (s.status !== 'VERIFICATION_REQUIRED') return this.public(s);
+    const challenge = await this.detectVerification(s.page);
+    if (!challenge) {
+      s.status = 'NORMAL';
+      s.verification = null;
+      s.canonicalUrl = safeUrl(s.page.url()) || s.canonicalUrl;
+      s.title = await s.page.title().catch(() => s.title || '');
+      await this.capture(s, true);
+      await this.#exportSessionState(s);
+    }
+    return this.public(s);
+  }
+
   // Connect to an external Chromium host over the Chrome DevTools Protocol.
   // Supports ws(s):// endpoints (Browserless, Browserbase, Steel, chrome
   // --remote-debugging-port) and http(s):// endpoints that expose /json/version.
@@ -465,13 +499,7 @@ class BrowserEngine {
       }
       if (response && response.status() >= 400 && !challenge) session.error = `HTTP ${response.status()}`;
       await this.capture(session, true);
-      
-      if (this.onStorageState && session.proxySessionId) {
-        try {
-          const state = await session.context.storageState();
-          this.onStorageState(session.proxySessionId, state);
-        } catch {}
-      }
+      await this.#exportSessionState(session);
       return this.public(session);
     } catch (e) {
       session.status = 'ERROR';
@@ -526,6 +554,7 @@ class BrowserEngine {
     const s = this.get(sid), p = s.page;
     if (s.status === 'CLOSED') throw new Error('Browser session is closed.');
     s.lastUsed = Date.now();
+    const wasVerifying = s.status === 'VERIFICATION_REQUIRED';
     const kind = String(action?.type || '');
     
     
@@ -550,6 +579,9 @@ class BrowserEngine {
     s.status = challenge ? 'VERIFICATION_REQUIRED' : 'NORMAL';
     s.verification = challenge;
     await this.capture(s, true);
+    // The user just finished a security check in real Chromium — sync the
+    // clearance cookies + user-agent into the fast-proxy session right away.
+    if (wasVerifying && !challenge) await this.#exportSessionState(s);
     return this.public(s);
   }
 
@@ -589,12 +621,7 @@ class BrowserEngine {
   async stop(sid) {
     const s = this.get(sid);
     
-    if (this.onStorageState && s.proxySessionId) {
-      try {
-        const state = await s.context.storageState();
-        this.onStorageState(s.proxySessionId, state);
-      } catch {}
-    }
+    await this.#exportSessionState(s);
     s.status = 'CLOSED';
     clearTimeout(s.browserPoll);
     await s.context.close().catch(() => {});

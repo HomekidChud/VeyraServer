@@ -575,10 +575,10 @@ if (!IS_THREAD_WORKER) {
         failoverController.recordBrowserResult(session.proxySessionId, false, reason);
       }
     },
-    onStorageState: (proxySessionId, storageState) => {
+    onStorageState: (proxySessionId, storageState, chromiumUserAgent = "") => {
       
       if (storageState?.cookies && proxySessionId) {
-        sessionManager.importPlaywrightCookies(proxySessionId, storageState.cookies);
+        sessionManager.importPlaywrightCookies(proxySessionId, storageState.cookies, chromiumUserAgent);
         
         if (mongoStore.enabled) {
           mongoStore.putSessionCookies(proxySessionId, storageState.cookies).catch(() => {});
@@ -2014,7 +2014,7 @@ function challengeFallbackHtml(url, info, sid = "") {
     ["Brave Search", `https://search.brave.com/search?q=${encodeURIComponent(query)}`],
     ["DuckDuckGo", `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`]
   ].map(([n, h]) => `<a class="secondary" href="${escapeHtml(h)}" target="_blank" rel="noopener noreferrer">Open “${escapeHtml(query)}” on ${n}</a>`).join("") : "";
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#10151d;color:#eaf0f6;font:15px/1.5 system-ui,sans-serif}.card{max-width:650px;margin:24px;padding:32px;background:#171e28;border:1px solid #303a48;border-radius:18px;box-shadow:0 20px 60px #0008}.ey{font-size:11px;letter-spacing:.15em;text-transform:uppercase;color:#86a9d5}.card h1{font-size:26px;margin:10px 0}.card p{color:#aab5c4}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px}.actions a{display:inline-block;padding:10px 15px;border-radius:9px;text-decoration:none}.primary{background:#4b82c9;color:#fff}.secondary{border:1px solid #3a4657;color:#dce5ef}.secondary:hover{background:#1f2835}</style></head><body><main class="card"><div class="ey">Veyra Browser</div><h1>${escapeHtml(title)}</h1><p>${why}</p><div class="actions"><a class="primary" href="#" id="veyraChromium">Verify in real Chromium</a>${alt}<a class="secondary" href="${safe}" target="_blank" rel="noopener noreferrer">Open directly in a new tab</a><a class="secondary" href="${escapeHtml(makeViewUrl(url, sid))}">Retry through Veyra</a></div><p style="font-size:13px;margin-top:18px">Chromium shows the site's own check so <b>you</b> can complete it. Veyra does not solve, evade, or weaken CAPTCHA/anti-bot checks.</p></main><script>(function(){var m={type:"veyra:challenge",url:${JSON.stringify(String(url)).replace(/</g, "\\u003c")},kind:${JSON.stringify(String(info?.type || "verification"))},auto:${process.env.CHALLENGE_AUTO_HANDOFF == null ? "true" : /^(1|true|yes|on)$/i.test(String(process.env.CHALLENGE_AUTO_HANDOFF)) ? "true" : "false"}};try{if(parent!==window)parent.postMessage(m,"*")}catch(e){}var b=document.getElementById("veyraChromium");if(b){if(parent===window){b.href=${JSON.stringify(String(url)).replace(/</g, "\\u003c")};b.target="_blank";b.textContent="Open Google directly to verify"}else b.onclick=function(e){e.preventDefault();m.auto=false;m.manual=true;try{parent.postMessage(m,"*")}catch(x){}}}})();</script></body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#10151d;color:#eaf0f6;font:15px/1.5 system-ui,sans-serif}.card{max-width:650px;margin:24px;padding:32px;background:#171e28;border:1px solid #303a48;border-radius:18px;box-shadow:0 20px 60px #0008}.ey{font-size:11px;letter-spacing:.15em;text-transform:uppercase;color:#86a9d5}.card h1{font-size:26px;margin:10px 0}.card p{color:#aab5c4}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px}.actions a{display:inline-block;padding:10px 15px;border-radius:9px;text-decoration:none}.primary{background:#4b82c9;color:#fff}.secondary{border:1px solid #3a4657;color:#dce5ef}.secondary:hover{background:#1f2835}</style></head><body><main class="card"><div class="ey">Veyra Browser</div><h1>${escapeHtml(title)}</h1><p>${why}</p><div class="actions"><a class="primary" href="#" id="veyraChromium">Verify in real Chromium</a>${alt}<a class="secondary" href="${safe}" target="_blank" rel="noopener noreferrer">Open directly in a new tab</a><a class="secondary" href="${escapeHtml(makeViewUrl(url, sid))}">Retry through Veyra</a></div><p style="font-size:13px;margin-top:18px">Chromium shows the site's own check so <b>you</b> can complete it. Veyra does not solve, evade, or weaken CAPTCHA/anti-bot checks. Once you finish the check, this tab returns to the fast proxy automatically.</p></main><script>(function(){var m={type:"veyra:challenge",url:${JSON.stringify(String(url)).replace(/</g, "\\u003c")},kind:${JSON.stringify(String(info?.type || "verification"))},auto:${process.env.CHALLENGE_AUTO_HANDOFF == null ? "true" : /^(1|true|yes|on)$/i.test(String(process.env.CHALLENGE_AUTO_HANDOFF)) ? "true" : "false"}};try{if(parent!==window)parent.postMessage(m,"*")}catch(e){}var b=document.getElementById("veyraChromium");if(b){if(parent===window){b.href=${JSON.stringify(String(url)).replace(/</g, "\\u003c")};b.target="_blank";b.textContent="Open Google directly to verify"}else b.onclick=function(e){e.preventDefault();m.auto=false;m.manual=true;try{parent.postMessage(m,"*")}catch(x){}}}})();</script></body></html>`;
 }
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m])); }
 
@@ -4707,8 +4707,20 @@ app.post('/api/browser/session', async (req, res) => {
   }
 });
 
-app.get('/api/browser/session/:sid', (req, res) => {
-  try { const s = browserSessionOrThrow(req.params.sid); res.json({ ok: true, session: browserEngine.public(s) }); }
+app.get('/api/browser/session/:sid', async (req, res) => {
+  try {
+    const s = browserSessionOrThrow(req.params.sid);
+    // While the tab sits on a security check, each UI poll re-detects whether
+    // the user has finished it. The moment it clears, the clearance cookies +
+    // user-agent sync into the fast-proxy session and the tab can return to
+    // the (now unlocked) fast proxy.
+    if (s.status === 'VERIFICATION_REQUIRED') {
+      const session = await browserEngine.refreshVerification(req.params.sid);
+      if (session.status === 'NORMAL' && s.proxySessionId) sessionManager.resumeFromVerification(s.proxySessionId);
+      return res.json({ ok: true, session });
+    }
+    res.json({ ok: true, session: browserEngine.public(s) });
+  }
   catch (e) { respondError(res, e.status || 404, e.message, e.code || "BROWSER_SESSION_NOT_FOUND"); }
 });
 app.post('/api/browser/session/:sid/navigate', async (req, res) => {
@@ -5570,7 +5582,7 @@ async function proxyRequest(req, res, mode) {
     // appends ?app=desktop&themeRefresh=1, Veyra's virtualPageUrl pins the URL back to
     // m.youtube.com, and the page reloads forever on its skeleton.
     const mobileYoutubeRequest = (() => { try { return /^m\.youtube\.com$/i.test(new URL(canonical).hostname); } catch { return false; } })();
-    const effectiveUserAgent = mobileYoutubeRequest ? "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36" : requestUserAgent;
+    const effectiveUserAgent = mobileYoutubeRequest ? "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36" : (sessionManager.chromiumUaFor(sid, canonical) || requestUserAgent);
     const hasAuthorization = !!req.get("Authorization");
     const result = await browserScheduler.request(browserKey, () => fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, requestId: req.veyraRequestId, userAgent: effectiveUserAgent || undefined, limit: requestLimit, retries, limitForContentType, noCache: method !== "GET" || mediaRequest || hasAuthorization || isNextRsc, timeout: mediaRequest ? CFG.mediaRequestTimeoutMs : CFG.requestTimeoutMs, bodyTimeoutMs: mediaRequest ? CFG.mediaBodyTimeoutMs : CFG.bodyTimeoutMs, streamOversize: mode === "resource", passthroughBinary: mode === "resource" && !download && CFG.proxyPassthroughBinary }), { priority: browserPriority + (mediaRequest ? 30 : 0), host: hostOf(canonical), url: canonical });
   
