@@ -9,6 +9,21 @@ The Developer Platform now supports:
 - Resend-compatible email delivery.
 - Optional early-access checkout links.
 
+## Gate waitlist emails
+
+The invite gate uses the same Resend sender. Once the environment variables below
+are set on Render:
+
+- Joining the gate waitlist (`/api/gate/waitlist`) sends a confirmation email.
+- Accepting a gate waitlist entry or reissuing a key emails the access key to
+  the user automatically; the key is still shown once to the owner as a
+  fallback.
+- Gate waitlist entries record `emailStatus` (`sent` / `failed` /
+  `not_configured`), visible in the admin waitlist listing.
+
+Without the variables the gate works exactly as before and delivery is marked
+`not_configured` — no fake email provider is used.
+
 ## 1. Create a Resend account
 
 1. Create an account at [Resend](https://resend.com/).
