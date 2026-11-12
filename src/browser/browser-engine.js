@@ -121,7 +121,11 @@ class BrowserEngine {
     let endpoint = raw;
     try {
       if (/^https?:\/\//i.test(raw)) {
-        const info = await fetch(raw.replace(/\/$/, '') + '/json/version', { signal: AbortSignal.timeout(10 * 1000) });
+        // Append /json/version to the path while keeping any query string
+        // (providers like Browserless put the token in ?token=...).
+        const discovery = new URL(raw);
+        discovery.pathname = (discovery.pathname.replace(/\/+$/, '') || '') + '/json/version';
+        const info = await fetch(discovery.href, { signal: AbortSignal.timeout(10 * 1000) });
         if (!info.ok) throw new Error(`CDP discovery returned HTTP ${info.status}`);
         const meta = await info.json();
         const ws = meta.webSocketDebuggerUrl || meta.webSocketUrl || '';
