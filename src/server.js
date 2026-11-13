@@ -1057,42 +1057,48 @@ function requestOrigin(req) {
   const host = String(req.get("host") || "").slice(0, 200);
   return host ? `${proto}://${host}` : String(CFG.frontendUrl || "https://veyraserver-xscy.onrender.com");
 }
-function handoffReturnUrl(req, sid, target) {
+// The return trip goes straight to the Veyra app (never through this
+// server), so the popup the user opens touches only the real site and,
+// when the site's return parameter fires, the app itself.
+function handoffReturnUrl(sid, target) {
   try {
-    const u = new URL("/api/handoff/return", requestOrigin(req));
-    if (sid) u.searchParams.set("sid", String(sid).slice(0, 64));
-    if (target) u.searchParams.set("url", String(target).slice(0, 2000));
+    const base = String(CFG.frontendUrl || "");
+    if (!/^https?:\/\//i.test(base)) return ""; // no absolute frontend URL configured
+    const u = new URL(base);
+    if (target) u.searchParams.set("veyra_handoff", String(target).slice(0, 2000));
     return u.href;
   } catch { return ""; }
 }
-// Sites whose own login page accepts a return-trip parameter. After the user
-// signs in there, the site sends them straight back to Veyra. Sites not
-// listed still work: the handoff lands on the exact page the user was on,
-// and they return to the still-open Veyra tab (or use the "Bring session
-// back" bookmarklet) when they are done.
+// Sites whose auth pages accept a return-trip parameter. On these, an
+// auth-style page (login, register, verify, …) gets the automatic bounce back
+// into the Veyra app. Every other page — on these sites and everywhere else —
+// is handed off as the exact page the user was on; if it needs a sign-in, the
+// site's own login redirect takes over and brings them back to the page.
 const HANDOFF_LOGIN_PAGES = {
   "chess.com": { path: "/login", param: "returnUrl" },
   "github.com": { path: "/login", param: "return_to" },
   "gitlab.com": { path: "/users/sign_in", param: "return_to" },
 };
-function handoffLoginRedirect(req, target, sid) {
+const AUTH_PAGE_PATH = /login|signin|sign-in|log-in|register|signup|sign-up|join|auth|verify|verification|challenge|captcha|consent|confirm/i;
+function handoffLoginRedirect(target, sid) {
   let dest = "";
   try {
     const u = new URL(target);
     const host = u.hostname.toLowerCase();
     const bare = host.replace(/^www\./, "");
     const known = HANDOFF_LOGIN_PAGES[bare] || HANDOFF_LOGIN_PAGES[host];
-    if (known) {
-      const ret = handoffReturnUrl(req, sid, target);
-      const base = new URL(known.path, u);
-      if (ret) base.searchParams.set(known.param, ret);
-      dest = base.href;
+    const ret = handoffReturnUrl(sid, target);
+    // Known site + auth-style page: attach the return trip so the user
+    // bounces back into the Veyra app when the site is done with them.
+    if (known && ret && (u.pathname === known.path || AUTH_PAGE_PATH.test(u.pathname))) {
+      u.searchParams.set(known.param, ret);
+      dest = u.href;
     } else {
-      // Every other site: hand off the exact page the user was on. This is
-      // what makes the flow work for every site and every wall — not just
-      // logins. On the real site in their own browser the user can finish
-      // whatever the page asks of them (sign in, verify, consent, confirm
-      // age) and then bring the session back.
+      // Every other site and page: hand off the exact page the user was on.
+      // This is what makes the flow work for every site and every wall —
+      // not just logins. On the real site in their own browser the user can
+      // finish whatever the page asks of them (sign in, verify, consent,
+      // confirm age) and then bring the session back.
       dest = u.href;
     }
   } catch { dest = ""; }
@@ -2085,8 +2091,11 @@ function challengeFallbackHtml(url, info, sid = "", apiOrigin = "") {
   // browser, then let them bring their session cookies back into this Veyra
   // session so the fast proxy keeps working logged-in.
   const handoffable = !!sid && info?.type !== "unusual-traffic";
-  const handoffAction = handoffable
-    ? `<a class="primary" href="/api/handoff/login?sid=${encodeURIComponent(sid)}&url=${encodeURIComponent(url)}" target="_blank" rel="noopener noreferrer">Open this page directly & come back</a>`
+  // The button links the real site directly — no hop through this server —
+  // so a blocked or asleep API origin can never break the handoff.
+  const handoffDest = handoffable ? handoffLoginRedirect(url, sid) : "";
+  const handoffAction = handoffable && handoffDest
+    ? `<a class="primary" href="${escapeHtml(handoffDest)}" target="_blank" rel="noopener noreferrer">Open this page directly & come back</a>`
     : "";
   const directClass = handoffable ? "secondary" : (CHROMIUM_VERIFY_DISABLED ? "primary" : "secondary");
   // One-click return for every site: a bookmarklet the user drags to their
@@ -4372,8 +4381,14 @@ app.get("/api/handoff/login", (req, res) => {
   const target = normalizeUrl(String(req.query.url || ""));
   if (!target) return respondError(res, 400, "A valid http(s) url is required.", "BAD_REQUEST");
   const sid = normalizeSessionId(String(req.query.sid || ""));
-  const dest = handoffLoginRedirect(req, target, sid);
+  const dest = handoffLoginRedirect(target, sid);
   if (!dest) return respondError(res, 400, "A valid http(s) url is required.", "BAD_REQUEST");
+  // The frontend asks for JSON (Accept: application/json) so it can open the
+  // real site directly — the user's popup then never navigates through this
+  // server at all. A plain navigation still gets the 302 for old links.
+  if (/json/i.test(String(req.get("accept") || ""))) {
+    return res.json({ ok: true, dest });
+  }
   res.redirect(302, dest);
 });
 // The site's returnUrl lands here after the user logs in; bounce into the

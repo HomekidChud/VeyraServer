@@ -18,27 +18,45 @@ const path = require("node:path");
     await new Promise((resolve, reject) => { server.once("listening", resolve); server.once("error", reject); });
     const base = `http://127.0.0.1:${server.address().port}`;
 
-    // 1: login handoff redirects.
+    // 1: login handoff redirects — straight to the real site, with the return
+    // trip pointing at the app itself (never through the API origin).
     let r = await fetch(`${base}/api/handoff/login?url=${encodeURIComponent("https://www.chess.com/register")}&sid=handofftestsid1234`, { redirect: "manual" });
     assert.equal(r.status, 302, "login handoff must redirect");
     let loc = String(r.headers.get("location") || "");
-    assert.match(loc, /^https:\/\/www\.chess\.com\/login\?returnUrl=/, "chess.com must go to its real login page");
+    assert.match(loc, /^https:\/\/www\.chess\.com\/register\?returnUrl=/, "chess.com must open the exact auth page the user was on");
     const decoded = decodeURIComponent(decodeURIComponent(loc));
-    assert.match(decoded, /\/api\/handoff\/return\?sid=handofftestsid1234&url=https:\/\/www\.chess\.com\/register/, "the return trip must carry the session and the original target");
+    assert.match(decoded, /veyra_handoff=https:\/\/www\.chess\.com\/register/, "the return trip must carry the original target back to the app");
+    assert.ok(!loc.includes("127.0.0.1"), "the handoff destination must not route through the API origin");
+
+    r = await fetch(`${base}/api/handoff/login?url=${encodeURIComponent("https://www.chess.com/home")}`, { redirect: "manual" });
+    loc = String(r.headers.get("location") || "");
+    assert.equal(loc, "https://www.chess.com/home", "non-auth pages must hand off the exact page unchanged");
 
     r = await fetch(`${base}/api/handoff/login?url=${encodeURIComponent("https://unknown.example/deep/path")}`, { redirect: "manual" });
     loc = String(r.headers.get("location") || "");
     assert.equal(loc, "https://unknown.example/deep/path", "unknown hosts must hand off the exact page (any wall, not just logins)");
 
-    // Known login pages with a return-trip parameter get the automatic bounce.
-    r = await fetch(`${base}/api/handoff/login?url=${encodeURIComponent("https://github.com/org/repo")}&sid=handofftestsid1234`, { redirect: "manual" });
+    // Known sites: auth pages get the return trip; other pages stay exact.
+    r = await fetch(`${base}/api/handoff/login?url=${encodeURIComponent("https://github.com/login")}&sid=handofftestsid1234`, { redirect: "manual" });
     loc = String(r.headers.get("location") || "");
-    assert.match(loc, /^https:\/\/github\.com\/login\?return_to=/, "github must go to its real login page with a return trip");
+    assert.match(loc, /^https:\/\/github\.com\/login\?return_to=/, "github login must keep its own login page with a return trip");
     const ghDecoded = decodeURIComponent(decodeURIComponent(loc));
-    assert.match(ghDecoded, /\/api\/handoff\/return\?sid=handofftestsid1234&url=https:\/\/github\.com\/org\/repo/, "the github return trip must carry the session and target");
+    assert.match(ghDecoded, /veyra_handoff=https:\/\/github\.com\/login/, "the github return trip must carry the target back to the app");
+
+    r = await fetch(`${base}/api/handoff/login?url=${encodeURIComponent("https://github.com/org/repo")}`, { redirect: "manual" });
+    loc = String(r.headers.get("location") || "");
+    assert.equal(loc, "https://github.com/org/repo", "github content pages must hand off the exact page");
 
     r = await fetch(`${base}/api/handoff/login?url=javascript:alert(1)`, { redirect: "manual" });
     assert.equal(r.status, 400, "non-http(s) targets must be rejected");
+
+    // JSON mode: the frontend asks for the destination so the popup never
+    // navigates through the API origin at all.
+    r = await fetch(`${base}/api/handoff/login?url=${encodeURIComponent("https://www.chess.com/register")}&sid=handofftestsid1234`, { headers: { accept: "application/json" } });
+    const destJson = await r.json();
+    assert.equal(r.status, 200, "JSON handoff must succeed");
+    assert.equal(destJson.ok, true, "JSON handoff must report ok");
+    assert.match(String(destJson.dest || ""), /^https:\/\/www\.chess\.com\/register\?returnUrl=/, "JSON handoff must return the direct site destination");
 
     // 2: return endpoint bounces into the app with the target.
     r = await fetch(`${base}/api/handoff/return?url=${encodeURIComponent("https://www.chess.com/register")}`, { redirect: "manual" });
@@ -90,6 +108,7 @@ const path = require("node:path");
     // 4: the challenge interstitial offers the handoff (source-level wiring).
     const src = fs.readFileSync(path.join(__dirname, "..", "src", "server.js"), "utf8");
     assert.match(src, /Open this page directly & come back/, "the interstitial must link the generic handoff");
+    assert.match(src, /handoffDest/, "the interstitial must link the real site directly, not through the API");
     assert.match(src, /Bring your session into Veyra/, "the interstitial must offer the session import");
     assert.match(src, /Bring session back/, "the interstitial must offer the bookmarklet return for every site");
     assert.match(src, /veyra_handoff/, "the app return parameter must be wired");
