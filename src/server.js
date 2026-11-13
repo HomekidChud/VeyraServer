@@ -4622,20 +4622,102 @@ function platformData(user) {
   const p = data.platform && typeof data.platform === "object" ? data.platform : {};
   if (!Array.isArray(p.workspaces)) p.workspaces = [];
   if (!p.billing || typeof p.billing !== "object") p.billing = { status: "required" };
+  // Migration: keys created before hashing stored a 16-char plaintext prefix.
+  // Drop it — only the sha256 hash and last-4 are kept at rest from now on.
+  for (const w of p.workspaces) for (const k of w.keys || []) { if (k && k.prefix) delete k.prefix; }
   return { ...data, platform: p };
 }
-function savePlatformData(user, data) { authStore.setData(user, data); return data.platform; }
+function savePlatformData(user, data) { platformResetKeyIndex(); authStore.setData(user, data); return data.platform; }
 function platformOwner(user) { return authStore.roleFor(user.email) === "admin"; }
-function platformPublicKey(k) { return { id: k.id, name: k.name, prefix: k.prefix, createdAt: k.createdAt, lastUsedAt: k.lastUsedAt || null, revokedAt: k.revokedAt || null }; }
+/* ---------- platform API keys: hashed at rest, secret shown exactly once ----------
+   Only a sha256 hash and the last 4 characters of the raw key are persisted; the
+   raw `vyr_live_…` secret is returned once on create/rotate and never stored. */
+function platformHashKey(raw) { return crypto.createHash("sha256").update(String(raw || "")).digest("hex"); }
+function platformPublicKey(k) {
+  return { id: k.id, name: k.name, last4: k.last4 || k.prefix || null, createdAt: k.createdAt, lastUsedAt: k.lastUsedAt || null, revokedAt: k.revokedAt || null, usage: { requests: k.usage?.requests || 0, last24h: k.usage?.last24h || 0 } };
+}
 function platformPublicWorkspace(w) { return { id: w.id, name: w.name, slug: w.slug, description: w.description || "", createdAt: w.createdAt, keys: (w.keys || []).filter(k => !k.revokedAt).map(platformPublicKey) }; }
 function platformFindWorkspace(data, id) { return data.platform.workspaces.find(x => x.id === String(id || "")); }
 function platformFindKey(workspace, id) { return workspace?.keys?.find(x => x.id === String(id || "")); }
 function platformNewKey(name) {
   const raw = `vyr_live_${crypto.randomBytes(24).toString("base64url")}`;
   const now = new Date().toISOString();
-  return { raw, key: { id: crypto.randomUUID(), name: String(name || "Default key").trim().slice(0, 80) || "Default key", prefix: raw.slice(0, 16), hash: crypto.createHash("sha256").update(raw).digest("hex"), createdAt: now, lastUsedAt: null, revokedAt: null, usage: { requests: 0, last24h: 0 } } };
+  const key = { id: crypto.randomUUID(), name, hash: platformHashKey(raw), last4: raw.slice(-4), createdAt: now, lastUsedAt: null, revokedAt: null, usage: { requests: 0, last24h: 0, window: [] } };
+  return { raw, key };
+}
+function platformCheckName(value, { min = 2, max = 80 } = {}) {
+  const name = String(value || "").replace(/\s+/g, " ").trim();
+  if (name.length < min || name.length > max) return null;
+  if (!/[a-z0-9]/i.test(name)) return null;
+  return name;
 }
 function platformSlug(name) { return String(name || "workspace").toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "workspace"; }
+/* ---------- key lookup index (hash -> owner), rebuilt lazily and on every save ---------- */
+let platformKeyIndex = null, platformKeyIndexAt = 0;
+function platformResetKeyIndex() { platformKeyIndex = null; }
+function platformFindKeyByHash(hash) {
+  if (!platformKeyIndex || Date.now() - platformKeyIndexAt > 30000) {
+    platformKeyIndex = new Map();
+    for (const user of authStore.users.values()) {
+      const workspaces = user.data?.platform?.workspaces;
+      if (!Array.isArray(workspaces)) continue;
+      for (const w of workspaces) for (const k of w.keys || []) {
+        if (k?.hash && !k.revokedAt) platformKeyIndex.set(k.hash, { user, workspace: w, key: k });
+      }
+    }
+    platformKeyIndexAt = Date.now();
+  }
+  return platformKeyIndex.get(String(hash || "")) || null;
+}
+/* ---------- in-memory rate limiting for platform routes ---------- */
+const PLATFORM_RATE_BUCKETS = new Map();
+function platformRateLimited(bucket, max, windowMs) {
+  const now = Date.now();
+  let b = PLATFORM_RATE_BUCKETS.get(bucket);
+  if (!b || now - b.start >= windowMs) { b = { start: now, count: 0 }; PLATFORM_RATE_BUCKETS.set(bucket, b); }
+  b.count += 1;
+  if (PLATFORM_RATE_BUCKETS.size > 20000) {
+    for (const [k, v] of PLATFORM_RATE_BUCKETS) if (now - v.start >= windowMs) PLATFORM_RATE_BUCKETS.delete(k);
+  }
+  return { limited: b.count > max, retryAfterMs: Math.max(1000, windowMs - (now - b.start)) };
+}
+function platformRateLimit({ max, windowMs, scope = "ip" } = {}) {
+  return (req, res, next) => {
+    const id = scope === "key" ? String(req.veyraKey?.id || clientIp(req)) : clientIp(req);
+    // The bucket key carries the budget itself so overlapping limiters (the
+    // platform-wide 120/min plus the stricter per-route waitlist budget) never
+    // share or pollute each other's counters.
+    const r = platformRateLimited(`${scope}:${id}:${max}/${windowMs}`, max, windowMs);
+    if (r.limited) {
+      res.setHeader("Retry-After", String(Math.ceil(r.retryAfterMs / 1000)));
+      return respondError(res, 429, "Too many requests. Slow down and try again shortly.", "PLATFORM_RATE_LIMITED", { retryAfterMs: r.retryAfterMs });
+    }
+    next();
+  };
+}
+/* ---------- API-key auth + usage tracking for the public platform API (/api/v1) ---------- */
+function requirePlatformKey(req, res, next) {
+  const h = String(req.get?.("authorization") || "");
+  const m = /^Bearer\s+(\S+)$/i.exec(h);
+  const raw = m ? m[1] : "";
+  if (!raw.startsWith("vyr_live_")) return respondError(res, 401, "Provide an API key: Authorization: Bearer vyr_live_…", "PLATFORM_KEY_REQUIRED");
+  const found = platformFindKeyByHash(platformHashKey(raw));
+  if (!found) return respondError(res, 401, "That API key is not valid or was revoked.", "PLATFORM_KEY_INVALID");
+  const k = found.key, u = k.usage || (k.usage = { requests: 0, last24h: 0, window: [] });
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  u.window = (Array.isArray(u.window) ? u.window : []).filter(t => Number(t) > cutoff);
+  u.window.push(Date.now());
+  if (u.window.length > 5000) u.window = u.window.slice(-5000);
+  u.requests = (Number(u.requests) || 0) + 1;
+  u.last24h = u.window.length;
+  u.lastUsedAt = new Date().toISOString();
+  k.lastUsedAt = u.lastUsedAt;
+  req.veyraKeyOwner = found.user;
+  req.veyraKeyWorkspace = found.workspace;
+  req.veyraKey = k;
+  try { savePlatformData(found.user, found.user.data || {}); } catch {}
+  next();
+}
 const PLATFORM_PRICING = [
   { id: "owner", name: "Owner", price: 0, unit: "forever", description: "Included for Veyra owners and administrators.", features: ["Unlimited workspaces", "API keys", "Platform documentation"] },
   { id: "developer", name: "Developer", price: 0, unit: "during beta", description: "Free while the API platform is in beta. Billing profile required.", features: ["3 workspaces", "10 API keys per workspace", "Usage dashboard"] },
@@ -4690,7 +4772,11 @@ async function sendPlatformEmail({ to, subject, html }) {
     return { sent: true, status: "sent" };
   } catch (e) { serverLog("warn", "PLATFORM_EMAIL", `Could not send email to ${to}: ${e.message}`); return { sent: false, status: "failed", error: e.message }; }
 }
-app.post('/api/platform/waitlist', async (req, res) => {
+/* Rate limits for every developer-platform route: 120 requests/minute per IP for
+   session-authenticated management calls, and a much tighter budget for the public
+   waitlist form so it cannot be used to spam confirmation emails. */
+app.use('/api/platform', platformRateLimit({ max: 120, windowMs: 60 * 1000, scope: "ip" }));
+app.post('/api/platform/waitlist', platformRateLimit({ max: 5, windowMs: 60 * 60 * 1000, scope: "ip" }), async (req, res) => {
   const email = String(req.body?.email || "").trim().toLowerCase(), name = String(req.body?.name || "").trim().slice(0, 100), plan = req.body?.plan === "early_access" ? "early_access" : "developer";
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return respondError(res, 400, "Enter a valid email address.", "WAITLIST_EMAIL_INVALID");
   const rows = readPlatformWaitlist(), existing = rows.find(x => x.email === email);
@@ -4707,7 +4793,7 @@ app.get('/api/platform/waitlist', requireAdmin, (req, res) => { const rows = rea
 app.post('/api/platform/waitlist/:id/accept', requireAdmin, async (req, res) => {
   const rows = readPlatformWaitlist(), x = rows.find(v => v.id === req.params.id); if (!x) return respondError(res, 404, "Waitlist entry not found.", "WAITLIST_NOT_FOUND");
   x.status = "accepted"; x.acceptedAt = new Date().toISOString(); x.emailStatus = "pending"; writePlatformWaitlist(rows);
-  const base = String(process.env.PLATFORM_URL || "https://homekidchud.github.io/VeyraBrowser/dev/platform").replace(/\/$/, ""), checkout = String(process.env.PLATFORM_EARLY_ACCESS_URL || "").trim();
+  const base = String(process.env.PLATFORM_URL || "https://homekidchud.github.io/VeyraBrowser/web/dev/platform").replace(/\/$/, ""), checkout = String(process.env.PLATFORM_EARLY_ACCESS_URL || "").trim();
   const result = await sendPlatformEmail({ to: x.email, subject: "Your Veyra platform access is ready", html: `<p>Hi ${escapeHtml(x.name || "there")},</p><p>Your Veyra Developer Platform access is ready.</p><p><a href="${escapeHtml(base)}">Open the Veyra platform</a> and sign in to create your workspace.</p>${x.plan === "early_access" ? `<p>Early access is <strong>$2.99/month</strong>. ${checkout ? `<a href="${escapeHtml(checkout)}">Continue to secure checkout</a>.` : "A checkout link will be added by the Veyra team."}</p>` : ""}<p>Keep your API keys private and rotate them regularly.</p>` });
   x.emailStatus = result.status; writePlatformWaitlist(rows); res.json({ ok: true, entry: publicWaitlistEntry(x), email: result });
 });
@@ -4728,15 +4814,16 @@ app.post('/api/platform/billing/setup', requireUser, (req, res) => {
 app.post('/api/platform/workspaces', requireUser, (req, res) => {
   const d = platformData(req.veyraUser), owner = platformOwner(req.veyraUser);
   if (!owner && d.platform.workspaces.length >= 3) return respondError(res, 402, "Your Developer plan allows 3 workspaces. Upgrade to create more.", "PLATFORM_PLAN_LIMIT");
-  const name = String(req.body?.name || "").trim().slice(0, 80);
-  if (name.length < 2) return respondError(res, 400, "Workspace name must be at least 2 characters.", "WORKSPACE_NAME_INVALID");
+  const name = platformCheckName(req.body?.name, { min: 2, max: 80 });
+  if (!name) return respondError(res, 400, "Workspace name must be 2–80 characters and include a letter or digit.", "WORKSPACE_NAME_INVALID");
   const base = platformSlug(name); let slug = base, n = 2; while (d.platform.workspaces.some(w => w.slug === slug)) slug = `${base}-${n++}`;
+  if (!/^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$/.test(slug)) return respondError(res, 400, "Workspace name cannot be turned into a valid slug. Try a different name.", "WORKSPACE_SLUG_INVALID");
   const w = { id: crypto.randomUUID(), name, slug, description: String(req.body?.description || "").trim().slice(0, 240), createdAt: new Date().toISOString(), keys: [] };
   d.platform.workspaces.push(w); savePlatformData(req.veyraUser, d); res.status(201).json({ ok: true, workspace: platformPublicWorkspace(w) });
 });
 app.patch('/api/platform/workspaces/:id', requireUser, (req, res) => {
   const d = platformData(req.veyraUser), w = d.platform.workspaces.find(x => x.id === req.params.id); if (!w) return respondError(res, 404, "Workspace not found.", "WORKSPACE_NOT_FOUND");
-  if (req.body?.name != null) { const name = String(req.body.name).trim().slice(0, 80); if (name.length < 2) return respondError(res, 400, "Workspace name is too short.", "WORKSPACE_NAME_INVALID"); w.name = name; }
+  if (req.body?.name != null) { const name = platformCheckName(req.body.name, { min: 2, max: 80 }); if (!name) return respondError(res, 400, "Workspace name must be 2–80 characters and include a letter or digit.", "WORKSPACE_NAME_INVALID"); w.name = name; }
   if (req.body?.description != null) w.description = String(req.body.description).trim().slice(0, 240);
   savePlatformData(req.veyraUser, d); res.json({ ok: true, workspace: platformPublicWorkspace(w) });
 });
@@ -4758,7 +4845,9 @@ app.post('/api/platform/workspaces/:id/keys', requireUser, (req, res) => {
   const d = platformData(req.veyraUser), w = d.platform.workspaces.find(x => x.id === req.params.id); if (!w) return respondError(res, 404, "Workspace not found.", "WORKSPACE_NOT_FOUND");
   const owner = platformOwner(req.veyraUser); if (!owner && d.platform.billing.status !== "configured") return respondError(res, 402, "Set up billing before creating API keys.", "BILLING_REQUIRED");
   if (!owner && w.keys.filter(k => !k.revokedAt).length >= 10) return respondError(res, 402, "This workspace reached its API key limit.", "PLATFORM_KEY_LIMIT");
-  const created = platformNewKey(req.body?.name); w.keys.push(created.key); savePlatformData(req.veyraUser, d); res.status(201).json({ ok: true, key: created.raw, keyInfo: platformPublicKey(created.key), warning: "Copy this key now. Veyra will not show it again." });
+  const name = req.body?.name != null ? platformCheckName(req.body.name, { min: 2, max: 80 }) : "Default key";
+  if (!name) return respondError(res, 400, "API key name must be 2–80 characters and include a letter or digit.", "API_KEY_NAME_INVALID");
+  const created = platformNewKey(name); w.keys.push(created.key); savePlatformData(req.veyraUser, d); res.status(201).json({ ok: true, key: created.raw, keyInfo: platformPublicKey(created.key), warning: "Copy this key now. Veyra will not show it again." });
 });
 app.get('/api/platform/workspaces/:workspaceId/keys/:keyId', requireUser, (req, res) => {
   const d = platformData(req.veyraUser), w = platformFindWorkspace(d, req.params.workspaceId), k = platformFindKey(w, req.params.keyId);
@@ -4770,19 +4859,41 @@ app.patch('/api/platform/workspaces/:workspaceId/keys/:keyId', requireUser, (req
   const d = platformData(req.veyraUser), w = platformFindWorkspace(d, req.params.workspaceId), k = platformFindKey(w, req.params.keyId);
   if (!w) return respondError(res, 404, "Workspace not found.", "WORKSPACE_NOT_FOUND");
   if (!k || k.revokedAt) return respondError(res, 404, "API key not found.", "API_KEY_NOT_FOUND");
-  if (req.body?.name != null) { const name = String(req.body.name).trim().slice(0, 80); if (name.length < 2) return respondError(res, 400, "Key name is too short.", "API_KEY_NAME_INVALID"); k.name = name; }
+  if (req.body?.name != null) { const name = platformCheckName(req.body.name, { min: 2, max: 80 }); if (!name) return respondError(res, 400, "API key name must be 2–80 characters and include a letter or digit.", "API_KEY_NAME_INVALID"); k.name = name; }
   savePlatformData(req.veyraUser, d); res.json({ ok: true, key: platformPublicKey(k) });
 });
 app.post('/api/platform/workspaces/:workspaceId/keys/:keyId/rotate', requireUser, (req, res) => {
   const d = platformData(req.veyraUser), w = platformFindWorkspace(d, req.params.workspaceId), old = platformFindKey(w, req.params.keyId);
   if (!w) return respondError(res, 404, "Workspace not found.", "WORKSPACE_NOT_FOUND");
   if (!old || old.revokedAt) return respondError(res, 404, "API key not found.", "API_KEY_NOT_FOUND");
+  const name = req.body?.name != null ? platformCheckName(req.body.name, { min: 2, max: 80 }) : old.name;
+  if (!name) return respondError(res, 400, "API key name must be 2–80 characters and include a letter or digit.", "API_KEY_NAME_INVALID");
   old.revokedAt = new Date().toISOString();
-  const created = platformNewKey(req.body?.name || old.name); w.keys.push(created.key); savePlatformData(req.veyraUser, d);
+  const created = platformNewKey(name); w.keys.push(created.key); savePlatformData(req.veyraUser, d);
   res.status(201).json({ ok: true, key: created.raw, keyInfo: platformPublicKey(created.key), replacedKeyId: old.id, warning: "The previous key was revoked. Copy this replacement now; it will not be shown again." });
 });
 app.delete('/api/platform/workspaces/:workspaceId/keys/:keyId', requireUser, (req, res) => {
   const d = platformData(req.veyraUser), w = d.platform.workspaces.find(x => x.id === req.params.workspaceId), k = w?.keys?.find(x => x.id === req.params.keyId); if (!k) return respondError(res, 404, "API key not found.", "API_KEY_NOT_FOUND"); k.revokedAt = new Date().toISOString(); savePlatformData(req.veyraUser, d); res.json({ ok: true, revoked: true });
+});
+
+/* ---------- public platform API (/api/v1): authenticated with API keys ----------
+   These are the endpoints developers call from their own code with
+   `Authorization: Bearer vyr_live_…`. Every call is rate limited per key and
+   counted towards that key's usage (requests total + rolling 24h window). The
+   limiter is IP-scoped because it runs before the key is verified. */
+app.use('/api/v1', platformRateLimit({ max: 120, windowMs: 60 * 1000, scope: "ip" }));
+app.get('/api/v1/me', requirePlatformKey, (req, res) => {
+  const k = req.veyraKey, w = req.veyraKeyWorkspace;
+  res.json({ ok: true, workspace: { id: w.id, name: w.name, slug: w.slug }, key: { id: k.id, name: k.name, last4: k.last4, createdAt: k.createdAt }, usage: { requests: k.usage?.requests || 0, last24h: k.usage?.last24h || 0, lastUsedAt: k.lastUsedAt || null } });
+});
+app.get('/api/v1/usage', requirePlatformKey, (req, res) => {
+  const k = req.veyraKey;
+  const buckets = {};
+  for (const t of (k.usage?.window || [])) {
+    const hour = new Date(Number(t)).toISOString().slice(0, 13) + ":00:00Z";
+    buckets[hour] = (buckets[hour] || 0) + 1;
+  }
+  res.json({ ok: true, keyId: k.id, usage: { requests: k.usage?.requests || 0, last24h: k.usage?.last24h || 0, lastUsedAt: k.lastUsedAt || null }, byHour: buckets });
 });
 
 
