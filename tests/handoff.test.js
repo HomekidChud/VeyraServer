@@ -28,7 +28,14 @@ const path = require("node:path");
 
     r = await fetch(`${base}/api/handoff/login?url=${encodeURIComponent("https://unknown.example/deep/path")}`, { redirect: "manual" });
     loc = String(r.headers.get("location") || "");
-    assert.equal(loc, "https://unknown.example/", "unknown hosts must fall back to the site homepage");
+    assert.equal(loc, "https://unknown.example/deep/path", "unknown hosts must hand off the exact page (any wall, not just logins)");
+
+    // Known login pages with a return-trip parameter get the automatic bounce.
+    r = await fetch(`${base}/api/handoff/login?url=${encodeURIComponent("https://github.com/org/repo")}&sid=handofftestsid1234`, { redirect: "manual" });
+    loc = String(r.headers.get("location") || "");
+    assert.match(loc, /^https:\/\/github\.com\/login\?return_to=/, "github must go to its real login page with a return trip");
+    const ghDecoded = decodeURIComponent(decodeURIComponent(loc));
+    assert.match(ghDecoded, /\/api\/handoff\/return\?sid=handofftestsid1234&url=https:\/\/github\.com\/org\/repo/, "the github return trip must carry the session and target");
 
     r = await fetch(`${base}/api/handoff/login?url=javascript:alert(1)`, { redirect: "manual" });
     assert.equal(r.status, 400, "non-http(s) targets must be rejected");
@@ -82,8 +89,9 @@ const path = require("node:path");
 
     // 4: the challenge interstitial offers the handoff (source-level wiring).
     const src = fs.readFileSync(path.join(__dirname, "..", "src", "server.js"), "utf8");
-    assert.match(src, /Log in directly & come back/, "the interstitial must link the login handoff");
+    assert.match(src, /Open this page directly & come back/, "the interstitial must link the generic handoff");
     assert.match(src, /Bring your session into Veyra/, "the interstitial must offer the session import");
+    assert.match(src, /Bring session back/, "the interstitial must offer the bookmarklet return for every site");
     assert.match(src, /veyra_handoff/, "the app return parameter must be wired");
   } finally {
     await new Promise(resolve => server.close(resolve));

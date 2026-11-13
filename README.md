@@ -1,4 +1,18 @@
 
+## Cross-site handoff (direct sign-in, every site)
+
+When a site's own security check blocks the fast proxy, Veyra hands the page to the user's real browser instead of launching Chromium:
+
+- `GET /api/handoff/login?url=…&sid=…` sends the user to the site's real page. Sites with a known return-trip parameter (chess.com `returnUrl`, github.com `return_to`, gitlab.com `return_to`) bounce the user back to Veyra automatically; every other site lands the user on the exact page they were on, so the flow covers anything a site asks — sign-in, verification, consent, age gates — not just logins.
+- The challenge interstitial offers a draggable **“Bring session back”** bookmarklet. Clicked on the real site once the user is done, it posts that site's readable cookies to `POST /api/handoff/cookies` (CORS-open, works from any origin) and imports them, with the user's user-agent, into the session jar. HttpOnly cookies can't be read by the bookmarklet; the manual paste form stays for those.
+- The frontend also exposes “Sign in on the real site” in the site-info pop for any page, not just challenge screens.
+
+Tests: `node tests/handoff.test.js`.
+
+## Keep-alive
+
+Render's free tier spins the service down after 15 minutes without traffic, and its wake-up interstitial is unframeable — Veyra tabs then show `ERR_BLOCKED_BY_RESPONSE`. `.github/workflows/keepalive.yml` pings `/health` every 10 minutes to prevent spin-down, and the frontend warms the API (`ensureApiAwake`) before any iframe navigation as a fallback. If the error still appears, check the Render dashboard for a **suspended** service (out of free instance hours) — that is a billing state, not an idle one.
+
 ## Acquisition defaults
 
 Veyra uses the shared `AcquisitionManager` for bounded direct HTTP retrieval, conditional validators, response caching, robots policy, search-first discovery, structured document parsing, and sitemap discovery. Chromium is retained for browser sessions but is **disabled by default**:
