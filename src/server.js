@@ -40,6 +40,7 @@ const httpReader = require("./services/http-reader");
 const IS_THREAD_WORKER = !isMainThread && process.env.VEYRA_THREAD_WORKER === "1";
 const { fetch: undiciFetch, Agent: UndiciAgent } = require("undici");
 const https = require("node:https");
+const zlib = require("node:zlib");
 const { isGoogleAccountsUrl, requestGoogleAccounts } = require("./network/google-accounts-transport");
 const veyraConfigModule = require("./config");
 
@@ -372,9 +373,12 @@ function createPublicSocketLookup(resolve = dns.lookup) {
 }
 const DIRECT_HTTP_AGENT = new UndiciAgent({
   connect: { timeout: 12000, autoSelectFamily: true, autoSelectFamilyAttemptTimeout: 250, lookup: createPublicSocketLookup() },
-  keepAliveTimeout: 10000,
-  keepAliveMaxTimeout: 30000,
-  connections: 24,
+  // Keep upstream sockets warm longer and allow more parallel connections per
+  // origin so a page's many subresources (same CDN/host) fetch concurrently
+  // instead of queueing behind 24 sockets, and TCP/TLS handshakes are reused.
+  keepAliveTimeout: 30000,
+  keepAliveMaxTimeout: 60000,
+  connections: 64,
   pipelining: 1
 });
 const GOOGLE_ACCOUNTS_HTTPS_AGENT = new https.Agent({ keepAlive: true, maxSockets: 16, lookup: createPublicSocketLookup() });
@@ -1398,9 +1402,12 @@ async function fetchBuffer(url, opts = {}) {
         const dispatcher = suppliedDispatcher || (directMode ? DIRECT_HTTP_AGENT : undefined);
         // The same public Google Accounts URL is rejected by Undici but returns its normal redirect via Node HTTPS; scope this fallback to direct traffic so VPN/custom dispatchers are never bypassed.
         const requestBody = opts.body && method !== "GET" && method !== "HEAD" ? opts.body : undefined;
+        // Test seam: fetchBuffer is the retry/redirect core of the fast proxy,
+        // and tests inject a stub upstream here instead of hitting the network.
+        const upstreamFetch = opts.upstreamFetch || undiciFetch;
         const response = directMode && isGoogleAccountsUrl(current)
           ? await requestGoogleAccounts(current, { method, headers: reqHeaders, body: requestBody, agent: GOOGLE_ACCOUNTS_HTTPS_AGENT, signal: controller.signal })
-          : await undiciFetch(current, { method, headers: reqHeaders, redirect: "manual", signal: controller.signal, body: requestBody, ...(dispatcher ? { dispatcher } : {}) });
+          : await upstreamFetch(current, { method, headers: reqHeaders, redirect: "manual", signal: controller.signal, body: requestBody, ...(dispatcher ? { dispatcher } : {}) });
         if (sessionId) storeSetCookies(sessionId, current, response);
         clearTimeout(timer);
         if (upstreamSignal) upstreamSignal.removeEventListener("abort", onAbort);
@@ -1418,6 +1425,10 @@ async function fetchBuffer(url, opts = {}) {
           redirectChain.push({ url: current, status: response.status });
           current = next;
           cached = null;
+          // The redirect itself succeeded, so an error from an earlier retried
+          // attempt is stale. Without this, "fail once, then redirect" pages
+          // throw the old error instead of following the redirect.
+          lastError = null;
           break;
         }
         if (retryableStatus(response.status) && attempt < (opts.retries ?? CFG.maxRetries)) {
@@ -5693,6 +5704,33 @@ function mergeStrayProxyParams(req, canonical) {
   return changed ? target.href : canonical;
 }
 
+// Compress rewritten text responses (HTML/CSS/JS/JSON) on the way to the
+// client. Rewritten pages are routinely hundreds of KB and were previously
+// served uncompressed; brotli/gzip cuts the bytes on the wire by ~70-85%,
+// which dominates time-to-first-paint for the fast-proxy iframe on slow links.
+// Undici already decompresses upstream responses, so this only affects the
+// server->client hop.
+const PROXY_COMPRESS_MIN_BYTES = 1024;
+function proxyCompressibleContentType(contentType) {
+  return /text\/html|text\/css|text\/plain|text\/xml|javascript|ecmascript|json|svg|x-component/i.test(String(contentType || ""));
+}
+const gzipAsync = (buf, opts) => new Promise((resolve, reject) => zlib.gzip(buf, opts, (err, out) => (err ? reject(err) : resolve(out))));
+const brotliAsync = (buf, params) => new Promise((resolve, reject) => zlib.brotliCompress(buf, params, (err, out) => (err ? reject(err) : resolve(out))));
+async function maybeCompressProxyPayload(req, payload, contentType) {
+  if (!payload || !Buffer.isBuffer(payload) || payload.length < PROXY_COMPRESS_MIN_BYTES) return null;
+  const accept = String(req.headers["accept-encoding"] || "");
+  if (!/\b(?:br|gzip|deflate)\b/.test(accept)) return null;
+  if (!proxyCompressibleContentType(contentType)) return null;
+  if (/\bbr\b/.test(accept)) {
+    const body = await brotliAsync(payload, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 4 } }).catch(() => null);
+    if (body && body.length < payload.length) return { body, encoding: "br" };
+  }
+  if (/\bgzip\b/.test(accept)) {
+    const body = await gzipAsync(payload, { level: 5 }).catch(() => null);
+    if (body && body.length < payload.length) return { body, encoding: "gzip" };
+  }
+  return null;
+}
 async function proxyRequest(req, res, mode) {
   const canonical = mergeStrayProxyParams(req, firstValidUrl([req.query.url, req.query.target, req.query.u], req.get('Origin') || undefined)) || proxyRefererCanonical(req);
   const download = String(req.query.download || "") === "1";
@@ -5858,6 +5896,14 @@ async function proxyRequest(req, res, mode) {
     
     recordRewriteFailure(result.finalUrl || canonical, mode, rewriteErr);
     payload = result.body;
+  }
+  if (!download && method === "GET") {
+    const compressed = await maybeCompressProxyPayload(req, payload, result.contentType || (mode === "view" ? "text/html" : "")).catch(() => null);
+    if (compressed) {
+      payload = compressed.body;
+      res.setHeader("content-encoding", compressed.encoding);
+      res.setHeader("vary", "accept-encoding");
+    }
   }
   for (const [k,v] of Object.entries(upstreamHeaders)) if (v) res.setHeader(k, v);
   const exposedCanonical = mode === "view" ? virtualPageUrl(canonical, result.finalUrl || canonical) : (result.finalUrl || canonical);
@@ -6903,6 +6949,11 @@ function startVeyraServer() {
     };
     const startServer = () => {
       httpServer = app.listen(PORT, "0.0.0.0", () => {
+      // Keep client keep-alive connections open much longer than Node's 5 s
+      // default so the browser reuses one warm TCP/TLS connection across
+      // navigations and API calls instead of re-handshaking each time.
+      httpServer.keepAliveTimeout = 65000;
+      httpServer.headersTimeout = 70000;
       serverLog("info", "SYSTEM", `Veyra server listening on ${PORT}`);
       serverLog("info", "CONFIG", `Plan ${VEYRA_CONFIG.plan.label} (${CFG.plan}, ${VEYRA_CONFIG.plan.ramMb}MB / ${VEYRA_CONFIG.plan.cpu} CPU, via ${VEYRA_CONFIG.planSource}) — ${CFG.maxActiveJobs} crawlers × ${CFG.maxActiveFetches} fetches, ${CFG.parseWorkers} parse workers, ${CFG.maxProxySessions} sessions, ${CFG.maxBrowserSessions} browser sessions.`);
       serverLog("info", "MONGO", mongoStore.status().configured ? `MongoDB configured (${CFG.mongoDb}); persistence/cache is fail-open.` : "MongoDB not configured; using local/ephemeral persistence where applicable.");
@@ -6979,4 +7030,4 @@ const __workerOps = {
   discover: (text, kind, base, contentType) => collectDiscovery(text, kind, base, contentType)
 };
 
-module.exports = { app, get accessGate() { return accessGate; }, mongoStore, mergeStrayProxyParams, detectChallenge, CFG, browserCapabilitySignals, canRenderHtmlWithBrowser, renderHtmlWithBrowser, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions, normalizeOpenEngineMode, shouldStartCrawlerForEngineMode, startVeyraServer, cacheSafeUrl, cacheSafeResponse };
+module.exports = { app, get accessGate() { return accessGate; }, mongoStore, mergeStrayProxyParams, detectChallenge, maybeCompressProxyPayload, proxyCompressibleContentType, CFG, browserCapabilitySignals, canRenderHtmlWithBrowser, renderHtmlWithBrowser, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions, normalizeOpenEngineMode, shouldStartCrawlerForEngineMode, startVeyraServer, cacheSafeUrl, cacheSafeResponse, fetchBuffer };
