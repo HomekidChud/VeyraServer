@@ -1057,41 +1057,34 @@ function requestOrigin(req) {
   const host = String(req.get("host") || "").slice(0, 200);
   return host ? `${proto}://${host}` : String(CFG.frontendUrl || "https://veyraserver-xscy.onrender.com");
 }
-// The return trip goes straight to the Veyra app (never through this
-// server), so the popup the user opens touches only the real site and,
-// when the site's return parameter fires, the app itself.
-function handoffReturnUrl(sid, target) {
-  try {
-    const base = String(CFG.frontendUrl || "");
-    if (!/^https?:\/\//i.test(base)) return ""; // no absolute frontend URL configured
-    const u = new URL(base);
-    if (target) u.searchParams.set("veyra_handoff", String(target).slice(0, 2000));
-    return u.href;
-  } catch { return ""; }
-}
+// The return trip is the target page itself: the site's own login flow
+// brings the user back to the exact page they wanted — still on the real
+// site, where the "Bring session back" bookmarklet can finish the job.
+// (The Veyra app watches its session jar and reloads the challenged tab
+// automatically once the session arrives; the user never has to route
+// back through this server.)
 // Sites whose auth pages accept a return-trip parameter. On these, an
-// auth-style page (login, register, verify, …) gets the automatic bounce back
-// into the Veyra app. Every other page — on these sites and everywhere else —
-// is handed off as the exact page the user was on; if it needs a sign-in, the
-// site's own login redirect takes over and brings them back to the page.
+// auth-style page (login, register, verify, …) returns the user to the exact
+// page they wanted on the real site. Every other page — on these sites and
+// everywhere else — is handed off as the exact page the user was on; if it
+// needs a sign-in, the site's own login redirect takes over from there.
 const HANDOFF_LOGIN_PAGES = {
   "chess.com": { path: "/login", param: "returnUrl" },
   "github.com": { path: "/login", param: "return_to" },
   "gitlab.com": { path: "/users/sign_in", param: "return_to" },
 };
 const AUTH_PAGE_PATH = /login|signin|sign-in|log-in|register|signup|sign-up|join|auth|verify|verification|challenge|captcha|consent|confirm/i;
-function handoffLoginRedirect(target, sid) {
+function handoffLoginRedirect(target) {
   let dest = "";
   try {
     const u = new URL(target);
     const host = u.hostname.toLowerCase();
     const bare = host.replace(/^www\./, "");
     const known = HANDOFF_LOGIN_PAGES[bare] || HANDOFF_LOGIN_PAGES[host];
-    const ret = handoffReturnUrl(sid, target);
-    // Known site + auth-style page: attach the return trip so the user
-    // bounces back into the Veyra app when the site is done with them.
-    if (known && ret && (u.pathname === known.path || AUTH_PAGE_PATH.test(u.pathname))) {
-      u.searchParams.set(known.param, ret);
+    // Known site + auth-style page: attach the return trip so the site's own
+    // login flow returns the user to the exact page they wanted, on the site.
+    if (known && (u.pathname === known.path || AUTH_PAGE_PATH.test(u.pathname))) {
+      u.searchParams.set(known.param, target);
       dest = u.href;
     } else {
       // Every other site and page: hand off the exact page the user was on.
@@ -2093,7 +2086,7 @@ function challengeFallbackHtml(url, info, sid = "", apiOrigin = "") {
   const handoffable = !!sid && info?.type !== "unusual-traffic";
   // The button links the real site directly — no hop through this server —
   // so a blocked or asleep API origin can never break the handoff.
-  const handoffDest = handoffable ? handoffLoginRedirect(url, sid) : "";
+  const handoffDest = handoffable ? handoffLoginRedirect(url) : "";
   const handoffAction = handoffable && handoffDest
     ? `<a class="primary" href="${escapeHtml(handoffDest)}" target="_blank" rel="noopener noreferrer">Open this page directly & come back</a>`
     : "";
@@ -2106,10 +2099,10 @@ function challengeFallbackHtml(url, info, sid = "", apiOrigin = "") {
   const bkApi = String(apiOrigin || "").replace(/'/g, "");
   const bkSid = String(sid || "").replace(/[^A-Za-z0-9_-]/g, "");
   const handoffBookmarklet = handoffable && bkApi && bkSid
-    ? `<a class="secondary" draggable="true" id="veyraBk" href="javascript:(function(){fetch('${escapeHtml(bkApi)}/api/handoff/cookies',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({sid:'${escapeHtml(bkSid)}',url:location.href,cookies:document.cookie||'',userAgent:navigator.userAgent})}).then(function(r){return r.json()}).then(function(j){if(j&&j.ok){alert('Veyra imported '+(j.imported||0)+' cookie(s) from '+location.hostname+'. You can switch back to the Veyra tab.')}else{alert('Veyra could not import cookies ('+((j&&(j.error||j.message))||('HTTP '+r.status))+'). Sign in on this site first, then click again.')}}).catch(function(e){alert('Veyra import failed: '+e)})})()" onclick="return false" title="Drag me to your bookmarks bar">“Bring session back” — drag to bookmarks</a>`
+    ? `<a class="secondary" draggable="true" id="veyraBk" href="javascript:(function(){fetch('${escapeHtml(bkApi)}/api/handoff/cookies',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({sid:'${escapeHtml(bkSid)}',url:location.href,cookies:document.cookie||'',userAgent:navigator.userAgent})}).then(function(r){return r.json()}).then(function(j){if(j&&j.ok){alert('Veyra imported '+(j.imported||0)+' cookie(s) from '+location.hostname+'. The Veyra tab picks them up automatically — this tab will close itself.');setTimeout(function(){try{window.close()}catch(e){}},600)}else{alert('Veyra could not import cookies ('+((j&&(j.error||j.message))||('HTTP '+r.status))+'). Sign in on this site first, then click again.')}}).catch(function(e){alert('Veyra import failed: '+e)})})()" onclick="return false" title="Drag me to your bookmarks bar">“Bring session back” — drag to bookmarks</a>`
     : "";
   const handoffForm = handoffable
-    ? `<details style="margin-top:18px"><summary style="cursor:pointer;color:#86a9d5;font-size:13px">Already done on the real site? Bring your session into Veyra</summary><p style="font-size:13px;color:#aab5c4">The handoff works for anything a site asks of you — signing in, verifying, consenting, confirming your age — not just logins. Open the site directly, finish what it needs as yourself, then bring the session back. Easiest: drag the “Bring session back” button above to your bookmarks bar and click it on the site. For cookies the bookmarklet cannot read (HttpOnly), copy the site's cookies (your browser's devtools &rarr; Application &rarr; Cookies) and paste them below. Veyra stores them in this session only and never shares them. Only import cookies from your own accounts.</p><textarea id="veyraCookies" rows="3" placeholder="name=value; other=value" style="width:100%;box-sizing:border-box;margin:8px 0;background:#10151d;color:#eaf0f6;border:1px solid #303a48;border-radius:9px;padding:8px;font:12px/1.4 ui-monospace,monospace;resize:vertical"></textarea><button id="veyraImportBtn" style="padding:8px 16px;border-radius:9px;border:1px solid #3a4657;background:#1f2835;color:#dce5ef;cursor:pointer;font-size:13px">Import session</button> <span id="veyraImportMsg" style="font-size:12px;color:#86a9d5"></span></details><script>(function(){var b=document.getElementById("veyraImportBtn");if(!b)return;b.onclick=function(){var t=document.getElementById("veyraCookies");var m=document.getElementById("veyraImportMsg");if(!t||!t.value.trim()){if(m)m.textContent="Paste the site's cookies first.";return}b.disabled=true;if(m)m.textContent="Importing…";fetch("/api/handoff/cookies",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({sid:${JSON.stringify(String(sid))},url:${JSON.stringify(String(url)).replace(/</g, "\\u003c")},cookies:t.value,userAgent:navigator.userAgent})}).then(function(r){return r.json().then(function(j){if(!r.ok||j.ok===false)throw new Error(j.message||("HTTP "+r.status));if(m)m.textContent="Imported "+(j.imported||"the")+" cookie(s). Reloading…";setTimeout(function(){location.reload()},700)}).catch(function(e){if(m)m.textContent="Import failed: "+e.message;b.disabled=false})}).catch(function(e){if(m)m.textContent="Import failed: "+e.message;b.disabled=false})};})();</script>`
+    ? `<details style="margin-top:18px"><summary style="cursor:pointer;color:#86a9d5;font-size:13px">Already done on the real site? Bring your session into Veyra</summary><p style="font-size:13px;color:#aab5c4">The handoff works for anything a site asks of you — signing in, verifying, consenting, confirming your age — not just logins. Open the site directly, finish what it needs as yourself, then bring the session back. Easiest: drag the “Bring session back” button above to your bookmarks bar and click it on the site. For cookies the bookmarklet cannot read (HttpOnly), copy the site's cookies (your browser's devtools &rarr; Application &rarr; Cookies) and paste them below. Veyra stores them in this session only and never shares them. Only import cookies from your own accounts.</p><textarea id="veyraCookies" rows="3" placeholder="name=value; other=value" style="width:100%;box-sizing:border-box;margin:8px 0;background:#10151d;color:#eaf0f6;border:1px solid #303a48;border-radius:9px;padding:8px;font:12px/1.4 ui-monospace,monospace;resize:vertical"></textarea><button id="veyraImportBtn" style="padding:8px 16px;border-radius:9px;border:1px solid #3a4657;background:#1f2835;color:#dce5ef;cursor:pointer;font-size:13px">Import session</button> <span id="veyraImportMsg" style="font-size:12px;color:#86a9d5"></span></details><script>(function(){var b=document.getElementById("veyraImportBtn");if(!b)return;b.onclick=function(){var t=document.getElementById("veyraCookies");var m=document.getElementById("veyraImportMsg");if(!t||!t.value.trim()){if(m)m.textContent="Paste the site's cookies first.";return}b.disabled=true;if(m)m.textContent="Importing…";fetch("/api/handoff/cookies",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({sid:${JSON.stringify(String(sid))},url:${JSON.stringify(String(url)).replace(/</g, "\\u003c")},cookies:t.value,userAgent:navigator.userAgent})}).then(function(r){return r.json().then(function(j){if(!r.ok||j.ok===false)throw new Error(j.message||("HTTP "+r.status));if(m)m.textContent="Imported "+(j.imported||"the")+" cookie(s).";if(parent===window){setTimeout(function(){location.reload()},700)}else if(m){m.textContent="Imported "+(j.imported||"the")+" cookie(s). Veyra picks them up automatically — this page will reload by itself."}}).catch(function(e){if(m)m.textContent="Import failed: "+e.message;b.disabled=false})}).catch(function(e){if(m)m.textContent="Import failed: "+e.message;b.disabled=false})};})();</script>`
     : "";
   // Route every "open in a new tab" action through the app: a popup opened by
   // this sandboxed frame inherits the sandbox, and any site that sends
@@ -4388,7 +4381,7 @@ app.get("/api/handoff/login", (req, res) => {
   const target = normalizeUrl(String(req.query.url || ""));
   if (!target) return respondError(res, 400, "A valid http(s) url is required.", "BAD_REQUEST");
   const sid = normalizeSessionId(String(req.query.sid || ""));
-  const dest = handoffLoginRedirect(target, sid);
+  const dest = handoffLoginRedirect(target);
   if (!dest) return respondError(res, 400, "A valid http(s) url is required.", "BAD_REQUEST");
   // The frontend asks for JSON (Accept: application/json) so it can open the
   // real site directly — the user's popup then never navigates through this

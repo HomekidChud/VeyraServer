@@ -19,13 +19,14 @@ const path = require("node:path");
     const base = `http://127.0.0.1:${server.address().port}`;
 
     // 1: login handoff redirects — straight to the real site, with the return
-    // trip pointing at the app itself (never through the API origin).
+    // trip being the target page itself (the site's own login flow brings the
+    // user back to the page they wanted; the app watches for the session).
     let r = await fetch(`${base}/api/handoff/login?url=${encodeURIComponent("https://www.chess.com/register")}&sid=handofftestsid1234`, { redirect: "manual" });
     assert.equal(r.status, 302, "login handoff must redirect");
     let loc = String(r.headers.get("location") || "");
     assert.match(loc, /^https:\/\/www\.chess\.com\/register\?returnUrl=/, "chess.com must open the exact auth page the user was on");
     const decoded = decodeURIComponent(decodeURIComponent(loc));
-    assert.match(decoded, /veyra_handoff=https:\/\/www\.chess\.com\/register/, "the return trip must carry the original target back to the app");
+    assert.match(decoded, /returnUrl=https:\/\/www\.chess\.com\/register/, "the return trip must be the target page itself, on the site");
     assert.ok(!loc.includes("127.0.0.1"), "the handoff destination must not route through the API origin");
 
     r = await fetch(`${base}/api/handoff/login?url=${encodeURIComponent("https://www.chess.com/home")}`, { redirect: "manual" });
@@ -41,7 +42,7 @@ const path = require("node:path");
     loc = String(r.headers.get("location") || "");
     assert.match(loc, /^https:\/\/github\.com\/login\?return_to=/, "github login must keep its own login page with a return trip");
     const ghDecoded = decodeURIComponent(decodeURIComponent(loc));
-    assert.match(ghDecoded, /veyra_handoff=https:\/\/github\.com\/login/, "the github return trip must carry the target back to the app");
+    assert.match(ghDecoded, /return_to=https:\/\/github\.com\/login/, "the github return trip must be the target page itself");
 
     r = await fetch(`${base}/api/handoff/login?url=${encodeURIComponent("https://github.com/org/repo")}`, { redirect: "manual" });
     loc = String(r.headers.get("location") || "");
@@ -109,6 +110,7 @@ const path = require("node:path");
     const src = fs.readFileSync(path.join(__dirname, "..", "src", "server.js"), "utf8");
     assert.match(src, /Open this page directly & come back/, "the interstitial must link the generic handoff");
     assert.match(src, /handoffDest/, "the interstitial must link the real site directly, not through the API");
+    assert.match(src, /window\.close\(\)/, "the bookmarklet must close the handoff popup after importing");
     assert.match(src, /Bring your session into Veyra/, "the interstitial must offer the session import");
     assert.match(src, /Bring session back/, "the interstitial must offer the bookmarklet return for every site");
     assert.match(src, /veyra_handoff/, "the app return parameter must be wired");
