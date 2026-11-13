@@ -48,6 +48,21 @@ assert.match(inlineGeoFs, /\/api\/resource\?url=https%3A%2F%2Fmps\.geo-fs\.com/)
 assert.match(inlineGeoFs, /\/api\/resource\?url=https%3A%2F%2Fdata\.geo-fs\.com%2Fosm%2F\{z\}%2F\{x\}%2F\{y\}\.png/);
 assert.doesNotMatch(inlineGeoFs, /data\.geo-fs\.com%2Fosm%2F%7Bz%7D/);
 
+// Regression: OSM tile templates (e.g. https://data.geo-fs.com/osm/{z}/{x}/{y}.png)
+// found in an inline <script> must NOT be turned into a critical <link rel=preload>.
+// The page substitutes {z}/{x}/{y} at runtime; preloading the raw template causes
+// the browser to request an address that has never been substituted (a guaranteed
+// 404). Live GeoFS sessions showed "Failed to load <link> resource.
+// data.geo-fs.com/osm/%7Bz%7D/%7Bx%7D/%7By%7D.png" in the Veyra console.
+{
+  const osmHtml = rewriteHtml('<html><head><script>geofs.osmTileProvider = "https://data.geo-fs.com/osm/{z}/{x}/{y}.png";</script></head></html>', 'https://www.geo-fs.com/geofs.php', 'osm-tpl');
+  assert.doesNotMatch(osmHtml, /<link[^>]*preload[^>]*osm/, 'a tile template must not become a critical preload');
+  assert.doesNotMatch(osmHtml, /<link[^>]*preload[^>]*%7Bz%7D/, 'a percent-encoded tile template must not be preloaded');
+  // Sanity: a real image URL still gets a preload.
+  const realImg = rewriteHtml('<html><head><style>.x{background:url("https://www.geo-fs.com/images/planes/c172.png")}</style></head></html>', 'https://www.geo-fs.com/geofs.php', 'real-img');
+  assert.match(realImg, /<link[^>]*rel="preload"[^>]*c172\.png/, 'a real image URL should still be preloaded');
+}
+
 // Regression: the rewritten Cesium <script src> ends with "Cesium.js" followed by
 // the proxy's own query params, so Cesium's /((?:.*\/)|^)Cesium\.js(?:\?|#|$)/
 // regex no longer matches its own <script src>. buildModuleUrl then falls back
