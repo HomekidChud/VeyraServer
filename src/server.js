@@ -6779,12 +6779,14 @@ app.post("/api/cast/create", (req, res) => {
 app.get("/api/cast/poll/:sessionId", (req, res) => {
   if (!castServer) return res.status(503).json({ error: "Cast server not available" });
   const msgs = castServer.pollSession(req.params.sessionId);
+  if (msgs === null) return res.status(404).json({ ok: false, error: "Cast session not found", code: "CAST_SESSION_NOT_FOUND" });
   res.json({ ok: true, messages: msgs });
 });
 app.post("/api/cast/push/:sessionId", (req, res) => {
   if (!castServer) return res.status(503).json({ error: "Cast server not available" });
-  castServer.pushToPoll(req.params.sessionId, req.body);
-  res.json({ ok: true });
+  const result = castServer.browserPush(req.params.sessionId, req.body);
+  if (!result.ok) return res.status(404).json(result);
+  res.json(result);
 });
 app.post("/api/cast/send/:sessionId", (req, res) => {
   if (!castServer) return res.status(503).json({ error: "Cast server not available" });

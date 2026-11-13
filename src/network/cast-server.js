@@ -43,6 +43,9 @@ class DeviceSession {
     this.deviceType = "";
     this.createdAt = now();
     this.pairedAt = null;
+    this.server = null;
+    this.usePolling = false;
+    this.lastBrowserPollAt = 0;
     this.status = "waiting"; 
     this.frameCount = 0;
     this.bytesTransferred = 0;
@@ -69,16 +72,21 @@ class DeviceSession {
   isReady() { return this.browserWs && this.deviceWs && this.status === "streaming"; }
 
   relayFrame(frameData) {
-    if (!this.browserWs || this.browserWs.readyState !== WebSocket.OPEN) return;
+    const viaWs = this.browserWs && this.browserWs.readyState === WebSocket.OPEN;
+    // A session whose browser fell back to HTTP polling still receives frames
+    // through its polling buffer, so a transport switch never drops the cast.
+    if (!viaWs && !(this.usePolling && this.server)) return;
     this.frameCount++;
     this.bytesTransferred += frameData.length;
     this.lastFrameAt = now();
-    this.browserWs.send(JSON.stringify({
+    const msg = {
       type: "frame",
       data: frameData,
       sequence: this.frameCount,
       timestamp: now(),
-    }));
+    };
+    if (viaWs) this.browserWs.send(JSON.stringify(msg));
+    else this.server.pushToPoll(this.id, msg);
   }
 
   relayInput(input) {
@@ -92,8 +100,11 @@ class DeviceSession {
   }
 
   sendToBrowser(msg) {
-    if (!this.browserWs || this.browserWs.readyState !== WebSocket.OPEN) return;
-    this.browserWs.send(JSON.stringify(msg));
+    if (this.browserWs && this.browserWs.readyState === WebSocket.OPEN) {
+      this.browserWs.send(JSON.stringify(msg));
+    } else if (this.usePolling && this.server) {
+      this.server.pushToPoll(this.id, msg);
+    }
   }
 
   sendToDevice(msg) {
@@ -162,6 +173,7 @@ class CastServer {
   createSessionViaPoll() {
     const sessionId = `cast_${crypto.randomBytes(6).toString("hex")}`;
     const session = new DeviceSession(sessionId, null);
+    session.server = this;
     session.usePolling = true;
     this.sessions.set(sessionId, session);
     this.pollingBuffers.set(sessionId, []);
@@ -170,10 +182,28 @@ class CastServer {
   }
 
   pollSession(sessionId) {
+    const session = this.sessions.get(sessionId);
     const buf = this.pollingBuffers.get(sessionId);
-    if (!buf) return [];
-    const msgs = buf.splice(0, buf.length);
-    return msgs;
+    // A session that no longer exists must not look like an empty one —
+    // returning null lets the HTTP route answer 404 so the frontend stops
+    // polling a dead session instead of spinning forever.
+    if (!session || !buf) return null;
+    session.lastBrowserPollAt = now();
+    return buf.splice(0, buf.length);
+  }
+
+  // Frames and messages pushed by an HTTP-polled device, routed through the
+  // session so they reach the browser whichever transport it is on (a WS
+  // browser previously never read the polling buffer, so its frames vanished).
+  browserPush(sessionId, msg) {
+    const session = this.sessions.get(String(sessionId));
+    if (!session) return { ok: false, error: "Session not found" };
+    if (msg && msg.type === "frame") {
+      session.relayFrame(msg.data);
+    } else {
+      this.sendToBrowser(session, msg);
+    }
+    return { ok: true };
   }
 
   pushToPoll(sessionId, msg) {
@@ -223,10 +253,12 @@ class CastServer {
     if (!session) {
       sessionId = sessionId || `cast_${crypto.randomBytes(6).toString("hex")}`;
       session = new DeviceSession(sessionId, ws);
+      session.server = this;
       this.sessions.set(sessionId, session);
       this.stats.totalSessions++;
     } else {
       session.browserWs = ws;
+      session.server = this;
     }
 
     ws.on("message", (data) => {
@@ -259,8 +291,14 @@ class CastServer {
 
     ws.on("close", () => {
       if (session.status === "streaming") this.stats.activeStreams = Math.max(0, this.stats.activeStreams - 1);
-      session.disconnect("browser_closed");
-      this.sessions.delete(sessionId);
+      session.browserWs = null;
+      // Keep the session alive in HTTP-polling mode: the browser's polling
+      // fallback reuses this session id, so a dropped WebSocket no longer
+      // tears down the cast (and the device stays paired). The cleanup
+      // sweep reaps sessions whose browser stops polling.
+      session.usePolling = true;
+      session.lastBrowserPollAt = now();
+      if (!this.pollingBuffers.has(sessionId)) this.pollingBuffers.set(sessionId, []);
     });
 
     
@@ -359,6 +397,11 @@ class CastServer {
       if (session.status === "waiting" && now() - session.createdAt > 10 * 60 * 1000) {
         session.disconnect("timeout");
         this.sessions.delete(id);
+      }
+      // Reap sessions whose browser fell back to polling and then went silent —
+      // without this a dead polling session would linger with its device paired.
+      if (session.usePolling && !session.browserWs && session.lastBrowserPollAt && now() - session.lastBrowserPollAt > 2 * 60 * 1000) {
+        this.closeSession(id, "browser_timeout");
       }
     }
   }
