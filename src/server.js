@@ -2261,7 +2261,13 @@ function injectRuntime(html, original, sid = "") {
   function proxyHistory(method,native){return function(state,title,url){
     let next=virtualUrl;try{if(url!=null)next=fixOwn(new URL(unwrap(String(url)),virtualUrl)).href}catch{}
     remember(next);
-    try{native.call(this||history,state,title,proxy('view',next))}catch{}
+    // When the page was served via escaped navigation (path-based URL, not
+    // /api/view), keep the same path shape for the history entry so that
+    // location.pathname keeps reporting the real site path. MSN Casual Games
+    // extracts its game ID from location.pathname, so rewriting it back to
+    // /api/view during hydration breaks the game data fetch.
+    let showUrl=null;try{const u=new URL(unwrap(String(url??''),virtualUrl));showUrl=/^[/]api[/]/.test(location.pathname)?proxy('view',next):(location.origin+u.pathname+u.search+u.hash)}catch{}
+    try{native.call(this||history,state,title,showUrl||proxy('view',next))}catch{}
     emit('history.'+method,next);return undefined;
   }}
   // Patch the prototype (not just the instance): apps such as YouTube call
@@ -2270,7 +2276,14 @@ function injectRuntime(html, original, sid = "") {
   try{if(HP){const np=HP.pushState,nr=HP.replaceState;HP.pushState=proxyHistory('pushState',np);HP.replaceState=proxyHistory('replaceState',nr)}else{const np=history.pushState,nr=history.replaceState;history.pushState=proxyHistory('pushState',np);history.replaceState=proxyHistory('replaceState',nr)}}catch{}
   // Watchdog: if anything still escapes (pristine History from another realm),
   // map the escaped path back onto the real site and restore the proxied URL.
-  function heal(){try{if(!/^[/]api[/]/.test(location.pathname)){const next=new URL(location.pathname+location.search+location.hash,virtualUrl).href;remember(next);nativeReplaceState.call(history,history.state,'',proxy('view',next));emit('history.heal',next)}}catch{}}
+  // Escaped navigation (e.g. /en-gb/play/games/<slug>/cg-<id>) serves the page
+  // at the same path as the original site so apps that parse location.pathname
+  // (MSN Casual Games extracts the game ID from it) see the real path. The
+  // previous version immediately rewrote the URL back to /api/view, which
+  // re-broke those apps before their boot code could read the path. Now we
+  // keep the escaped path as the visible URL and only remember the virtual
+  // URL, so pathname stays the real site path for the lifetime of the page.
+  function heal(){try{if(!/^[/]api[/]/.test(location.pathname)){const next=new URL(location.pathname+location.search+location.hash,virtualUrl).href;remember(next);emit('history.heal',next)}}catch{}}
   try{setInterval(heal,300);addEventListener('popstate',()=>{try{const u=canonicalizeMaybeProxy(location.href);if(u&&u!==virtualUrl){remember(u);emit('history.popstate',u)}}catch{}})}catch{}
   try{
     const LP=Location&&Location.prototype;
