@@ -303,6 +303,15 @@ class BrowserEngine {
         viewport: { width: 1365, height: 820 },
         serviceWorkers: 'allow'
       };
+      // Sites like MSN bot-wall the default "HeadlessChrome/x.y" user agent and
+      // redirect to sign-in walls. Present the real desktop Chrome identity
+      // (version taken from the launched browser) so streamed pages behave like
+      // a normal visitor.
+      try {
+        const version = (await browser.version()) || '';
+        const major = /^(\d+)/.exec(version)?.[1];
+        if (major) contextOptions.userAgent = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`;
+      } catch {}
       if (vpnProfile?.proxy) {
         contextOptions.proxy = { ...vpnProfile.proxy };
         const hints = vpnProfile.contextHints || {};

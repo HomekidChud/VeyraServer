@@ -58,6 +58,11 @@ function createShield(env = process.env, { log = () => {}, lean = false } = {}) 
     api: new TokenBuckets({ capacity: Math.round(num(env, "SHIELD_API_BURST", 120, 10, 10000) * mult), refillPerSec: num(env, "SHIELD_API_RPS", 10, 0.5, 1000) * mult }),
     
     heavy: new TokenBuckets({ capacity: Math.round(num(env, "SHIELD_HEAVY_BURST", 30, 3, 1000) * mult), refillPerSec: num(env, "SHIELD_HEAVY_RPS", 0.5, 0.01, 100) * mult }),
+    // Session-scoped Chromium stream traffic (status + screenshot polls ~1/s
+    // each, input events on every keystroke/pointer move). This used to share
+    // the 0.5 rps "heavy" bucket, which starved live streams of tokens and
+    // killed them with 429s about a minute into a session.
+    stream: new TokenBuckets({ capacity: Math.round(num(env, "SHIELD_STREAM_BURST", 300, 30, 20000) * mult), refillPerSec: num(env, "SHIELD_STREAM_RPS", 30, 1, 2000) * mult }),
     auth: new TokenBuckets({ capacity: Math.round(num(env, "SHIELD_AUTH_BURST", 10, 2, 1000) * mult), refillPerSec: num(env, "SHIELD_AUTH_RPS", 0.1, 0.01, 100) * mult })
   };
   const blockIps = new Set(String(env.SHIELD_BLOCK_IPS || "").split(",").map(s => s.trim()).filter(Boolean));
@@ -68,7 +73,11 @@ function createShield(env = process.env, { log = () => {}, lean = false } = {}) 
     const p = req.path || "";
     const m = req.method;
     if (/^\/api\/auth\/(?:login|signup|password|reset)/.test(p) && m === "POST") return "auth";
-    if ((p === "/api/session" && m === "POST") || /^\/api\/browser\/(?:session|open|start)/.test(p) || (p === "/api/open" && m === "POST") || /^\/api\/crawl(?:\/|$)/.test(p) && m === "POST") return "heavy";
+    // Session-scoped Chromium routes (status/screenshot/input/navigate/history/
+    // stop on an existing session id) are steady stream traffic, not
+    // session-spawning abuse — they belong in the generous "stream" bucket.
+    if (/^\/api\/browser\/session\/[^/]+(?:\/[a-z-]+)?$/.test(p)) return "stream";
+    if ((p === "/api/session" && m === "POST") || (p === "/api/browser/session" && m === "POST") || /^\/api\/browser\/(?:open|start)/.test(p) || (p === "/api/open" && m === "POST") || /^\/api\/crawl(?:\/|$)/.test(p) && m === "POST") return "heavy";
     if (/^\/api\/(?:view|resource|form-get|download)/.test(p)) return "proxy";
     if (p.startsWith("/api/")) return "api";
     return "proxy"; 

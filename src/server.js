@@ -349,7 +349,10 @@ const CFG = Object.freeze({
   maxDiscoveredUrlLength: numberEnv("MAX_DISCOVERED_URL_LENGTH", 4096, 256, 20000),
   maxCrossOriginResources: Math.min(numberEnv("MAX_CROSS_ORIGIN_RESOURCES", P.maxCrossOriginResources, 0, 10000), P.maxCrossOriginResources),
   skipLowValueThirdParty: boolEnv("SKIP_LOW_VALUE_THIRD_PARTY", true),
-  playwrightBrowsersPath: process.env.PLAYWRIGHT_BROWSERS_PATH || "0"
+// Leave unset when the env var is absent: forcing "0" points Playwright at
+  // node_modules/.local-browsers and hides the default ~/.cache/ms-playwright
+  // install, which made a perfectly installed Chromium look "not installed".
+  playwrightBrowsersPath: process.env.PLAYWRIGHT_BROWSERS_PATH || null
 });
 try { fs.mkdirSync(CFG.authDataDir, { recursive: true }); } catch {}
 
@@ -2148,7 +2151,12 @@ function rewriteJsText(text, base, sid = "") {
   let out = String(text || "");
   
   
-  out = out.replace(/navigator\.serviceWorker\.register\s*\(/g, 'navigator.serviceWorker.register=function(){return Promise.reject(new Error("Service workers are not available in Veyra proxy mode."))};navigator.serviceWorker.register(');
+  // Neutralise service-worker registration inside proxied JS. The replacement
+  // must stay valid in *expression* position (e.g. `await navigator
+  // .serviceWorker.register(...)` in MSN/casual-games bundles) — a bare
+  // `x = fn;` statement there is a SyntaxError ("Invalid left-hand side in
+  // assignment"), so wrap the reassignment in parens and call it instead.
+  out = out.replace(/navigator\.serviceWorker\.register\s*\(/g, '(navigator.serviceWorker.register=function(){return Promise.reject(new Error("Service workers are not available in Veyra proxy mode."))})(');
   for (const re of patterns) {
     out = out.replace(re, (m, prefix, quote, spec) => {
       const u = resolveResource(spec, base);
@@ -2290,6 +2298,49 @@ function injectRuntime(html, original, sid = "") {
     ProxiedWebSocket.prototype=NativeWebSocket.prototype;ProxiedWebSocket.CONNECTING=0;ProxiedWebSocket.OPEN=1;ProxiedWebSocket.CLOSING=2;ProxiedWebSocket.CLOSED=3;
     try{Object.defineProperty(ProxiedWebSocket,'name',{value:'WebSocket'})}catch(e){}
     window.WebSocket=ProxiedWebSocket;}}catch{}
+  // Runtime-created <script> and <iframe> elements (webpack/rspack lazy chunks,
+  // JSONP, OAuth silent-auth frames) bypass the HTML rewriting, so cross-origin
+  // URLs hit the origin directly. CDNs like assets.msn.com restrict CORS to the
+  // real site origin and chunk loaders set crossOrigin="anonymous", which then
+  // fails and leaves the app blank; OAuth frames fail whole-app hydration the
+  // same way. Intercept src assignment and route site resources through the
+  // proxy so runtime loading is same-origin and CORS-free.
+  try{(function(){
+    var nativeCreate=document.createElement.bind(document);
+    var VAPI=/^\\/api\\/(view|resource|download|form-get|open|crawl|search|suggest|browser|debug|session|vpn|status|health|devtools|cast)([\\/?#]|$)/;
+    function srcFix(v,kind){
+      try{
+        var raw=String(v||'');
+        if(!raw||/^(data:|blob:|about:|javascript:)/i.test(raw))return v;
+        var u=new URL(raw,location.href);
+        if(VAPI.test(u.pathname))return v;
+        if(/^[a-z][a-z0-9+.-]*:\\/\\//i.test(raw)){
+          if(u.protocol!=='http:'&&u.protocol!=='https:')return v;
+          if(u.origin===location.origin)return v;
+          return proxy(kind,u.href);
+        }
+        var real=new URL(raw,virtualUrl);
+        if(!/^https?:$/.test(real.protocol))return v;
+        if(real.origin===location.origin)return v;
+        return proxy(kind,real.href);
+      }catch(e){return v}
+    }
+    document.createElement=function(tag,options){
+      var el=nativeCreate(tag,options);
+      var name=String(tag).toLowerCase();
+      if(name==='script'||name==='iframe'){
+        try{
+          var kind=name==='script'?'resource':'view';
+          var proto=Object.getPrototypeOf(el);
+          var desc=Object.getOwnPropertyDescriptor(proto,'src');
+          if(desc&&desc.set)Object.defineProperty(el,'src',{get:desc.get,set:function(v){desc.set.call(el,srcFix(v,kind))},configurable:true});
+          var nativeSetAttr=el.setAttribute.bind(el);
+          el.setAttribute=function(k,v){if(String(k).toLowerCase()==='src')v=srcFix(v,kind);return nativeSetAttr(k,v)};
+        }catch(e){}
+      }
+      return el;
+    };
+  })()}catch(e){}
   // Empty SPA shell detector (Roblox, browser.lol, etc.): if the main root stays
   // empty after scripts have had a chance to run, ask the parent to switch to Chromium.
   try{(function(){var fired=false;function check(){if(fired)return;try{var root=document.querySelector('#root,#app,#__next,[data-reactroot],#react-root');var body=document.body;var text=(body&&body.innerText||'').replace(/\\s+/g,' ').trim();var kids=body?body.children.length:0;var emptyRoot=root&&!(root.textContent||'').trim()&&root.children.length===0;var sparse=!text||text.length<40&&kids<4;if(emptyRoot||sparse){fired=true;topPost({type:'veyra:browser-required',reason:'empty-spa-shell',sessionId:SESSION_ID,pageUrl:virtualUrl})}}catch{}}setTimeout(check,2500);setTimeout(check,6000)})()}catch{}
@@ -4015,7 +4066,7 @@ function browserCapabilitySignals(html = "", headers = {}) {
   const spa = /__next|__nuxt|webpack|vite|react|angular|vue|svelte|ng-version|roblox|rbxcdn|rbx\.com/i.test(text);
   
   
-  const gameOrRemoteBrowser = /roblox\.com|rbxcdn\.com|browser\.lol|now\.gg|play\.google\.com\/store|geforce\.com\/games/i.test(lower);
+  const gameOrRemoteBrowser = /roblox\.com|rbxcdn\.com|browser\.lol|now\.gg|play\.google\.com\/store|geforce\.com\/games|msn\.com\/[a-z-]+\/play\/games|\/play\/games\/cg-|casualgamesgameplay|poki\.com\/[a-z-]+\/g\/|crazygames\.com\/[a-z0-9-]+\/|miniclip\.com\/game|kongregate\.com\/games|itch\.io\/embed|gamepix\.com\/play/i.test(lower);
   const scriptHeavy = scriptCount >= CFG.proxyJsHeavyThreshold && (fetchSignals >= 1 || moduleCount > 0 || shellSignals);
   const spaHeavy = spa && (fetchSignals >= 2 || shellSignals || moduleCount > 0);
   const heavy = shellSignals || fetchSignals >= 4 || scriptHeavy || spaHeavy || gameOrRemoteBrowser;
@@ -4033,10 +4084,14 @@ const FORCE_BROWSER_HOSTS = new Set([
 ]);
 function hostNeedsRealBrowser(url) {
   try {
-    const h = new URL(url).hostname.toLowerCase().replace(/^www\./, "");
+    const u = new URL(url);
+    const h = u.hostname.toLowerCase().replace(/^www\./, "");
     if (FORCE_BROWSER_HOSTS.has(h) || FORCE_BROWSER_HOSTS.has("www." + h)) return true;
     if (/(^|\.)roblox\.com$/.test(h) || /(^|\.)rbxcdn\.com$/.test(h)) return true;
     if (/(^|\.)browser\.lol$/.test(h)) return true;
+    // MSN casual games (PolyTrack etc.) are MSAL-authenticated WebGL apps that
+    // refuse to hydrate through the fast proxy — they need real Chromium.
+    if (/(^|\.)msn\.com$/.test(h) && /^\/[a-z-]+\/play\/games\//i.test(u.pathname)) return true;
   } catch {}
   return false;
 }
