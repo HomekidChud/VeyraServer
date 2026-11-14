@@ -2471,9 +2471,13 @@ function injectRuntime(html, original, sid = "") {
   // with '*' — the sender already holds the same-origin window handle, so
   // nothing is disclosed that it could not read directly.
   try{(function(){
-    if(!window.__VEYRA_PROXY__||!Window.prototype||!Window.prototype.postMessage)return;
-    var nativePM=Window.prototype.postMessage;
-    Window.prototype.postMessage=function(message,targetOrigin,transfer){
+    // postMessage is an OWN property of each window instance (not on
+    // Window.prototype), so the patch must replace window.postMessage itself —
+    // a Window.prototype-level patch is silently shadowed and never runs.
+    if(!window.__VEYRA_PROXY__)return;
+    var nativePM=window.postMessage;
+    if(typeof nativePM!=='function')return;
+    window.postMessage=function(message,targetOrigin,transfer){
       try{
         if(this===window&&arguments.length>=2&&typeof targetOrigin==='string'&&targetOrigin!=='*'&&targetOrigin!=='/'){
           var u=null;try{u=new URL(targetOrigin,location.href)}catch{}
@@ -2485,6 +2489,13 @@ function injectRuntime(html, original, sid = "") {
       return nativePM.apply(this,arguments)
     }
   })()}catch{}
+  // Some games gate themselves to their publisher's domains by reading
+  // location.hostname (PolyTrack: *.msn.com/*.msnfun.com) and halt with an
+  // "unofficial version" screen on any other host — including the proxy
+  // origin. The game's own code exposes window.polytrackModConfiguration
+  // (unblocked:true) as its supported escape hatch for mirrors; set it so
+  // proxied play works. No other site reads this variable.
+  try{if(!window.polytrackModConfiguration)window.polytrackModConfiguration={unblocked:true}}catch{}
   // Web workers (physics/AI simulation bundles in games like PolyTrack) load
   // relative script URLs that resolve against the escaped proxy path and 404.
   // Route the worker script through the proxy like any other resource; the
@@ -2494,6 +2505,11 @@ function injectRuntime(html, original, sid = "") {
     var NativeWorker=Worker;
     function VeyraWorker(url,opts){
       try{
+        // Blob/data workers (DRACO decoder, meshopt, game code) are created
+        // locally and must go to the native constructor; resolve() rewrites
+        // them to their inner http URL, which the proxy then 404s.
+        var raw=String(realUrl(url)||'');
+        if(/^(blob:|data:)/i.test(raw))return new NativeWorker(url,opts);
         var target=resolve(url);
         if(/^https?:$/.test(new URL(target,location.href).protocol)){
           try{return new NativeWorker(proxy('resource',target),opts)}catch(e){}
