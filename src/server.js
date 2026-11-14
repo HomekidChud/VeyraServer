@@ -2257,6 +2257,15 @@ function injectRuntime(html, original, sid = "") {
   const HP=(typeof History!=='undefined'&&History.prototype)||null;
   const nativeReplaceState=HP?HP.replaceState:history.replaceState;
   function rootProxiedFrame(){try{return window.parent===window||!window.parent.__VEYRA_PROXY__}catch{return true}}
+  // The main proxied page is embedded in the Veyra app, but its parent is
+  // cross-origin (the app lives on another origin), so rootProxiedFrame()
+  // alone cannot tell it apart from a page opened directly at a proxy URL —
+  // every popup guard silently turned off and window.open()/target=_blank
+  // escaped into raw browser tabs at path-based proxy URLs. The app answers
+  // an embed ping; once acked, popups route through the app as new Veyra
+  // tabs and element inspection works on the main frame too.
+  var appEmbedded=false;
+  try{addEventListener('message',function(ev){try{if(ev.data&&ev.data.type==='veyra:embed-ack')appEmbedded=true}catch{}});topPost({type:'veyra:embed-ping',sessionId:SESSION_ID})}catch{}
   function remember(next){virtualUrl=next;window.__VEYRA_PAGE_URL__=next;if(rootProxiedFrame())try{document.cookie='veyra_ctx='+encodeURIComponent(next)+'|'+encodeURIComponent(SESSION_ID)+';path=/;max-age=3600;'+(location.protocol==='https:'?'SameSite=None;Secure;Partitioned':'SameSite=Lax')}catch{}}
   function proxyHistory(method,native){return function(state,title,url){
     let next=virtualUrl;try{if(url!=null)next=fixOwn(new URL(unwrap(String(url)),virtualUrl)).href}catch{}
@@ -2283,7 +2292,7 @@ function injectRuntime(html, original, sid = "") {
   // re-broke those apps before their boot code could read the path. Now we
   // keep the escaped path as the visible URL and only remember the virtual
   // URL, so pathname stays the real site path for the lifetime of the page.
-  function heal(){try{if(!/^[/]api[/]/.test(location.pathname)){const next=new URL(location.pathname+location.search+location.hash,virtualUrl).href;remember(next);emit('history.heal',next)}}catch{}}
+  function heal(){try{if(!/^[/]api[/]/.test(location.pathname)){const next=new URL(location.pathname+location.search+location.hash,virtualUrl).href;if(next!==virtualUrl){remember(next);emit('history.heal',next)}}}catch{}}
   try{setInterval(heal,300);addEventListener('popstate',()=>{try{const u=canonicalizeMaybeProxy(location.href);if(u&&u!==virtualUrl){remember(u);emit('history.popstate',u)}}catch{}})}catch{}
   try{
     const LP=Location&&Location.prototype;
@@ -2368,21 +2377,85 @@ function injectRuntime(html, original, sid = "") {
         return proxy(kind,real.href);
       }catch(e){return v}
     }
+    // Runtime-created resources: scripts and iframes were already covered, but
+    // images, media, tracks, embeds, objects and stylesheets created by SPA
+    // code bypassed the HTML rewriting — relative URLs then hit the proxy
+    // origin directly and cross-origin loads failed CORS. Route every
+    // resource element's src/href/data through the proxy.
+    var FIX_ATTRS={script:'src',iframe:'src',img:'src',source:'src',audio:'src',video:'src',track:'src',embed:'src',object:'data',link:'href'};
+    function fixElement(el,name){
+      try{
+        var attr=FIX_ATTRS[name];
+        if(!attr)return el;
+        var kind=name==='iframe'?'view':'resource';
+        var proto=Object.getPrototypeOf(el);
+        var desc=Object.getOwnPropertyDescriptor(proto,attr);
+        if(desc&&desc.set)Object.defineProperty(el,attr,{get:desc.get,set:function(v){desc.set.call(el,srcFix(v,kind))},configurable:true});
+        var nativeSetAttr=el.setAttribute.bind(el);
+        el.setAttribute=function(k,v){if(String(k).toLowerCase()===attr)v=srcFix(v,kind);return nativeSetAttr(k,v)};
+      }catch(e){}
+      return el;
+    }
     document.createElement=function(tag,options){
       var el=nativeCreate(tag,options);
-      var name=String(tag).toLowerCase();
-      if(name==='script'||name==='iframe'){
+      return fixElement(el,String(tag).toLowerCase());
+    };
+    // new Image() does not go through document.createElement.
+    try{
+      var NativeImage=window.Image;
+      function VeyraImage(w,h){return fixElement(new NativeImage(w,h),'img')}
+      try{Object.defineProperty(VeyraImage,'name',{value:'Image'})}catch(e){}
+      VeyraImage.prototype=NativeImage.prototype;
+      window.Image=VeyraImage;
+    }catch(e){}
+    // innerHTML/insertAdjacentHTML parse resource tags without calling
+    // createElement or setAttribute, so patch the shared setAttribute too.
+    try{
+      var nativeSetAttrAny=Element.prototype.setAttribute;
+      Element.prototype.setAttribute=function(k,v){
         try{
-          var kind=name==='script'?'resource':'view';
-          var proto=Object.getPrototypeOf(el);
-          var desc=Object.getOwnPropertyDescriptor(proto,'src');
-          if(desc&&desc.set)Object.defineProperty(el,'src',{get:desc.get,set:function(v){desc.set.call(el,srcFix(v,kind))},configurable:true});
-          var nativeSetAttr=el.setAttribute.bind(el);
-          el.setAttribute=function(k,v){if(String(k).toLowerCase()==='src')v=srcFix(v,kind);return nativeSetAttr(k,v)};
+          var kk=String(k).toLowerCase();
+          var tag=String(this.tagName||'').toLowerCase();
+          if(FIX_ATTRS[tag]===kk)v=srcFix(v,tag==='iframe'?'view':'resource');
+        }catch(e){}
+        return nativeSetAttrAny.call(this,k,v);
+      };
+    }catch(e){}
+    // innerHTML/insertAdjacentHTML parse raw markup through the HTML parser,
+    // which bypasses createElement and setAttribute entirely — those elements
+    // would fetch raw paths. A MutationObserver rewrites them on insertion.
+    try{
+      var FIX_SEL=Object.keys(FIX_ATTRS).join(',');
+      function fixAttr(el,attr){
+        try{
+          var v=el.getAttribute(attr);
+          if(v&&v.indexOf('javascript:')!==0&&v.indexOf('/api/')!==0&&v.charAt(0)!=='#'&&!/^(data|blob|about|mailto|tel):/i.test(v))
+            el.setAttribute(attr,v);
         }catch(e){}
       }
-      return el;
-    };
+      function fixTree(root){
+        try{
+          if(root.nodeType!==1)return;
+          var t=String(root.tagName||'').toLowerCase();
+          if(FIX_ATTRS[t])fixAttr(root,FIX_ATTRS[t]);
+          if(root.querySelectorAll){
+            var els=root.querySelectorAll(FIX_SEL);
+            for(var i=0;i<els.length;i++){
+              var et=String(els[i].tagName||'').toLowerCase();
+              if(FIX_ATTRS[et])fixAttr(els[i],FIX_ATTRS[et]);
+            }
+          }
+        }catch(e){}
+      }
+      var veyraMO=new MutationObserver(function(muts){
+        for(var i=0;i<muts.length;i++){
+          var nodes=muts[i].addedNodes;
+          if(!nodes)continue;
+          for(var j=0;j<nodes.length;j++)fixTree(nodes[j]);
+        }
+      });
+      veyraMO.observe(document.documentElement,{childList:true,subtree:true});
+    }catch(e){}
   })()}catch(e){}
   // Empty SPA shell detector (Roblox, browser.lol, etc.): if the main root stays
   // empty after scripts have had a chance to run, ask the parent to switch to Chromium.
@@ -2399,7 +2472,7 @@ function injectRuntime(html, original, sid = "") {
   function emitGetForm(form,submitter,source){if(rootProxiedFrame())return false;const target=submitTarget(form,submitter);if(!target)return false;const method=String(form.method||'get').toUpperCase();if(method!=='GET')return false;const fd=new FormData(form,submitter||undefined);const u=new URL(target);for(const [k,v] of fd.entries())if(typeof v==='string')u.searchParams.append(k,v);emit(source||'form.submit',u.href);return true}
   try{const nativeFormSubmit=HTMLFormElement.prototype.submit;HTMLFormElement.prototype.submit=function(){try{if(rootProxiedFrame())return nativeFormSubmit.call(this);if(emitGetForm(this,null,'form.submit'))return;const target=submitTarget(this,null);const method=String(this.method||'get').toUpperCase();if(target&&method==='POST'){const fd=new FormData(this);const entries=[];for(const [k,v] of fd.entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});return;}}catch{}return nativeFormSubmit.call(this)}}catch{}
   try{const nativeRequestSubmit=HTMLFormElement.prototype.requestSubmit;if(nativeRequestSubmit)HTMLFormElement.prototype.requestSubmit=function(submitter){try{if(rootProxiedFrame())return nativeRequestSubmit.call(this,submitter);if(emitGetForm(this,submitter,'form.requestSubmit'))return;const target=submitTarget(this,submitter);const method=String(this.method||'get').toUpperCase();if(target&&method==='POST'){const entries=[];for(const [k,v] of new FormData(this,submitter).entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});return;}}catch{}return nativeRequestSubmit.call(this,submitter)}}catch{}
-  try{const nativeOpen=window.open;window.open=function(url,target,features){const u=canonicalizeMaybeProxy(url);if(u){if(!rootProxiedFrame()){topPost({type:'veyra:open',url:u,sessionId:SESSION_ID});return null}return nativeOpen.call(window,proxy('view',u),target,features)}return nativeOpen.call(window,url,target,features)}}catch{}
+  try{const nativeOpen=window.open;window.open=function(url,target,features){const u=canonicalizeMaybeProxy(url);if(u){if(!rootProxiedFrame()||appEmbedded){topPost({type:'veyra:open',url:u,sessionId:SESSION_ID});return null}return nativeOpen.call(window,proxy('view',u),target,features)}if(appEmbedded)return null;return nativeOpen.call(window,url,target,features)}}catch{}
   function fmtArg(x,d){d=d||0;if(typeof x==='string')return x;if(x instanceof Error)return (x.name||'Error')+': '+x.message+(x.stack?'\\n'+String(x.stack).split('\\n').slice(1,6).join('\\n'):'');if(typeof Node!=='undefined'&&x instanceof Node)return x.nodeType===1?'<'+x.tagName.toLowerCase()+(x.id?'#'+x.id:'')+(x.className&&typeof x.className==='string'?'.'+x.className.trim().split(/\\s+/).slice(0,3).join('.'):'')+'>':x.nodeName;if(typeof x==='function')return 'ƒ '+(x.name||'anonymous')+'()';try{const seen=new WeakSet();return JSON.stringify(x,(k,v)=>{if(typeof v==='object'&&v){if(seen.has(v))return '[Circular]';seen.add(v)}if(typeof v==='function')return 'ƒ';if(typeof v==='bigint')return String(v)+'n';return v})||String(x)}catch{return String(x)}}
   let consoleBudget=400,consoleWindow=Date.now();
   try{['log','info','debug','warn','error','trace','dir','table','assert','group','groupCollapsed','groupEnd','count','timeEnd'].forEach(level=>{if(typeof console[level]!=='function')return;const native=console[level].bind(console);console[level]=(...args)=>{native(...args);if(level==='assert'){if(args[0])return;args=['Assertion failed:',...args.slice(1)]}const now=Date.now();if(now-consoleWindow>2000){consoleWindow=now;consoleBudget=400}if(--consoleBudget<0)return;let stack='';if(level==='trace'||level==='error'){try{stack=String(new Error().stack||'').split('\\n').slice(2,9).join('\\n')}catch{}}let msg='';try{msg=args.map(x=>fmtArg(x)).join(' ')}catch{}topPost({type:'veyra:page-console',level:level==='assert'?'error':level,sessionId:SESSION_ID,message:msg.slice(0,20000),stack,time:now,pageUrl:virtualUrl})}})}catch{}
@@ -2461,11 +2534,22 @@ ${pageActionsRuntime()}
   }catch{}},true);
   window.addEventListener('message',function(ev){const d=ev.data||{};if(d.type==='veyra:find'){try{const q=String(d.query||'').slice(0,200);if(!q){window.getSelection()?.removeAllRanges();topPost({type:'veyra:find-result',matches:0,pageUrl:virtualUrl});return;}let text=String(document.body?.innerText||'').slice(0,2000000);const hay=text.toLocaleLowerCase(),needle=q.toLocaleLowerCase();const matches=needle?(hay.split(needle).length-1):0;window.find(q,false,String(d.direction||'forward')==='backward',true,false,false,false);topPost({type:'veyra:find-result',matches,pageUrl:virtualUrl});}catch{}}else if(d.type==='veyra:find-close'){try{window.getSelection()?.removeAllRanges();}catch{}}else if(d.type==='veyra:print'){try{window.print();}catch{}}});
   document.addEventListener('mousemove',function(ev){if(!inspectMode)return;const now=performance.now();if(now-inspectLast<45)return;inspectLast=now;let el=ev.target;if(!(el instanceof Element))return;inspectEmit('veyra:inspect-hover',el)},true);
-  document.addEventListener('click',function(ev){if(rootProxiedFrame())return;if(inspectMode){ev.preventDefault();ev.stopPropagation();let el=ev.target;while(el&&el.nodeType===1&&el.tagName==='HTML')el=el.parentElement;inspectSelected=el;if(el)inspectEmit('veyra:inspect-select',el);return;}
+  document.addEventListener('click',function(ev){if(rootProxiedFrame()&&!appEmbedded)return;if(inspectMode){ev.preventDefault();ev.stopPropagation();let el=ev.target;while(el&&el.nodeType===1&&el.tagName==='HTML')el=el.parentElement;inspectSelected=el;if(el)inspectEmit('veyra:inspect-select',el);return;}
     const a=ev.target&&ev.target.closest?ev.target.closest('a[href],area[href]'):null;if(!a)return;
-    const raw=a.getAttribute('href')||'';const u=canonicalizeMaybeProxy(raw);if(!u)return;
+    const raw=a.getAttribute('href')||'';
+    // In the app-embedded root frame, pure-hash links keep their native
+    // scroll-to-anchor behaviour instead of a full proxy reload.
+    if(rootProxiedFrame()&&raw.charAt(0)==='#')return;
+    const u=canonicalizeMaybeProxy(raw);if(!u)return;
+    // target=_blank must never escape into a raw browser tab: route it
+    // through the app, which opens it as a new Veyra tab.
+    if(String(a.getAttribute('target')||'').toLowerCase()==='_blank'){ev.preventDefault();ev.stopPropagation();topPost({type:'veyra:open',url:u,sessionId:SESSION_ID});return}
+    // In the app-embedded root frame, same-frame links navigate the iframe
+    // natively to their rewritten href; only nested proxied frames need the
+    // document-navigation message (their parent is another proxied page).
+    if(rootProxiedFrame())return;
     ev.preventDefault();ev.stopPropagation();
-    if(String(a.getAttribute('target')||'').toLowerCase()==='_blank')topPost({type:'veyra:open',url:u,sessionId:SESSION_ID});else emit('document-navigation',u);
+    emit('document-navigation',u);
   },true);
   document.addEventListener('submit',function(ev){
     if(rootProxiedFrame())return;
