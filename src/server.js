@@ -2791,6 +2791,62 @@ ${pageActionsRuntime()}
   }catch{}},true);
   window.addEventListener('message',function(ev){const d=ev.data||{};if(d.type==='veyra:find'){try{const q=String(d.query||'').slice(0,200);if(!q){window.getSelection()?.removeAllRanges();topPost({type:'veyra:find-result',matches:0,pageUrl:virtualUrl});return;}let text=String(document.body?.innerText||'').slice(0,2000000);const hay=text.toLocaleLowerCase(),needle=q.toLocaleLowerCase();const matches=needle?(hay.split(needle).length-1):0;window.find(q,false,String(d.direction||'forward')==='backward',true,false,false,false);topPost({type:'veyra:find-result',matches,pageUrl:virtualUrl});}catch{}}else if(d.type==='veyra:find-close'){try{window.getSelection()?.removeAllRanges();}catch{}}else if(d.type==='veyra:print'){try{window.print();}catch{}}});
   document.addEventListener('mousemove',function(ev){if(!inspectMode)return;const now=performance.now();if(now-inspectLast<45)return;inspectLast=now;let el=ev.target;if(!(el instanceof Element))return;inspectEmit('veyra:inspect-hover',el)},true);
+  // Sign-in handoff: a click on a detected sign-in control (text like "Sign
+  // in"/"Log in", or a login/oauth/auth URL) is handed to the app, which
+  // opens the site's real sign-in in the user's own browser — the "auto
+  // sign-in" handoff — instead of rendering the site's OAuth/login wall
+  // through the proxy. Veyra never sees the credentials: the user signs in
+  // as themselves on the real site and brings the session back. Hold Shift
+  // (or Ctrl/Cmd) to bypass the handoff and sign in through the proxy.
+  var SIGNIN_AUTH_HOST=/^(?:accounts?\\.google\\.com|appleid\\.apple\\.com|login\\.(?:microsoftonline|microsoft|live)\\.com|securetoken\\.com|(?:auth|sso|signin|login|accounts)\\.[a-z0-9-]+\\.[a-z]{2,})$/i;
+  var SIGNIN_AUTH_PATH=/(?:^|\\/)(?:login|signin|sign-in|log-in|signup|sign-up|register|oauth|oauth2|openid|sso|servicelogin|authentication|authorize|dialog\\/oauth|i\\/oauth2|users\\/sign_in)(?:\\/?$|\\?|#)/i;
+  var SIGNIN_TEXT=/^(?:sign in|sign-in|signin|log ?in|login|log on|sign up|sign-up|signup|join(?: now)?|create (?:an )?account|register|continue with (?:google|apple|microsoft|facebook|steam|discord|twitter|x|email)|log in with (?:google|apple|microsoft|facebook|steam|discord|twitter|x))\\b/i;
+  function signinLabel(n){
+    try{
+      const txt=String(n.textContent||'').replace(/\\s+/g,' ').trim();
+      const aria=String(n.getAttribute('aria-label')||'')+' '+String(n.getAttribute('title')||'')+' '+String(n.getAttribute('alt')||'');
+      return (txt+' '+aria.replace(/\\s+/g,' ').trim()).trim().slice(0,80);
+    }catch(e){return ''}
+  }
+  function signinControl(path){
+    for(let i=0;i<path.length;i++){
+      const n=path[i];
+      if(!n||n.nodeType!==1)continue;
+      const tag=String(n.tagName||'').toUpperCase();
+      if(tag==='HTML'||tag==='BODY')break;
+      if(tag==='FORM')break;
+      const role=String((n.getAttribute&&n.getAttribute('role'))||'').toLowerCase();
+      const isCtl=tag==='A'||tag==='BUTTON'||role==='button'||role==='link'||String((n.getAttribute&&n.getAttribute('type'))||'').toLowerCase()==='submit';
+      if(!isCtl)continue;
+      let href='';
+      try{href=String(n.getAttribute('href')||n.getAttribute('action')||n.getAttribute('formaction')||'')}catch(e){}
+      if(href==='#')href='';
+      // Anchor hrefs are already rewritten to /api/view?url=... — unwrap the
+      // real destination before deciding whether this is a sign-in control.
+      let raw=href;try{raw=unwrap(href)||href}catch(e){}
+      let host='',pathPart='';
+      try{const uu=new URL(raw,virtualUrl);host=uu.hostname.toLowerCase();pathPart=uu.pathname+uu.search}catch(e){}
+      const label=signinLabel(n);
+      if((host&&SIGNIN_AUTH_HOST.test(host))||(pathPart&&SIGNIN_AUTH_PATH.test(pathPart))||(label&&SIGNIN_TEXT.test(label))){
+        return {node:n,dest:raw};
+      }
+    }
+    return null;
+  }
+  document.addEventListener('click',function(ev){
+    if(!appEmbedded||ev.defaultPrevented)return;
+    if(ev.shiftKey||ev.ctrlKey||ev.metaKey||ev.altKey)return;
+    try{
+      const path=ev.composedPath?ev.composedPath():[ev.target];
+      const hit=signinControl(path);
+      if(!hit)return;
+      ev.preventDefault();ev.stopPropagation();
+      let u='';
+      try{u=hit.dest?resolve(hit.dest):''}catch(e){}
+      if(!u||!/^https?:/i.test(u))u=virtualUrl;
+      topPost({type:'veyra:signin',url:u,sessionId:SESSION_ID,pageUrl:virtualUrl});
+    }catch(e){}
+  },true);
   function anchorFromEvent(ev){
     try{
       if(ev.composedPath){
@@ -6476,9 +6532,19 @@ async function proxyRequest(req, res, mode) {
   };
   const challenge = mode === "view" ? detectChallenge(result.body.toString("utf8"), result.contentType, result.status, { server: result.serverHeader, "cf-mitigated": result.cfMitigated, finalUrl: result.finalUrl }) : null;
   if (challenge) {
-    res.setHeader("X-Veyra-Challenge", "true");
-    res.setHeader("X-Veyra-Canonical-URL", canonical);
-    return res.status(200).type("html").send(challengeFallbackHtml(canonical, challenge, sid, requestOrigin(req)));
+    // Google's captcha wall can never be completed through a proxy, so it
+    // keeps its card (with the alternative-search links). Every other
+    // security/bot-verification page is passed through as-is: the site's own
+    // check runs in the fast-proxy frame — Veyra neither solves nor weakens
+    // it — and when the site's check passes and redirects, the fast proxy
+    // follows the redirect and the site loads fully instead of being
+    // replaced by an interstitial card.
+    if (challenge.type === "unusual-traffic") {
+      res.setHeader("X-Veyra-Challenge", "true");
+      res.setHeader("X-Veyra-Canonical-URL", canonical);
+      return res.status(200).type("html").send(challengeFallbackHtml(canonical, challenge, sid, requestOrigin(req)));
+    }
+    res.setHeader("X-Veyra-Challenge", String(challenge.type || "security-verification"));
   }
   // Same safety fix as the early 302: only redirect when the Referer origin
   // matches YouTube itself (native tab). Fast-proxy iframes must receive the
