@@ -2261,7 +2261,13 @@ function injectRuntime(html, original, sid = "") {
   function proxyHistory(method,native){return function(state,title,url){
     let next=virtualUrl;try{if(url!=null)next=fixOwn(new URL(unwrap(String(url)),virtualUrl)).href}catch{}
     remember(next);
-    try{native.call(this||history,state,title,proxy('view',next))}catch{}
+    // When the page was served via escaped navigation (path-based URL, not
+    // /api/view), keep the same path shape for the history entry so that
+    // location.pathname keeps reporting the real site path. MSN Casual Games
+    // extracts its game ID from location.pathname, so rewriting it back to
+    // /api/view during hydration breaks the game data fetch.
+    let showUrl=null;try{const u=new URL(unwrap(String(url??''),virtualUrl));showUrl=/^[/]api[/]/.test(location.pathname)?proxy('view',next):(location.origin+u.pathname+u.search+u.hash)}catch{}
+    try{native.call(this||history,state,title,showUrl||proxy('view',next))}catch{}
     emit('history.'+method,next);return undefined;
   }}
   // Patch the prototype (not just the instance): apps such as YouTube call
@@ -2270,12 +2276,49 @@ function injectRuntime(html, original, sid = "") {
   try{if(HP){const np=HP.pushState,nr=HP.replaceState;HP.pushState=proxyHistory('pushState',np);HP.replaceState=proxyHistory('replaceState',nr)}else{const np=history.pushState,nr=history.replaceState;history.pushState=proxyHistory('pushState',np);history.replaceState=proxyHistory('replaceState',nr)}}catch{}
   // Watchdog: if anything still escapes (pristine History from another realm),
   // map the escaped path back onto the real site and restore the proxied URL.
-  function heal(){try{if(!/^[/]api[/]/.test(location.pathname)){const next=new URL(location.pathname+location.search+location.hash,virtualUrl).href;remember(next);nativeReplaceState.call(history,history.state,'',proxy('view',next));emit('history.heal',next)}}catch{}}
+  // Escaped navigation (e.g. /en-gb/play/games/<slug>/cg-<id>) serves the page
+  // at the same path as the original site so apps that parse location.pathname
+  // (MSN Casual Games extracts the game ID from it) see the real path. The
+  // previous version immediately rewrote the URL back to /api/view, which
+  // re-broke those apps before their boot code could read the path. Now we
+  // keep the escaped path as the visible URL and only remember the virtual
+  // URL, so pathname stays the real site path for the lifetime of the page.
+  function heal(){try{if(!/^[/]api[/]/.test(location.pathname)){const next=new URL(location.pathname+location.search+location.hash,virtualUrl).href;remember(next);emit('history.heal',next)}}catch{}}
   try{setInterval(heal,300);addEventListener('popstate',()=>{try{const u=canonicalizeMaybeProxy(location.href);if(u&&u!==virtualUrl){remember(u);emit('history.popstate',u)}}catch{}})}catch{}
   try{
     const LP=Location&&Location.prototype;
     if(LP&&LP.assign){const nativeAssign=LP.assign;LP.assign=function(next){const u=canonicalizeMaybeProxy(next);if(u){if(!rootProxiedFrame()){emit('location.assign',u);return;}return nativeAssign.call(this,proxy('view',u));}return nativeAssign.call(this,next)}}
     if(LP&&LP.replace){const nativeReplace=LP.replace;LP.replace=function(next){const u=canonicalizeMaybeProxy(next);if(u){if(!rootProxiedFrame()){emit('location.replace',u);return;}return nativeReplace.call(this,proxy('view',u));}return nativeReplace.call(this,next)}}
+    // Report the virtual (original) page URL from location: apps such as MSN
+    // Casual Games parse location.pathname (/en-gb/play/games/<slug>/cg-<id>)
+    // to extract the active game ID. On the proxied page the path is
+    // /api/view, so the extraction returns nothing, the GameplayV2 data
+    // fetch is skipped and the game iframe never receives a URL.
+    // location's accessors are own properties of the window.location instance
+    // (not Location.prototype) in Chromium, so define them there.
+    try{
+      const vp=()=>{try{return new URL(virtualUrl)}catch{return null}};
+      const target=window.location;
+      const defs={};
+      for(const prop of ['pathname','search','hash','href','origin']){
+        const d=Object.getOwnPropertyDescriptor(target,prop)||Object.getOwnPropertyDescriptor(LP,prop);
+        if(d&&d.get){const nativeGet=d.get;
+          defs[prop]={get:function(){
+            try{const v=vp();
+              if(v){
+                if(prop==='pathname')return v.pathname;
+                if(prop==='search')return v.search;
+                if(prop==='hash')return v.hash;
+                if(prop==='href')return v.href;
+                if(prop==='origin')return v.origin;
+              }
+            }catch{}
+            return nativeGet.call(this);
+          },configurable:true};
+        }
+      }
+      try{Object.defineProperties(target,defs)}catch{}
+    }catch{}
   }catch{}
   try{navigator.serviceWorker&&navigator.serviceWorker.register&&(navigator.serviceWorker.register=function(){topPost({type:'veyra:browser-required',reason:'service-worker',sessionId:SESSION_ID,pageUrl:virtualUrl});return Promise.reject(new DOMException('This page requires browser service-worker support.','NotSupportedError'))})}catch{}
   try{if(typeof WebSocket==='function'){const NativeWebSocket=WebSocket;function relayWsBase(){try{const o=API_ORIGIN||location.origin;return o.replace(/^http:/i,'ws:').replace(/^https:/i,'wss:')}catch(e){return ''}}
