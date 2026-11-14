@@ -159,8 +159,19 @@ class CastServer {
     this.useWebSocket = !!WebSocketServer && isRealServer;
 
     if (this.useWebSocket) {
-      this.wss = new WebSocketServer({ server, path: "/ws/cast" });
+      // noServer + manual path dispatch: multiple WebSocketServers on one HTTP
+      // server each abort (400) every upgrade whose path doesn't match their
+      // own, so a path-scoped server attached earlier (or later) breaks the
+      // other's handshakes. Handle only our own path and ignore the rest.
+      this.wss = new WebSocketServer({ noServer: true });
       this.wss.on("connection", (ws, req) => this.onConnection(ws, req));
+      server.on("upgrade", (req, socket, head) => {
+        try {
+          const pathname = req.url.split("?")[0];
+          if (pathname !== "/ws/cast") return;
+          this.wss.handleUpgrade(req, socket, head, ws => this.wss.emit("connection", ws, req));
+        } catch { try { socket.destroy(); } catch {} }
+      });
     }
     
     
