@@ -7038,6 +7038,68 @@ async function resolveEscapedChunk(sid, relative) {
   }
   return null;
 }
+// Recover the proxied-page context for an escaped (path-based) navigation.
+// After the runtime keeps the escaped path shape (MSN Casual Games etc. do a
+// history.pushState to the site's real path, and location.href assignments
+// then navigate to that same shape), the referring page is itself a
+// path-based URL — not /api/view — so proxiedPageFromReferer cannot parse it
+// and every subsequent in-page navigation (button clicks, form GETs,
+// reloads) fell through to a 404. These requests still identify the session:
+// the runtime bakes ?url=<previous page>&sid=<session> into the path URL
+// (the site copies its own query string when building links), and the
+// veyra_ctx cookie always carries the last virtual page. Recover both, and
+// only accept a sid that matches a live session.
+function liveSessionId(value) {
+  const sid = String(value || "").trim();
+  return /^[A-Za-z0-9_-]{16,80}$/.test(sid) && !sessionManager.isTerminated(sid) && sessionManager.has(sid) ? sid : "";
+}
+function escapedPageContext(req) {
+  const sids = [];
+  const qSid = liveSessionId(req.query?.sid);
+  if (qSid) sids.push(qSid);
+  let pageUrl = "";
+  const raw = String(req.get("Referer") || "");
+  if (raw) {
+    try {
+      const r = new URL(raw);
+      if (r.origin === requestOrigin(req)) {
+        const rSid = liveSessionId(r.searchParams.get("sid"));
+        if (rSid) sids.push(rSid);
+        // A path-based referer renders the page in its own ?url= param (the
+        // runtime keeps it there), so it is the best resolution base.
+        pageUrl = normalizeUrl(r.searchParams.get("url") || "") || "";
+      }
+    } catch {}
+  }
+  if (!pageUrl) {
+    const cookieCtx = proxiedPageFromCookie(req);
+    if (cookieCtx) {
+      const cSid = liveSessionId(cookieCtx.sid);
+      if (cSid) sids.push(cSid);
+      pageUrl = cookieCtx.pageUrl;
+    }
+  }
+  // Last resort: the request's own ?url= param is the page the site's link
+  // came from (the runtime bakes the previous page into escaped URLs).
+  if (!pageUrl) pageUrl = normalizeUrl(String(req.query?.url || "")) || "";
+  if (!pageUrl) return null;
+  const sid = sids.find(s => !!s);
+  return sid ? { pageUrl, sid } : null;
+}
+// Resolve an escaped (path-based) request path onto the real site URL. The
+// site copies its own query string when it builds links, and the runtime's
+// escaped URLs keep Veyra's routing params in it — strip the ones that
+// belong to Veyra (a live session id / from marker) so the real target URL
+// does not inherit them.
+function resolveEscapedTarget(escaped, pageUrl) {
+  try {
+    const parsed = new URL(escaped, "http://veyra.escaped.invalid");
+    for (const k of [...parsed.searchParams.keys()]) {
+      if (/^__veyra/i.test(k) || ((k === "sid" || k === "from") && liveSessionId(parsed.searchParams.get(k)))) parsed.searchParams.delete(k);
+    }
+    return normalizeUrl(new URL(parsed.pathname + parsed.search + parsed.hash, pageUrl).href);
+  } catch { return null; }
+}
 const VEYRA_API_ROUTES = new Set(["view", "resource", "download", "form-get", "open", "crawl", "search", "suggest", "browser", "debug", "session", "sessions", "config", "vpn", "extensions", "status", "health"]);
 app.use(async (req, res, next) => {
   if (!CFG.proxyRelativeFallback || res.headersSent) return next();
@@ -7058,11 +7120,16 @@ app.use(async (req, res, next) => {
   const dest = String(req.get("Sec-Fetch-Dest") || "").toLowerCase();
   const topLevel = dest === "document" || (!dest && /text\/html/i.test(String(req.get("Accept") || "")) && !req.get("Referer"));
   const reserved = isReservedOriginPath(req.path);
-  const ctx = proxiedPageFromReferer(req, { allowCookie: !topLevel && !reserved && !shield.isPreviewBot(req.get("User-Agent")) });
+  let ctx = proxiedPageFromReferer(req, { allowCookie: !topLevel && !reserved && !shield.isPreviewBot(req.get("User-Agent")) });
+  // Escaped (path-based) navigations: the referer is itself a path URL once
+  // the runtime keeps the escaped path shape, so recover the session and
+  // resolution base from the sid/url params the page carries and the
+  // veyra_ctx cookie instead of falling through to a 404.
+  if (!ctx) ctx = reserved ? null : escapedPageContext(req);
   if (!ctx) return next();
   let target = null;
   if (escaped !== req.originalUrl && /[.](m?js|css|wasm|json|map)([?#]|$)/i.test(req.path)) target = await resolveEscapedChunk(ctx.sid, escaped);
-  if (!target) { try { target = normalizeUrl(new URL(escaped, ctx.pageUrl).href); } catch { target = null; } }
+  if (!target) target = resolveEscapedTarget(escaped, ctx.pageUrl);
   if (!target) return next();
   const mode = dest === "document" || dest === "iframe" || dest === "frame" ? "view" : "resource";
   Object.defineProperty(req, "query", { value: { url: target, sid: ctx.sid, from: ctx.pageUrl }, writable: true, configurable: true });
@@ -7241,4 +7308,4 @@ const __workerOps = {
   discover: (text, kind, base, contentType) => collectDiscovery(text, kind, base, contentType)
 };
 
-module.exports = { app, get accessGate() { return accessGate; }, mongoStore, mergeStrayProxyParams, detectChallenge, maybeCompressProxyPayload, proxyCompressibleContentType, CFG, browserCapabilitySignals, canRenderHtmlWithBrowser, renderHtmlWithBrowser, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions, normalizeOpenEngineMode, shouldStartCrawlerForEngineMode, startVeyraServer, cacheSafeUrl, cacheSafeResponse, fetchBuffer };
+module.exports = { app, get accessGate() { return accessGate; }, mongoStore, mergeStrayProxyParams, detectChallenge, maybeCompressProxyPayload, proxyCompressibleContentType, CFG, browserCapabilitySignals, canRenderHtmlWithBrowser, renderHtmlWithBrowser, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions, normalizeOpenEngineMode, shouldStartCrawlerForEngineMode, startVeyraServer, cacheSafeUrl, cacheSafeResponse, fetchBuffer, escapedPageContext, liveSessionId, resolveEscapedTarget };
