@@ -2368,7 +2368,14 @@ function injectRuntime(html, original, sid = "") {
         if(VAPI.test(u.pathname))return v;
         if(/^[a-z][a-z0-9+.-]*:\\/\\//i.test(raw)){
           if(u.protocol!=='http:'&&u.protocol!=='https:')return v;
-          if(u.origin===location.origin)return v;
+          if(u.origin===location.origin){
+            // Absolute URLs at the proxy origin: proper API routes pass
+            // through; escaped paths (site code resolved a relative URL
+            // against the proxy document path, e.g. /api/font.woff2) are
+            // recovered against the real page URL and re-proxied.
+            if(VAPI.test(u.pathname))return v;
+            try{return proxy(kind,new URL(u.pathname.replace(/^\\/api\\//,'')+u.search,virtualUrl).href)}catch(e){return v}
+          }
           return proxy(kind,u.href);
         }
         var real=new URL(raw,virtualUrl);
@@ -2435,16 +2442,59 @@ function injectRuntime(html, original, sid = "") {
       }
       function fixTree(root){
         try{
+          if(root.nodeType===3){
+            // Text appended to a <style> after insertion.
+            var p=root.parentElement;
+            if(p&&String(p.tagName||'').toLowerCase()==='style')fixStyleText(p);
+            return;
+          }
           if(root.nodeType!==1)return;
           var t=String(root.tagName||'').toLowerCase();
           if(FIX_ATTRS[t])fixAttr(root,FIX_ATTRS[t]);
+          if(t==='style')fixStyleText(root);
           if(root.querySelectorAll){
             var els=root.querySelectorAll(FIX_SEL);
             for(var i=0;i<els.length;i++){
               var et=String(els[i].tagName||'').toLowerCase();
               if(FIX_ATTRS[et])fixAttr(els[i],FIX_ATTRS[et]);
             }
+            var sts=root.querySelectorAll('style');
+            for(var k=0;k<sts.length;k++)fixStyleText(sts[k]);
           }
+        }catch(e){}
+      }
+      // url(...) inside JS-injected <style> resolves against the proxy
+      // document path (/api/view), producing 404s like /api/font.woff2.
+      // Rewrite them to proxied absolute URLs.
+      function fixCssText(txt){
+        try{
+          txt=String(txt||'');
+          if(txt.indexOf('url(')===-1)return txt;
+          return txt.replace(/url\\(\\s*(['"]?)([^'")]+)\\1\\s*\\)/gi,function(m,q,v){
+            try{
+              v=String(v).trim();
+              if(!v||v.indexOf('/api/')===0||v.charAt(0)==='#'||/^(data:|blob:|about:|mailto:)/i.test(v))return m;
+              var abs=new URL(v,virtualUrl).href;
+              if(!/^https?:$/.test(new URL(abs).protocol))return m;
+              var po=API_ORIGIN||location.origin;
+              if(abs.indexOf(po+'/api/')===0){
+                var rest=abs.slice(po.length+5);
+                // Proper proxy URLs (/api/resource?url=...) are left alone;
+                // escaped paths like /api/font.woff2 are resolved back to
+                // the real site and re-proxied.
+                if(/^(view|resource|download|form-get|open|crawl|search|suggest|browser|debug|session|sessions|config|vpn|extensions|status|health|devtools|cast)([\/?#]|$)/.test(rest))return m;
+                try{return 'url("'+proxy('resource',new URL(rest,virtualUrl).href)+'")'}catch(e){return m}
+              }
+              return 'url("'+proxy('resource',abs)+'")';
+            }catch(e){return m}
+          });
+        }catch(e){return txt}
+      }
+      function fixStyleText(st){
+        try{
+          var txt=st.textContent||'';
+          var changed=fixCssText(txt);
+          if(changed!==txt)st.textContent=changed;
         }catch(e){}
       }
       var veyraMO=new MutationObserver(function(muts){
@@ -2455,6 +2505,30 @@ function injectRuntime(html, original, sid = "") {
         }
       });
       veyraMO.observe(document.documentElement,{childList:true,subtree:true});
+      // Shadow DOM (MSN casual games, game-play iframes, etc.) is invisible
+      // to the document-level observer — observe every shadow root as it
+      // is attached so its resource elements get rewritten too.
+      try{
+        var nativeAttachShadow=Element.prototype.attachShadow;
+        Element.prototype.attachShadow=function(init){
+          var root=nativeAttachShadow.call(this,init);
+          try{veyraMO.observe(root,{childList:true,subtree:true})}catch(e){}
+          return root;
+        };
+      }catch(e){}
+      // Constructable stylesheets (replaceSync/replace/insertRule) never touch
+      // the DOM, so url(font.woff2) resolves against /api/ and 404s. Rewrite
+      // the CSS text as it enters the sheet.
+      try{
+        if(window.CSSStyleSheet){
+          var nativeRSS=CSSStyleSheet.prototype.replaceSync;
+          if(nativeRSS)CSSStyleSheet.prototype.replaceSync=function(txt){try{txt=fixCssText(txt)}catch(e){}return nativeRSS.call(this,txt)};
+          var nativeRS=CSSStyleSheet.prototype.replace;
+          if(nativeRS)CSSStyleSheet.prototype.replace=function(txt){try{txt=fixCssText(txt)}catch(e){}return nativeRS.call(this,txt)};
+          var nativeIR=CSSStyleSheet.prototype.insertRule;
+          if(nativeIR)CSSStyleSheet.prototype.insertRule=function(rule,idx){try{rule=fixCssText(String(rule))}catch(e){}return nativeIR.call(this,rule,idx)};
+        }
+      }catch(e){}
     }catch(e){}
   })()}catch(e){}
   // Empty SPA shell detector (Roblox, browser.lol, etc.): if the main root stays
@@ -2534,16 +2608,40 @@ ${pageActionsRuntime()}
   }catch{}},true);
   window.addEventListener('message',function(ev){const d=ev.data||{};if(d.type==='veyra:find'){try{const q=String(d.query||'').slice(0,200);if(!q){window.getSelection()?.removeAllRanges();topPost({type:'veyra:find-result',matches:0,pageUrl:virtualUrl});return;}let text=String(document.body?.innerText||'').slice(0,2000000);const hay=text.toLocaleLowerCase(),needle=q.toLocaleLowerCase();const matches=needle?(hay.split(needle).length-1):0;window.find(q,false,String(d.direction||'forward')==='backward',true,false,false,false);topPost({type:'veyra:find-result',matches,pageUrl:virtualUrl});}catch{}}else if(d.type==='veyra:find-close'){try{window.getSelection()?.removeAllRanges();}catch{}}else if(d.type==='veyra:print'){try{window.print();}catch{}}});
   document.addEventListener('mousemove',function(ev){if(!inspectMode)return;const now=performance.now();if(now-inspectLast<45)return;inspectLast=now;let el=ev.target;if(!(el instanceof Element))return;inspectEmit('veyra:inspect-hover',el)},true);
+  function anchorFromEvent(ev){
+    try{
+      if(ev.composedPath){
+        const p=ev.composedPath();
+        for(let i=0;i<p.length;i++){
+          const n=p[i];
+          if(n&&n.tagName==='A'&&n.getAttribute&&n.getAttribute('href')!=null)return n;
+        }
+      }
+    }catch{}
+    try{
+      let t=ev.target;
+      while(t&&t!==document){
+        if(t.tagName==='A'&&t.getAttribute&&t.getAttribute('href')!=null)return t;
+        t=t.parentElement;
+      }
+    }catch{}
+    return null;
+  }
   document.addEventListener('click',function(ev){if(rootProxiedFrame()&&!appEmbedded)return;if(inspectMode){ev.preventDefault();ev.stopPropagation();let el=ev.target;while(el&&el.nodeType===1&&el.tagName==='HTML')el=el.parentElement;inspectSelected=el;if(el)inspectEmit('veyra:inspect-select',el);return;}
-    const a=ev.target&&ev.target.closest?ev.target.closest('a[href],area[href]'):null;if(!a)return;
+    // The anchor can live inside shadow DOM (MSN casual-game cards), where
+    // ev.target is retargeted to the shadow host and closest() never finds
+    // it — resolve through the composed path instead.
+    const a=anchorFromEvent(ev);if(!a)return;
     const raw=a.getAttribute('href')||'';
     // In the app-embedded root frame, pure-hash links keep their native
     // scroll-to-anchor behaviour instead of a full proxy reload.
     if(rootProxiedFrame()&&raw.charAt(0)==='#')return;
     const u=canonicalizeMaybeProxy(raw);if(!u)return;
-    // target=_blank must never escape into a raw browser tab: route it
-    // through the app, which opens it as a new Veyra tab.
-    if(String(a.getAttribute('target')||'').toLowerCase()==='_blank'){ev.preventDefault();ev.stopPropagation();topPost({type:'veyra:open',url:u,sessionId:SESSION_ID});return}
+    // _blank, named windows, _parent and _top must never escape into a raw
+    // browser tab or replace the app: route them through the app, which
+    // opens them as a new Veyra tab.
+    const tgt=String(a.getAttribute('target')||'').toLowerCase();
+    if(tgt&&tgt!=='_self'){ev.preventDefault();ev.stopPropagation();topPost({type:'veyra:open',url:u,sessionId:SESSION_ID});return}
     // In the app-embedded root frame, same-frame links navigate the iframe
     // natively to their rewritten href; only nested proxied frames need the
     // document-navigation message (their parent is another proxied page).
