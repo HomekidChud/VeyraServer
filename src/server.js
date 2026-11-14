@@ -395,6 +395,25 @@ app.use(shield.middleware);
 // a current rotating invite token, or the admin token.
 let accessGate = null;
 app.use((req, res, next) => (accessGate ? accessGate.middleware()(req, res, next) : next()));
+// The "Bring session back" bookmarklet runs on arbitrary real sites
+// (github.com, chess.com, poxel.io, …) and posts that site's readable cookies
+// into the caller's own Veyra session. It is the whole return trip of the
+// direct-login handoff — and it cannot work when the global CORS allowlist
+// (FRONTEND_ORIGIN, e.g. the GitHub Pages origin) is the only policy, because
+// the browser blocks the bookmarklet's fetch from every other origin. This
+// endpoint is safe to answer cross-origin: the sid in the body is the only
+// credential and any holder of it can already import cookies with curl; the
+// response carries no session data. Registered before the global cors() so
+// its permissive policy wins for this one path.
+app.use("/api/handoff/cookies", (req, res, next) => {
+  res.set("Access-Control-Allow-Origin", req.get("origin") || "*");
+  res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "content-type");
+  res.set("Access-Control-Max-Age", "600");
+  res.vary("Origin");
+  if (req.method === "OPTIONS") return res.status(204).end();
+  next();
+});
 installBrandRoutes(app, { frontendUrl: () => CFG.frontendUrl, version: VEYRA_VERSION, isPreviewBot: ua => shield.isPreviewBot(ua), hasProxiedReferer: req => !!proxiedPageFromReferer(req, { allowCookie: false }) });
 const allowedOrigins = CFG.frontendOrigins.includes("*") ? true : CFG.frontendOrigins;
 app.use(cors({
