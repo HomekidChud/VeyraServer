@@ -1051,6 +1051,31 @@ function makeViewUrl(url, sid = "") {
   const q = `/api/view?url=${encodeURIComponent(url)}`;
   return sid ? `${q}&sid=${encodeURIComponent(sid)}` : q;
 }
+// A document navigation (top-level page or iframe), as opposed to an
+// API/script fetch of /api/view. Iframe loads of the proxied page always
+// accept text/html; direct script fetches do not.
+function documentNavigation(req) {
+  const dest = String(req.get("Sec-Fetch-Dest") || "").toLowerCase();
+  if (dest === "document" || dest === "iframe" || dest === "frame") return true;
+  if (dest) return false;
+  return /text\/html/i.test(String(req.get("Accept") || ""));
+}
+// The escaped (path-based) form is only safe for site paths that cannot be
+// confused with Veyra's own origin routes: not the root, not a reserved
+// asset/brand path, not /api/*, and not a bare static asset (those are
+// loaded as resources, not navigated to as documents).
+function escapedPathFor(target) {
+  try {
+    const u = new URL(target);
+    const p = u.pathname;
+    if (!p || p === "/" || p.length < 2) return null;
+    if (/^\/api\//i.test(p)) return null;
+    if (isReservedOriginPath(p)) return null;
+    if (/^\/(?:console|view_source|status|health)(?:\/|$)/i.test(p)) return null;
+    if (/\.(?:m?js|css|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|otf|mp4|webm|mp3|ogg|wasm|json|map|pdf|zip)(?:\/|$)/i.test(p)) return null;
+    return u;
+  } catch { return null; }
+}
 // ---------- Direct-login handoff (fast proxy, no Chromium) ----------
 // When a site's own security check blocks the fast proxy, the server can send
 // the user to the site's real login page in their own browser — where the
@@ -1477,6 +1502,13 @@ async function fetchBuffer(url, opts = {}) {
           contentLength,
           serverHeader: response.headers.get("server") || "",
           cfMitigated: response.headers.get("cf-mitigated") || "",
+          // Mirror the upstream's own nosniff decision: some CDNs (e.g.
+          // download.gameanalytics.com on S3) serve scripts as
+          // binary/octet-stream WITHOUT x-content-type-options, and browsers
+          // execute those scripts fine — until the proxy adds nosniff, which
+          // makes Chrome refuse them ("Refused to execute script ... MIME
+          // type ... not executable") and breaks game SDK bootstraps.
+          xContentTypeOptions: response.headers.get("x-content-type-options") || "",
           xFrameOptions: response.headers.get("x-frame-options") || "",
           contentSecurityPolicy: response.headers.get("content-security-policy") || "",
           bytes: body.bytes,
@@ -2192,6 +2224,74 @@ function rewriteJsText(text, base, sid = "") {
   });
   return out;
 }
+// Workers created through the proxy load their script from a proxy URL
+// (/api/resource or an escaped path), so every URL the worker resolves
+// itself — importScripts("lib/x.js"), emscripten's scriptDirectory +
+// "module.wasm", location.origin + path — anchors onto the proxy origin
+// instead of the real site and 404s (PolyTrack's physics WASM never loads
+// and the game stays on its loading screen). Prepend a tiny prelude that
+// re-anchors worker network calls onto the worker's virtual base URL.
+// It is prepended AFTER rewriteJsText so the JS rewriter cannot mangle the
+// prelude's own URL strings.
+function workerScopePrelude(base, sid = "") {
+  if (!/^https?:\/\//i.test(String(base || ""))) return "";
+  const workerSid = String(sid || "");
+  return `
+;/* Veyra worker scope: re-anchor worker-resolved URLs onto the real site */
+;(function(){
+  try{
+    var VB=${JSON.stringify(String(base))};
+    var VSID=${JSON.stringify(workerSid)};
+    var O=self.location.origin;
+    var RD="";try{RD=new URL("./",self.location.href).href}catch(e){}
+    var VD="";try{VD=new URL("./",VB).href}catch(e){}
+    var API_RE=/^\\/api\\/(?:view|resource|download|form-get|open|crawl|search|suggest|browser|debug|session|sessions|config|vpn|extensions|status|health)(?:[\\/?#]|$)/;
+    function P(abs){return O+"/api/resource?url="+encodeURIComponent(abs.href)+"&from="+encodeURIComponent(VB)+(VSID?"&sid="+encodeURIComponent(VSID):"")}
+    function fix(u){
+      try{
+        var s=String(u);
+        var abs=new URL(s,VB);
+        if(abs.origin===O){
+          if(API_RE.test(abs.pathname))return s;
+          if(RD&&s.indexOf(RD)===0&&VD){try{abs=new URL(VD+s.slice(RD.length))}catch(e){}}
+        }
+        if(/^https?:$/.test(abs.protocol)&&abs.origin!==O)return P(abs);
+      }catch(e){}
+      return u;
+    }
+    if(typeof importScripts==="function"){
+      var IS=importScripts;
+      self.importScripts=function(){
+        var a=[];for(var i=0;i<arguments.length;i++)a.push(fix(arguments[i]));
+        return IS.apply(null,a);
+      };
+    }
+    if(typeof fetch==="function"){
+      var NF=fetch.bind(self);
+      self.fetch=function(u,o){
+        try{
+          if(u&&typeof u==="object"&&typeof u.url==="string"){
+            var f=fix(u.url);
+            if(f!==u.url&&typeof Request!=="undefined")return NF(new Request(f,u),o);
+          }else{
+            var f2=fix(String(u));
+            if(f2!==String(u))return NF(f2,o);
+          }
+        }catch(e){}
+        return NF(u,o);
+      };
+    }
+    if(typeof XMLHttpRequest!=="undefined"&&XMLHttpRequest.prototype&&XMLHttpRequest.prototype.open){
+      var XO=XMLHttpRequest.prototype.open;
+      XMLHttpRequest.prototype.open=function(m,u){
+        try{arguments[1]=fix(String(u))}catch(e){}
+        return XO.apply(this,arguments);
+      };
+    }
+  }catch(e){}
+})();
+`;
+}
 function rewriteSrcset(raw, base, sid = "") {
   return String(raw || "").split(",").map(candidate => {
     const parts = candidate.trim().split(/\s+/);
@@ -2226,23 +2326,28 @@ function injectRuntime(html, original, sid = "") {
     return raw;
   }
   function ownOrigin(o){return o===location.origin||(!!API_ORIGIN&&o===API_ORIGIN)}
+  // Escaped-path URLs carry Veyra's routing params (__veyra_url/__veyra_sid)
+  // in the query. Site code copies its own query string when it builds
+  // links, so the params would spread into every navigation and the
+  // reported virtual URL. Strip them wherever a URL becomes virtual.
+  function cleanVeyraParams(u){try{if(u&&u.searchParams){u.searchParams.delete('__veyra_url');u.searchParams.delete('__veyra_sid')}}catch{}return u}
   const VEYRA_ROUTES=/^[/]api[/](view|resource|download|form-get|open|crawl|search|suggest|browser|debug|session|vpn|status|health)([/?#]|$)/;
   function fixOwn(u){try{if(!ownOrigin(u.origin))return u;
-    if(!/^[/]api[/]/.test(u.pathname))return new URL(u.pathname+u.search+u.hash,virtualUrl);
+    if(!/^[/]api[/]/.test(u.pathname))return cleanVeyraParams(new URL(u.pathname+u.search+u.hash,virtualUrl));
     // location.pathname is "/api/view" on a proxied page, so app code that builds
     // URLs from it yields "/api/view/<rest>"; map that onto the real page path.
     const vp=new URL(virtualUrl);
-    if(/^[/]api[/]view[/]/.test(u.pathname))return new URL(vp.pathname.replace(/[/]$/,'')+u.pathname.slice(9)+u.search+u.hash,vp);
+    if(/^[/]api[/]view[/]/.test(u.pathname))return cleanVeyraParams(new URL(vp.pathname.replace(/[/]$/,'')+u.pathname.slice(9)+u.search+u.hash,vp));
     // Other non-Veyra /api/... paths belong to the website, not Veyra. Keep
     // the leading slash so /api/... remains rooted on the website when the
     // current page is /watch/... or another nested route.
-    if(!VEYRA_ROUTES.test(u.pathname))return new URL(u.pathname.slice(4)+u.search+u.hash,virtualUrl);
+    if(!VEYRA_ROUTES.test(u.pathname))return cleanVeyraParams(new URL(u.pathname.slice(4)+u.search+u.hash,virtualUrl));
   }catch{}return u}
   // Read a Request's real URL via the native getter: some apps (YouTube) hand fetch()
   // a data: Request with a spoofed own 'url' getter to replay a cached response.
   const reqUrlGet=(()=>{try{return Object.getOwnPropertyDescriptor(Request.prototype,'url').get}catch{return null}})();
   function realUrl(v){if(v==null)return '';if(typeof v==='string')return v;try{if(reqUrlGet&&typeof Request!=='undefined'&&v instanceof Request)return reqUrlGet.call(v)}catch{}if(typeof v.url==='string')return v.url;if(typeof v.href==='string')return v.href;return String(v)}
-  function toVirtual(raw){if(/^[?#]/.test(raw))return new URL(raw,virtualUrl);const u=new URL(raw,location.href);return ownOrigin(u.origin)?fixOwn(u):u}
+  function toVirtual(raw){if(/^[?#]/.test(raw))return cleanVeyraParams(new URL(raw,virtualUrl));const u=new URL(raw,location.href);return cleanVeyraParams(ownOrigin(u.origin)?fixOwn(u):u)}
   function resolve(v){try{const raw=unwrap(realUrl(v));return (raw===''?new URL(virtualUrl):toVirtual(raw)).href}catch{return String(v||'')}}
   function shouldProxy(v){try{const u=new URL(unwrap(v));return /^https?:$/.test(u.protocol)}catch{return false}}
   function proxy(kind,u){const prefix=API_ORIGIN || location.origin;const base=prefix+(kind==='view'?'/api/view?url=':'/api/resource?url=')+encodeURIComponent(u);const from=encodeURIComponent(new URL(virtualUrl).href);return kind==='view'?base+'&sid='+encodeURIComponent(SESSION_ID):base+'&from='+from+'&sid='+encodeURIComponent(SESSION_ID)}
@@ -2268,14 +2373,20 @@ function injectRuntime(html, original, sid = "") {
   try{addEventListener('message',function(ev){try{if(ev.data&&ev.data.type==='veyra:embed-ack')appEmbedded=true}catch{}});topPost({type:'veyra:embed-ping',sessionId:SESSION_ID})}catch{}
   function remember(next){virtualUrl=next;window.__VEYRA_PAGE_URL__=next;if(rootProxiedFrame())try{document.cookie='veyra_ctx='+encodeURIComponent(next)+'|'+encodeURIComponent(SESSION_ID)+';path=/;max-age=3600;'+(location.protocol==='https:'?'SameSite=None;Secure;Partitioned':'SameSite=Lax')}catch{}}
   function proxyHistory(method,native){return function(state,title,url){
-    let next=virtualUrl;try{if(url!=null)next=fixOwn(new URL(unwrap(String(url)),virtualUrl)).href}catch{}
+    let next=virtualUrl;try{if(url!=null)next=cleanVeyraParams(fixOwn(new URL(unwrap(String(url)),virtualUrl))).href}catch{}
     remember(next);
     // When the page was served via escaped navigation (path-based URL, not
     // /api/view), keep the same path shape for the history entry so that
     // location.pathname keeps reporting the real site path. MSN Casual Games
     // extracts its game ID from location.pathname, so rewriting it back to
     // /api/view during hydration breaks the game data fetch.
-    let showUrl=null;try{const u=new URL(unwrap(String(url??''),virtualUrl));showUrl=/^[/]api[/]/.test(location.pathname)?proxy('view',next):(location.origin+u.pathname+u.search+u.hash)}catch{}
+    let showUrl=null;try{const u=new URL(unwrap(String(url??''),virtualUrl));
+      // Only the root frame shows a clean URL: nested frames keep the
+      // __veyra routing params in their visible URL so their Referer still
+      // carries the exact virtual base for relative subresource requests
+      // (the escaped-path fallback resolves those against the referer).
+      const shown=rootProxiedFrame()?cleanVeyraParams(u):u;
+      showUrl=/^[/]api[/]/.test(location.pathname)?proxy('view',next):(location.origin+shown.pathname+shown.search+shown.hash)}catch{}
     try{native.call(this||history,state,title,showUrl||proxy('view',next))}catch{}
     emit('history.'+method,next);return undefined;
   }}
@@ -2292,7 +2403,7 @@ function injectRuntime(html, original, sid = "") {
   // re-broke those apps before their boot code could read the path. Now we
   // keep the escaped path as the visible URL and only remember the virtual
   // URL, so pathname stays the real site path for the lifetime of the page.
-  function heal(){try{if(!/^[/]api[/]/.test(location.pathname)){const next=new URL(location.pathname+location.search+location.hash,virtualUrl).href;if(next!==virtualUrl){remember(next);emit('history.heal',next)}}}catch{}}
+  function heal(){try{if(!/^[/]api[/]/.test(location.pathname)){const next=cleanVeyraParams(new URL(location.pathname+location.search+location.hash,virtualUrl)).href;if(next!==virtualUrl){remember(next);emit('history.heal',next)}}}catch{}}
   try{setInterval(heal,300);addEventListener('popstate',()=>{try{const u=canonicalizeMaybeProxy(location.href);if(u&&u!==virtualUrl){remember(u);emit('history.popstate',u)}}catch{}})}catch{}
   try{
     const LP=Location&&Location.prototype;
@@ -2350,6 +2461,50 @@ function injectRuntime(html, original, sid = "") {
     ProxiedWebSocket.prototype=NativeWebSocket.prototype;ProxiedWebSocket.CONNECTING=0;ProxiedWebSocket.OPEN=1;ProxiedWebSocket.CLOSING=2;ProxiedWebSocket.CLOSED=3;
     try{Object.defineProperty(ProxiedWebSocket,'name',{value:'WebSocket'})}catch(e){}
     window.WebSocket=ProxiedWebSocket;}}catch{}
+  // Same-origin proxied frames still address each other with the site's real
+  // origins: MSN posts to its login widget with targetOrigin
+  // https://login.live.com, and the MSN Games SDK posts to its configured
+  // parentOrigin (https://www.msn.com). Every proxied frame shares the proxy
+  // origin, so the browser drops those messages with a console error and the
+  // handshake the app depends on never completes. When a proxied frame
+  // receives a message addressed to a different absolute origin, relay it
+  // with '*' — the sender already holds the same-origin window handle, so
+  // nothing is disclosed that it could not read directly.
+  try{(function(){
+    if(!window.__VEYRA_PROXY__||!Window.prototype||!Window.prototype.postMessage)return;
+    var nativePM=Window.prototype.postMessage;
+    Window.prototype.postMessage=function(message,targetOrigin,transfer){
+      try{
+        if(this===window&&arguments.length>=2&&typeof targetOrigin==='string'&&targetOrigin!=='*'&&targetOrigin!=='/'){
+          var u=null;try{u=new URL(targetOrigin,location.href)}catch{}
+          if(u&&/^https?:$/.test(u.protocol)&&u.origin!==location.origin){
+            return nativePM.call(this,message,'*',transfer)
+          }
+        }
+      }catch{}
+      return nativePM.apply(this,arguments)
+    }
+  })()}catch{}
+  // Web workers (physics/AI simulation bundles in games like PolyTrack) load
+  // relative script URLs that resolve against the escaped proxy path and 404.
+  // Route the worker script through the proxy like any other resource; the
+  // /api/resource URL is same-origin, so the Worker still constructs.
+  try{(function(){
+    if(typeof Worker!=='function')return;
+    var NativeWorker=Worker;
+    function VeyraWorker(url,opts){
+      try{
+        var target=resolve(url);
+        if(/^https?:$/.test(new URL(target,location.href).protocol)){
+          try{return new NativeWorker(proxy('resource',target),opts)}catch(e){}
+        }
+      }catch(e){}
+      return new NativeWorker(url,opts);
+    }
+    try{Object.defineProperty(VeyraWorker,'name',{value:'Worker'})}catch(e){}
+    VeyraWorker.prototype=NativeWorker.prototype;
+    window.Worker=VeyraWorker;
+  })()}catch{}
   // Runtime-created <script> and <iframe> elements (webpack/rspack lazy chunks,
   // JSONP, OAuth silent-auth frames) bypass the HTML rewriting, so cross-origin
   // URLs hit the origin directly. CDNs like assets.msn.com restrict CORS to the
@@ -2407,6 +2562,18 @@ function injectRuntime(html, original, sid = "") {
       var el=nativeCreate(tag,options);
       return fixElement(el,String(tag).toLowerCase());
     };
+    // THREE.js and other engines build resource elements with
+    // document.createElementNS('http://www.w3.org/1999/xhtml', 'img'),
+    // bypassing the createElement patch. Texture URLs then hit the proxy
+    // origin unrewritten and 404, crashing WebGL games (PolyTrack's
+    // smoke.png / clouds.jpg). Cover the namespace variant too.
+    try{
+      var nativeCreateNS=document.createElementNS.bind(document);
+      document.createElementNS=function(ns,tag,options){
+        var el=nativeCreateNS(ns,tag,options);
+        return fixElement(el,String(tag).toLowerCase());
+      };
+    }catch(e){}
     // new Image() does not go through document.createElement.
     try{
       var NativeImage=window.Image;
@@ -6040,7 +6207,11 @@ async function streamOversizeResponse(req, res, result, ctx) {
   const type = result.contentType || "application/octet-stream";
   res.setHeader("content-type", type);
   res.setHeader("cache-control", ctx.download ? "no-store" : "public, max-age=60");
-  res.setHeader("x-content-type-options", "nosniff");
+  // Mirror the upstream's nosniff decision instead of forcing it on (see
+  // fetchBuffer's xContentTypeOptions note); the shield middleware may
+  // have pre-set it, so remove it when the upstream did not send it.
+  if (result.xContentTypeOptions) res.setHeader("x-content-type-options", result.xContentTypeOptions);
+  else res.removeHeader("x-content-type-options");
   res.setHeader("referrer-policy", "no-referrer");
   if (ctx.download) res.setHeader("content-disposition", `attachment; filename="${safeDownloadFilename(result.finalUrl || ctx.canonical, type)}"`);
   if (result.contentRange) res.setHeader("content-range", result.contentRange);
@@ -6180,6 +6351,31 @@ async function proxyRequest(req, res, mode) {
       if (mode === "view") return res.status(200).type("html").send("<!doctype html><title></title>");
       return res.status(204).end();
     } }
+  // --- Escaped-path serving for top-level pages ---------------------------
+  // Location is [LegacyUnforgeable] in every browser, so no in-page shim can
+  // make location.pathname report the site's real path while the page lives
+  // at /api/view. Apps that parse their own URL (MSN Casual Games extracts
+  // the game ID from /<locale>/play/games/<slug>/cg-<id>) then hydrate
+  // without their content id and render a blank shell. Send top-level
+  // navigations to the escaped path form (origin + the site's real path +
+  // search): the escaped-path middleware resolves those back onto the real
+  // site, and the page's own code sees its true pathname natively. The
+  // target travels in __veyra_url/__veyra_sid params (stripped from the
+  // resolved target by resolveEscapedTarget), so the context survives even
+  // when third-party cookies are blocked.
+  if (mode === "view" && method === "GET" && !download && req.path === "/api/view" && escapedPathFor(canonical)) {
+    const liveSid = liveSessionId(sid);
+    if (liveSid && documentNavigation(req)) {
+      const u = new URL(canonical);
+      const sep = u.search ? "&" : "?";
+      const loc = requestOrigin(req) + u.pathname + u.search +
+        `${sep}__veyra_url=${encodeURIComponent(u.href)}&__veyra_sid=${encodeURIComponent(liveSid)}` + u.hash;
+      res.setHeader("location", loc);
+      res.setHeader("cache-control", "no-store");
+      res.setHeader("x-veyra-escaped-path", "1");
+      return res.status(302).end();
+    }
+  }
   const headers = forwardProxyBrowserHeaders(req, canonical, sourceUrl, mode, {
     accept,
     
@@ -6192,7 +6388,21 @@ async function proxyRequest(req, res, mode) {
     ...(req.get("Range") ? { range: String(req.get("Range")).slice(0, 200) } : {}),
     ...(referrer ? { referer: referrer } : {}),
     
-    ...(sourceOrigin && method !== "GET" && method !== "HEAD" ? { origin: sourceOrigin } : {})
+    // Origin for site API calls: on the real site, a cross-origin XHR/fetch
+    // always carries the page's Origin (PolyTrack's vps.kodub.com backend
+    // 403s the request without it, hanging the game on its loading screen).
+    // Through the proxy the call is same-origin, so the browser sends no
+    // Origin on GET — synthesize what the real site would have sent
+    // whenever the target lives on another origin, and rewrite any Origin
+    // the browser did attach (it names the proxy origin, not the site).
+    ...(sourceOrigin && (() => {
+      let targetOrigin = "";
+      try { targetOrigin = new URL(canonical).origin; } catch {}
+      const browserSentOrigin = !!String(req.get("Origin") || "").trim();
+      const xhrLike = String(req.get("Sec-Fetch-Dest") || "").toLowerCase() === "empty";
+      const crossOriginCall = !!targetOrigin && sourceOrigin !== targetOrigin;
+      return method !== "GET" && method !== "HEAD" || browserSentOrigin || (xhrLike && crossOriginCall);
+    })() ? { origin: sourceOrigin } : {})
   });
   const limitForContentType = (ct) => {
     const type = String(ct || "").toLowerCase();
@@ -6240,7 +6450,10 @@ async function proxyRequest(req, res, mode) {
     "content-type": result.contentType || (mode === "view" ? "text/html; charset=utf-8" : "application/octet-stream"),
     "cache-control": download ? "no-store" : mode === "view" ? "no-store" : staticResource ? "public, max-age=60, stale-while-revalidate=300" : "public, max-age=15",
     ...(download ? { "content-disposition": `attachment; filename="${safeDownloadFilename(result.finalUrl || canonical, result.contentType)}"` } : {}),
-    "x-content-type-options": "nosniff",
+    // Mirror the upstream's own nosniff decision instead of forcing it on:
+    // CDNs that serve scripts as binary/octet-stream without nosniff rely on
+    // the browser executing them anyway (see fetchBuffer's note).
+    ...(result.xContentTypeOptions ? { "x-content-type-options": result.xContentTypeOptions } : {}),
     "referrer-policy": mode === "view" ? "same-origin" : "no-referrer",
     ...(result.contentRange ? { "content-range": result.contentRange } : {}),
     ...(result.acceptRanges ? { "accept-ranges": result.acceptRanges } : {})
@@ -6278,7 +6491,15 @@ async function proxyRequest(req, res, mode) {
       payload = Buffer.from(await rewriteOffThread("rewriteHtml", payload.toString("utf8"), [pageUrl, sid], rewriteHtml), "utf8");
     }
     else if (!download && mode === "resource" && result.contentType.toLowerCase().includes("text/css")) payload = Buffer.from(await rewriteOffThread("rewriteCss", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteCssText), "utf8");
-    else if (!download && mode === "resource" && /javascript|ecmascript/.test(result.contentType.toLowerCase()) && !shouldSkipYoutubeStaticJsRewrite(result.finalUrl || canonical, result.contentType)) payload = Buffer.from(await rewriteOffThread("rewriteJs", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteJsText), "utf8");
+    else if (!download && mode === "resource" && /javascript|ecmascript/.test(result.contentType.toLowerCase()) && !shouldSkipYoutubeStaticJsRewrite(result.finalUrl || canonical, result.contentType)) {
+      payload = Buffer.from(await rewriteOffThread("rewriteJs", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteJsText), "utf8");
+      // Worker scripts (physics/AI simulation bundles) resolve their own
+      // subresources (importScripts, WASM) against the proxy URL, which 404s
+      // on the proxy origin. Prepend the worker-scope prelude so worker-side
+      // fetch/XHR/importScripts re-anchor onto the real site.
+      const workerDest = /^(?:worker|sharedworker)$/.test(String(req.get("Sec-Fetch-Dest") || "").toLowerCase());
+      if (workerDest) payload = Buffer.from(workerScopePrelude(result.finalUrl || canonical, sid) + payload.toString("utf8"), "utf8");
+    }
     else if (!download && mode === "resource" && /mpegurl|dash\+xml/i.test(result.contentType.toLowerCase())) payload = Buffer.from(rewriteMediaManifest(payload.toString("utf8"), result.finalUrl || canonical, sid), "utf8");
   } catch (rewriteErr) {
     
@@ -6297,6 +6518,11 @@ async function proxyRequest(req, res, mode) {
     }
   }
   for (const [k,v] of Object.entries(upstreamHeaders)) if (v) res.setHeader(k, v);
+  // The global shield middleware pre-set nosniff on every response. Proxied
+  // resources must mirror the UPSTREAM's decision instead: CDNs serving
+  // scripts as binary/octet-stream without nosniff rely on the browser
+  // executing them anyway, and forcing nosniff makes Chrome refuse them.
+  if (!result.xContentTypeOptions) res.removeHeader("x-content-type-options");
   const exposedCanonical = mode === "view" ? virtualPageUrl(canonical, result.finalUrl || canonical) : (result.finalUrl || canonical);
   res.setHeader("X-Veyra-Canonical-URL", exposedCanonical);
   res.setHeader("X-Veyra-Session-ID", sid);
@@ -7237,9 +7463,18 @@ function liveSessionId(value) {
 }
 function escapedPageContext(req) {
   const sids = [];
+  // Escaped-path redirects bake the exact target and session into
+  // __veyra_url/__veyra_sid (never colliding with the site's own params,
+  // which MSN Casual Games also uses: url= and sid=). The request's own
+  // params are exact and win over every other source: the referer only
+  // carries the site's own url param once the runtime has stripped Veyra's
+  // params from the visible URL, and that param names a DIFFERENT page
+  // (e.g. the MSN play landing page, not the game frame's CDN host).
+  const qVeyraSid = liveSessionId(req.query?.__veyra_sid);
+  if (qVeyraSid) sids.push(qVeyraSid);
+  let pageUrl = normalizeUrl(String(req.query?.__veyra_url || "")) || "";
   const qSid = liveSessionId(req.query?.sid);
   if (qSid) sids.push(qSid);
-  let pageUrl = "";
   const raw = String(req.get("Referer") || "");
   if (raw) {
     try {
@@ -7247,9 +7482,12 @@ function escapedPageContext(req) {
       if (r.origin === requestOrigin(req)) {
         const rSid = liveSessionId(r.searchParams.get("sid"));
         if (rSid) sids.push(rSid);
+        const rVeyraSid = liveSessionId(r.searchParams.get("__veyra_sid"));
+        if (rVeyraSid) sids.push(rVeyraSid);
         // A path-based referer renders the page in its own ?url= param (the
-        // runtime keeps it there), so it is the best resolution base.
-        pageUrl = normalizeUrl(r.searchParams.get("url") || "") || "";
+        // runtime keeps it there), so it is the best resolution base when
+        // the request itself carries no exact target.
+        if (!pageUrl) pageUrl = normalizeUrl(r.searchParams.get("__veyra_url") || "") || (normalizeUrl(r.searchParams.get("url") || "") || "");
       }
     } catch {}
   }
@@ -7261,7 +7499,7 @@ function escapedPageContext(req) {
       pageUrl = cookieCtx.pageUrl;
     }
   }
-  // Last resort: the request's own ?url= param is the page the site's link
+  // Last resort: the site's own ?url= param is the page the site's link
   // came from (the runtime bakes the previous page into escaped URLs).
   if (!pageUrl) pageUrl = normalizeUrl(String(req.query?.url || "")) || "";
   if (!pageUrl) return null;
@@ -7302,13 +7540,26 @@ app.use(async (req, res, next) => {
   const dest = String(req.get("Sec-Fetch-Dest") || "").toLowerCase();
   const topLevel = dest === "document" || (!dest && /text\/html/i.test(String(req.get("Accept") || "")) && !req.get("Referer"));
   const reserved = isReservedOriginPath(req.path);
-  let ctx = proxiedPageFromReferer(req, { allowCookie: !topLevel && !reserved && !shield.isPreviewBot(req.get("User-Agent")) });
+  // Escaped-path redirects bake the exact target into __veyra_url with a
+  // live __veyra_sid. That pair is authoritative — it must win over the
+  // veyra_ctx cookie (which names the PARENT page, e.g. the MSN play page
+  // while the request is for the game frame's CDN host) and over the
+  // referer's site-owned url param. Without this, iframe navigations
+  // resolved against the parent page and 404'd on the origin.
+  let ctx = null;
+  {
+    const exactSid = liveSessionId(req.query?.__veyra_sid);
+    const exactUrl = exactSid ? normalizeUrl(String(req.query?.__veyra_url || "")) : "";
+    if (exactUrl) ctx = { pageUrl: exactUrl, sid: exactSid };
+  }
+  if (!ctx) ctx = proxiedPageFromReferer(req, { allowCookie: !topLevel && !reserved && !shield.isPreviewBot(req.get("User-Agent")) });
   // Escaped (path-based) navigations: the referer is itself a path URL once
   // the runtime keeps the escaped path shape, so recover the session and
   // resolution base from the sid/url params the page carries and the
   // veyra_ctx cookie instead of falling through to a 404.
   if (!ctx) ctx = reserved ? null : escapedPageContext(req);
   if (!ctx) return next();
+  if (process.env.VEYRA_DEBUG_ESCAPED) console.log("[escaped-debug]", JSON.stringify({ path: req.path, query: Object.fromEntries(Object.entries(req.query || {}).map(([k, v]) => [k, String(v).slice(0, 90)])), referer: String(req.get("Referer") || "").slice(0, 140), cookie: String(req.get("Cookie") || "").slice(0, 90), ctx }));
   let target = null;
   if (escaped !== req.originalUrl && /[.](m?js|css|wasm|json|map)([?#]|$)/i.test(req.path)) target = await resolveEscapedChunk(ctx.sid, escaped);
   if (!target) target = resolveEscapedTarget(escaped, ctx.pageUrl);
