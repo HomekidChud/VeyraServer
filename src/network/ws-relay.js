@@ -141,9 +141,21 @@ class WsRelay {
    */
   attach(server) {
     if (!WebSocketServer || !server) return null;
-    this.wss = new WebSocketServer({ server, path: RELAY_PATH });
+    // noServer + manual path dispatch: multiple WebSocketServers on one HTTP
+    // server each abort (400) every upgrade whose path doesn't match their
+    // own (ws >= 8 aborts in shouldHandle), so a path-scoped server attached
+    // earlier (e.g. /ws/cast) broke every /ws/relay handshake. Handle only
+    // our own path and ignore the rest.
+    this.wss = new WebSocketServer({ noServer: true });
     this.wss.on("connection", (ws, req) => { this.onConnection(ws, req).catch(e => this.log("warn", "WS-RELAY", `Handler error: ${e.message}`)); });
     this.wss.on("error", err => this.log("warn", "WS-RELAY", `Server error: ${err.message}`));
+    server.on("upgrade", (req, socket, head) => {
+      try {
+        const pathname = req.url.split("?")[0];
+        if (pathname !== RELAY_PATH) return;
+        this.wss.handleUpgrade(req, socket, head, ws => this.wss.emit("connection", ws, req));
+      } catch { try { socket.destroy(); } catch {} }
+    });
     return this.wss;
   }
 
