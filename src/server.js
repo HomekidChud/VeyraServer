@@ -2163,8 +2163,12 @@ function challengeFallbackHtml(url, info, sid = "", apiOrigin = "") {
   // return-trip parameter instead send the user back automatically.
   const bkApi = String(apiOrigin || "").replace(/'/g, "");
   const bkSid = String(sid || "").replace(/[^A-Za-z0-9_-]/g, "");
+  // Hybrid delivery: strict-CSP sites (github.com, …) block the cross-origin
+  // fetch from the page entirely (connect-src), so on failure the bookmarklet
+  // finishes by NAVIGATING to the API — top-level navigations are not subject
+  // to connect-src. The GET endpoint answers with a self-closing page.
   const handoffBookmarklet = handoffable && bkApi && bkSid
-    ? `<a class="secondary" draggable="true" id="veyraBk" href="javascript:(function(){fetch('${escapeHtml(bkApi)}/api/handoff/cookies',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({sid:'${escapeHtml(bkSid)}',url:location.href,cookies:document.cookie||'',userAgent:navigator.userAgent})}).then(function(r){return r.json()}).then(function(j){if(j&&j.ok){alert('Veyra imported '+(j.imported||0)+' cookie(s) from '+location.hostname+'. The Veyra tab picks them up automatically — this tab will close itself.');setTimeout(function(){try{window.close()}catch(e){}},600)}else{alert('Veyra could not import cookies ('+((j&&(j.error||j.message))||('HTTP '+r.status))+'). Sign in on this site first, then click again.')}}).catch(function(e){alert('Veyra import failed: '+e)})})()" onclick="return false" title="Drag me to your bookmarks bar">“Bring session back” — drag to bookmarks</a>`
+    ? `<a class="secondary" draggable="true" id="veyraBk" href="javascript:(function(){var api='${escapeHtml(bkApi)}',sid='${escapeHtml(bkSid)}';var d={sid:sid,url:location.href,cookies:document.cookie||'',userAgent:navigator.userAgent};var q='?sid='+encodeURIComponent(sid)+'&url='+encodeURIComponent(d.url)+'&cookies='+encodeURIComponent(d.cookies)+'&ua='+encodeURIComponent(d.userAgent);fetch(api+'/api/handoff/cookies',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(d)}).then(function(r){return r.json()}).then(function(j){if(j&&j.ok){alert('Veyra imported '+(j.imported||0)+' cookie(s) from '+location.hostname+'. The Veyra tab picks them up automatically — this tab will close itself.');setTimeout(function(){try{window.close()}catch(e){}},600)}else{alert('Veyra could not import cookies ('+((j&&(j.error||j.message))||'unknown')+'). Sign in on this site first, then click again.')}}).catch(function(e){window.open(api+'/api/handoff/cookies'+q,'_blank')})})()" onclick="return false" title="Drag me to your bookmarks bar">“Bring session back” — drag to bookmarks</a>`
     : "";
   const handoffForm = handoffable
     ? `<details style="margin-top:18px"><summary style="cursor:pointer;color:#86a9d5;font-size:13px">Already done on the real site? Bring your session into Veyra</summary><p style="font-size:13px;color:#aab5c4">The handoff works for anything a site asks of you — signing in, verifying, consenting, confirming your age — not just logins. Open the site directly, finish what it needs as yourself, then bring the session back. Easiest: drag the “Bring session back” button above to your bookmarks bar and click it on the site. For cookies the bookmarklet cannot read (HttpOnly), copy the site's cookies (your browser's devtools &rarr; Application &rarr; Cookies) and paste them below. Veyra stores them in this session only and never shares them. Only import cookies from your own accounts.</p><textarea id="veyraCookies" rows="3" placeholder="name=value; other=value" style="width:100%;box-sizing:border-box;margin:8px 0;background:#10151d;color:#eaf0f6;border:1px solid #303a48;border-radius:9px;padding:8px;font:12px/1.4 ui-monospace,monospace;resize:vertical"></textarea><button id="veyraImportBtn" style="padding:8px 16px;border-radius:9px;border:1px solid #3a4657;background:#1f2835;color:#dce5ef;cursor:pointer;font-size:13px">Import session</button> <span id="veyraImportMsg" style="font-size:12px;color:#86a9d5"></span></details><script>(function(){var b=document.getElementById("veyraImportBtn");if(!b)return;b.onclick=function(){var t=document.getElementById("veyraCookies");var m=document.getElementById("veyraImportMsg");if(!t||!t.value.trim()){if(m)m.textContent="Paste the site's cookies first.";return}b.disabled=true;if(m)m.textContent="Importing…";fetch("/api/handoff/cookies",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({sid:${JSON.stringify(String(sid))},url:${JSON.stringify(String(url)).replace(/</g, "\\u003c")},cookies:t.value,userAgent:navigator.userAgent})}).then(function(r){return r.json().then(function(j){if(!r.ok||j.ok===false)throw new Error(j.message||("HTTP "+r.status));if(m)m.textContent="Imported "+(j.imported||"the")+" cookie(s).";if(parent===window){setTimeout(function(){location.reload()},700)}else if(m){m.textContent="Imported "+(j.imported||"the")+" cookie(s). Veyra picks them up automatically — this page will reload by itself."}}).catch(function(e){if(m)m.textContent="Import failed: "+e.message;b.disabled=false})}).catch(function(e){if(m)m.textContent="Import failed: "+e.message;b.disabled=false})};})();</script>`
@@ -4956,16 +4960,16 @@ app.get("/api/handoff/return", (req, res) => {
 // Bring the user's own session cookies into the fast-proxy session jar. The
 // user pastes cookies they copied from their own browser after signing in
 // directly; Veyra replays them (and the matching user-agent) for that host.
-app.post("/api/handoff/cookies", (req, res) => {
-  const sid = normalizeSessionId(String(req.body?.sid || ""));
+function importHandoffCookies({ sid: rawSid, url: rawUrl, cookies: rawCookies, ua: rawUa, userAgent: rawUserAgent }) {
+  const sid = normalizeSessionId(String(rawSid || ""));
   const rec = sessionManager.peek(sid);
-  if (!rec) return respondError(res, 404, "No such session. Start a Veyra session first.", "SESSION_NOT_FOUND");
-  const target = normalizeUrl(String(req.body?.url || ""));
-  if (!target) return respondError(res, 400, "A valid http(s) url is required.", "BAD_REQUEST");
+  if (!rec) { const e = new Error("No such session. Start a Veyra session first."); e.status = 404; throw e; }
+  const target = normalizeUrl(String(rawUrl || ""));
+  if (!target) { const e = new Error("A valid http(s) url is required."); e.status = 400; throw e; }
   let host = "", secure = false;
-  try { const u = new URL(target); host = u.hostname.toLowerCase(); secure = u.protocol === "https:"; } catch { return respondError(res, 400, "A valid http(s) url is required.", "BAD_REQUEST"); }
-  const raw = String(req.body?.cookies || "").slice(0, 20000);
-  const ua = String(req.body?.userAgent || "").slice(0, 500);
+  try { const u = new URL(target); host = u.hostname.toLowerCase(); secure = u.protocol === "https:"; } catch { const e = new Error("A valid http(s) url is required."); e.status = 400; throw e; }
+  const raw = String(rawCookies || "").slice(0, 20000);
+  const ua = String(rawUa || rawUserAgent || "").slice(0, 500);
   // Accept a raw cookie header ("a=1; b=2") or a JSON array of cookies.
   let arr = null;
   const trimmed = raw.trim();
@@ -4981,10 +4985,32 @@ app.post("/api/handoff/cookies", (req, res) => {
       return { name, value: part.slice(i + 1).trim(), domain: host, path: "/", secure, expires: 0 };
     }).filter(Boolean);
   }
-  if (!arr.length) return respondError(res, 400, "No valid cookies found. Paste a cookie header like \"name=value; other=value\".", "BAD_REQUEST");
+  if (!arr.length) { const e = new Error("No valid cookies found. Paste a cookie header like \"name=value; other=value\"."); e.status = 400; throw e; }
   sessionManager.importPlaywrightCookies(sid, arr, ua);
   serverLog("info", "HANDOFF", `Imported ${arr.length} cookie(s) for ${host} into session ${sid.slice(0, 8)} via direct-login handoff.`);
-  res.json({ ok: true, imported: arr.length });
+  return { imported: arr.length, host };
+}
+app.post("/api/handoff/cookies", (req, res) => {
+  try {
+    const r = importHandoffCookies(req.body || {});
+    res.json({ ok: true, imported: r.imported });
+  } catch (e) {
+    respondError(res, e.status || 400, e.message, e.code || "HANDOFF_IMPORT_FAILED");
+  }
+});
+// The bookmarklet's CSP fallback: strict-CSP sites (github.com, …) block
+// cross-origin fetch from the page entirely (connect-src), so the bookmarklet
+// finishes the import by NAVIGATING here — top-level navigations are not
+// subject to connect-src. Same import logic, answered with a small
+// self-closing page instead of JSON.
+app.get("/api/handoff/cookies", (req, res) => {
+  const page = (ok, heading, detail) => `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Veyra session import</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#10151d;color:#eaf0f6;font:15px/1.5 system-ui,sans-serif}.card{max-width:520px;margin:24px;padding:32px;background:#171e28;border:1px solid #303a48;border-radius:18px;box-shadow:0 20px 60px #0008}.ey{font-size:11px;letter-spacing:.15em;text-transform:uppercase;color:#86a9d5}.card h1{font-size:22px;margin:10px 0}.card p{color:#aab5c4}a{color:#4b82c9}</style></head><body><main class="card"><div class="ey">Veyra Browser</div><h1>${escapeHtml(heading)}</h1><p>${escapeHtml(detail)}</p><p><a href="#" onclick="try{window.close()}catch(e){};return false">Close this tab</a> — the Veyra tab picks your session up automatically.</p><script>try{setTimeout(function(){try{window.close()}catch(e){}},900)}catch(e){}</${"script"}></main></body></html>`;
+  try {
+    const r = importHandoffCookies({ sid: req.query.sid, url: req.query.url, cookies: req.query.cookies, ua: req.query.ua });
+    res.type("html").send(page(true, "Session imported", `Veyra imported ${r.imported} cookie(s) from ${r.host}. Finish in the Veyra tab — it reloads signed in by itself.`));
+  } catch (e) {
+    res.status(e.status || 400).type("html").send(page(false, "Could not import session", e.message || "Something went wrong."));
+  }
 });
 app.get('/api/session/:sid', (req, res) => {
   const sid = String(req.params.sid);

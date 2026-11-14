@@ -106,6 +106,29 @@ const path = require("node:path");
     });
     assert.equal(r.status, 400, "cookie payloads without pairs must be rejected");
 
+    // 3b: GET mode — the bookmarklet's CSP fallback. Strict-CSP sites
+    // (github.com, …) block the cross-origin fetch from the page entirely
+    // (connect-src), so the bookmarklet finishes by NAVIGATING here;
+    // top-level navigations are not subject to connect-src. Answered with a
+    // self-closing page, same import logic as the POST.
+    const sid2 = "handofftestsession0000000000000002";
+    sessionManager.touch(sid2);
+    r = await fetch(`${base}/api/handoff/cookies?${new URLSearchParams({ sid: sid2, url: "https://github.com/", cookies: "logged_in=yes; dotcom_user=octo", ua: "Mozilla/5.0 (TestBrowser) Chrome/131.0.0.0" })}`);
+    const html = await r.text();
+    assert.equal(r.status, 200, "GET cookie import must succeed");
+    assert.match((r.headers.get("content-type") || ""), /html/, "GET mode must answer with HTML, not JSON");
+    assert.match(html, /Session imported/, "the GET page must confirm the import");
+    assert.match(html, /imported 2 cookie\(s\)/, "the GET page must count the imported cookies");
+    assert.match(html, /github\.com/, "the GET page must name the source host");
+    assert.match(html, /window\.close/, "the GET page must close itself");
+    const rec2 = sessionManager.peek(sid2);
+    assert.equal(rec2.cookies.get("github.com|/|logged_in").value, "yes", "GET cookies must land in the session jar");
+    assert.equal(sessionManager.chromiumUaFor(sid2, "https://github.com/home"), "Mozilla/5.0 (TestBrowser) Chrome/131.0.0.0", "GET mode must pin the user-agent too");
+
+    r = await fetch(`${base}/api/handoff/cookies?${new URLSearchParams({ sid: "doesnotexist1234567890abcdef", url: "https://github.com/", cookies: "a=b" })}`);
+    assert.equal(r.status, 404, "GET mode must reject unknown sessions");
+    assert.match(await r.text(), /No such session/, "GET errors must be human-readable HTML");
+
     // 4: the challenge interstitial offers the handoff (source-level wiring).
     const src = fs.readFileSync(path.join(__dirname, "..", "src", "server.js"), "utf8");
     assert.match(src, /Open this page directly & come back/, "the interstitial must link the generic handoff");
@@ -114,6 +137,11 @@ const path = require("node:path");
     assert.match(src, /Bring your session into Veyra/, "the interstitial must offer the session import");
     assert.match(src, /Bring session back/, "the interstitial must offer the bookmarklet return for every site");
     assert.match(src, /veyra_handoff/, "the app return parameter must be wired");
+    // CSP fallback wiring: the bookmarklet must fall back to a GET navigation
+    // when the page's own CSP blocks the fetch, and the server must answer it.
+    assert.match(src, /window\.open\(api\+'\/api\/handoff\/cookies'\+q,'_blank'\)/, "the interstitial bookmarklet must fall back to a GET navigation on fetch failure");
+    assert.match(src, /catch\(function\(e\)\{window\.open\(api\+'/, "the fallback must be wired into the bookmarklet's catch");
+    assert.match(src, /The bookmarklet's CSP fallback/, "the GET endpoint must be documented as the CSP fallback");
   } finally {
     await new Promise(resolve => server.close(resolve));
   }
