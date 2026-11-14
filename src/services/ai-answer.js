@@ -219,6 +219,28 @@ function similarity(a, b) {
   if (!aa.size || !bb.size) return 0;
   return [...aa].filter(x => bb.has(x)).length / Math.max(aa.size, bb.size);
 }
+function tokenBigrams(value) {
+  const text = String(value || "");
+  const grams = new Set();
+  for (let i = 0; i + 1 < text.length; i++) grams.add(text.slice(i, i + 2));
+  return grams;
+}
+function tokenMatches(a, b) {
+  if (a === b) return true;
+  // Numbers, dates and versions must match exactly — never fuzzy-match them.
+  if (/^[\d.,:%$/-]+$/.test(a) || /^[\d.,:%$/-]+$/.test(b)) return false;
+  if (a.length >= 5 && (a.startsWith(b) || b.startsWith(a))) return true;
+  const left = tokenBigrams(a), right = tokenBigrams(b);
+  if (!left.size || !right.size) return false;
+  let shared = 0;
+  for (const gram of left) if (right.has(gram)) shared += 1;
+  return (2 * shared) / (left.size + right.size) >= 0.78;
+}
+function tokenSetHas(set, token) {
+  if (set.has(token)) return true;
+  for (const candidate of set) if (tokenMatches(candidate, token)) return true;
+  return false;
+}
 function claimSupported(claimTokens, source) {
   if (!claimTokens?.length || !source) return false;
   const candidates = [...new Set([...(source.verificationSentences || []), ...(source.matched || [])])];
@@ -226,7 +248,7 @@ function claimSupported(claimTokens, source) {
   const minRatio = claimTokens.length < 5 ? 0.5 : claimTokens.length < 12 ? 0.35 : 0.28;
   return candidates.some(sentence => {
     const sourceTokens = new Set(groundingTerms(sentence));
-    const overlap = claimTokens.filter(token => sourceTokens.has(token)).length;
+    const overlap = claimTokens.filter(token => tokenSetHas(sourceTokens, token)).length;
     return overlap >= minAnchors && overlap / claimTokens.length >= minRatio;
   });
 }
@@ -239,8 +261,8 @@ function claimSupportedAcrossSources(claimTokens, sources) {
   const minRatio = claimTokens.length < 5 ? 0.5 : claimTokens.length < 12 ? 0.45 : 0.4;
   const minContribution = claimTokens.length < 8 ? 1 : 2;
   const combined = new Set(sourceTokens.flatMap(tokens => [...tokens]));
-  const contributingSources = sourceTokens.filter(tokens => claimTokens.filter(token => tokens.has(token)).length >= minContribution).length;
-  const overlap = claimTokens.filter(token => combined.has(token)).length;
+  const contributingSources = sourceTokens.filter(tokens => claimTokens.filter(token => tokenSetHas(tokens, token)).length >= minContribution).length;
+  const overlap = claimTokens.filter(token => tokenSetHas(combined, token)).length;
   return contributingSources >= 2 && overlap >= minAnchors && overlap / claimTokens.length >= minRatio;
 }
 const ANSWER_QUALITY_FEATURES = Object.freeze(["bias", "grounding", "citationCoverage", "sourceDiversity", "lengthCoverage", "originalWording", "formatConsistency"]);
@@ -309,9 +331,10 @@ class AnswerQualityModel {
 
 class AIAnswerEngine {
   constructor(opts = {}) {
-    this.maxPagesToRead = opts.maxPagesToRead || Number(process.env.AI_ANSWER_MAX_PAGES || 12);
+    this.maxPagesToRead = opts.maxPagesToRead || Number(process.env.AI_ANSWER_MAX_PAGES || 24);
     this.maxContentBytes = opts.maxContentBytes || Number(process.env.AI_ANSWER_MAX_CONTENT_BYTES || 90000);
     this.timeoutMs = opts.timeoutMs || Number(process.env.AI_ANSWER_TIMEOUT_MS || 10000);
+    this.fetchConcurrency = Math.max(2, Math.min(12, Number(process.env.AI_ANSWER_FETCH_CONCURRENCY) || 8));
     this.userAgent = opts.userAgent || "VeyraAIBot/2.0 (+https://veyra.app/bot)";
     this.providerSettings = providerConfig(process.env, opts.model || "");
     this.model = opts.model || this.providerSettings.model;
@@ -334,7 +357,11 @@ class AIAnswerEngine {
     const llm = await this.synthesizeWithLLM(q, intent, evidence, synthesisDiagnostics).catch(() => { synthesisDiagnostics.failureCode = "provider_error"; return null; });
     const draft = llm || local;
     const draftVerification = this.verifyAnswer(draft.answer, evidence);
-    const llmVerified = !!llm && draftVerification.unsupported === 0;
+    // Accept an LLM answer whose claims are overwhelmingly supported: a single
+    // partially-verified sentence no longer discards an otherwise grounded
+    // answer (it is flagged in caveats instead). Answers whose claims are
+    // mostly unsupported are still rejected outright.
+    const llmVerified = !!llm && (draftVerification.unsupported === 0 || (draftVerification.supported >= 2 && draftVerification.unsupported <= Math.max(1, Math.floor(draftVerification.supported / 3))));
     if (!llmVerified && !this.allowExtractiveFallback) {
       const configured = providerConfig(process.env, this.model).configured;
       const diagnosticCode = llm ? "grounding_rejected" : synthesisDiagnostics.failureCode || "provider_error";
@@ -379,11 +406,25 @@ class AIAnswerEngine {
     return { type: "explore", subject: q };
   }
   extractSubject(q) { return String(q).replace(/^what\s+(is|are|was|were)\s+/i, "").replace(/^what\s+does\s+/i, "").replace(/\s+mean\??$/i, "").replace(/^what's\s+/i, "").replace(/^define\s+/i, "").replace(/^meaning\s+of\s+/i, "").replace(/\s+(meaning|definition)\??$/i, "").trim() || q; }
-  async fetchContents(results, signal) { return (await Promise.all(results.map(async r => { try {
-    const indexed = String(r.contentText || "");
-    const content = indexed.length >= 80 ? { ...this.parseContent(indexed, r.canonicalUrl || r.url), extractionStatus: "local-index", extractionQuality: 0.7 } : await this.fetchPageContent(r.url, { signal });
-    return content?.text?.length >= 80 ? { ...content, url: r.url, canonicalUrl: r.canonicalUrl || content.canonicalUrl || r.url, title: r.title || content.title, snippet: r.snippet, rank: r.rank, sourceIdentity: r.sourceIdentity || host(r.url), provider: r.provider || r.source?.provider || r.source, retrievedAt: r.retrievedAt || new Date().toISOString(), extractionStatus: content.extractionStatus || "extracted" } : null;
-  } catch { return null; } }))).filter(Boolean); }
+  async fetchContents(results, signal) {
+    // Read many candidate pages with bounded concurrency so the answer is built
+    // from broad evidence, not just the first handful of search hits.
+    const out = [];
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(this.fetchConcurrency, Math.max(1, results.length)) }, async () => {
+      while (cursor < results.length) {
+        const r = results[cursor++];
+        try {
+          const indexed = String(r.contentText || "");
+          const content = indexed.length >= 80 ? { ...this.parseContent(indexed, r.canonicalUrl || r.url), extractionStatus: "local-index", extractionQuality: 0.7 } : await this.fetchPageContent(r.url, { signal });
+          if (content?.text?.length >= 80) out.push({ ...content, url: r.url, canonicalUrl: r.canonicalUrl || content.canonicalUrl || r.url, title: r.title || content.title, snippet: r.snippet, rank: r.rank, sourceIdentity: r.sourceIdentity || host(r.url), provider: r.provider || r.source?.provider || r.source, retrievedAt: r.retrievedAt || new Date().toISOString(), extractionStatus: content.extractionStatus || "extracted" });
+        } catch {}
+      }
+    });
+    await Promise.all(workers);
+    out.sort((a, b) => (a.rank || 999) - (b.rank || 999));
+    return out;
+  }
   fetchPageContent(url, { signal } = {}) {
     if (this.acquisitionManager) {
       return this.acquisitionManager.fetch(url, { engine: "answer", maxBytes: this.maxContentBytes, timeoutMs: this.timeoutMs, signal })
@@ -397,7 +438,7 @@ class AIAnswerEngine {
     const out = [], contentSeen = [];
     for (const c of candidates) {
       const sourceSentences = [...(c.sentences || sentences(c.text || "")), ...(c.snippet ? [c.snippet] : [])].map(evidenceText).filter(Boolean);
-      const matched = sourceSentences.map(text => { const low = text.toLowerCase(), subjectHits = sTerms.filter(t => low.includes(t)).length, queryHits = qTerms.filter(t => low.includes(t)).length; let score = subjectHits / Math.max(1, sTerms.length) * 0.62 + queryHits / Math.max(1, qTerms.length) * 0.25; if (intent.type === "definition" && /\b(is|are|means|refers to|defined as)\b/i.test(text)) score += 0.22; if (intent.type === "howto" && /\b(step|first|then|next|finally|install|configure|use)\b/i.test(text)) score += 0.18; if (text.length >= 60 && text.length <= 420) score += 0.08; return { text, score }; }).filter(x => x.score > 0.05).sort((a, b) => b.score - a.score).slice(0, 5);
+      const matched = sourceSentences.map(text => { const sentenceTokens = new Set(groundingTerms(text)), subjectHits = sTerms.filter(t => tokenSetHas(sentenceTokens, t)).length, queryHits = qTerms.filter(t => tokenSetHas(sentenceTokens, t)).length; let score = subjectHits / Math.max(1, sTerms.length) * 0.62 + queryHits / Math.max(1, qTerms.length) * 0.25; if (intent.type === "definition" && /\b(is|are|means|refers to|defined as)\b/i.test(text)) score += 0.22; if (intent.type === "howto" && /\b(step|first|then|next|finally|install|configure|use)\b/i.test(text)) score += 0.18; if (text.length >= 60 && text.length <= 420) score += 0.08; return { text, score }; }).filter(x => x.score > 0.05).sort((a, b) => b.score - a.score).slice(0, 5);
       if (!matched.length) continue;
       const body = String(c.text || "");
       const contentHash = hash((body || matched.map(x => x.text).join(" ")).toLowerCase());

@@ -79,6 +79,68 @@ function parseYahooHtml(html) {
   });
   return out;
 }
+function rankTokens(text) {
+  return String(text || "").toLowerCase().replace(/[^a-z0-9\s-]+/g, " ").split(/\s+/).filter(Boolean).map(word => {
+    if (word.length > 4 && word.endsWith("ies")) return `${word.slice(0, -3)}y`;
+    if (word.length > 3 && word.endsWith("s") && !/(?:ss|us|is|ous|ics)$/.test(word)) return word.slice(0, -1);
+    return word;
+  });
+}
+function charBigrams(value) {
+  const text = String(value || "");
+  const grams = new Set();
+  for (let i = 0; i + 1 < text.length; i++) grams.add(text.slice(i, i + 2));
+  return grams;
+}
+function diceSimilarity(a, b) {
+  const left = charBigrams(a), right = charBigrams(b);
+  if (!left.size || !right.size) return 0;
+  let shared = 0;
+  for (const gram of left) if (right.has(gram)) shared += 1;
+  return (2 * shared) / (left.size + right.size);
+}
+const RANK_STOP = new Set("a an and are as at be but by for from how in is it of on or the to was were what when where which who why with does do did can could should would com www http https".split(" "));
+function scoreResultRelevance(query, row) {
+  const queryTokens = [...new Set(rankTokens(query))].filter(token => token.length > 1 && !RANK_STOP.has(token));
+  const titleTokens = new Set(rankTokens(row.title));
+  const urlTokens = new Set(rankTokens(row.displayUrl || row.url));
+  const snippetTokens = new Set(rankTokens(row.snippet));
+  const allTokens = [...new Set([...titleTokens, ...urlTokens, ...snippetTokens])];
+  if (!queryTokens.length) return { score: 0, coverage: 0, matchedTokens: [] };
+  const matched = [];
+  let score = 0;
+  for (const token of queryTokens) {
+    let hit = 0;
+    if (titleTokens.has(token)) hit = 3;
+    else if (urlTokens.has(token)) hit = 2;
+    else if (snippetTokens.has(token)) hit = 1;
+    if (!hit) {
+      // Character-level fuzzy match so typos and word variants still rank (e.g. "gmaes" ~ "games").
+      const fuzzy = allTokens.find(candidate => candidate.length > 3 && (candidate.startsWith(token) || token.startsWith(candidate) || diceSimilarity(candidate, token) >= 0.72));
+      if (fuzzy) hit = 1.5;
+    }
+    if (hit) { score += hit; matched.push(token); }
+  }
+  const coverage = matched.length / queryTokens.length;
+  score *= 0.4 + 0.6 * coverage;
+  const phrase = query.trim().toLowerCase();
+  if (phrase.length > 3 && (`${row.title} ${row.snippet}`).toLowerCase().includes(phrase)) score += 4;
+  score += Math.min(3, (row.providers?.length || 1) - 1) * 1.5;
+  return { score: Math.round(score * 1000) / 1000, coverage: Math.round(coverage * 1000) / 1000, matchedTokens: matched };
+}
+function rankResultsByRelevance(query, rows) {
+  const scored = rows.map((row, index) => {
+    const relevance = scoreResultRelevance(query, row);
+    return { row, index, ...relevance };
+  });
+  const anyMatched = scored.some(item => item.coverage > 0);
+  scored.sort((a, b) => {
+    // Soft-demote: when at least one result matches the query, zero-coverage rows go to the end.
+    if (anyMatched && a.coverage === 0 !== (b.coverage === 0)) return a.coverage === 0 ? 1 : -1;
+    return b.score - a.score || a.index - b.index;
+  });
+  return scored.map(item => ({ ...item.row, relevance: item.coverage, relevanceScore: item.score }));
+}
 function canonicalKey(url) {
   try { const u = new URL(url); if (u.username || u.password) return ""; u.hash = ""; for (const k of [...u.searchParams.keys()]) if (/^utm_/i.test(k) || /^(fbclid|gclid|mc_cid|mc_eid)$/i.test(k)) u.searchParams.delete(k); u.hostname = u.hostname.toLowerCase(); return u.pathname === "/" && !u.search ? u.origin : u.href; }
   catch { return ""; }
@@ -276,13 +338,15 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       if (!existing) merged.set(id, { ...result, providers: [item.name], source: item.name });
       else { if (!existing.providers.includes(item.name)) existing.providers.push(item.name); if (result.snippet.length > existing.snippet.length) existing.snippet = result.snippet; }
     }
-    const results = [...merged.values()].slice(0, requestedLimit);
+    // Rank the merged provider results by token relevance to the query so the
+    // most on-topic pages surface first instead of raw provider arrival order.
+    const results = rankResultsByRelevance(q, [...merged.values()]).slice(0, requestedLimit);
     const source = successful.find(x => x.results.length)?.name || "none";
-    const value = { provider: source, results, total: successful.reduce((n, x) => n + (x.total || x.results.length), 0) || null, more: successful.some(x => x.more), attempts, googleConfigured: configured("google"), braveConfigured: configured("brave"), bingConfigured: configured("bing"), providersUsed: successful.filter(x => x.results.length).map(x => x.name), cancelled: callerCancelled, earlyCancelled, deadlineExceeded: deadlineExpired, responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: firstResultAt == null ? null : firstResultAt - requestStartedAt, diagnostics: { providerCount: eligible.length, parallelism: Math.min(parallelism, eligible.length), overallDeadlineMs, earlyCancelWindowMs, earlyResultThreshold, providers: Object.fromEntries(Object.keys(providers).map(name => [name, healthSummary(name)])), google: healthSummary("google") } };
+    const value = { provider: source, results, ranking: { method: "token-relevance" }, total: successful.reduce((n, x) => n + (x.total || x.results.length), 0) || null, more: successful.some(x => x.more), attempts, googleConfigured: configured("google"), braveConfigured: configured("brave"), bingConfigured: configured("bing"), providersUsed: successful.filter(x => x.results.length).map(x => x.name), cancelled: callerCancelled, earlyCancelled, deadlineExceeded: deadlineExpired, responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: firstResultAt == null ? null : firstResultAt - requestStartedAt, diagnostics: { providerCount: eligible.length, parallelism: Math.min(parallelism, eligible.length), overallDeadlineMs, earlyCancelWindowMs, earlyResultThreshold, providers: Object.fromEntries(Object.keys(providers).map(name => [name, healthSummary(name)])), google: healthSummary("google") } };
     if (results.length && cacheTtlMs) { cache.set(key, { time: Date.now(), value }); while (cache.size > MAX_CACHE) cache.delete(cache.keys().next().value); }
     return value;
   }
   return { search, googleConfigured: () => configured("google"), order, providers: Object.keys(providers), diagnostics: () => ({ adaptiveOrdering: true, maxProviders, parallelism, overallDeadlineMs, providers: Object.fromEntries(Object.keys(providers).map(name => [name, healthSummary(name)])) }) };
 }
 
-module.exports = { createWebSearch, parseDuckDuckGoHtml, parseBingHtml, parseMojeekHtml, parseEcosiaHtml, parseStartpageHtml, parseYahooHtml, parseGoogleApi, parseBraveApi, parseBingApi, unwrapBing, unwrapDuckDuckGo, classifyGoogleResponse, canonicalKey };
+module.exports = { createWebSearch, parseDuckDuckGoHtml, parseBingHtml, parseMojeekHtml, parseEcosiaHtml, parseStartpageHtml, parseYahooHtml, parseGoogleApi, parseBraveApi, parseBingApi, unwrapBing, unwrapDuckDuckGo, classifyGoogleResponse, canonicalKey, rankResultsByRelevance, scoreResultRelevance, diceSimilarity };
