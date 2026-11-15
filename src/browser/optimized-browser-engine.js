@@ -11,6 +11,7 @@
  */
 
 const crypto = require('crypto');
+const { followPopup, restoreAfterClose } = require('./popup-follow');
 const fs = require('fs');
 
 function id(prefix = 'b') { return `${prefix}_${crypto.randomBytes(12).toString('base64url')}`; }
@@ -428,9 +429,19 @@ class OptimizedBrowserEngine {
       }
       session.pages.add(popup);
       this.attachPage(session, popup);
+      // The streamed surface and all input target session.page: follow the
+      // popup so a window the site actually needs (OAuth, launcher, auth) is
+      // visible and clickable instead of opening invisibly in the background.
+      followPopup(session, popup);
       this.pushConsole(session, 'info', `Popup opened: ${sanitizeUrl(popup.url()) || 'new page'}`);
     });
-    page.on('close', () => session.pages.delete(page));
+    page.on('close', () => {
+      // When the active page closes (an auth popup finishing), hand control
+      // back to the opener instead of leaving session.page on a dead page.
+      const wasActive = session.page === page;
+      const next = restoreAfterClose(session, page);
+      if (wasActive && next) this.pushConsole(session, 'info', `Popup closed; back on ${sanitizeUrl(next.url()) || 'the previous page'}.`);
+    });
   }
 
   pushConsole(session, level, message) {
