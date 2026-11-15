@@ -2820,7 +2820,17 @@ function injectRuntime(html, original, sid = "") {
   function emitGetForm(form,submitter,source){if(rootProxiedFrame())return false;const target=submitTarget(form,submitter);if(!target)return false;const method=String(form.method||'get').toUpperCase();if(method!=='GET')return false;const fd=new FormData(form,submitter||undefined);const u=new URL(target);for(const [k,v] of fd.entries())if(typeof v==='string')u.searchParams.append(k,v);emit(source||'form.submit',u.href);return true}
   try{const nativeFormSubmit=HTMLFormElement.prototype.submit;HTMLFormElement.prototype.submit=function(){try{if(rootProxiedFrame())return nativeFormSubmit.call(this);if(emitGetForm(this,null,'form.submit'))return;const target=submitTarget(this,null);const method=String(this.method||'get').toUpperCase();if(target&&method==='POST'){const fd=new FormData(this);const entries=[];for(const [k,v] of fd.entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});return;}}catch{}return nativeFormSubmit.call(this)}}catch{}
   try{const nativeRequestSubmit=HTMLFormElement.prototype.requestSubmit;if(nativeRequestSubmit)HTMLFormElement.prototype.requestSubmit=function(submitter){try{if(rootProxiedFrame())return nativeRequestSubmit.call(this,submitter);if(emitGetForm(this,submitter,'form.requestSubmit'))return;const target=submitTarget(this,submitter);const method=String(this.method||'get').toUpperCase();if(target&&method==='POST'){const entries=[];for(const [k,v] of new FormData(this,submitter).entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});return;}}catch{}return nativeRequestSubmit.call(this,submitter)}}catch{}
-  try{const nativeOpen=window.open;window.open=function(url,target,features){const u=canonicalizeMaybeProxy(url);if(u){if(!rootProxiedFrame()||appEmbedded){topPost({type:'veyra:open',url:u,sessionId:SESSION_ID});return null}return nativeOpen.call(window,proxy('view',u),target,features)}if(appEmbedded)return null;return nativeOpen.call(window,url,target,features)}}catch{}
+  try{const nativeOpen=window.open;window.open=function(url,target,features){const u=canonicalizeMaybeProxy(url);if(u){
+    // A navigation button that opens its destination over the current page —
+    // window.open(url,'_self'), and '_top'/'_parent' from the root frame —
+    // must never become a new tab: it is in-place navigation.
+    const tgt=String(target||'').toLowerCase();
+    if(tgt==='_self'||((tgt==='_top'||tgt==='_parent')&&rootProxiedFrame())){
+      if(!rootProxiedFrame()){emit('location.assign',u);return null}
+      try{location.assign(proxy('view',u))}catch(e){}
+      return null;
+    }
+    if(!rootProxiedFrame()||appEmbedded){topPost({type:'veyra:open',url:u,target:tgt||'_blank',sessionId:SESSION_ID});return null}return nativeOpen.call(window,proxy('view',u),target,features)}if(appEmbedded)return null;return nativeOpen.call(window,url,target,features)}}catch{}
   function fmtArg(x,d){d=d||0;if(typeof x==='string')return x;if(x instanceof Error)return (x.name||'Error')+': '+x.message+(x.stack?'\\n'+String(x.stack).split('\\n').slice(1,6).join('\\n'):'');if(typeof Node!=='undefined'&&x instanceof Node)return x.nodeType===1?'<'+x.tagName.toLowerCase()+(x.id?'#'+x.id:'')+(x.className&&typeof x.className==='string'?'.'+x.className.trim().split(/\\s+/).slice(0,3).join('.'):'')+'>':x.nodeName;if(typeof x==='function')return 'ƒ '+(x.name||'anonymous')+'()';try{const seen=new WeakSet();return JSON.stringify(x,(k,v)=>{if(typeof v==='object'&&v){if(seen.has(v))return '[Circular]';seen.add(v)}if(typeof v==='function')return 'ƒ';if(typeof v==='bigint')return String(v)+'n';return v})||String(x)}catch{return String(x)}}
   let consoleBudget=400,consoleWindow=Date.now();
   try{['log','info','debug','warn','error','trace','dir','table','assert','group','groupCollapsed','groupEnd','count','timeEnd'].forEach(level=>{if(typeof console[level]!=='function')return;const native=console[level].bind(console);console[level]=(...args)=>{native(...args);if(level==='assert'){if(args[0])return;args=['Assertion failed:',...args.slice(1)]}const now=Date.now();if(now-consoleWindow>2000){consoleWindow=now;consoleBudget=400}if(--consoleBudget<0)return;let stack='';if(level==='trace'||level==='error'){try{stack=String(new Error().stack||'').split('\\n').slice(2,9).join('\\n')}catch{}}let msg='';try{msg=args.map(x=>fmtArg(x)).join(' ')}catch{}topPost({type:'veyra:page-console',level:level==='assert'?'error':level,sessionId:SESSION_ID,message:msg.slice(0,20000),stack,time:now,pageUrl:virtualUrl})}})}catch{}
@@ -2994,9 +3004,11 @@ ${pageActionsRuntime()}
     const u=canonicalizeMaybeProxy(raw);if(!u)return;
     // _blank, named windows, _parent and _top must never escape into a raw
     // browser tab or replace the app: route them through the app, which
-    // opens them as a new Veyra tab.
+    // opens them as a new Veyra tab — or, for _top/_parent, navigates the
+    // tab in place (a target=_top link is the page replacing the whole
+    // view, not a request for a second tab).
     const tgt=String(a.getAttribute('target')||'').toLowerCase();
-    if(tgt&&tgt!=='_self'){ev.preventDefault();ev.stopPropagation();topPost({type:'veyra:open',url:u,sessionId:SESSION_ID});return}
+    if(tgt&&tgt!=='_self'){ev.preventDefault();ev.stopPropagation();topPost({type:'veyra:open',url:u,target:tgt,sessionId:SESSION_ID});return}
     // In the app-embedded root frame, same-frame links navigate the iframe
     // natively to their rewritten href; only nested proxied frames need the
     // document-navigation message (their parent is another proxied page).
