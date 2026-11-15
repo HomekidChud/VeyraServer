@@ -41,6 +41,10 @@ assert.match(out, /window\.__VEYRA_PAGE_URL__=CANONICAL;/);
 // proxy-host suffix back onto the virtual site's host.
 assert.match(out, /function fixDerivedHost\(u\)\{/);
 assert.match(out, /return cleanVeyraParams\(fixDerivedHost\(ownOrigin\(u\.origin\)\?fixOwn\(u\):u\)\)\}/);
+// DOM-inserted resource elements (<script src> etc.) go through srcFix, which
+// must apply the same remap — Roblox loads its rotating-client-service prelude
+// via an injected <script src="https://apis.<proxy-host>/...">.
+assert.match(out, /u=fixDerivedHost\(u\);\s*\n\s*if\(VAPI\.test\(u\.pathname\)\)return v;/);
 
 // Behavioral check: run the emitted fixDerivedHost/toVirtual with a fake
 // proxy-origin location (like the Render deployment) and confirm derived

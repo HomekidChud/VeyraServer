@@ -2614,6 +2614,13 @@ function injectRuntime(html, original, sid = "") {
         var raw=String(v||'');
         if(!raw||/^(data:|blob:|about:|javascript:)/i.test(raw))return v;
         var u=new URL(raw,location.href);
+        // Site code that derives API hosts from location.hostname builds
+        // <sub>.<proxy-host> resource URLs (Roblox injects a <script src>
+        // for its rotating-client-service prelude that way). Proxying them
+        // as-is 502s on the proxy host, so remap the proxy-host suffix back
+        // onto the virtual site's host first — same as fixDerivedHost in
+        // toVirtual.
+        u=fixDerivedHost(u);
         if(VAPI.test(u.pathname))return v;
         if(/^[a-z][a-z0-9+.-]*:\\/\\//i.test(raw)){
           if(u.protocol!=='http:'&&u.protocol!=='https:')return v;
