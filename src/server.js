@@ -2390,6 +2390,13 @@ function injectRuntime(html, original, sid = "") {
   // tabs and element inspection works on the main frame too.
   var appEmbedded=false;
   try{addEventListener('message',function(ev){try{if(ev.data&&ev.data.type==='veyra:embed-ack')appEmbedded=true}catch{}});topPost({type:'veyra:embed-ping',sessionId:SESSION_ID})}catch{}
+  // Escape watchdog handshake: the app probes each loaded frame; only a frame
+  // still running this runtime can answer. A frame that navigated off the
+  // proxy to a real site (e.g. an X-Frame-Options blocked auth redirect)
+  // stays silent, which lets the app recover the tab. The ack goes to
+  // window.top via topPost — replying to ev.source can loop back into the
+  // frame when the page's own SDKs wrap window.postMessage.
+  try{addEventListener('message',function(ev){try{if(ev.data&&ev.data.type==='veyra:embed-probe'){topPost({type:'veyra:embed-probe-ack',sessionId:SESSION_ID})}}catch{}})}catch{}
   function remember(next){virtualUrl=next;window.__VEYRA_PAGE_URL__=next;if(rootProxiedFrame())try{document.cookie='veyra_ctx='+encodeURIComponent(next)+'|'+encodeURIComponent(SESSION_ID)+';path=/;max-age=3600;'+(location.protocol==='https:'?'SameSite=None;Secure;Partitioned':'SameSite=Lax')}catch{}}
   function proxyHistory(method,native){return function(state,title,url){
     let next=virtualUrl;try{if(url!=null)next=cleanVeyraParams(fixOwn(new URL(unwrap(String(url)),virtualUrl))).href}catch{}
@@ -2426,8 +2433,15 @@ function injectRuntime(html, original, sid = "") {
   try{setInterval(heal,300);addEventListener('popstate',()=>{try{const u=canonicalizeMaybeProxy(location.href);if(u&&u!==virtualUrl){remember(u);emit('history.popstate',u)}}catch{}})}catch{}
   try{
     const LP=Location&&Location.prototype;
-    if(LP&&LP.assign){const nativeAssign=LP.assign;LP.assign=function(next){const u=canonicalizeMaybeProxy(next);if(u){if(!rootProxiedFrame()){emit('location.assign',u);return;}return nativeAssign.call(this,proxy('view',u));}return nativeAssign.call(this,next)}}
-    if(LP&&LP.replace){const nativeReplace=LP.replace;LP.replace=function(next){const u=canonicalizeMaybeProxy(next);if(u){if(!rootProxiedFrame()){emit('location.replace',u);return;}return nativeReplace.call(this,proxy('view',u));}return nativeReplace.call(this,next)}}
+    // OAuth/login redirects (location.assign/replace) must not render through
+    // the proxy: the auth page's own scripts then navigate the frame to the
+    // real site (e.g. MSN's authorize 404 page sets window.location to
+    // https://www.msn.com/), which the app's iframe cannot show — the user
+    // gets Chrome's "This content is blocked" error. Route sign-in redirects
+    // to the handoff instead: the site's real sign-in opens in the user's own
+    // browser and the session comes back via the bookmarklet.
+    if(LP&&LP.assign){const nativeAssign=LP.assign;LP.assign=function(next){const u=canonicalizeMaybeProxy(next);if(u){if(!rootProxiedFrame()){emit('location.assign',u);return;}if(appEmbedded&&isSigninRedirect(u)){topPost({type:'veyra:signin',url:u,sessionId:SESSION_ID,pageUrl:virtualUrl});return;}return nativeAssign.call(this,proxy('view',u));}return nativeAssign.call(this,next)}}
+    if(LP&&LP.replace){const nativeReplace=LP.replace;LP.replace=function(next){const u=canonicalizeMaybeProxy(next);if(u){if(!rootProxiedFrame()){emit('location.replace',u);return;}if(appEmbedded&&isSigninRedirect(u)){topPost({type:'veyra:signin',url:u,sessionId:SESSION_ID,pageUrl:virtualUrl});return;}return nativeReplace.call(this,proxy('view',u));}return nativeReplace.call(this,next)}}
     // Report the virtual (original) page URL from location: apps such as MSN
     // Casual Games parse location.pathname (/en-gb/play/games/<slug>/cg-<id>)
     // to extract the active game ID. On the proxied page the path is
@@ -2820,6 +2834,14 @@ ${pageActionsRuntime()}
   var SIGNIN_AUTH_HOST=/^(?:accounts?\\.google\\.com|appleid\\.apple\\.com|login\\.(?:microsoftonline|microsoft|live)\\.com|securetoken\\.com|(?:auth|sso|signin|login|accounts)\\.[a-z0-9-]+\\.[a-z]{2,})$/i;
   var SIGNIN_AUTH_PATH=/(?:^|\\/)(?:login|signin|sign-in|log-in|signup|sign-up|register|oauth|oauth2|openid|sso|servicelogin|authentication|authorize|dialog\\/oauth|i\\/oauth2|users\\/sign_in)(?:\\/?$|\\?|#)/i;
   var SIGNIN_TEXT=/^(?:sign in|sign-in|signin|log ?in|login|log on|sign up|sign-up|signup|join(?: now)?|create (?:an )?account|register|continue with (?:google|apple|microsoft|facebook|steam|discord|twitter|x|email)|log in with (?:google|apple|microsoft|facebook|steam|discord|twitter|x))\\b/i;
+  function isSigninRedirect(u){
+    try{
+      const uu=new URL(u,virtualUrl);
+      const host=uu.hostname.toLowerCase();
+      const pathPart=uu.pathname+uu.search;
+      return !!(host&&SIGNIN_AUTH_HOST.test(host))||!!(pathPart&&SIGNIN_AUTH_PATH.test(pathPart));
+    }catch(e){return false}
+  }
   function signinLabel(n){
     try{
       const txt=String(n.textContent||'').replace(/\\s+/g,' ').trim();
