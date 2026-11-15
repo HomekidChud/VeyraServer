@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Popup Follow Test</title>
+<style>
+body { font-family: system-ui, sans-serif; background: #101418; color: #eee; padding: 40px; }
+h1 { font-size: 22px; }
+p { max-width: 60ch; line-height: 1.5; }
+button { font-size: 16px; padding: 10px 18px; margin: 6px 8px 6px 0; cursor: pointer; }
+#status { margin-top: 20px; font-weight: bold; color: #7ec0ff; }
+</style>
+</head>
+<body>
+<h1>Popup Follow Test</h1>
+<p>This page opens a cross-origin popup (example.com) like browser.lol / now.gg launchers do.</p>
+<button id="open">Open cross-origin popup</button>
+<button id="self">window.open with _self</button>
+<button id="top">window.open with _top</button>
+<div id="status">idle</div>
+<script>
+document.getElementById('open').addEventListener('click', function () {
+  document.getElementById('status').textContent = 'popup opening…';
+  var w = window.open('https://example.com/', '_blank', 'width=900,height=600');
+  document.getElementById('status').textContent = w ? 'popup opened' : 'popup blocked';
+});
+document.getElementById('self').addEventListener('click', function () {
+  window.open('https://example.com/', '_self');
+});
+document.getElementById('top').addEventListener('click', function () {
+  window.open('https://example.com/', '_top');
+});
+</script>
+</body>
+</html>
