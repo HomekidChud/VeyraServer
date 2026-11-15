@@ -1080,14 +1080,20 @@ function documentNavigation(req) {
   return /text\/html/i.test(String(req.get("Accept") || ""));
 }
 // The escaped (path-based) form is only safe for site paths that cannot be
-// confused with Veyra's own origin routes: not the root, not a reserved
-// asset/brand path, not /api/*, and not a bare static asset (those are
-// loaded as resources, not navigated to as documents).
+// confused with Veyra's own origin routes: not a reserved asset/brand path,
+// not /api/*, and not a bare static asset (those are loaded as resources,
+// not navigated to as documents). The site ROOT is escapable too: the
+// escaped form carries __veyra_url/__veyra_sid params, and the brand root
+// route passes through when they are present. Without this, root pages
+// lived at /api/view, so location.pathname was "/api/view" — apps that
+// route on their own pathname (Roblox's SDUI landing app matches "/" to
+// pick its page config and otherwise renders nothing) broke.
 function escapedPathFor(target) {
   try {
     const u = new URL(target);
     const p = u.pathname;
-    if (!p || p === "/" || p.length < 2) return null;
+    if (!p || (p !== "/" && p.length < 2)) return null;
+    if (p === "/") return u;
     if (/^\/api\//i.test(p)) return null;
     if (isReservedOriginPath(p)) return null;
     if (/^\/(?:console|view_source|status|health)(?:\/|$)/i.test(p)) return null;
@@ -7938,4 +7944,4 @@ const __workerOps = {
   discover: (text, kind, base, contentType) => collectDiscovery(text, kind, base, contentType)
 };
 
-module.exports = { app, get accessGate() { return accessGate; }, mongoStore, mergeStrayProxyParams, detectChallenge, maybeCompressProxyPayload, proxyCompressibleContentType, CFG, browserCapabilitySignals, canRenderHtmlWithBrowser, renderHtmlWithBrowser, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions, normalizeOpenEngineMode, shouldStartCrawlerForEngineMode, startVeyraServer, cacheSafeUrl, cacheSafeResponse, fetchBuffer, escapedPageContext, liveSessionId, resolveEscapedTarget, workerScopePrelude };
+module.exports = { app, get accessGate() { return accessGate; }, mongoStore, mergeStrayProxyParams, detectChallenge, maybeCompressProxyPayload, proxyCompressibleContentType, CFG, browserCapabilitySignals, canRenderHtmlWithBrowser, renderHtmlWithBrowser, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions, normalizeOpenEngineMode, shouldStartCrawlerForEngineMode, startVeyraServer, cacheSafeUrl, cacheSafeResponse, fetchBuffer, escapedPageContext, escapedPathFor, liveSessionId, resolveEscapedTarget, workerScopePrelude };

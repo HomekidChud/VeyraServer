@@ -67,7 +67,10 @@ function installBrandRoutes(app, { frontendUrl, version = "", isPreviewBot = () 
   const passThrough = req => hasProxiedReferer(req);
 
   app.get("/", (req, res, next) => {
-    if (passThrough(req)) return next();
+    // Escaped-path document navigations to a site's ROOT land on "/?__veyra_url=…"
+    // (see escapedPathFor in server.js): pass them through so the escaped-path
+    // middleware can proxy the real page instead of serving the landing page.
+    if (passThrough(req) || req.query?.__veyra_url || req.query?.__veyra_sid) return next();
     res.setHeader("Cache-Control", "public, max-age=300");
     res.type("html").send(landingHtml(req, front(), version));
   });
