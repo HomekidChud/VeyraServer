@@ -2889,14 +2889,28 @@ ${pageActionsRuntime()}
   // through the proxy. Veyra never sees the credentials: the user signs in
   // as themselves on the real site and brings the session back. Hold Shift
   // (or Ctrl/Cmd) to bypass the handoff and sign in through the proxy.
+  // Sign-up is deliberately excluded: "Sign up"/"Create account"/"Register"
+  // controls and signup URLs load the site's real signup page through Veyra,
+  // so the user signs up inside Veyra instead of the handoff.
   var SIGNIN_AUTH_HOST=/^(?:accounts?\\.google\\.com|appleid\\.apple\\.com|login\\.(?:microsoftonline|microsoft|live)\\.com|securetoken\\.com|(?:auth|sso|signin|login|accounts)\\.[a-z0-9-]+\\.[a-z]{2,})$/i;
-  var SIGNIN_AUTH_PATH=/(?:^|\\/)(?:login|signin|sign-in|log-in|signup|sign-up|register|oauth|oauth2|openid|sso|servicelogin|authentication|authorize|dialog\\/oauth|i\\/oauth2|users\\/sign_in)(?:\\/?$|\\?|#)/i;
-  var SIGNIN_TEXT=/^(?:sign in|sign-in|signin|log ?in|login|log on|sign up|sign-up|signup|join(?: now)?|create (?:an )?account|register|continue with (?:google|apple|microsoft|facebook|steam|discord|twitter|x|email)|log in with (?:google|apple|microsoft|facebook|steam|discord|twitter|x))\\b/i;
+  var SIGNIN_AUTH_PATH=/(?:^|\\/)(?:login|signin|sign-in|log-in|oauth|oauth2|openid|sso|servicelogin|authentication|authorize|dialog\\/oauth|i\\/oauth2|users\\/sign_in)(?:\\/?$|\\?|#)/i;
+  var SIGNIN_TEXT=/^(?:sign in|sign-in|signin|log ?in|login|log on|continue with (?:google|apple|microsoft|facebook|steam|discord|twitter|x|email)|log in with (?:google|apple|microsoft|facebook|steam|discord|twitter|x))\\b/i;
+  // Sign-up is not sign-in: a "Sign up"/"Create account"/"Register" control
+  // (label or URL) must load the site's real signup page through Veyra so the
+  // user creates their account inside Veyra — never the browser handoff.
+  var SIGNUP_TEXT=/^(?:sign up|sign-up|signup|join(?: now| free)?|create (?:an )?account|register|get started)\\b/i;
+  var SIGNUP_PATH=/(?:^|\\/)(?:signup|sign-up|register|registration|join|create-account)(?:\\/?$|\\?|#)/i;
+  // Auth providers bury signup deeper in the path (accounts.google.com/signup/v2/webcreateaccount).
+  var SIGNUP_PATH_ANYWHERE=/(?:^|\\/)(?:signup|sign-up|register|create-account)/i;
   function isSigninRedirect(u){
     try{
       const uu=new URL(u,virtualUrl);
       const host=uu.hostname.toLowerCase();
       const pathPart=uu.pathname+uu.search;
+      // Sign-up destinations never trigger the sign-in handoff: they load
+      // through the proxy so the user signs up inside Veyra.
+      if(pathPart&&SIGNUP_PATH.test(pathPart))return false;
+      if(host&&SIGNIN_AUTH_HOST.test(host)&&pathPart&&SIGNUP_PATH_ANYWHERE.test(pathPart))return false;
       return !!(host&&SIGNIN_AUTH_HOST.test(host))||!!(pathPart&&SIGNIN_AUTH_PATH.test(pathPart));
     }catch(e){return false}
   }
@@ -2927,6 +2941,9 @@ ${pageActionsRuntime()}
       try{const uu=new URL(raw,virtualUrl);host=uu.hostname.toLowerCase();pathPart=uu.pathname+uu.search}catch(e){}
       const label=signinLabel(n);
       if((host&&SIGNIN_AUTH_HOST.test(host))||(pathPart&&SIGNIN_AUTH_PATH.test(pathPart))||(label&&SIGNIN_TEXT.test(label))){
+        // A sign-up control (label or URL) is not a sign-in control: let the
+        // click run through the proxy so the signup page loads inside Veyra.
+        if((label&&SIGNUP_TEXT.test(label))||(pathPart&&SIGNUP_PATH.test(pathPart)))return null;
         return {node:n,dest:raw};
       }
     }
