@@ -2393,8 +2393,10 @@ function injectRuntime(html, original, sid = "") {
   // Escape watchdog handshake: the app probes each loaded frame; only a frame
   // still running this runtime can answer. A frame that navigated off the
   // proxy to a real site (e.g. an X-Frame-Options blocked auth redirect)
-  // stays silent, which lets the app recover the tab.
-  try{addEventListener('message',function(ev){try{if(ev.data&&ev.data.type==='veyra:embed-probe'&&ev.source){ev.source.postMessage({type:'veyra:embed-probe-ack',sessionId:SESSION_ID},ev.origin)}}catch{}})}catch{}
+  // stays silent, which lets the app recover the tab. The ack goes to
+  // window.top via topPost — replying to ev.source can loop back into the
+  // frame when the page's own SDKs wrap window.postMessage.
+  try{addEventListener('message',function(ev){try{if(ev.data&&ev.data.type==='veyra:embed-probe'){topPost({type:'veyra:embed-probe-ack',sessionId:SESSION_ID})}}catch{}})}catch{}
   function remember(next){virtualUrl=next;window.__VEYRA_PAGE_URL__=next;if(rootProxiedFrame())try{document.cookie='veyra_ctx='+encodeURIComponent(next)+'|'+encodeURIComponent(SESSION_ID)+';path=/;max-age=3600;'+(location.protocol==='https:'?'SameSite=None;Secure;Partitioned':'SameSite=Lax')}catch{}}
   function proxyHistory(method,native){return function(state,title,url){
     let next=virtualUrl;try{if(url!=null)next=cleanVeyraParams(fixOwn(new URL(unwrap(String(url)),virtualUrl))).href}catch{}

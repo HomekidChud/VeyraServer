@@ -27,8 +27,9 @@ assert.match(out, /if\(appEmbedded&&isSigninRedirect\(u\)\)\{topPost\(\{type:'ve
 assert.match(out, /if\(appEmbedded&&isSigninRedirect\(u\)\)\{topPost\(\{type:'veyra:signin',url:u,sessionId:SESSION_ID,pageUrl:virtualUrl\}\);return;\}return nativeReplace\.call\(this,proxy\('view',u\)\)/);
 
 // Escape watchdog handshake: the app probes each loaded frame; only a frame
-// still running this runtime can answer.
-assert.match(out, /ev\.data&&ev\.data\.type==='veyra:embed-probe'&&ev\.source/);
-assert.match(out, /ev\.source\.postMessage\(\{type:'veyra:embed-probe-ack',sessionId:SESSION_ID\},ev\.origin\)/);
+// still running this runtime can answer — and the ack must go to window.top
+// (topPost), not ev.source, or the page's own postMessage wrappers can loop
+// the ack back into the frame.
+assert.match(out, /ev\.data&&ev\.data\.type==='veyra:embed-probe'\)\{topPost\(\{type:'veyra:embed-probe-ack',sessionId:SESSION_ID\}\)\}/);
 
 console.log('sign-in escape regression checks passed');
