@@ -33,4 +33,33 @@ assert.match(out, /if\(!window\.polytrackModConfiguration\)window\.polytrackModC
 assert.match(out, /<script data-veyra-runtime>/);
 assert.match(out, /window\.__VEYRA_PAGE_URL__=CANONICAL;/);
 
+// Site code that derives API hosts from location.hostname (Roblox's RealTime
+// gateway builder: hostname minus "www." prefixed with "apis.") produces
+// <sub>.<proxy-host> URLs under the proxy. On a public proxy host those DNS
+// names don't exist and every request 502s (Roblox special-cases localhost
+// in its own bundle, so local testing hides it). The runtime must remap the
+// proxy-host suffix back onto the virtual site's host.
+assert.match(out, /function fixDerivedHost\(u\)\{/);
+assert.match(out, /return cleanVeyraParams\(fixDerivedHost\(ownOrigin\(u\.origin\)\?fixOwn\(u\):u\)\)\}/);
+
+// Behavioral check: run the emitted fixDerivedHost/toVirtual with a fake
+// proxy-origin location (like the Render deployment) and confirm derived
+// hosts are remapped while real site URLs pass through untouched.
+{
+  const script = out.match(/<script data-veyra-runtime>([\s\S]*?)<\/script>/)[1];
+  const fnSrc = script.slice(script.indexOf('function fixDerivedHost'), script.indexOf('function resolve('));
+  const toVirtual = new Function('location', 'virtualUrl', 'URL', 'cleanVeyraParams', 'ownOrigin', 'fixOwn',
+    fnSrc + '\nreturn toVirtual;')(
+    { hostname: 'veyraserver-xscy.onrender.com', origin: 'https://veyraserver-xscy.onrender.com', protocol: 'https:', href: 'https://veyraserver-xscy.onrender.com/api/view?url=x' },
+    'https://www.roblox.com/', URL, (u) => u, () => false, (u) => u);
+  assert.equal(toVirtual('https://apis.veyraserver-xscy.onrender.com/rotating-client-service/v1/prelude/latest').href,
+    'https://apis.roblox.com/rotating-client-service/v1/prelude/latest');
+  assert.equal(toVirtual('https://chat.veyraserver-xscy.onrender.com/v1/connect').href,
+    'https://chat.roblox.com/v1/connect');
+  assert.equal(toVirtual('https://apis.roblox.com/already-fine').href,
+    'https://apis.roblox.com/already-fine');
+  assert.equal(toVirtual('https://apis.veyraserver-xscy.onrender.com/x?a=1&b=2').href,
+    'https://apis.roblox.com/x?a=1&b=2');
+}
+
 console.log('runtime patch regression checks passed');

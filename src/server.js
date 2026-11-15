@@ -2370,7 +2370,28 @@ function injectRuntime(html, original, sid = "") {
   // a data: Request with a spoofed own 'url' getter to replay a cached response.
   const reqUrlGet=(()=>{try{return Object.getOwnPropertyDescriptor(Request.prototype,'url').get}catch{return null}})();
   function realUrl(v){if(v==null)return '';if(typeof v==='string')return v;try{if(reqUrlGet&&typeof Request!=='undefined'&&v instanceof Request)return reqUrlGet.call(v)}catch{}if(typeof v.url==='string')return v.url;if(typeof v.href==='string')return v.href;return String(v)}
-  function toVirtual(raw){if(/^[?#]/.test(raw))return cleanVeyraParams(new URL(raw,virtualUrl));const u=new URL(raw,location.href);return cleanVeyraParams(ownOrigin(u.origin)?fixOwn(u):u)}
+  // Site code that derives API hosts from location.hostname (e.g. Roblox's
+  // RealTime gateway builder takes location.hostname, strips "www.", and
+  // prefixes "apis.") produces <sub>.<proxy-host> URLs that point at the
+  // proxy origin instead of the site — on a public proxy host those DNS names
+  // don't exist and every request 502s (locally "localhost" is often
+  // special-cased by the site itself, hiding the bug). Remap the proxy-host
+  // suffix back onto the virtual site's host so the URL describes the
+  // site's own subdomain and the fetch/XHR wrappers proxy it normally.
+  function fixDerivedHost(u){
+    try{
+      const ph=location.hostname;
+      if(!ph||u.hostname===ph||!u.hostname.endsWith('.'+ph))return u;
+      const sub=u.hostname.slice(0,u.hostname.length-ph.length-1);
+      if(!sub)return u;
+      const vh=new URL(virtualUrl).hostname;
+      if(!vh||vh===ph)return u;
+      const base=vh.replace(/^www\\./i,'');
+      if(!base||base===vh&&/^www\\./i.test(vh))return u;
+      return new URL(u.protocol+'//'+sub+'.'+base+u.pathname+u.search+u.hash);
+    }catch{return u}
+  }
+  function toVirtual(raw){if(/^[?#]/.test(raw))return cleanVeyraParams(new URL(raw,virtualUrl));const u=new URL(raw,location.href);return cleanVeyraParams(fixDerivedHost(ownOrigin(u.origin)?fixOwn(u):u))}
   function resolve(v){try{const raw=unwrap(realUrl(v));return (raw===''?new URL(virtualUrl):toVirtual(raw)).href}catch{return String(v||'')}}
   function shouldProxy(v){try{const u=new URL(unwrap(v));return /^https?:$/.test(u.protocol)}catch{return false}}
   function proxy(kind,u){const prefix=API_ORIGIN || location.origin;const base=prefix+(kind==='view'?'/api/view?url=':'/api/resource?url=')+encodeURIComponent(u);const from=encodeURIComponent(new URL(virtualUrl).href);return kind==='view'?base+'&sid='+encodeURIComponent(SESSION_ID):base+'&from='+from+'&sid='+encodeURIComponent(SESSION_ID)}
