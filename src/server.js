@@ -2270,6 +2270,25 @@ function workerScopePrelude(base, sid = "") {
     var VD="";try{VD=new URL("./",VB).href}catch(e){}
     var API_RE=/^\\/api\\/(?:view|resource|download|form-get|open|crawl|search|suggest|browser|debug|session|sessions|config|vpn|extensions|status|health)(?:[\\/?#]|$)/;
     function P(abs){return O+"/api/resource?url="+encodeURIComponent(abs.href)+"&from="+encodeURIComponent(VB)+(VSID?"&sid="+encodeURIComponent(VSID):"")}
+    // Site code that derives API hosts from location.hostname (Roblox's
+    // RealTime gateway: hostname minus "www." prefixed with "apis.") builds
+    // <sub>.<proxy-host> URLs inside the worker too — proxy them straight
+    // through and they 502 on the proxy host. Remap the proxy-host suffix
+    // back onto the virtual site's host before proxying, mirroring
+    // fixDerivedHost in the page runtime.
+    var PH="";try{PH=self.location.hostname}catch(e){}
+    function DH(abs){
+      try{
+        if(!PH||abs.hostname===PH||!abs.hostname.endsWith("."+PH))return abs;
+        var sub=abs.hostname.slice(0,abs.hostname.length-PH.length-1);
+        if(!sub)return abs;
+        var vh="";try{vh=new URL(VB).hostname}catch(e){}
+        if(!vh||vh===PH)return abs;
+        var base=vh.replace(/^www\\./i,"");
+        if(!base)return abs;
+        return new URL(abs.protocol+"//"+sub+"."+base+abs.pathname+abs.search+abs.hash);
+      }catch(e){return abs}
+    }
     function fix(u){
       try{
         var s=String(u);
@@ -2278,6 +2297,7 @@ function workerScopePrelude(base, sid = "") {
           if(API_RE.test(abs.pathname))return s;
           if(RD&&s.indexOf(RD)===0&&VD){try{abs=new URL(VD+s.slice(RD.length))}catch(e){}}
         }
+        abs=DH(abs);
         if(/^https?:$/.test(abs.protocol)&&abs.origin!==O)return P(abs);
       }catch(e){}
       return u;
@@ -7911,4 +7931,4 @@ const __workerOps = {
   discover: (text, kind, base, contentType) => collectDiscovery(text, kind, base, contentType)
 };
 
-module.exports = { app, get accessGate() { return accessGate; }, mongoStore, mergeStrayProxyParams, detectChallenge, maybeCompressProxyPayload, proxyCompressibleContentType, CFG, browserCapabilitySignals, canRenderHtmlWithBrowser, renderHtmlWithBrowser, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions, normalizeOpenEngineMode, shouldStartCrawlerForEngineMode, startVeyraServer, cacheSafeUrl, cacheSafeResponse, fetchBuffer, escapedPageContext, liveSessionId, resolveEscapedTarget };
+module.exports = { app, get accessGate() { return accessGate; }, mongoStore, mergeStrayProxyParams, detectChallenge, maybeCompressProxyPayload, proxyCompressibleContentType, CFG, browserCapabilitySignals, canRenderHtmlWithBrowser, renderHtmlWithBrowser, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions, normalizeOpenEngineMode, shouldStartCrawlerForEngineMode, startVeyraServer, cacheSafeUrl, cacheSafeResponse, fetchBuffer, escapedPageContext, liveSessionId, resolveEscapedTarget, workerScopePrelude };

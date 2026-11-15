@@ -62,4 +62,35 @@ assert.match(out, /return cleanVeyraParams\(fixDerivedHost\(ownOrigin\(u\.origin
     'https://apis.roblox.com/x?a=1&b=2');
 }
 
+// Worker scope: the prelude re-anchors worker-resolved URLs onto the real
+// site. Site code that derives API hosts from location.hostname (Roblox's
+// RealTime gateway) builds <sub>.<proxy-host> URLs inside blob workers too;
+// the worker prelude must remap the proxy-host suffix back onto the virtual
+// site's host before proxying, mirroring fixDerivedHost in the page runtime.
+{
+  const { workerScopePrelude } = require('../src/server');
+  const prelude = workerScopePrelude('https://www.roblox.com/', 'sess-test');
+  const captured = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (u) => { captured.push(String(u)); return Promise.resolve({ ok: true }); };
+  function FakeXHR() {}
+  FakeXHR.prototype.open = (m, u) => { captured.push(String(u)); };
+  const RealXHR = globalThis.XMLHttpRequest;
+  globalThis.XMLHttpRequest = FakeXHR;
+  const scope = {
+    location: { origin: 'https://veyraserver-xscy.onrender.com', hostname: 'veyraserver-xscy.onrender.com', href: 'https://veyraserver-xscy.onrender.com/api/resource?url=blobworker' },
+  };
+  scope.self = scope;
+  new Function('self', prelude)(scope);
+  const derived = 'https://apis.veyraserver-xscy.onrender.com/rotating-client-service/v1/prelude/latest';
+  scope.fetch(derived);
+  new globalThis.XMLHttpRequest().open('GET', derived);
+  scope.fetch('https://apis.roblox.com/rotating-client-service/v1/prelude/latest');
+  globalThis.fetch = realFetch;
+  if (RealXHR === undefined) delete globalThis.XMLHttpRequest; else globalThis.XMLHttpRequest = RealXHR;
+  const remapped = captured.filter(u => u.startsWith('https://veyraserver-xscy.onrender.com/api/resource?url=https%3A%2F%2Fapis.roblox.com%2Frotating-client-service'));
+  assert.equal(remapped.length, 3, 'worker fetch/XHR must proxy derived hosts onto the virtual site: ' + JSON.stringify(captured));
+  assert.ok(captured.every(u => !u.includes('%2F%2Fapis.veyraserver-xscy.onrender.com')), 'no request may target the derived proxy subdomain: ' + JSON.stringify(captured));
+}
+
 console.log('runtime patch regression checks passed');
