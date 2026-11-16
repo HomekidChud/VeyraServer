@@ -83,18 +83,28 @@ assert.equal(ret, null);
 assert.equal(assigned.length, 1, "window.open(url,'_top') from the root frame must navigate in place");
 assert.equal(openedTabs.length, 0, "window.open(url,'_top') from the root frame must never open a new tab");
 
-// window.open(url) with no target still opens a new Veyra tab.
+// window.open(url) with no target opens a new proxied Veyra tab and
+// returns the popup relay shim (real opener semantics for OAuth flows).
 openedTabs = []; assigned = [];
 ret = api.open("https://example.com/games");
-assert.equal(ret, null);
+assert.ok(ret && typeof ret.postMessage === "function" && ret.closed === false,
+  "window.open must return the popup relay shim, not null");
 assert.equal(openedTabs.length, 1, "window.open(url) without a target still hands off to the app");
-assert.equal(openedTabs[0].type, "veyra:open");
-assert.equal(openedTabs[0].target, "_blank", "the default target is _blank");
+assert.equal(openedTabs[0].type, "veyra:popup-open");
+assert.equal(openedTabs[0].target, undefined, "the popup-open message carries no target (the popup IS the tab)");
+assert.equal(typeof openedTabs[0].popupId, "string", "the popup-open message carries the popup id");
 
 // The app must be able to tell in-place targets from new-tab targets.
-assert.equal(openedTabs[0].target, "_blank");
 openedTabs = [];
 ret = api.open("https://example.com/games", "_blank");
-assert.equal(openedTabs[0].target, "_blank", "explicit _blank passes its target through");
+assert.equal(openedTabs[0].name, "_blank", "explicit _blank passes its window name through");
+// The shim's postMessage relays through the app (veyra:popup-message).
+const before = openedTabs.length;
+ret.postMessage({ hello: 1 }, "https://example.com");
+assert.equal(openedTabs[openedTabs.length - 1].type, "veyra:popup-message", "the shim postMessage must relay to the app");
+assert.equal(openedTabs[openedTabs.length - 1].data.hello, 1);
+// The shim's close() asks the app to close the popup tab.
+ret.close();
+assert.equal(openedTabs[openedTabs.length - 1].type, "veyra:popup-close", "the shim close() must ask the app to close the tab");
 
 console.log("navigation-in-place regression tests passed");

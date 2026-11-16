@@ -395,25 +395,13 @@ app.use(shield.middleware);
 // a current rotating invite token, or the admin token.
 let accessGate = null;
 app.use((req, res, next) => (accessGate ? accessGate.middleware()(req, res, next) : next()));
-// The "Bring session back" bookmarklet runs on arbitrary real sites
-// (github.com, chess.com, poxel.io, …) and posts that site's readable cookies
-// into the caller's own Veyra session. It is the whole return trip of the
-// direct-login handoff — and it cannot work when the global CORS allowlist
-// (FRONTEND_ORIGIN, e.g. the GitHub Pages origin) is the only policy, because
-// the browser blocks the bookmarklet's fetch from every other origin. This
-// endpoint is safe to answer cross-origin: the sid in the body is the only
-// credential and any holder of it can already import cookies with curl; the
-// response carries no session data. Registered before the global cors() so
-// its permissive policy wins for this one path.
-app.use("/api/handoff/cookies", (req, res, next) => {
-  res.set("Access-Control-Allow-Origin", req.get("origin") || "*");
-  res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.set("Access-Control-Allow-Headers", "content-type");
-  res.set("Access-Control-Max-Age", "600");
-  res.vary("Origin");
-  if (req.method === "OPTIONS") return res.status(204).end();
-  next();
-});
+// NOTE: the cross-session cookie handoff ("/api/handoff/cookies", the
+// "Bring session back" bookmarklet, the paste-import form) was removed.
+// Sign-in now happens inside the fast proxy itself: the site's login and
+// OAuth pages load through the proxy in the session's own cookie jar, and
+// OAuth popups open as proxied Veyra tabs with opener semantics relayed
+// by the app. No cookie ever crosses between the user's browser and a
+// Veyra session, or between two Veyra sessions.
 installBrandRoutes(app, { frontendUrl: () => CFG.frontendUrl, version: VEYRA_VERSION, isPreviewBot: ua => shield.isPreviewBot(ua), hasProxiedReferer: req => !!proxiedPageFromReferer(req, { allowCookie: false }) });
 const allowedOrigins = CFG.frontendOrigins.includes("*") ? true : CFG.frontendOrigins;
 app.use(cors({
@@ -1110,59 +1098,24 @@ function escapedPathFor(target) {
     return u;
   } catch { return null; }
 }
-// ---------- Direct-login handoff (fast proxy, no Chromium) ----------
-// When a site's own security check blocks the fast proxy, the server can send
-// the user to the site's real login page in their own browser — where the
-// site's own checks pass normally. After logging in there, the site returns
-// the user to Veyra, and the user can bring their session cookies into the
-// Veyra session so the fast proxy keeps working logged-in. Veyra never solves
-// or weakens a site's checks: the user signs in as themselves and delegates
-// their own session.
+// ---------- In-proxy sign-in (fast proxy, no Chromium) ----------
+// Sign-in happens inside the fast proxy: the site's login/OAuth pages load
+// through the proxy in the session's own cookie jar, and OAuth popups open
+// as proxied Veyra tabs with opener semantics relayed by the app. The old
+// direct-login handoff (open the real site in the user's own browser, then
+// import its cookies back into the Veyra session) was removed — no cookie
+// ever crosses sessions.
+// (This block intentionally left without endpoints; see the runtime's
+// sign-in interception below and the popup relay further down.)
 function requestOrigin(req) {
   const proto = String(req.get("X-Forwarded-Proto") || req.protocol || "https").split(",")[0].trim() || "https";
   const host = String(req.get("host") || "").slice(0, 200);
   return host ? `${proto}://${host}` : String(CFG.frontendUrl || "https://veyraserver-xscy.onrender.com");
 }
-// The return trip is the target page itself: the site's own login flow
-// brings the user back to the exact page they wanted — still on the real
-// site, where the "Bring session back" bookmarklet can finish the job.
-// (The Veyra app watches its session jar and reloads the challenged tab
-// automatically once the session arrives; the user never has to route
-// back through this server.)
-// Sites whose auth pages accept a return-trip parameter. On these, an
-// auth-style page (login, register, verify, …) returns the user to the exact
-// page they wanted on the real site. Every other page — on these sites and
-// everywhere else — is handed off as the exact page the user was on; if it
-// needs a sign-in, the site's own login redirect takes over from there.
-const HANDOFF_LOGIN_PAGES = {
-  "chess.com": { path: "/login", param: "returnUrl" },
-  "github.com": { path: "/login", param: "return_to" },
-  "gitlab.com": { path: "/users/sign_in", param: "return_to" },
-};
-const AUTH_PAGE_PATH = /login|signin|sign-in|log-in|register|signup|sign-up|join|auth|verify|verification|challenge|captcha|consent|confirm/i;
-function handoffLoginRedirect(target) {
-  let dest = "";
-  try {
-    const u = new URL(target);
-    const host = u.hostname.toLowerCase();
-    const bare = host.replace(/^www\./, "");
-    const known = HANDOFF_LOGIN_PAGES[bare] || HANDOFF_LOGIN_PAGES[host];
-    // Known site + auth-style page: attach the return trip so the site's own
-    // login flow returns the user to the exact page they wanted, on the site.
-    if (known && (u.pathname === known.path || AUTH_PAGE_PATH.test(u.pathname))) {
-      u.searchParams.set(known.param, target);
-      dest = u.href;
-    } else {
-      // Every other site and page: hand off the exact page the user was on.
-      // This is what makes the flow work for every site and every wall —
-      // not just logins. On the real site in their own browser the user can
-      // finish whatever the page asks of them (sign in, verify, consent,
-      // confirm age) and then bring the session back.
-      dest = u.href;
-    }
-  } catch { dest = ""; }
-  return dest;
-}
+// (Removed) the direct-login handoff: HANDOFF_LOGIN_PAGES,
+// AUTH_PAGE_PATH and handoffLoginRedirect computed where the user's own
+// browser should land to sign in on the real site. Sign-in now happens
+// inside the fast proxy, so there is no such destination to compute.
 function makeResourceUrl(url, referrer = "", sid = "") {
   // Cesium replaces {z}/{x}/{y} after receiving a URL template. Keep those
   // tokens literal in the proxy query; encoding them as %7B...%7D makes the
@@ -2162,34 +2115,13 @@ function challengeFallbackHtml(url, info, sid = "", apiOrigin = "") {
     ? `<p style="font-size:13px;margin-top:18px">Veyra does not solve, evade, or weaken CAPTCHA/anti-bot checks. Connecting Veyra VPN to a residential exit often avoids these checks for sites like this.</p>`
     : `<p style="font-size:13px;margin-top:18px">Chromium shows the site's own check so <b>you</b> can complete it. Veyra does not solve, evade, or weaken CAPTCHA/anti-bot checks. Once you finish the check, this tab returns to the fast proxy automatically.</p>`;
   const chromiumScript = CHROMIUM_VERIFY_DISABLED ? "" : `<script>(function(){var m={type:"veyra:challenge",url:${JSON.stringify(String(url)).replace(/</g, "\\u003c")},kind:${JSON.stringify(String(info?.type || "verification"))},auto:${process.env.CHALLENGE_AUTO_HANDOFF == null ? "true" : /^(1|true|yes|on)$/i.test(String(process.env.CHALLENGE_AUTO_HANDOFF)) ? "true" : "false"}};try{if(parent!==window)parent.postMessage(m,"*")}catch(e){}var b=document.getElementById("veyraChromium");if(b){if(parent===window){b.href=${JSON.stringify(String(url)).replace(/</g, "\\u003c")};b.target="_blank";b.textContent="Open Google directly to verify"}else b.onclick=function(e){e.preventDefault();m.auto=false;m.manual=true;try{parent.postMessage(m,"*")}catch(x){}}}})();</script>`;
-  // Direct-login handoff: send the user to the site's real page in their own
-  // browser, then let them bring their session cookies back into this Veyra
-  // session so the fast proxy keeps working logged-in.
-  const handoffable = !!sid && info?.type !== "unusual-traffic";
-  // The button links the real site directly — no hop through this server —
-  // so a blocked or asleep API origin can never break the handoff.
-  const handoffDest = handoffable ? handoffLoginRedirect(url) : "";
-  const handoffAction = handoffable && handoffDest
-    ? `<a class="primary" href="${escapeHtml(handoffDest)}" target="_blank" rel="noopener noreferrer">Open this page directly & come back</a>`
-    : "";
-  const directClass = handoffable ? "secondary" : (CHROMIUM_VERIFY_DISABLED ? "primary" : "secondary");
-  // One-click return for every site: a bookmarklet the user drags to their
-  // bookmarks bar. Clicked on the real site once they are done (signed in,
-  // verified, consented — whatever the page needed), it sends that site's
-  // readable cookies straight into the Veyra session. Sites that support a
-  // return-trip parameter instead send the user back automatically.
-  const bkApi = String(apiOrigin || "").replace(/'/g, "");
-  const bkSid = String(sid || "").replace(/[^A-Za-z0-9_-]/g, "");
-  // Hybrid delivery: strict-CSP sites (github.com, …) block the cross-origin
-  // fetch from the page entirely (connect-src), so on failure the bookmarklet
-  // finishes by NAVIGATING to the API — top-level navigations are not subject
-  // to connect-src. The GET endpoint answers with a self-closing page.
-  const handoffBookmarklet = handoffable && bkApi && bkSid
-    ? `<a class="secondary" draggable="true" id="veyraBk" href="javascript:(function(){var api='${escapeHtml(bkApi)}',sid='${escapeHtml(bkSid)}';var d={sid:sid,url:location.href,cookies:document.cookie||'',userAgent:navigator.userAgent};var q='?sid='+encodeURIComponent(sid)+'&url='+encodeURIComponent(d.url)+'&cookies='+encodeURIComponent(d.cookies)+'&ua='+encodeURIComponent(d.userAgent);fetch(api+'/api/handoff/cookies',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(d)}).then(function(r){return r.json()}).then(function(j){if(j&&j.ok){alert('Veyra imported '+(j.imported||0)+' cookie(s) from '+location.hostname+'. The Veyra tab picks them up automatically — this tab will close itself.');setTimeout(function(){try{window.close()}catch(e){}},600)}else{alert('Veyra could not import cookies ('+((j&&(j.error||j.message))||'unknown')+'). Sign in on this site first, then click again.')}}).catch(function(e){window.open(api+'/api/handoff/cookies'+q,'_blank')})})()" onclick="return false" title="Drag me to your bookmarks bar">“Bring session back” — drag to bookmarks</a>`
-    : "";
-  const handoffForm = handoffable
-    ? `<details style="margin-top:18px"><summary style="cursor:pointer;color:#86a9d5;font-size:13px">Already done on the real site? Bring your session into Veyra</summary><p style="font-size:13px;color:#aab5c4">The handoff works for anything a site asks of you — signing in, verifying, consenting, confirming your age — not just logins. Open the site directly, finish what it needs as yourself, then bring the session back. Easiest: drag the “Bring session back” button above to your bookmarks bar and click it on the site. For cookies the bookmarklet cannot read (HttpOnly), copy the site's cookies (your browser's devtools &rarr; Application &rarr; Cookies) and paste them below. Veyra stores them in this session only and never shares them. Only import cookies from your own accounts.</p><textarea id="veyraCookies" rows="3" placeholder="name=value; other=value" style="width:100%;box-sizing:border-box;margin:8px 0;background:#10151d;color:#eaf0f6;border:1px solid #303a48;border-radius:9px;padding:8px;font:12px/1.4 ui-monospace,monospace;resize:vertical"></textarea><button id="veyraImportBtn" style="padding:8px 16px;border-radius:9px;border:1px solid #3a4657;background:#1f2835;color:#dce5ef;cursor:pointer;font-size:13px">Import session</button> <span id="veyraImportMsg" style="font-size:12px;color:#86a9d5"></span></details><script>(function(){var b=document.getElementById("veyraImportBtn");if(!b)return;b.onclick=function(){var t=document.getElementById("veyraCookies");var m=document.getElementById("veyraImportMsg");if(!t||!t.value.trim()){if(m)m.textContent="Paste the site's cookies first.";return}b.disabled=true;if(m)m.textContent="Importing…";fetch("/api/handoff/cookies",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({sid:${JSON.stringify(String(sid))},url:${JSON.stringify(String(url)).replace(/</g, "\\u003c")},cookies:t.value,userAgent:navigator.userAgent})}).then(function(r){return r.json().then(function(j){if(!r.ok||j.ok===false)throw new Error(j.message||("HTTP "+r.status));if(m)m.textContent="Imported "+(j.imported||"the")+" cookie(s).";if(parent===window){setTimeout(function(){location.reload()},700)}else if(m){m.textContent="Imported "+(j.imported||"the")+" cookie(s). Veyra picks them up automatically — this page will reload by itself."}}).catch(function(e){if(m)m.textContent="Import failed: "+e.message;b.disabled=false})}).catch(function(e){if(m)m.textContent="Import failed: "+e.message;b.disabled=false})};})();</script>`
-    : "";
+  // The cross-session cookie handoff (open the real site in your own
+  // browser, then bring your cookies back) was removed. Sign-in and
+  // verification happen inside the fast proxy: the challenge page runs in
+  // the proxied frame with the session's own cookie jar. "Open directly"
+  // remains as an escape hatch for the user's own browser, but no cookie
+  // ever crosses back into the Veyra session.
+  const directClass = CHROMIUM_VERIFY_DISABLED ? "primary" : "secondary";
   // Route every "open in a new tab" action through the app: a popup opened by
   // this sandboxed frame inherits the sandbox, and any site that sends
   // Cross-Origin-Opener-Policy (chess.com, Google, Twitter, …) then refuses to
@@ -2197,7 +2129,7 @@ function challengeFallbackHtml(url, info, sid = "", apiOrigin = "") {
   // a normal tab and always works. If the app does not answer the ping (very
   // old cached frontend), the plain link still runs as before.
   const handoffEscapeScript = `<script>(function(){if(parent===window)return;var haveParent=false;try{addEventListener('message',function(ev){try{var d=ev.data;if(d&&d.type==='veyra:open-direct-ack')haveParent=true}catch(e){}});parent.postMessage({type:'veyra:open-direct-ping'},'*')}catch(e){}var links=document.querySelectorAll('.actions a[target="_blank"]');for(var i=0;i<links.length;i++){(function(a){a.addEventListener('click',function(e){if(!haveParent)return;e.preventDefault();try{parent.postMessage({type:'veyra:open-direct',url:a.href},'*')}catch(err){}})})(links[i])}})();</${"script"}>`;
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#10151d;color:#eaf0f6;font:15px/1.5 system-ui,sans-serif}.card{max-width:650px;margin:24px;padding:32px;background:#171e28;border:1px solid #303a48;border-radius:18px;box-shadow:0 20px 60px #0008}.ey{font-size:11px;letter-spacing:.15em;text-transform:uppercase;color:#86a9d5}.card h1{font-size:26px;margin:10px 0}.card p{color:#aab5c4}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px}.actions a{display:inline-block;padding:10px 15px;border-radius:9px;text-decoration:none}.primary{background:#4b82c9;color:#fff}.secondary{border:1px solid #3a4657;color:#dce5ef}.secondary:hover{background:#1f2835}</style></head><body><main class="card"><div class="ey">Veyra Browser</div><h1>${escapeHtml(title)}</h1><p>${why}</p><div class="actions">${chromiumActions}${handoffAction}${handoffBookmarklet}${alt}<a class="${directClass}" href="${safe}" target="_blank" rel="noopener noreferrer">Open directly in a new tab</a><a class="secondary" href="${escapeHtml(makeViewUrl(url, sid))}">Retry through Veyra</a></div>${chromiumNote}${handoffForm}</main>${chromiumScript}${handoffEscapeScript}</body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#10151d;color:#eaf0f6;font:15px/1.5 system-ui,sans-serif}.card{max-width:650px;margin:24px;padding:32px;background:#171e28;border:1px solid #303a48;border-radius:18px;box-shadow:0 20px 60px #0008}.ey{font-size:11px;letter-spacing:.15em;text-transform:uppercase;color:#86a9d5}.card h1{font-size:26px;margin:10px 0}.card p{color:#aab5c4}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px}.actions a{display:inline-block;padding:10px 15px;border-radius:9px;text-decoration:none}.primary{background:#4b82c9;color:#fff}.secondary{border:1px solid #3a4657;color:#dce5ef}.secondary:hover{background:#1f2835}</style></head><body><main class="card"><div class="ey">Veyra Browser</div><h1>${escapeHtml(title)}</h1><p>${why}</p><div class="actions">${chromiumActions}${alt}<a class="${directClass}" href="${safe}" target="_blank" rel="noopener noreferrer">Open directly in a new tab</a><a class="secondary" href="${escapeHtml(makeViewUrl(url, sid))}">Retry through Veyra</a></div>${chromiumNote}</main>${chromiumScript}${handoffEscapeScript}</body></html>`;
 }
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m])); }
 
@@ -2460,6 +2392,66 @@ function injectRuntime(html, original, sid = "") {
   // tabs and element inspection works on the main frame too.
   var appEmbedded=false;
   try{addEventListener('message',function(ev){try{if(ev.data&&ev.data.type==='veyra:embed-ack')appEmbedded=true}catch{}});topPost({type:'veyra:embed-ping',sessionId:SESSION_ID})}catch{}
+  // ----- Popup relay: OAuth popups open as proxied Veyra tabs -----
+  // A site's window.open() (Google/Microsoft/Apple sign-in, "continue with
+  // …" OAuth popups) must not escape to a raw browser tab, and the popup
+  // flow needs opener semantics: the popup posts its OAuth response to
+  // window.opener, the opener polls .closed, and either side may reply via
+  // event.source. The app opens the popup as a proxied Veyra tab and
+  // relays every postMessage between the two frames; each side receives a
+  // synthetic MessageEvent whose origin is the OTHER side's virtual (real)
+  // origin, so the site's own origin checks keep passing. Everything runs
+  // in this session's cookie jar — no cross-session cookies anywhere.
+  var POPUP_SEQ=0;
+  var POPUP_HANDLES={};
+  function popupReplyShim(dir,popupId){
+    return {closed:false,focus:function(){},length:0,opener:null,
+      postMessage:function(data,origin){
+        if(dir==='to-opener')topPost({type:'veyra:popup-to-opener',data:data,targetOrigin:origin,sessionId:SESSION_ID,virtualUrl:virtualUrl});
+        else topPost({type:'veyra:popup-message',popupId:popupId,data:data,targetOrigin:origin,sessionId:SESSION_ID,virtualUrl:virtualUrl});
+      }};
+  }
+  function popupDispatchRelay(d){
+    try{
+      if(d==null||typeof d!=='object')return;
+      // d.from says which side sent the original message ('opener' or
+      // 'popup'); the synthetic event's source shim must reply to that
+      // side — the opposite direction.
+      var src=null;
+      if(d.from==='opener')src=popupReplyShim('to-opener','');
+      else if(d.from==='popup')src=popupReplyShim('to-popup',d.popupId||'');
+      var ev=null;
+      try{ev=new MessageEvent('message',{data:d.data,origin:String(d.origin||API_ORIGIN||location.origin),lastEventId:'',ports:[]})}catch(e){return}
+      // The constructor rejects a plain object as the source (it wants a
+      // WindowProxy/MessagePort), so shadow the accessor with an own
+      // property pointing at the relay reply shim.
+      try{if(src)Object.defineProperty(ev,'source',{value:src,configurable:true})}catch(e){}
+      window.dispatchEvent(ev);
+    }catch(e){}
+  }
+  try{addEventListener('message',function(ev){
+    try{
+      if(ev.source!==window.parent)return;
+      var d=ev.data;
+      if(!d||typeof d!=='object'||typeof d.type!=='string')return;
+      if(d.type==='veyra:popup-role'){
+        try{if(!window.opener)window.opener=popupReplyShim('to-opener','')}catch(e){}
+        try{window.close=function(){topPost({type:'veyra:popup-self-close',sessionId:SESSION_ID})}}catch(e){}
+        return;
+      }
+      if(d.type==='veyra:relay-message'){popupDispatchRelay(d);return}
+      if(d.type==='veyra:popup-closed'&&d.popupId&&POPUP_HANDLES[d.popupId]){try{POPUP_HANDLES[d.popupId].closed=true}catch(e){}return}
+    }catch(e){}
+  })}catch(e){}
+  // The app marks a popup tab's frame URL with veyra_popup=1 so the shim
+  // installs synchronously at injection time — before any site script can
+  // touch window.opener (no round-trip race on the first load).
+  try{
+    if(/[?&]veyra_popup=1(?:&|$)/.test(String(window.location.search||''))){
+      try{if(!window.opener)window.opener=popupReplyShim('to-opener','')}catch(e){}
+      try{window.close=function(){topPost({type:'veyra:popup-self-close',sessionId:SESSION_ID})}}catch(e){}
+    }
+  }catch(e){}
   // Escape watchdog handshake: the app probes each loaded frame; only a frame
   // still running this runtime can answer. A frame that navigated off the
   // proxy to a real site (e.g. an X-Frame-Options blocked auth redirect)
@@ -2508,8 +2500,9 @@ function injectRuntime(html, original, sid = "") {
     // real site (e.g. MSN's authorize 404 page sets window.location to
     // https://www.msn.com/), which the app's iframe cannot show — the user
     // gets Chrome's "This content is blocked" error. Route sign-in redirects
-    // to the handoff instead: the site's real sign-in opens in the user's own
-    // browser and the session comes back via the bookmarklet.
+    // through the app: it loads the site's sign-in page through the fast
+    // proxy in the tab, so the user signs in inside Veyra — the session's
+    // own cookie jar carries the signed-in state, no cross-session cookies.
     if(LP&&LP.assign){const nativeAssign=LP.assign;LP.assign=function(next){const u=canonicalizeMaybeProxy(next);if(u){if(!rootProxiedFrame()){emit('location.assign',u);return;}if(appEmbedded&&isSigninRedirect(u)){topPost({type:'veyra:signin',url:u,sessionId:SESSION_ID,pageUrl:virtualUrl});return;}return nativeAssign.call(this,proxy('view',u));}return nativeAssign.call(this,next)}}
     if(LP&&LP.replace){const nativeReplace=LP.replace;LP.replace=function(next){const u=canonicalizeMaybeProxy(next);if(u){if(!rootProxiedFrame()){emit('location.replace',u);return;}if(appEmbedded&&isSigninRedirect(u)){topPost({type:'veyra:signin',url:u,sessionId:SESSION_ID,pageUrl:virtualUrl});return;}return nativeReplace.call(this,proxy('view',u));}return nativeReplace.call(this,next)}}
     // Report the virtual (original) page URL from location: apps such as MSN
@@ -2864,7 +2857,23 @@ function injectRuntime(html, original, sid = "") {
       try{location.assign(proxy('view',u))}catch(e){}
       return null;
     }
-    if(!rootProxiedFrame()||appEmbedded){topPost({type:'veyra:open',url:u,target:tgt||'_blank',sessionId:SESSION_ID});return null}return nativeOpen.call(window,proxy('view',u),target,features)}if(appEmbedded)return null;return nativeOpen.call(window,url,target,features)}}catch{}
+    if(!rootProxiedFrame()||appEmbedded){
+      // OAuth/sign-in popups (and every other popup) open as proxied Veyra
+      // tabs. The returned handle is a shim with real opener semantics:
+      // .closed tracks the tab, .close() closes it, .postMessage() relays
+      // through the app, and assigning .location navigates the popup tab —
+      // so popup-based sign-in flows (GIS, MSAL, appleid, …) complete
+      // inside the fast proxy instead of escaping to a raw browser tab.
+      const popupId='vp'+(++POPUP_SEQ);
+      topPost({type:'veyra:popup-open',url:u,name:String(target||''),popupId:popupId,sessionId:SESSION_ID,virtualUrl:virtualUrl});
+      const shim=popupReplyShim('to-popup',popupId);
+      try{shim.name=String(target||'')}catch(e){}
+      try{Object.defineProperty(shim,'location',{set:function(loc){const lu=canonicalizeMaybeProxy(loc);if(lu)topPost({type:'veyra:popup-navigate',popupId:popupId,url:lu,sessionId:SESSION_ID})},get:function(){return {href:virtualUrl,replace:function(loc){const lu=canonicalizeMaybeProxy(loc);if(lu)topPost({type:'veyra:popup-navigate',popupId:popupId,url:lu,sessionId:SESSION_ID})},assign:function(loc){const lu=canonicalizeMaybeProxy(loc);if(lu)topPost({type:'veyra:popup-navigate',popupId:popupId,url:lu,sessionId:SESSION_ID})}}},configurable:true})}catch(e){}
+      shim.close=function(){topPost({type:'veyra:popup-close',popupId:popupId,sessionId:SESSION_ID})};
+      POPUP_HANDLES[popupId]=shim;
+      return shim;
+    }
+    return nativeOpen.call(window,proxy('view',u),target,features)}if(appEmbedded)return null;return nativeOpen.call(window,url,target,features)}}catch{}
   function fmtArg(x,d){d=d||0;if(typeof x==='string')return x;if(x instanceof Error)return (x.name||'Error')+': '+x.message+(x.stack?'\\n'+String(x.stack).split('\\n').slice(1,6).join('\\n'):'');if(typeof Node!=='undefined'&&x instanceof Node)return x.nodeType===1?'<'+x.tagName.toLowerCase()+(x.id?'#'+x.id:'')+(x.className&&typeof x.className==='string'?'.'+x.className.trim().split(/\\s+/).slice(0,3).join('.'):'')+'>':x.nodeName;if(typeof x==='function')return 'ƒ '+(x.name||'anonymous')+'()';try{const seen=new WeakSet();return JSON.stringify(x,(k,v)=>{if(typeof v==='object'&&v){if(seen.has(v))return '[Circular]';seen.add(v)}if(typeof v==='function')return 'ƒ';if(typeof v==='bigint')return String(v)+'n';return v})||String(x)}catch{return String(x)}}
   let consoleBudget=400,consoleWindow=Date.now();
   try{['log','info','debug','warn','error','trace','dir','table','assert','group','groupCollapsed','groupEnd','count','timeEnd'].forEach(level=>{if(typeof console[level]!=='function')return;const native=console[level].bind(console);console[level]=(...args)=>{native(...args);if(level==='assert'){if(args[0])return;args=['Assertion failed:',...args.slice(1)]}const now=Date.now();if(now-consoleWindow>2000){consoleWindow=now;consoleBudget=400}if(--consoleBudget<0)return;let stack='';if(level==='trace'||level==='error'){try{stack=String(new Error().stack||'').split('\\n').slice(2,9).join('\\n')}catch{}}let msg='';try{msg=args.map(x=>fmtArg(x)).join(' ')}catch{}topPost({type:'veyra:page-console',level:level==='assert'?'error':level,sessionId:SESSION_ID,message:msg.slice(0,20000),stack,time:now,pageUrl:virtualUrl})}})}catch{}
@@ -2926,16 +2935,14 @@ ${pageActionsRuntime()}
   }catch{}},true);
   window.addEventListener('message',function(ev){const d=ev.data||{};if(d.type==='veyra:find'){try{const q=String(d.query||'').slice(0,200);if(!q){window.getSelection()?.removeAllRanges();topPost({type:'veyra:find-result',matches:0,pageUrl:virtualUrl});return;}let text=String(document.body?.innerText||'').slice(0,2000000);const hay=text.toLocaleLowerCase(),needle=q.toLocaleLowerCase();const matches=needle?(hay.split(needle).length-1):0;window.find(q,false,String(d.direction||'forward')==='backward',true,false,false,false);topPost({type:'veyra:find-result',matches,pageUrl:virtualUrl});}catch{}}else if(d.type==='veyra:find-close'){try{window.getSelection()?.removeAllRanges();}catch{}}else if(d.type==='veyra:print'){try{window.print();}catch{}}});
   document.addEventListener('mousemove',function(ev){if(!inspectMode)return;const now=performance.now();if(now-inspectLast<45)return;inspectLast=now;let el=ev.target;if(!(el instanceof Element))return;inspectEmit('veyra:inspect-hover',el)},true);
-  // Sign-in handoff: a click on a detected sign-in control (text like "Sign
-  // in"/"Log in", or a login/oauth/auth URL) is handed to the app, which
-  // opens the site's real sign-in in the user's own browser — the "auto
-  // sign-in" handoff — instead of rendering the site's OAuth/login wall
-  // through the proxy. Veyra never sees the credentials: the user signs in
-  // as themselves on the real site and brings the session back. Hold Shift
-  // (or Ctrl/Cmd) to bypass the handoff and sign in through the proxy.
-  // Sign-up is deliberately excluded: "Sign up"/"Create account"/"Register"
-  // controls and signup URLs load the site's real signup page through Veyra,
-  // so the user signs up inside Veyra instead of the handoff.
+  // Sign-in inside Veyra: a click on a detected sign-in control (text like
+  // "Sign in"/"Log in", or a login/oauth/auth URL) is handed to the app,
+  // which loads the site's sign-in page through the fast proxy in the tab.
+  // The user signs in inside Veyra — credentials go through the session's
+  // own cookie jar and never cross sessions. Sign-up is deliberately
+  // excluded from interception: "Sign up"/"Create account"/"Register"
+  // controls and signup URLs load the site's real signup page through Veyra
+  // so the user creates the account inside Veyra.
   var SIGNIN_AUTH_HOST=/^(?:accounts?\\.google\\.com|appleid\\.apple\\.com|login\\.(?:microsoftonline|microsoft|live)\\.com|securetoken\\.com|(?:auth|sso|signin|login|accounts)\\.[a-z0-9-]+\\.[a-z]{2,})$/i;
   var SIGNIN_AUTH_PATH=/(?:^|\\/)(?:login|signin|sign-in|log-in|oauth|oauth2|openid|sso|servicelogin|authentication|authorize|dialog\\/oauth|i\\/oauth2|users\\/sign_in)(?:\\/?$|\\?|#)/i;
   var SIGNIN_TEXT=/^(?:sign in|sign-in|signin|log ?in|login|log on|continue with (?:google|apple|microsoft|facebook|steam|discord|twitter|x|email)|log in with (?:google|apple|microsoft|facebook|steam|discord|twitter|x))\\b/i;
@@ -5083,90 +5090,13 @@ app.post('/api/session', (req, res) => {
   rec.incognito = req.body?.incognito === true;
   res.status(201).json({ ok: true, ...sessionInfo(sid, rec), user: user ? authStore.publicUser(user) : null });
 });
-// Direct-login handoff: send the user to the site's real login page (or
-// homepage) in their own browser, with a return trip back into Veyra.
-app.get("/api/handoff/login", (req, res) => {
-  const target = normalizeUrl(String(req.query.url || ""));
-  if (!target) return respondError(res, 400, "A valid http(s) url is required.", "BAD_REQUEST");
-  const sid = normalizeSessionId(String(req.query.sid || ""));
-  const dest = handoffLoginRedirect(target);
-  if (!dest) return respondError(res, 400, "A valid http(s) url is required.", "BAD_REQUEST");
-  // The frontend asks for JSON (Accept: application/json) so it can open the
-  // real site directly — the user's popup then never navigates through this
-  // server at all. A plain navigation still gets the 302 for old links.
-  if (/json/i.test(String(req.get("accept") || ""))) {
-    return res.json({ ok: true, dest });
-  }
-  res.redirect(302, dest);
-});
-// The site's returnUrl lands here after the user logs in; bounce into the
-// Veyra app with the original target so the tab picks it back up.
-app.get("/api/handoff/return", (req, res) => {
-  const target = String(req.query.url || "");
-  const base = String(CFG.frontendUrl || "/").replace(/\/$/, "") || "/";
-  let dest = base;
-  try {
-    const u = new URL(base + (base.endsWith("/") ? "" : "/"));
-    if (/^https?:\/\//i.test(target)) u.searchParams.set("veyra_handoff", target);
-    dest = u.href;
-  } catch {}
-  res.redirect(302, dest);
-});
-// Bring the user's own session cookies into the fast-proxy session jar. The
-// user pastes cookies they copied from their own browser after signing in
-// directly; Veyra replays them (and the matching user-agent) for that host.
-function importHandoffCookies({ sid: rawSid, url: rawUrl, cookies: rawCookies, ua: rawUa, userAgent: rawUserAgent }) {
-  const sid = normalizeSessionId(String(rawSid || ""));
-  const rec = sessionManager.peek(sid);
-  if (!rec) { const e = new Error("No such session. Start a Veyra session first."); e.status = 404; throw e; }
-  const target = normalizeUrl(String(rawUrl || ""));
-  if (!target) { const e = new Error("A valid http(s) url is required."); e.status = 400; throw e; }
-  let host = "", secure = false;
-  try { const u = new URL(target); host = u.hostname.toLowerCase(); secure = u.protocol === "https:"; } catch { const e = new Error("A valid http(s) url is required."); e.status = 400; throw e; }
-  const raw = String(rawCookies || "").slice(0, 20000);
-  const ua = String(rawUa || rawUserAgent || "").slice(0, 500);
-  // Accept a raw cookie header ("a=1; b=2") or a JSON array of cookies.
-  let arr = null;
-  const trimmed = raw.trim();
-  if (trimmed.startsWith("[")) {
-    try { const parsed = JSON.parse(trimmed); if (Array.isArray(parsed)) arr = parsed; } catch {}
-  }
-  if (!arr) {
-    arr = trimmed.split(";").map(part => {
-      const i = part.indexOf("=");
-      if (i < 1) return null;
-      const name = part.slice(0, i).trim();
-      if (!name) return null;
-      return { name, value: part.slice(i + 1).trim(), domain: host, path: "/", secure, expires: 0 };
-    }).filter(Boolean);
-  }
-  if (!arr.length) { const e = new Error("No valid cookies found. Paste a cookie header like \"name=value; other=value\"."); e.status = 400; throw e; }
-  sessionManager.importPlaywrightCookies(sid, arr, ua);
-  serverLog("info", "HANDOFF", `Imported ${arr.length} cookie(s) for ${host} into session ${sid.slice(0, 8)} via direct-login handoff.`);
-  return { imported: arr.length, host };
-}
-app.post("/api/handoff/cookies", (req, res) => {
-  try {
-    const r = importHandoffCookies(req.body || {});
-    res.json({ ok: true, imported: r.imported });
-  } catch (e) {
-    respondError(res, e.status || 400, e.message, e.code || "HANDOFF_IMPORT_FAILED");
-  }
-});
-// The bookmarklet's CSP fallback: strict-CSP sites (github.com, …) block
-// cross-origin fetch from the page entirely (connect-src), so the bookmarklet
-// finishes the import by NAVIGATING here — top-level navigations are not
-// subject to connect-src. Same import logic, answered with a small
-// self-closing page instead of JSON.
-app.get("/api/handoff/cookies", (req, res) => {
-  const page = (ok, heading, detail) => `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Veyra session import</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#10151d;color:#eaf0f6;font:15px/1.5 system-ui,sans-serif}.card{max-width:520px;margin:24px;padding:32px;background:#171e28;border:1px solid #303a48;border-radius:18px;box-shadow:0 20px 60px #0008}.ey{font-size:11px;letter-spacing:.15em;text-transform:uppercase;color:#86a9d5}.card h1{font-size:22px;margin:10px 0}.card p{color:#aab5c4}a{color:#4b82c9}</style></head><body><main class="card"><div class="ey">Veyra Browser</div><h1>${escapeHtml(heading)}</h1><p>${escapeHtml(detail)}</p><p><a href="#" onclick="try{window.close()}catch(e){};return false">Close this tab</a> — the Veyra tab picks your session up automatically.</p><script>try{setTimeout(function(){try{window.close()}catch(e){}},900)}catch(e){}</${"script"}></main></body></html>`;
-  try {
-    const r = importHandoffCookies({ sid: req.query.sid, url: req.query.url, cookies: req.query.cookies, ua: req.query.ua });
-    res.type("html").send(page(true, "Session imported", `Veyra imported ${r.imported} cookie(s) from ${r.host}. Finish in the Veyra tab — it reloads signed in by itself.`));
-  } catch (e) {
-    res.status(e.status || 400).type("html").send(page(false, "Could not import session", e.message || "Something went wrong."));
-  }
-});
+// (Removed) /api/handoff/login, /api/handoff/return and
+// /api/handoff/cookies (bookmarklet + paste cookie import). Sign-in and
+// verification happen inside the fast proxy in the session's own cookie
+// jar; no cookie ever crosses between the user's browser and a Veyra
+// session, or between two Veyra sessions. The session-cookie endpoints
+// below remain: the app uses them to display and clear the session's own
+// jar (devtools cookie panel), never to import foreign cookies.
 app.get('/api/session/:sid', (req, res) => {
   const sid = String(req.params.sid);
   if (sessionManager.checkLimit(sid)) return res.json({ ok: true, sessionId: sid, active: false, expired: true, reason: "SESSION_EXPIRED" });
