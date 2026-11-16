@@ -1,5 +1,22 @@
 const assert = require('assert');
-const { rewriteHtml, cacheSafeUrl, cacheSafeResponse } = require('../src/server');
+const { rewriteHtml, rewriteJsText, cacheSafeUrl, cacheSafeResponse } = require('../src/server');
+
+// Bare-origin string literals must stay verbatim in rewritten JS: apps parse
+// them with new URL(...) and compare hostnames (browser.lol's app-origin
+// constant gates Google One Tap; a relative /api/resource form makes the
+// parse throw and crashes hydration). Same-origin literals WITH a path keep
+// being rewritten so bundled asset URLs stay same-origin.
+{
+  const js = `62477,e=>{"use strict";e.s(["f",0,"https://browser.lol"])},1,e=>{fetch("https://browser.lol/img/x.png")}`;
+  const out = rewriteJsText(js, 'https://browser.lol/_next/static/chunks/app.js', 'sid1');
+  assert.match(out, /"https:\/\/browser\.lol"/);
+  assert.doesNotMatch(out, /"\/api\/resource\?url=https%3A%2F%2Fbrowser\.lol%2F&/);
+  assert.match(out, /"\/api\/resource\?url=https%3A%2F%2Fbrowser\.lol%2Fimg%2Fx\.png/);
+}
+// srcFix's script flag is a real parameter now (it used to be a free variable
+// that threw ReferenceError and silently disabled the whole script-form
+// logic): same-origin script URLs keep their path, other origins get proxied.
+// Covered end-to-end by the browser.lol hydration regression probe.
 
 assert.equal(cacheSafeUrl('https://example.com/public?page=2'), true);
 assert.equal(cacheSafeUrl('https://example.com/private?access_token=secret'), false);
@@ -23,7 +40,12 @@ const out = rewriteHtml(html, 'https://www.geo-fs.com/geofs.php', 'proxy-test');
 
 assert.match(out, /data-deferredsrc="\/api\/resource\?url=https%3A%2F%2Fwww\.geo-fs\.com%2Fjs%2Fgeofs\.js%3Fkc%3D3910/);
 assert.match(out, /data-deferredsrc="\/api\/resource\?url=https%3A%2F%2Fwww\.geo-fs\.com%2Fimages%2Fplanes%2Fc172\.png/);
-assert.match(out, /src="\/api\/resource\?url=https%3A%2F%2Fwww\.geo-fs\.com%2Fprojects%2FCESIUM%2FBuild%2FCesium%2FCesium\.js/);
+// Same-origin <script src> keeps its real path: Turbopack-style chunk loaders
+// key lazy chunk registrations by the raw src attribute, and query-form
+// /api/resource URLs break that match so hydration hangs (browser.lol).
+// The escaped-path fallback middleware serves path-form script srcs.
+assert.match(out, /src="\/projects\/CESIUM\/Build\/Cesium\/Cesium\.js"/);
+assert.doesNotMatch(out, /src="\/api\/resource\?url=https%3A%2F%2Fwww\.geo-fs\.com%2Fprojects/);
 assert.match(out, /dest="\/api\/resource\?url=https%3A%2F%2Fwww\.geo-fs\.com%2Fjs%2FCesium%2Fbuild%2FCesium\.js/);
 assert.doesNotMatch(out, /data-deferredsrc="\/js\/geofs\.js/);
 assert.doesNotMatch(out, /dest="js\/Cesium\/build\/Cesium\.js/);
@@ -43,8 +65,15 @@ const inlineGeoFs = rewriteHtml(`<html><head><script>
 // 404s at /api/resource/<z>/<x>/<y>.terrain.
 assert.match(inlineGeoFs, /geofs\.srtmServer\s*=\s*"https:\/\/data\.geo-fs\.com\/srtm\/"/);
 assert.doesNotMatch(inlineGeoFs, /srtmServer[^;]*\/api\/resource\?url=/);
-assert.match(inlineGeoFs, /\/api\/resource\?url=https%3A%2F%2Fweather\.geo-fs\.com%2F/);
-assert.match(inlineGeoFs, /\/api\/resource\?url=https%3A%2F%2Fmps\.geo-fs\.com/);
+// Bare-origin server constants ("https://weather.geo-fs.com/", "https://mps.geo-fs.com")
+// stay verbatim: loaders concatenate paths onto them (a query-string proxy URL
+// would corrupt the concatenation), and app code parses them with new URL()
+// (browser.lol's app-origin constant). Real fetches are proxied by the runtime
+// fetch/XHR wrappers instead.
+assert.match(inlineGeoFs, /geofs\.weatherServer\s*=\s*"https:\/\/weather\.geo-fs\.com\/"/);
+assert.match(inlineGeoFs, /geofs\.multiplayerHost\s*=\s*"https:\/\/mps\.geo-fs\.com"/);
+assert.doesNotMatch(inlineGeoFs, /weatherServer[^;]*\/api\/resource\?url=/);
+assert.doesNotMatch(inlineGeoFs, /multiplayerHost[^;]*\/api\/resource\?url=/);
 assert.match(inlineGeoFs, /\/api\/resource\?url=https%3A%2F%2Fdata\.geo-fs\.com%2Fosm%2F\{z\}%2F\{x\}%2F\{y\}\.png/);
 assert.doesNotMatch(inlineGeoFs, /data\.geo-fs\.com%2Fosm%2F%7Bz%7D/);
 

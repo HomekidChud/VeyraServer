@@ -2229,6 +2229,14 @@ function rewriteJsText(text, base, sid = "") {
     try {
       if (!u) return m;
       const target = new URL(u), source = new URL(base);
+      // Bare-origin literals ("https://site.com", "https://site.com/") are
+      // origin identifiers, not resource fetches: apps parse them with
+      // new URL(...) and compare hostnames (browser.lol's app-origin
+      // constant gates Google One Tap), and the relative proxy form makes
+      // that parse throw. Concatenating paths onto the query-string proxy
+      // URL would corrupt it anyway, and real fetches of the constant are
+      // proxied by the runtime fetch/XHR wrappers — leave it verbatim.
+      if (!target.pathname.replace(/\/+$/, "") && !target.search && !target.hash) return m;
       // GeoFS keeps terrain, imagery, weather, and multiplayer APIs on
       // separate geo-fs.com subdomains. Image/Cesium loaders do not pass
       // through fetch/XHR, so keep these URLs same-origin in the bundle.
@@ -2615,7 +2623,7 @@ function injectRuntime(html, original, sid = "") {
   try{(function(){
     var nativeCreate=document.createElement.bind(document);
     var VAPI=/^\\/api\\/(view|resource|download|form-get|open|crawl|search|suggest|browser|debug|session|vpn|status|health|devtools|cast)([\\/?#]|$)/;
-    function srcFix(v,kind){
+    function srcFix(v,kind,sc){
       try{
         var raw=String(v||'');
         if(!raw||/^(data:|blob:|about:|javascript:)/i.test(raw))return v;
@@ -2630,6 +2638,15 @@ function injectRuntime(html, original, sid = "") {
         if(VAPI.test(u.pathname))return v;
         if(/^[a-z][a-z0-9+.-]*:\\/\\//i.test(raw)){
           if(u.protocol!=='http:'&&u.protocol!=='https:')return v;
+          // Absolute URLs to the virtual site's own origin: for SCRIPTS keep
+          // the URL verbatim. Turbopack-style chunk loaders key their chunk
+          // registry by the exact URL they hand to the created <script>, so
+          // rewriting it to /api/resource?url=... makes the loaded chunk
+          // register under a key nothing waits for and hydration hangs
+          // forever (browser.lol). Scripts are CORS-free, so a direct fetch
+          // of the site's own asset URL is safe and matches the direct-site
+          // behavior exactly.
+          if(sc){try{var vp0=new URL(virtualUrl);if(u.origin===vp0.origin)return u.href}catch(e){}}
           if(u.origin===location.origin){
             // Absolute URLs at the proxy origin: proper API routes pass
             // through; escaped paths (site code resolved a relative URL
@@ -2643,6 +2660,12 @@ function injectRuntime(html, original, sid = "") {
         var real=new URL(raw,virtualUrl);
         if(!/^https?:$/.test(real.protocol))return v;
         if(real.origin===location.origin)return v;
+        // Same-origin scripts keep their real path (e.g. /_next/static/chunks/x.js).
+        // Turbopack-style runtimes key lazy chunk registrations by the raw src
+        // attribute; /api/resource?url=... forms break that match and the chunk
+        // promise never resolves. Path-form srcs match natively and the
+        // escaped-path fallback middleware resolves them via the Referer sid.
+        if(sc){try{var vp=new URL(virtualUrl);if(real.origin===vp.origin)return real.pathname+real.search}catch(e){}}
         return proxy(kind,real.href);
       }catch(e){return v}
     }
@@ -2659,9 +2682,9 @@ function injectRuntime(html, original, sid = "") {
         var kind=name==='iframe'?'view':'resource';
         var proto=Object.getPrototypeOf(el);
         var desc=Object.getOwnPropertyDescriptor(proto,attr);
-        if(desc&&desc.set)Object.defineProperty(el,attr,{get:desc.get,set:function(v){desc.set.call(el,srcFix(v,kind))},configurable:true});
+        if(desc&&desc.set)Object.defineProperty(el,attr,{get:desc.get,set:function(v){desc.set.call(el,srcFix(v,kind,name==='script'))},configurable:true});
         var nativeSetAttr=el.setAttribute.bind(el);
-        el.setAttribute=function(k,v){if(String(k).toLowerCase()===attr)v=srcFix(v,kind);return nativeSetAttr(k,v)};
+        el.setAttribute=function(k,v){if(String(k).toLowerCase()===attr)v=srcFix(v,kind,name==='script');return nativeSetAttr(k,v)};
       }catch(e){}
       return el;
     }
@@ -2697,7 +2720,7 @@ function injectRuntime(html, original, sid = "") {
         try{
           var kk=String(k).toLowerCase();
           var tag=String(this.tagName||'').toLowerCase();
-          if(FIX_ATTRS[tag]===kk)v=srcFix(v,tag==='iframe'?'view':'resource');
+          if(FIX_ATTRS[tag]===kk)v=srcFix(v,tag==='iframe'?'view':'resource',tag==='script');
         }catch(e){}
         return nativeSetAttrAny.call(this,k,v);
       };
@@ -3105,7 +3128,14 @@ function rewriteHtml(html, base, sid = "") {
   $("link[href]").each((_, el) => {
     const rel = String($(el).attr("rel") || "").toLowerCase();
     if (rel.includes("canonical")) return;
-    const raw = $(el).attr("href"); const u = resolveResource(raw, effectiveBase); if (u) { $(el).attr("href", makeResourceUrl(u, effectiveBase, sid)); $(el).removeAttr("crossorigin"); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); }
+    const raw = $(el).attr("href"); const u = resolveResource(raw, effectiveBase); if (!u) return;
+    // Script preloads keep the same-origin path form as the <script> tags they
+    // preload, so the preloader and the parser hit one URL (and Turbopack's
+    // head-manifest processing sees native paths).
+    if ((rel.includes("preload") || rel.includes("modulepreload")) && String($(el).attr("as") || "").toLowerCase() === "script") {
+      try { const lu = new URL(u); if (lu.origin === new URL(effectiveBase).origin) { $(el).attr("href", lu.pathname + lu.search); $(el).removeAttr("crossorigin"); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); return; } } catch {}
+    }
+    $(el).attr("href", makeResourceUrl(u, effectiveBase, sid)); $(el).removeAttr("crossorigin"); if ($(el).attr("integrity")) $(el).removeAttr("integrity");
   });
   $("script[src]").each((_, el) => {
     const rawSrc = $(el).attr("src");
@@ -3120,7 +3150,16 @@ function rewriteHtml(html, base, sid = "") {
     if (/Cesium\.js(?:\?|#|$)/i.test(String(rawSrc || ""))) {
       try { const cesiumBase = new URL(".", u).href; $(`<script>window.CESIUM_BASE_URL = ${JSON.stringify(cesiumBase)};</script>`).insertBefore(el); } catch {}
     }
-    $(el).attr("src", makeResourceUrl(u, effectiveBase, sid));
+    // Same-origin scripts keep their original path (e.g. /_next/static/chunks/x.js).
+    // Framework runtimes like Turbopack key chunk registrations by the raw src
+    // attribute and recompute chunk keys from it; /api/resource?url=... proxy
+    // URLs break that key match and hydration silently hangs (browser.lol).
+    // Path-form srcs match the runtime's expectations natively, and the
+    // escaped-path fallback middleware resolves them against the session's
+    // page URL (sid recovered from the Referer / veyra_ctx cookie).
+    let scriptUrl = null;
+    try { const su = new URL(u); if (su.origin === new URL(effectiveBase).origin) scriptUrl = su; } catch {}
+    $(el).attr("src", scriptUrl ? scriptUrl.pathname + scriptUrl.search : makeResourceUrl(u, effectiveBase, sid));
     $(el).removeAttr("crossorigin");
     if ($(el).attr("integrity")) $(el).removeAttr("integrity");
   });
