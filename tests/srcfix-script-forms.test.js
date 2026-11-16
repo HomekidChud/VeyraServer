@@ -80,4 +80,27 @@ assert.equal(srcFix('blob:https://browser.lol/x', 'resource', true), 'blob:https
 assert.match(script, /function srcFix\(v,kind,sc\)\{/);
 assert.match(script, /srcFix\(v,kind,name==='script'\)/);
 
+// 8. /cdn-cgi/ (Cloudflare challenge platform) is reserved by Cloudflare's
+//    own edge on the proxy host (Render is behind Cloudflare): a path-form
+//    /cdn-cgi/ script src is answered by Render's edge with the WRONG
+//    domain's challenge-platform copy, so a site's managed challenge can
+//    never complete (poxel.io). Both absolute and root-relative /cdn-cgi/
+//    script srcs must go through the proxy instead of staying path-form.
+{
+  const orch = '/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1?ray=a5ba14526c3d5ef1';
+  const abs = srcFix(`https://browser.lol${orch}`, 'resource', true);
+  assert.equal(abs, `${PROXY_BASE}/api/resource?url=${encodeURIComponent(`https://browser.lol${orch}`)}`,
+    'absolute /cdn-cgi/ script URLs must be proxied, not kept verbatim');
+  const rel = srcFix(orch, 'resource', true);
+  assert.equal(rel, `${PROXY_BASE}/api/resource?url=${encodeURIComponent(`https://browser.lol${orch}`)}`,
+    'relative /cdn-cgi/ script URLs must be proxied, not kept in path form');
+}
+
+// 9. The Turbopack path-form exception still applies OUTSIDE /cdn-cgi/ —
+//    regular same-origin chunk paths keep their path form (test 2 covers the
+//    relative case; this pins the branch ordering so the /cdn-cgi/ guard
+//    cannot swallow the general case).
+assert.equal(srcFix('/_next/static/chunks/y.js', 'resource', true), '/_next/static/chunks/y.js',
+  'non-/cdn-cgi/ same-origin scripts still keep their path form');
+
 console.log('srcFix script-form regression tests passed');

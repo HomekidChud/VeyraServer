@@ -2650,6 +2650,14 @@ function injectRuntime(html, original, sid = "") {
           // forever (browser.lol). Scripts are CORS-free, so a direct fetch
           // of the site's own asset URL is safe and matches the direct-site
           // behavior exactly.
+          // /cdn-cgi/ is Cloudflare's own reserved path prefix. The proxy host
+          // (Render) is itself behind Cloudflare, so a path-form /cdn-cgi/ URL
+          // is answered by Render's edge, NOT by the escaped-path fallback —
+          // a site's challenge-platform script would load the WRONG domain's
+          // copy and its managed challenge could never complete (poxel.io).
+          // Always send /cdn-cgi/ script srcs through the proxy so they come
+          // from the site itself, with the session's cookie jar.
+          if(sc && /^\\/cdn-cgi\\//i.test(u.pathname)){try{return proxy(kind,u.href)}catch(e){return v}}
           if(sc){try{var vp0=new URL(virtualUrl);if(u.origin===vp0.origin)return u.href}catch(e){}}
           if(u.origin===location.origin){
             // Absolute URLs at the proxy origin: proper API routes pass
@@ -2669,6 +2677,10 @@ function injectRuntime(html, original, sid = "") {
         // attribute; /api/resource?url=... forms break that match and the chunk
         // promise never resolves. Path-form srcs match natively and the
         // escaped-path fallback middleware resolves them via the Referer sid.
+        // Same /cdn-cgi/ rule as the absolute branch above: a root-relative
+        // /cdn-cgi/... script src must be proxied, never left in path form
+        // (Render's Cloudflare edge would answer it with its own copy).
+        if(sc && /^\\/cdn-cgi\\//i.test(real.pathname)){try{return proxy(kind,real.href)}catch(e){return v}}
         if(sc){try{var vp=new URL(virtualUrl);if(real.origin===vp.origin)return real.pathname+real.search}catch(e){}}
         return proxy(kind,real.href);
       }catch(e){return v}
@@ -3151,7 +3163,9 @@ function rewriteHtml(html, base, sid = "") {
     // preload, so the preloader and the parser hit one URL (and Turbopack's
     // head-manifest processing sees native paths).
     if ((rel.includes("preload") || rel.includes("modulepreload")) && String($(el).attr("as") || "").toLowerCase() === "script") {
-      try { const lu = new URL(u); if (lu.origin === new URL(effectiveBase).origin) { $(el).attr("href", lu.pathname + lu.search); $(el).removeAttr("crossorigin"); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); return; } } catch {}
+      // /cdn-cgi/ preloads must be proxied like their <script> partners —
+      // the proxy host's own Cloudflare edge answers path-form /cdn-cgi/.
+      try { const lu = new URL(u); if (lu.origin === new URL(effectiveBase).origin && !/^\/cdn-cgi\//i.test(lu.pathname)) { $(el).attr("href", lu.pathname + lu.search); $(el).removeAttr("crossorigin"); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); return; } } catch {}
     }
     $(el).attr("href", makeResourceUrl(u, effectiveBase, sid)); $(el).removeAttr("crossorigin"); if ($(el).attr("integrity")) $(el).removeAttr("integrity");
   });
@@ -3176,7 +3190,10 @@ function rewriteHtml(html, base, sid = "") {
     // escaped-path fallback middleware resolves them against the session's
     // page URL (sid recovered from the Referer / veyra_ctx cookie).
     let scriptUrl = null;
-    try { const su = new URL(u); if (su.origin === new URL(effectiveBase).origin) scriptUrl = su; } catch {}
+    // /cdn-cgi/ (Cloudflare challenge platform) scripts are proxied, never
+    // left in path form: the proxy host's own Cloudflare edge would serve its
+    // own copy of /cdn-cgi/ and the site's managed challenge would break.
+    try { const su = new URL(u); if (su.origin === new URL(effectiveBase).origin && !/^\/cdn-cgi\//i.test(su.pathname)) scriptUrl = su; } catch {}
     $(el).attr("src", scriptUrl ? scriptUrl.pathname + scriptUrl.search : makeResourceUrl(u, effectiveBase, sid));
     $(el).removeAttr("crossorigin");
     if ($(el).attr("integrity")) $(el).removeAttr("integrity");

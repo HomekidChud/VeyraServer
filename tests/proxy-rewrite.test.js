@@ -51,6 +51,31 @@ assert.match(out, /dest="\/api\/resource\?url=https%3A%2F%2Fwww\.geo-fs\.com%2Fj
 assert.doesNotMatch(out, /data-deferredsrc="\/js\/geofs\.js/);
 assert.doesNotMatch(out, /dest="js\/Cesium\/build\/Cesium\.js/);
 assert.doesNotMatch(out, /api\/resource\?url=https%3A%2F%2Fwww\.geo-fs\.com\/api\/resource/);
+
+// /cdn-cgi/ (Cloudflare challenge platform) scripts are the ONE same-origin
+// exception: the proxy host (Render) is itself behind Cloudflare, whose edge
+// answers path-form /cdn-cgi/ requests with its own copy — the site's managed
+// challenge would load the wrong domain's challenge platform and never
+// complete (poxel.io). Script tags AND script preloads for /cdn-cgi/ must be
+// rewritten to the proxied query form, while ordinary chunk paths stay native.
+{
+  const cf = rewriteHtml(
+    '<html><head>' +
+    '<link rel="preload" as="script" href="/cdn-cgi/challenge-platform/scripts/jsd/main.js">' +
+    '<link rel="preload" as="script" href="/_next/static/chunks/x.js">' +
+    '<script src="/cdn-cgi/challenge-platform/h/b/orchestrate/chl_page/v1?ray=r1"></script>' +
+    '<script src="/_next/static/chunks/y.js"></script>' +
+    '</head></html>',
+    'https://poxel.io/', 'cf-test');
+  // challenge-platform script + preload are proxied
+  assert.match(cf, /src="\/api\/resource\?url=https%3A%2F%2Fpoxel\.io%2Fcdn-cgi%2Fchallenge-platform%2Fh%2Fb%2Forchestrate/);
+  assert.match(cf, /href="\/api\/resource\?url=https%3A%2F%2Fpoxel\.io%2Fcdn-cgi%2Fchallenge-platform%2Fscripts%2Fjsd%2Fmain\.js/);
+  assert.doesNotMatch(cf, /src="\/cdn-cgi\//);
+  assert.doesNotMatch(cf, /href="\/cdn-cgi\//);
+  // ordinary same-origin script + preload keep the path form (Turbopack)
+  assert.match(cf, /src="\/_next\/static\/chunks\/y\.js"/);
+  assert.match(cf, /href="\/_next\/static\/chunks\/x\.js"/);
+}
 const alias = rewriteHtml('<html><body><img src="/images/icons/favicon.ico"></body></html>', 'https://geofs.com/geofs.php', 'proxy-alias');
 assert.match(alias, /https%3A%2F%2Fwww\.geo-fs\.com%2Fimages%2Ficons%2Ffavicon\.ico/);
 const inlineGeoFs = rewriteHtml(`<html><head><script>
