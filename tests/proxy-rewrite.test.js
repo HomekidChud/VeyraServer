@@ -16,7 +16,8 @@ const { rewriteHtml, rewriteJsText, cacheSafeUrl, cacheSafeResponse } = require(
 // srcFix's script flag is a real parameter now (it used to be a free variable
 // that threw ReferenceError and silently disabled the whole script-form
 // logic): same-origin script URLs keep their path, other origins get proxied.
-// Covered end-to-end by the browser.lol hydration regression probe.
+// Behavioral coverage lives in tests/srcfix-script-forms.test.js, which runs
+// the real emitted srcFix from injectRuntime in a fake proxy environment.
 
 assert.equal(cacheSafeUrl('https://example.com/public?page=2'), true);
 assert.equal(cacheSafeUrl('https://example.com/private?access_token=secret'), false);
