@@ -922,6 +922,15 @@ function isIncognitoSid(sid) {
   if (!id) return false;
   try { return !!sessionManager.peek(id)?.incognito; } catch { return false; }
 }
+// Guest sessions (created without a signed-in Veyra account) must never feed
+// or read the cross-session shared cache: one guest's fetched content must
+// not be served to another user. Signed-in users keep sharing public static
+// assets; guests stay isolated to their own session's ephemeral cache.
+function isGuestSid(sid) {
+  const id = String(sid || "");
+  if (!id) return false;
+  try { const rec = sessionManager.peek(id); return !!rec && !rec.userId; } catch { return false; }
+}
 function requestLogAdd(entry) {
   requestLog.push({ id: ++requestLogSeq, ...entry });
   if (requestLog.length > CFG.maxRequestLog) requestLog.splice(0, requestLog.length - CFG.maxRequestLog);
@@ -1828,18 +1837,20 @@ async function fetchCached(url, opts = {}) {
   const baseKey = `proxy-cache:v2 ${method} ${normalized} | ref=${referrerKey} | ua=${userAgentKey}`;
   const key = `${baseKey} | sid=${sid}`;
   const sharedKey = `proxy-cache:v2 ${method} ${normalized} | ua=${userAgentKey} | sid=*`;
+  // Guest sessions never read or write the shared (cross-session) cache.
+  const guest = isGuestSid(sid);
   const isolatedRequest = !cacheSafeUrl(normalized) || !!opts.private || hasCredentialRequestHeaders(opts.headers);
   const cacheReadAllowed = method === "GET" && !opts.noCache && !opts.streamOversize && !opts.passthroughBinary && !isolatedRequest;
   const canCoalesce = cacheReadAllowed;
   if (canCoalesce) { const existing = fetchInflight.get(key); if (existing) return existing; }
   const work = (async () => {
     let cachedEntry = cacheReadAllowed ? await validateCacheEntry(proxyCache.get(key) || null, key, normalized) : null;
-    if (!cachedEntry && cacheReadAllowed && CFG.mongoSharedCache) cachedEntry = await validateCacheEntry(proxyCache.get(sharedKey) || null, sharedKey, normalized);
+    if (!cachedEntry && cacheReadAllowed && CFG.mongoSharedCache && !guest) cachedEntry = await validateCacheEntry(proxyCache.get(sharedKey) || null, sharedKey, normalized);
     if (!cachedEntry && cacheReadAllowed && mongoStore.enabled) {
       const persisted = await mongoStore.getProxyCache(key);
       if (persisted) { cachedEntry = await validateCacheEntry(persisted, key, normalized); if (cachedEntry) cacheSet(proxyCache, key, cachedEntry, CFG.maxProxyCacheEntries); }
     }
-    if (!cachedEntry && cacheReadAllowed && CFG.mongoSharedCache && mongoStore.enabled) {
+    if (!cachedEntry && cacheReadAllowed && CFG.mongoSharedCache && !guest && mongoStore.enabled) {
       const persisted = await mongoStore.getProxyCache(sharedKey);
       if (persisted) { cachedEntry = await validateCacheEntry(persisted, sharedKey, normalized); if (cachedEntry) cacheSet(proxyCache, sharedKey, cachedEntry, CFG.maxProxyCacheEntries); }
     }
@@ -1868,7 +1879,7 @@ async function fetchCached(url, opts = {}) {
       const shareableType = /(?:text\/css|javascript|font\/|image\/|image\/svg\+xml)/i.test(String(result.contentType || ""));
       const noSessionCookies = !result.setCookieHeader && (!sid || !cookieHeader(sid, normalized));
       const incognito = isIncognitoSid(sid);
-      const shared = responseCacheable && CFG.mongoSharedCache && (shareableType || youtubeDocument) && noSessionCookies && !noStore && !result.truncated && !result.tooLarge && bodyBytes <= Math.min(CFG.maxCacheBodyBytes, CFG.mongoCacheBodyMaxBytes) && (!incognito || youtubeDocument);
+      const shared = responseCacheable && CFG.mongoSharedCache && (shareableType || youtubeDocument) && noSessionCookies && !noStore && !result.truncated && !result.tooLarge && bodyBytes <= Math.min(CFG.maxCacheBodyBytes, CFG.mongoCacheBodyMaxBytes) && (!incognito || youtubeDocument) && (!guest || youtubeDocument);
       if (shared) { const sharedResult = { ...result, sessionId: "" }; cacheSet(proxyCache, sharedKey, { response: sharedResult, etag: result.etag, lastModified: result.lastModified }, CFG.maxProxyCacheEntries); void mongoStore.putProxyCache(sharedKey, result, { url: result.finalUrl || normalized, sessionId: "" }); }
       else if (responseCacheable && !sid && !incognito && !noStore && !result.truncated && !result.tooLarge && bodyBytes <= Math.min(CFG.maxCacheBodyBytes, CFG.mongoCacheBodyMaxBytes)) void mongoStore.putProxyCache(key, result, { url: result.finalUrl || normalized, sessionId: "" });
     }
