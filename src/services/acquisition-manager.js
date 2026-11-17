@@ -3,6 +3,7 @@
 const crypto = require("crypto");
 const net = require("net");
 const dns = require("dns").promises;
+const { upstreamHeaderCapOptions } = require("../network/header-cap");
 const { URL } = require("url");
 const { fetch: undiciFetch, Agent } = require("undici");
 const cheerio = require("cheerio");
@@ -221,7 +222,7 @@ class AcquisitionManager {
     this.startedAt = Date.now();
     this.stats = { requests: 0, completedRequests: 0, successfulHttpResponses: 0, httpFailures: 0, retries: 0, timeouts: 0, cancellations: 0, redirects: 0, cacheHits: 0, persistentCacheHits: 0, conditionalHits: 0, cacheWrites: 0, bytes: 0, errors: 0, blocked: 0, documentsExtracted: 0, lowInformationExtractions: 0, emptyExtractions: 0, challengePages: 0, consentPages: 0, extractionFailures: 0, extractionCount: 0, extractionDurationMs: 0, extractionSamplesMs: [], duplicates: 0, feedsDiscovered: 0, byEngine: {}, errorsByCode: {}, recentErrors: [] };
     this.safeLookup = createSafeLookup(this.dnsLookup);
-    this.dispatcher = opts.dispatcher || new Agent({ connections: Math.max(2, this.perHostConcurrency), pipelining: 1, keepAliveTimeout: 10_000, connect: { lookup: this.safeLookup } });
+    this.dispatcher = opts.dispatcher || new Agent({ ...upstreamHeaderCapOptions(), connections: Math.max(2, this.perHostConcurrency), pipelining: 1, keepAliveTimeout: 10_000, connect: { lookup: this.safeLookup } });
   }
   _limiter(host) { if (!this.hosts.has(host)) this.hosts.set(host, new HostLimiter(this.perHostConcurrency)); return this.hosts.get(host); }
   _record(engine, patch = {}) { this.stats.byEngine[engine] = (this.stats.byEngine[engine] || 0) + 1; return { engine, ...patch }; }

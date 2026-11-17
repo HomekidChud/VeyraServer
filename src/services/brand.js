@@ -44,7 +44,13 @@ function meta(req, { title, description, frontend }) {
 const STYLE = `<style>:root{color-scheme:dark}body{margin:0;min-height:100vh;display:grid;place-items:center;background:radial-gradient(1200px 600px at 80% -10%,#1a2440,transparent),#0d0f13;color:#e8ecf3;font:15px/1.55 system-ui,-apple-system,Segoe UI,sans-serif}main{max-width:520px;padding:40px 28px;text-align:center}img{width:72px;height:72px;border-radius:18px;box-shadow:0 10px 40px #0008}h1{font-size:28px;margin:18px 0 6px;letter-spacing:-.02em}p{color:#a5b0c4;margin:0 0 22px}a.btn{display:inline-flex;align-items:center;gap:8px;height:42px;padding:0 20px;border-radius:999px;background:#8fb0f0;color:#0d0f13;font-weight:700;text-decoration:none}a.btn:focus-visible{outline:2px solid #fff;outline-offset:3px}small{display:block;margin-top:22px;color:#6f7a8e}small a{color:#8fb0f0}</style>`;
 
 function landingHtml(req, frontend, version) {
-  const redirect = !("stay" in (req.query || {}));
+  // Inside a proxied iframe/frame the meta-refresh hijacks the frame to the
+  // production app, which Chrome blocks ("This content is blocked"). Keep
+  // frames on the landing page (no auto-redirect) so the app's watchdog can
+  // recover the tab cleanly instead of entering an escape loop.
+  const dest = String(req.get("Sec-Fetch-Dest") || "").toLowerCase();
+  const inFrame = dest === "iframe" || dest === "frame" || String(req.get("Sec-Fetch-Site") || "") === "same-origin";
+  const redirect = !("stay" in (req.query || {})) && !inFrame;
   return `<!doctype html><html lang="en"><head>${meta(req, { title: "Veyra Browser", description: "Private cloud browsing in a clean, self-deleting session — fast proxy, real Chromium, incognito and VPN.", frontend })}
 ${redirect ? `<meta http-equiv="refresh" content="2;url=${esc(frontend)}">` : ""}${STYLE}</head><body><main>
 <img src="/icon-192.png" alt="" width="72" height="72"><h1>Veyra server is online</h1>
