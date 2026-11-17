@@ -49,19 +49,18 @@ function unusualTrafficHtml() {
   assert.ok(runtime, "the runtime script must be injected");
   // Must parse as valid JavaScript.
   new Function(runtime);
-  // Sign-in detection markers.
-  assert.match(runtime, /type:'veyra:signin'/, "a detected sign-in click must post veyra:signin to the app");
+  // Sign-in markers: location.assign/replace still posts veyra:signin
+  // (loaded in-tab through the fast proxy), and the auth host/path
+  // patterns still feed isSigninRedirect.
+  assert.match(runtime, /type:'veyra:signin'/, "a JS sign-in redirect must post veyra:signin to the app");
   assert.match(runtime, /SIGNIN_AUTH_HOST/, "auth-provider hosts must be detected");
   assert.match(runtime, /SIGNIN_AUTH_PATH/, "login/oauth paths must be detected");
-  assert.match(runtime, /SIGNIN_TEXT/, "sign-in button labels must be detected");
-  assert.match(runtime, /unwrap\(href\)\|\|href/, "rewritten proxy hrefs must be unwrapped before detection");
-  assert.match(runtime, /ev\.shiftKey\|\|ev\.ctrlKey\|\|ev\.metaKey\|\|ev\.altKey\)/, "modifier clicks must bypass the handoff");
-  // The sign-in listener must be registered BEFORE the generic anchor click
-  // handler so it can preventDefault the click first.
-  const signinListener = runtime.indexOf("type:'veyra:signin'");
-  const anchorListener = runtime.indexOf("anchorFromEvent(ev)");
-  assert.ok(signinListener >= 0 && anchorListener >= 0 && signinListener < anchorListener,
-    "the sign-in click listener must run before the generic anchor handler");
+  // The CLICK interception must be gone: it used to preventDefault sign-in
+  // controls (including form submit buttons like GitHub's "Continue with
+  // Google"), killing the natural navigation and reloading the login page.
+  // Regression: no capture-phase click listener posts veyra:signin.
+  assert.doesNotMatch(runtime, /signinControl/, "the sign-in click interceptor must be removed");
+  assert.doesNotMatch(runtime, /document\.addEventListener\('click'[^)]*\),true\)/, "no capture-phase click interceptor may remain");
 
   // ---------- /api/view: security-verification passes through ----------
   const server = app.listen(0, "127.0.0.1");

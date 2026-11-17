@@ -2957,7 +2957,6 @@ ${pageActionsRuntime()}
   // so the user creates the account inside Veyra.
   var SIGNIN_AUTH_HOST=/^(?:accounts?\\.google\\.com|appleid\\.apple\\.com|login\\.(?:microsoftonline|microsoft|live)\\.com|securetoken\\.com|(?:auth|sso|signin|login|accounts)\\.[a-z0-9-]+\\.[a-z]{2,})$/i;
   var SIGNIN_AUTH_PATH=/(?:^|\\/)(?:login|signin|sign-in|log-in|oauth|oauth2|openid|sso|servicelogin|authentication|authorize|dialog\\/oauth|i\\/oauth2|users\\/sign_in)(?:\\/?$|\\?|#)/i;
-  var SIGNIN_TEXT=/^(?:sign in|sign-in|signin|log ?in|login|log on|continue with (?:google|apple|microsoft|facebook|steam|discord|twitter|x|email)|log in with (?:google|apple|microsoft|facebook|steam|discord|twitter|x))\\b/i;
   // Sign-up is not sign-in: a "Sign up"/"Create account"/"Register" control
   // (label or URL) must load the site's real signup page through Veyra so the
   // user creates their account inside Veyra — never the browser handoff.
@@ -2977,55 +2976,20 @@ ${pageActionsRuntime()}
       return !!(host&&SIGNIN_AUTH_HOST.test(host))||!!(pathPart&&SIGNIN_AUTH_PATH.test(pathPart));
     }catch(e){return false}
   }
-  function signinLabel(n){
-    try{
-      const txt=String(n.textContent||'').replace(/\\s+/g,' ').trim();
-      const aria=String(n.getAttribute('aria-label')||'')+' '+String(n.getAttribute('title')||'')+' '+String(n.getAttribute('alt')||'');
-      return (txt+' '+aria.replace(/\\s+/g,' ').trim()).trim().slice(0,80);
-    }catch(e){return ''}
-  }
-  function signinControl(path){
-    for(let i=0;i<path.length;i++){
-      const n=path[i];
-      if(!n||n.nodeType!==1)continue;
-      const tag=String(n.tagName||'').toUpperCase();
-      if(tag==='HTML'||tag==='BODY')break;
-      if(tag==='FORM')break;
-      const role=String((n.getAttribute&&n.getAttribute('role'))||'').toLowerCase();
-      const isCtl=tag==='A'||tag==='BUTTON'||role==='button'||role==='link'||String((n.getAttribute&&n.getAttribute('type'))||'').toLowerCase()==='submit';
-      if(!isCtl)continue;
-      let href='';
-      try{href=String(n.getAttribute('href')||n.getAttribute('action')||n.getAttribute('formaction')||'')}catch(e){}
-      if(href==='#')href='';
-      // Anchor hrefs are already rewritten to /api/view?url=... — unwrap the
-      // real destination before deciding whether this is a sign-in control.
-      let raw=href;try{raw=unwrap(href)||href}catch(e){}
-      let host='',pathPart='';
-      try{const uu=new URL(raw,virtualUrl);host=uu.hostname.toLowerCase();pathPart=uu.pathname+uu.search}catch(e){}
-      const label=signinLabel(n);
-      if((host&&SIGNIN_AUTH_HOST.test(host))||(pathPart&&SIGNIN_AUTH_PATH.test(pathPart))||(label&&SIGNIN_TEXT.test(label))){
-        // A sign-up control (label or URL) is not a sign-in control: let the
-        // click run through the proxy so the signup page loads inside Veyra.
-        if((label&&SIGNUP_TEXT.test(label))||(pathPart&&SIGNUP_PATH.test(pathPart)))return null;
-        return {node:n,dest:raw};
-      }
-    }
-    return null;
-  }
-  document.addEventListener('click',function(ev){
-    if(!appEmbedded||ev.defaultPrevented)return;
-    if(ev.shiftKey||ev.ctrlKey||ev.metaKey||ev.altKey)return;
-    try{
-      const path=ev.composedPath?ev.composedPath():[ev.target];
-      const hit=signinControl(path);
-      if(!hit)return;
-      ev.preventDefault();ev.stopPropagation();
-      let u='';
-      try{u=hit.dest?resolve(hit.dest):''}catch(e){}
-      if(!u||!/^https?:/i.test(u))u=virtualUrl;
-      topPost({type:'veyra:signin',url:u,sessionId:SESSION_ID,pageUrl:virtualUrl});
-    }catch(e){}
-  },true);
+  // Sign-in CLICK interception removed. The interceptor used to
+  // preventDefault on sign-in controls (anchors AND form submit buttons)
+  // and post veyra:signin so the app could offer the old handoff choice.
+  // With in-proxy-only sign-in that interception is worse than useless:
+  // a form submit button (GitHub's "Continue with Google") had its
+  // submission KILLED, and the interceptor's URL resolution fell back to
+  // the current page, so the app reloaded the login page in a loop.
+  // Sign-in controls now navigate naturally: anchors load their rewritten
+  // /api/view href in-frame, forms POST through the proxy (the escaped
+  // path middleware follows the site's own redirects - GitHub's Google
+  // initiate lands on accounts.google.com inside the proxied frame), and
+  // window.open popups go through the popup relay. Only location.assign/
+  // replace still posts veyra:signin (isSigninRedirect below), which the
+  // app loads in-tab through the fast proxy.
   function anchorFromEvent(ev){
     try{
       if(ev.composedPath){
