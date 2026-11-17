@@ -109,6 +109,16 @@ const { fetch: undiciFetch, Agent } = require("undici");
     r = await fetch(`${base}/games`, { headers: { "sec-fetch-dest": "document", accept: "text/html", "x-forwarded-for": "203.0.113.10" } });
     body = await r.text();
     assert.ok(!/Private\/local destinations are blocked/.test(body), "top-level documents do not use the orphan fallback");
+
+    // A nested escaped frame keeps its own host in its referer. Its script
+    // requests must not resolve against the outer page's veyra_ctx cookie.
+    const frameUrl = "http://127.0.0.1:9/game";
+    const frameRef = `${base}/game?__veyra_url=${encodeURIComponent(frameUrl)}&__veyra_sid=${made}`;
+    r = await fetch(`${base}/assets/nested-module.js`, { headers: {
+      "sec-fetch-dest": "script", referer: frameRef,
+      cookie: `veyra_ctx=${encodeURIComponent("https://example.invalid/outer")}|${made}`,
+    } });
+    assert.match(await r.text(), /Private\/local destinations are blocked/, "the nested frame's host wins over the parent cookie");
   } finally {
     server.close();
   }

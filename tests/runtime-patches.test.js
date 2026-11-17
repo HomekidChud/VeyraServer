@@ -33,6 +33,23 @@ assert.match(out, /if\(!window\.polytrackModConfiguration\)window\.polytrackModC
 assert.match(out, /<script data-veyra-runtime>/);
 assert.match(out, /window\.__VEYRA_PAGE_URL__=CANONICAL;/);
 
+// The escaped path is the website's real path. A root-relative API request
+// must keep /api/, not fall through to a Next.js 404 page in the game portal.
+{
+  const script = out.match(/<script data-veyra-runtime>([\s\S]*?)<\/script>/)[1];
+  const resolver = script.slice(script.indexOf("const VEYRA_ROUTES"), script.indexOf("// Read a Request"));
+  const location = new URL("https://veyra.example/g/test-game");
+  const from = "https://bloxity.io/g/test-game";
+  const fix = (escaped) => new Function("virtualUrl", "ESCAPED_DOCUMENT", "ownOrigin", "cleanVeyraParams",
+    `${resolver}\nreturn fixOwn;`)(from, escaped, o => o === location.origin, u => u);
+  assert.equal(fix(true)(new URL("/api/identity/principal", location)).href,
+    "https://bloxity.io/api/identity/principal");
+  assert.equal(fix(false)(new URL("/api/font.woff2", location)).href,
+    "https://bloxity.io/font.woff2", "legacy proxy-directory recovery still works");
+  assert.equal(fix(true)(new URL("/api/resource?url=fixture", location)).origin, location.origin,
+    "Veyra routes stay on the proxy origin");
+}
+
 // Site code that derives API hosts from location.hostname (Roblox's RealTime
 // gateway builder: hostname minus "www." prefixed with "apis.") produces
 // <sub>.<proxy-host> URLs under the proxy. On a public proxy host those DNS
