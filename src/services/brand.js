@@ -77,6 +77,15 @@ function installBrandRoutes(app, { frontendUrl, version = "", isPreviewBot = () 
     // (see escapedPathFor in server.js): pass them through so the escaped-path
     // middleware can proxy the real page instead of serving the landing page.
     if (passThrough(req) || req.query?.__veyra_url || req.query?.__veyra_sid) return next();
+    // A proxied frame that reloaded the escaped root (YouTube's desktop build
+    // reloads with ?themeRefresh=1 after a theme change) has lost every
+    // routing param, but the runtime's veyra_ctx cookie still names the page
+    // and session. Pass embedded reloads through so the escaped middleware
+    // can re-resolve the real page instead of swapping the landing in
+    // mid-browse. Direct visits (no cookie) still get the landing.
+    const dest = String(req.get("Sec-Fetch-Dest") || "").toLowerCase();
+    const hasCtxCookie = /(?:^|;\s*)veyra_ctx=/.test(String(req.get("Cookie") || ""));
+    if ((dest === "iframe" || dest === "frame") && hasCtxCookie) return next();
     res.setHeader("Cache-Control", "public, max-age=300");
     res.type("html").send(landingHtml(req, front(), version));
   });

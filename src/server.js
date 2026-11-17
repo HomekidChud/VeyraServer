@@ -7778,6 +7778,16 @@ app.use(async (req, res, next) => {
   // resolution base from the sid/url params the page carries and the
   // veyra_ctx cookie instead of falling through to a 404.
   if (!ctx) ctx = reserved ? null : escapedPageContext(req);
+  // A frame that reloaded a reserved path (YouTube's desktop build reloads
+  // the escaped root with ?themeRefresh=1 after a theme change) has lost
+  // every routing param, but the runtime's veyra_ctx cookie still names the
+  // page and session. Recover it so the reload re-resolves the real page
+  // instead of swapping the brand landing in mid-browse. The cookie's sid
+  // must be live, so a stale cookie can never hijack a direct landing visit.
+  if (!ctx && reserved && (dest === "iframe" || dest === "frame")) {
+    const cookieCtx = proxiedPageFromCookie(req);
+    if (cookieCtx && liveSessionId(cookieCtx.sid)) ctx = { pageUrl: cookieCtx.pageUrl, sid: cookieCtx.sid };
+  }
   // Orphaned subresource fallback: remember the page this client last
   // resolved so cookie-less, origin-only-referer asset requests can still
   // be resolved (as guest fetches) instead of 404ing.

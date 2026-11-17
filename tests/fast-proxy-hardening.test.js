@@ -131,5 +131,49 @@ const { fetch: undiciFetch, Agent } = require("undici");
     server2.close();
   }
 
+  // --- 4. embedded frame reload of the escaped root ---------------------------
+  // YouTube's desktop build reloads the escaped root with ?themeRefresh=1,
+  // losing every routing param. The runtime's veyra_ctx cookie still names
+  // the page + session: an embedded (iframe-dest) reload of a reserved path
+  // must re-resolve the real page through the escaped middleware instead of
+  // swapping the brand landing in mid-browse.
+  const server3 = app.listen(0, "127.0.0.1");
+  try {
+    await new Promise((resolve, reject) => { server3.once("listening", resolve); server3.once("error", reject); });
+    const base3 = `http://127.0.0.1:${server3.address().port}`;
+    const sid = sessionManager.create("framereloadt" + Date.now().toString(16).padStart(8, "0")).id;
+    const ctxCookie = `veyra_ctx=${encodeURIComponent("http://127.0.0.1:9/")}|${encodeURIComponent(sid)}`;
+
+    // a) iframe reload WITH a live-session cookie: the landing route passes
+    //    through and the escaped middleware re-resolves the cookie's page
+    //    (the private URL then fails the SSRF guard — proving the proxy
+    //    machinery handled it, not the landing).
+    let r = await fetch(`${base3}/?themeRefresh=1`, { headers: { "sec-fetch-dest": "iframe", cookie: ctxCookie } });
+    let body = await r.text();
+    assert.match(body, /Private\/local destinations are blocked/, "an embedded frame reload re-resolves the cookie's page instead of showing the landing");
+
+    // b) iframe reload with a cookie naming a DEAD session: the pass-through
+    //    happens (cookie present) but recovery fails, so the frame gets the
+    //    brand 404 — never the meta-refresh hijack.
+    const deadCookie = `veyra_ctx=${encodeURIComponent("http://127.0.0.1:9/")}|deadSession00000000`;
+    r = await fetch(`${base3}/?themeRefresh=1`, { headers: { "sec-fetch-dest": "iframe", cookie: deadCookie } });
+    body = await r.text();
+    assert.ok(!/http-equiv="refresh"/.test(body), "a dead-session frame reload never meta-refreshes");
+    assert.ok(!/Veyra server is online/.test(body), "a dead-session frame reload does not get the landing");
+
+    // c) iframe reload with NO cookie: the landing still shows (no hijack).
+    r = await fetch(`${base3}/?themeRefresh=1`, { headers: { "sec-fetch-dest": "iframe" } });
+    body = await r.text();
+    assert.ok(/Veyra server is online/.test(body), "a cookie-less frame reload still gets the landing");
+
+    // d) A top-level visit with the cookie must NOT be diverted: the landing
+    //    is for humans typing the origin, cookie or not.
+    r = await fetch(`${base3}/?themeRefresh=1`, { headers: { "sec-fetch-dest": "document", accept: "text/html", cookie: ctxCookie } });
+    body = await r.text();
+    assert.ok(/Veyra server is online/.test(body), "a top-level visit with a veyra_ctx cookie still gets the landing");
+  } finally {
+    server3.close();
+  }
+
   console.log("fast-proxy-hardening.test.js — all assertions passed");
 })().catch(err => { console.error(err); process.exit(1); });
