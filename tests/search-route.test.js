@@ -7,6 +7,7 @@ process.env.WEB_SEARCH_ORDER = "google";
 process.env.VEYRA_CHROMIUM_ENABLED = "false";
 process.env.INDEX_AI_FINDINGS = "true";
 process.env.AI_ANSWER_ALLOW_EXTRACTIVE_FALLBACK = "true";
+process.env.VEYRA_TEST_MODE = "1";
 
 const { app, indexDocument, mongoStore, CFG } = require("../src/server");
 (async () => {
@@ -21,6 +22,10 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
         assert.equal(options.engine, "bing");
         assert.equal(options.limit, 20, "Veyra web search should request 20 results by default");
         return { provider: "mock-provider", results: [{ url: "https://search-fixture.example/result", title: "Mock result", snippet: "Controlled route fixture", provider: "mock-provider" }], attempts: [{ provider: "mock-provider", count: 1 }] };
+      }
+      if (query === "private fixture") {
+        assert.equal(options.noCache, true);
+        return { results: [{ url: "https://search-fixture.example/private", title: "Private fixture" }] };
       }
       assert.equal(options.limit, 20, "answer discovery should request 20 provider results");
       return { provider: "mock-provider", results: [
@@ -43,7 +48,10 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     await new Promise((resolve, reject) => { server.once("listening", resolve); server.once("error", reject); });
     const base = `http://127.0.0.1:${server.address().port}`;
 
-    const webResponse = await fetch(`${base}/api/search/web?q=mock%20web%20route%20query&engine=bing`);
+    const login = await (await fetch(`${base}/api/auth/test-login`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).json();
+    assert.ok(login.token, "test login succeeds");
+    const authorization = `Bearer ${login.token}`;
+    const webResponse = await fetch(`${base}/api/search/web?q=mock%20web%20route%20query&engine=bing`, { headers: { authorization } });
     const webPayload = await webResponse.json();
     assert.equal(webResponse.status, 200);
     assert.equal(webPayload.ok, true);
@@ -56,10 +64,18 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     assert.equal(crawlArgs.query, "mock web route query");
     assert.ok(crawlArgs.options.maxPages <= CFG.indexAiMaxPages);
     assert.equal(webSearchCalls, 1);
+    for (const [suffix, headers] of [["", {}], ["&private=1", { authorization }]]) {
+      const privateResponse = await fetch(`${base}/api/search/web?q=private%20fixture${suffix}`, { headers });
+      assert.equal(privateResponse.headers.get("cache-control"), "no-store");
+      assert.equal((await privateResponse.json()).results.length, 1);
+      assert.equal(crawlCalls, 1, "private searches are not queued for indexing");
+    }
+    const guestAnswer = await (await fetch(`${base}/api/search/answer`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ query: "private fixture" }) })).json();
+    assert.equal(guestAnswer.hasAnswer, false, "guest answer is not generated or retained");
 
     const answerResponse = await fetch(`${base}/api/search/answer`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", authorization },
       body: JSON.stringify({ query: "What does the Veyra local route fixture confirm?" })
     });
     const answer = await answerResponse.json();
@@ -75,7 +91,7 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     assert.equal(answer.responseTimeMs, answer.pipeline.responseTimeMs);
     assert.equal(Number.isFinite(answer.pipeline.sourceRetrieval.localSearchMs), true);
     assert.equal(answer.grounding.claims.every(claim => claim.sourceIds.length > 0), true);
-    assert.equal(webSearchCalls, 2);
+    assert.equal(webSearchCalls, 4);
 
     assert.match(answer.observationId, /^obs_[A-Za-z0-9_-]{20,40}$/);
     assert.equal(answer.qualityLearning.calibrated, false, "the learned quality estimate must not be presented as calibrated confidence");

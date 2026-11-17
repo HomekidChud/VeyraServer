@@ -1,5 +1,6 @@
 "use strict";
 
+const { setMaxListeners } = require("node:events");
 
 
 
@@ -79,7 +80,9 @@ class SessionManager {
         err.code = "SESSION_EXPIRED"; err.status = 410;
         throw err;
       }
-      rec = { id: sid, createdAt: t, lastUsed: t, cookies: new Map(), chromiumUaByHost: new Map(), vpnProfileId: null, browserSessions: new Set(), requests: 0, bytesOut: 0 };
+      rec = { id: sid, createdAt: t, lastUsed: t, cookies: new Map(), chromiumUaByHost: new Map(), vpnProfileId: null, browserSessions: new Set(), requests: 0, bytesOut: 0, abort: new AbortController() };
+      // One signal can cover many concurrent page subresources.
+      setMaxListeners(0, rec.abort.signal);
       this.sessions.set(sid, rec);
       this.stats.created += 1;
       this.enforceCap();
@@ -172,7 +175,7 @@ class SessionManager {
   
   
   pauseForVerification(sid, reason = 'challenge') {
-    if (!sid) return;
+    if (!this.sessions.has(sid)) return;
     this.pausedSessions.set(sid, { until: 0, reason, startedAt: this.now() });
     this.log("info", "SESSION", `Session ${sid.slice(0, 8)}… paused for verification (${reason}). Expiry suspended.`);
   }
@@ -270,13 +273,16 @@ class SessionManager {
     this.sessions.delete(sid);
     
     this.pausedSessions.delete(sid);
-    if (reason === "limit" || reason === "client") this.tombstone(sid);
+    this.tombstone(sid);
+    rec.abort.abort();
     if (reason === "limit") this.stats.expiredLimit += 1;
     else if (reason === "idle") this.stats.expiredIdle += 1;
     else if (reason === "cap") this.stats.expiredCap += 1;
     else if (reason === "pressure") this.stats.expiredPressure += 1;
     else if (reason === "client") this.stats.closedByClient += 1;
     rec.cookies.clear();
+    rec.chromiumUaByHost.clear();
+    rec.routingPage = null;
     for (const fn of this.hooks.expire) { try { const r = fn(sid, rec, reason); if (r?.catch) r.catch(() => {}); } catch {} }
     return true;
   }
