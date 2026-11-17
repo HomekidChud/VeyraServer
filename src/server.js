@@ -2311,6 +2311,7 @@ function injectRuntime(html, original, sid = "") {
   const CANONICAL=${JSON.stringify(original)};
   const SESSION_ID=${JSON.stringify(sid)};
   const API_ORIGIN=${JSON.stringify(process.env.PUBLIC_API_ORIGIN || "")};
+  const ESCAPED_DOCUMENT=location.pathname!=='/api/view';
   let virtualUrl=CANONICAL;
   window.__VEYRA_PAGE_URL__=CANONICAL;
   window.__VEYRA_PROXY__=true;
@@ -2343,10 +2344,10 @@ function injectRuntime(html, original, sid = "") {
     // URLs from it yields "/api/view/<rest>"; map that onto the real page path.
     const vp=new URL(virtualUrl);
     if(/^[/]api[/]view[/]/.test(u.pathname))return cleanVeyraParams(new URL(vp.pathname.replace(/[/]$/,'')+u.pathname.slice(9)+u.search+u.hash,vp));
-    // Other non-Veyra /api/... paths belong to the website, not Veyra. Keep
-    // the leading slash so /api/... remains rooted on the website when the
-    // current page is /watch/... or another nested route.
-    if(!VEYRA_ROUTES.test(u.pathname))return cleanVeyraParams(new URL(u.pathname.slice(4)+u.search+u.hash,virtualUrl));
+    // In path-shaped documents /api/... is the site's actual root path
+    // (e.g. Boxity's /api/identity/principal). Only query-form documents
+    // can pick up the proxy's /api/ directory when resolving a relative URL.
+    if(!VEYRA_ROUTES.test(u.pathname))return cleanVeyraParams(new URL((ESCAPED_DOCUMENT?u.pathname:u.pathname.slice(4))+u.search+u.hash,virtualUrl));
   }catch{}return u}
   // Read a Request's real URL via the native getter: some apps (YouTube) hand fetch()
   // a data: Request with a spoofed own 'url' getter to replay a cached response.
@@ -5547,7 +5548,7 @@ app.get('/api/v1/usage', requirePlatformKey, (req, res) => {
 
 // GET /api/v1/status — public (no key): API liveness, version and limits.
 app.get('/api/v1/status', (req, res) => {
-  res.json({ ok: true, api: "veyra", version: VEYRA_VERSION, uptimeSeconds: Math.floor(process.uptime()), rateLimit: { max: 120, windowMs: 60000 }, docs: `${CFG.frontendUrl}/dev/platform/` });
+  res.json({ ok: true, api: "veyra", version: VEYRA_VERSION, uptimeSeconds: Math.floor(process.uptime()), rateLimit: { max: 120, windowMs: 60000 }, docs: `${CFG.frontendUrl.replace(/\/+$/, "")}/dev/platform/` });
 });
 
 // GET /api/v1/verify — lightweight key check: identity + usage snapshot.
@@ -5615,16 +5616,17 @@ app.post('/api/v1/fetch', requirePlatformKey, async (req, res) => {
   if (String(req.body?.format || "text") === "json") {
     try {
       const result = await fetchBuffer(url, { sessionId: "", retries: 0, timeout: Math.min(CFG.requestTimeoutMs, 20000), limit: CFG.maxTextBytesPerResource });
-      let parsed = null;
-      try { parsed = JSON.parse(result.body.toString("utf8")); } catch {}
-      if (parsed == null) return respondError(res, 422, "The URL did not return valid JSON.", "FETCH_NOT_JSON");
+      if (result.truncated) return respondError(res, 422, "The JSON response exceeds the configured size limit.", "FETCH_NOT_JSON");
+      let parsed;
+      try { parsed = JSON.parse(result.body.toString("utf8")); }
+      catch { return respondError(res, 422, "The URL did not return valid JSON.", "FETCH_NOT_JSON"); }
       return res.json({ ok: true, status: result.status, url, finalUrl: result.finalUrl, contentType: result.contentType, json: parsed });
     } catch (e) { return respondError(res, 502, `Veyra could not fetch that URL: ${e.message}`, "FETCH_FAILED", { requestId: req.veyraRequestId }); }
   }
   try {
     const result = await fetchBuffer(url, { sessionId: "", retries: 0, timeout: Math.min(CFG.requestTimeoutMs, 20000), limit: 256 * 1024 });
     const body = result.body ? result.body.toString("utf8") : "";
-    res.json({ ok: true, status: result.status, url, finalUrl: result.finalUrl, contentType: result.contentType, truncated: body.length >= 256 * 1024, body });
+    res.json({ ok: true, status: result.status, url, finalUrl: result.finalUrl, contentType: result.contentType, truncated: !!result.truncated, body });
   } catch (e) { respondError(res, 502, `Veyra could not fetch that URL: ${e.message}`, "FETCH_FAILED", { requestId: req.veyraRequestId }); }
 });
 
@@ -7756,7 +7758,7 @@ function liveSessionId(value) {
   const sid = String(value || "").trim();
   return /^[A-Za-z0-9_-]{16,80}$/.test(sid) && !sessionManager.isTerminated(sid) && sessionManager.has(sid) ? sid : "";
 }
-function escapedPageContext(req) {
+function escapedPageContext(req, { allowCookie = true } = {}) {
   const sids = [];
   // Escaped-path redirects bake the exact target and session into
   // __veyra_url/__veyra_sid (never colliding with the site's own params,
@@ -7786,7 +7788,7 @@ function escapedPageContext(req) {
       }
     } catch {}
   }
-  if (!pageUrl) {
+  if (!pageUrl && allowCookie) {
     const cookieCtx = proxiedPageFromCookie(req);
     if (cookieCtx) {
       const cSid = liveSessionId(cookieCtx.sid);
@@ -7869,7 +7871,12 @@ app.use(async (req, res, next) => {
     const exactUrl = exactSid ? normalizeUrl(String(req.query?.__veyra_url || "")) : "";
     if (exactUrl) ctx = { pageUrl: exactUrl, sid: exactSid };
   }
-  if (!ctx) ctx = proxiedPageFromReferer(req, { allowCookie: !topLevel && !reserved && !shield.isPreviewBot(req.get("User-Agent")) });
+  if (!ctx) ctx = proxiedPageFromReferer(req, { allowCookie: false });
+  // The context cookie describes the outer proxy frame. Prefer a nested
+  // document's explicit escaped referer before consulting that cookie, so a
+  // game frame's scripts go to the game host, not the embedding site's host.
+  if (!ctx && !reserved) ctx = escapedPageContext(req, { allowCookie: false });
+  if (!ctx && !topLevel && !reserved && !shield.isPreviewBot(req.get("User-Agent"))) ctx = proxiedPageFromCookie(req);
   // Escaped (path-based) navigations: the referer is itself a path URL once
   // the runtime keeps the escaped path shape, so recover the session and
   // resolution base from the sid/url params the page carries and the

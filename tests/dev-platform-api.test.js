@@ -2,16 +2,32 @@
 // Regression tests for the expanded public platform API (/api/v1):
 // status, verify, keys listing/detail, hourly usage buckets, search,
 // suggestions and the URL-fetch endpoint. Live end-to-end pass against the
-// real express app; the fetch endpoint's error paths are exercised
-// network-free (the SSRF guard makes private destinations fail
-// deterministically).
+// real express app with an isolated stub for upstream fixture responses.
 process.env.VEYRA_ENV = "test";
 process.env.VEYRA_TEST_MODE = "true";
+process.env.VEYRA_FRONTEND_URL = "https://example.com/web/";
 process.env.VEYRA_DATA_DIR = require("fs").mkdtempSync(require("path").join(require("os").tmpdir(), "veyra-devapi-"));
 const assert = require("assert");
 
 (async () => {
-  const { app } = require("../src/server");
+  const upstream = require("undici");
+  const originalFetch = upstream.fetch;
+  const fixtureBase = "https://93.184.216.34";
+  const textLimit = 256 * 1024;
+  const fixtures = new Map([
+    [fixtureBase + "/json-null", () => new Response("null", { headers: { "content-type": "application/json" } })],
+    [fixtureBase + "/json-too-long", () => new Response("null", { headers: { "content-type": "application/json", "content-length": "100000000" } })],
+    [fixtureBase + "/text-too-long", () => new Response("é".repeat(textLimit), { headers: { "content-type": "text/plain" } })],
+    [fixtureBase + "/exact-limit", () => new Response("a".repeat(textLimit), { headers: { "content-type": "text/plain" } })],
+  ]);
+  upstream.fetch = async url => {
+    const fixture = fixtures.get(String(url));
+    assert.ok(fixture, `Unexpected upstream URL: ${url}`);
+    return fixture();
+  };
+  let app;
+  try { ({ app } = require("../src/server")); }
+  finally { upstream.fetch = originalFetch; }
   const server = await new Promise((resolve, reject) => {
     const s = app.listen(0, "127.0.0.1", () => resolve(s));
     s.on("error", reject);
@@ -32,6 +48,7 @@ const assert = require("assert");
     assert.equal(status.json.api, "veyra");
     assert.ok(status.json.version, "status reports the API version");
     assert.equal(status.json.rateLimit.max, 120, "status documents the rate limit");
+    assert.equal(status.json.docs, "https://example.com/web/dev/platform/");
 
     // ---- key required everywhere else ----
     for (const path of ["/api/v1/verify", "/api/v1/keys", "/api/v1/usage/hours", "/api/v1/search?q=x", "/api/v1/suggest?q=x"]) {
@@ -106,6 +123,24 @@ const assert = require("assert");
     assert.equal(fetchPrivate.status, 502);
     assert.equal(fetchPrivate.json.code, "FETCH_FAILED");
     assert.match(fetchPrivate.json.error, /Private\/local destinations are blocked/, "the fetch endpoint reuses the proxy's SSRF guards");
+
+    const postFetch = (path, format = "text") => fetchJson("/api/v1/fetch", {
+      method: "POST", headers: { Authorization: `Bearer ${key}` }, body: JSON.stringify({ url: fixtureBase + path, format }),
+    });
+    const nullJson = await postFetch("/json-null", "json");
+    assert.equal(nullJson.status, 200);
+    assert.equal(nullJson.json.json, null, "JSON null is a valid result");
+    const tooLongJson = await postFetch("/json-too-long", "json");
+    assert.equal(tooLongJson.status, 422);
+    assert.equal(tooLongJson.json.code, "FETCH_NOT_JSON");
+    assert.match(tooLongJson.json.error, /size limit/);
+    const tooLongText = await postFetch("/text-too-long");
+    assert.equal(tooLongText.status, 200);
+    assert.equal(tooLongText.json.truncated, true, "the limit is measured in bytes, not characters");
+    const exactText = await postFetch("/exact-limit");
+    assert.equal(exactText.status, 200);
+    assert.equal(exactText.json.body.length, textLimit);
+    assert.equal(exactText.json.truncated, false, "a complete result at exactly the limit is not truncated");
 
     // ---- usage counted across all endpoints ----
     const verify2 = await fetchJson("/api/v1/verify", { headers: { Authorization: `Bearer ${key}` } });
