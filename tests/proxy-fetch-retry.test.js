@@ -61,6 +61,25 @@ const dnsCache = new Map([
     "the failed attempt must be retried, then the redirect followed"
   );
 
+  for (const status of [301, 302, 303, 307, 308]) {
+    const steps = [];
+    const final = await fetchBuffer("https://example.com/submit", {
+      method: "POST", body: "field=fixture", headers: { "Content-Type": "application/x-www-form-urlencoded", Authorization: "Bearer fixture" },
+      retries: 0, dnsCache,
+      upstreamFetch: async (url, request) => {
+        steps.push(request);
+        return steps.length === 1 ? stubResponse(status, { location: "https://93.184.216.34/result" }) : stubResponse(200, {}, "done");
+      },
+    });
+    const keepPost = status === 307 || status === 308;
+    assert.equal(final.status, 200);
+    assert.equal(steps[0].method, "POST");
+    assert.equal(steps[1].method, keepPost ? "POST" : "GET", `HTTP ${status} uses the standard redirect method`);
+    assert.equal(steps[1].body, keepPost ? "field=fixture" : undefined);
+    assert.equal(steps[1].headers.has("content-type"), keepPost);
+    assert.equal(steps[1].headers.has("authorization"), false, "cross-origin redirects do not forward bearer credentials");
+  }
+
   // Sanity: a hard failure with no redirect still surfaces the upstream error.
   await assert.rejects(
     fetchBuffer("https://example.com/always-down", {
