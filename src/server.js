@@ -12,6 +12,7 @@ const { BrowserEngine } = require("./browser/browser-engine");
 const { pageActionsRuntime } = require("./browser/page-actions-runtime");
 const { VpnManager } = require("./network/vpn");
 const { createShield } = require("./network/shield");
+const { upstreamHeaderCapOptions } = require("./network/header-cap");
 const { createWebSearch } = require("./services/websearch");
 const { installBrandRoutes, isReservedOriginPath, brandNotFoundHtml } = require("./services/brand");
 const VEYRA_VERSION = require("../package.json").version;
@@ -382,7 +383,11 @@ const DIRECT_HTTP_AGENT = new UndiciAgent({
   keepAliveTimeout: 30000,
   keepAliveMaxTimeout: 60000,
   connections: 64,
-  pipelining: 1
+  pipelining: 1,
+  // undici's default response-header cap is 16KB; big-header sites (YouTube
+  // serves Chrome 156 UAs ~19KB of headers) overflowed it and the document
+  // fetch died with a generic "fetch failed". See src/network/header-cap.js.
+  ...upstreamHeaderCapOptions()
 });
 const GOOGLE_ACCOUNTS_HTTPS_AGENT = new https.Agent({ keepAlive: true, maxSockets: 16, lookup: createPublicSocketLookup() });
 
@@ -7699,6 +7704,28 @@ function escapedPageContext(req) {
   const sid = sids.find(s => !!s);
   return sid ? { pageUrl, sid } : null;
 }
+// Orphaned subresources: pages loaded inside the app's sandboxed third-party
+// iframe send asset requests with an origin-only Referer and no cookies
+// (Chrome blocks third-party iframe cookies), so no session context can be
+// recovered from the request itself and the asset 404s — YouTube's
+// dynamically-injected chunks are the canonical case. Remember the last
+// page each client resolved, and resolve these orphaned requests against it
+// as a GUEST fetch: a fresh guest session per request (empty sid), no
+// session cookies, so nothing leaks across sessions or clients.
+const clientLastResolvedPage = new Map();
+function noteClientResolvedPage(req, pageUrl) {
+  const key = String(req.ip || "");
+  if (!key || !pageUrl) return;
+  if (clientLastResolvedPage.get(key) === pageUrl) return;
+  clientLastResolvedPage.delete(key);
+  clientLastResolvedPage.set(key, pageUrl);
+  while (clientLastResolvedPage.size > 4000) clientLastResolvedPage.delete(clientLastResolvedPage.keys().next().value);
+}
+function orphanedPageContext(req) {
+  const key = String(req.ip || "");
+  const pageUrl = clientLastResolvedPage.get(key) || "";
+  return pageUrl ? { pageUrl, sid: "" } : null;
+}
 // Resolve an escaped (path-based) request path onto the real site URL. The
 // site copies its own query string when it builds links, and the runtime's
 // escaped URLs keep Veyra's routing params in it — strip the ones that
@@ -7751,6 +7778,21 @@ app.use(async (req, res, next) => {
   // resolution base from the sid/url params the page carries and the
   // veyra_ctx cookie instead of falling through to a 404.
   if (!ctx) ctx = reserved ? null : escapedPageContext(req);
+  // A frame that reloaded a reserved path (YouTube's desktop build reloads
+  // the escaped root with ?themeRefresh=1 after a theme change) has lost
+  // every routing param, but the runtime's veyra_ctx cookie still names the
+  // page and session. Recover it so the reload re-resolves the real page
+  // instead of swapping the brand landing in mid-browse. The cookie's sid
+  // must be live, so a stale cookie can never hijack a direct landing visit.
+  if (!ctx && reserved && (dest === "iframe" || dest === "frame")) {
+    const cookieCtx = proxiedPageFromCookie(req);
+    if (cookieCtx && liveSessionId(cookieCtx.sid)) ctx = { pageUrl: cookieCtx.pageUrl, sid: cookieCtx.sid };
+  }
+  // Orphaned subresource fallback: remember the page this client last
+  // resolved so cookie-less, origin-only-referer asset requests can still
+  // be resolved (as guest fetches) instead of 404ing.
+  if (ctx) noteClientResolvedPage(req, ctx.pageUrl);
+  if (!ctx && !topLevel && !reserved) ctx = orphanedPageContext(req);
   if (!ctx) return next();
   if (process.env.VEYRA_DEBUG_ESCAPED) console.log("[escaped-debug]", JSON.stringify({ path: req.path, query: Object.fromEntries(Object.entries(req.query || {}).map(([k, v]) => [k, String(v).slice(0, 90)])), referer: String(req.get("Referer") || "").slice(0, 140), cookie: String(req.get("Cookie") || "").slice(0, 90), ctx }));
   let target = null;
@@ -7934,4 +7976,4 @@ const __workerOps = {
   discover: (text, kind, base, contentType) => collectDiscovery(text, kind, base, contentType)
 };
 
-module.exports = { app, get accessGate() { return accessGate; }, mongoStore, mergeStrayProxyParams, detectChallenge, maybeCompressProxyPayload, proxyCompressibleContentType, CFG, browserCapabilitySignals, canRenderHtmlWithBrowser, renderHtmlWithBrowser, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions, normalizeOpenEngineMode, shouldStartCrawlerForEngineMode, startVeyraServer, cacheSafeUrl, cacheSafeResponse, fetchBuffer, escapedPageContext, escapedPathFor, liveSessionId, resolveEscapedTarget, workerScopePrelude };
+module.exports = { app, get accessGate() { return accessGate; }, mongoStore, mergeStrayProxyParams, detectChallenge, maybeCompressProxyPayload, proxyCompressibleContentType, CFG, browserCapabilitySignals, canRenderHtmlWithBrowser, renderHtmlWithBrowser, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions, normalizeOpenEngineMode, shouldStartCrawlerForEngineMode, startVeyraServer, cacheSafeUrl, cacheSafeResponse, fetchBuffer, escapedPageContext, escapedPathFor, liveSessionId, resolveEscapedTarget, workerScopePrelude, noteClientResolvedPage, orphanedPageContext, DIRECT_HTTP_AGENT, UPSTREAM_MAX_HEADER_BYTES: require("./network/header-cap").UPSTREAM_MAX_HEADER_BYTES };

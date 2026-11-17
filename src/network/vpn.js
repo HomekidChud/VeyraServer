@@ -21,6 +21,7 @@ const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
 const dns = require("dns").promises;
+const { upstreamHeaderCapOptions } = require("./header-cap");
 const { spawn } = require("child_process");
 const { Agent, buildConnector } = require("undici");
 
@@ -724,7 +725,7 @@ class VpnManager {
     if (!this.ensureConnection(sid)) return undefined;
     let agent = this.sessionAgents.get(sid);
     if (!agent) {
-      agent = new Agent({ connect: this.makeConnector(host => this.route(sid, host)), keepAliveTimeout: 15000, keepAliveMaxTimeout: 60000, connections: 16 });
+      agent = new Agent({ ...upstreamHeaderCapOptions(), connect: this.makeConnector(host => this.route(sid, host)), keepAliveTimeout: 15000, keepAliveMaxTimeout: 60000, connections: 16 });
       this.sessionAgents.set(sid, agent);
     }
     return agent;
@@ -733,7 +734,7 @@ class VpnManager {
   profileDispatcher(profile) {
     let agent = this.profileAgents.get(profile.id);
     if (!agent) {
-      agent = new Agent({ connect: this.makeConnector(() => ({ profile, conn: null })), keepAliveTimeout: 5000, connections: 4 });
+      agent = new Agent({ ...upstreamHeaderCapOptions(), connect: this.makeConnector(() => ({ profile, conn: null })), keepAliveTimeout: 5000, connections: 4 });
       this.profileAgents.set(profile.id, agent);
     }
     return agent;
