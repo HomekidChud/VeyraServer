@@ -1,0 +1,18 @@
+name: Account checks
+on:
+  pull_request:
+    paths: ["src/**", "tests/auth*.test.js", "tests/fast-proxy-account-flow.test.js", "tests/proxy-fetch-retry.test.js", "package*.json", ".github/workflows/auth-checks.yml"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  auth:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: node tests/auth.test.js && node tests/auth-http.test.js && node tests/fast-proxy-account-flow.test.js && node tests/proxy-fetch-retry.test.js

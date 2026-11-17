@@ -325,7 +325,10 @@ const CFG = Object.freeze({
   authSignupKey: process.env.VEYRA_SIGNUP_KEY || "",
   authTokenTtlMs: numberEnv("VEYRA_AUTH_TOKEN_TTL_MS", 7 * 24 * 60 * 60 * 1000, 10 * 60 * 1000, 90 * 24 * 60 * 60 * 1000),
   adminEmails: String(process.env.VEYRA_ADMIN_EMAILS || "").split(",").map(x => x.trim().toLowerCase()).filter(Boolean),
-  testMode: boolEnv("VEYRA_TEST_MODE", false),
+  // Never seed a test administrator on hosted or production instances,
+  // even when a previous deployment left VEYRA_TEST_MODE enabled.
+  testMode: !process.env.RENDER && !/^(production|prod)$/i.test(String(process.env.NODE_ENV || "").trim())
+    && ["development", "test"].includes(VEYRA_CONFIG.envName) && boolEnv("VEYRA_TEST_MODE", false),
   workDir: process.env.VEYRA_WORK_DIR || path.join(os.tmpdir(), "veyra-browse-jobs"),
   sessionMaxCookieBytes: numberEnv("SESSION_MAX_COOKIE_BYTES", 128 * 1024, 4 * 1024, 4 * 1024 * 1024),
   serverIdleSleepMs: numberEnv("SERVER_IDLE_SLEEP_MS", 10 * 60 * 1000, 0, 24 * 60 * 60 * 1000),
@@ -395,6 +398,15 @@ const shield = createShield(process.env, { lean: CFG.leanMode, log: (level, sour
 app.set("trust proxy", true);
 app.disable("x-powered-by");
 app.use(shield.middleware);
+const allowedOrigins = CFG.frontendOrigins.includes("*") ? true : CFG.frontendOrigins;
+app.use(cors({
+  origin: allowedOrigins,
+  methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  // The gate's 403 JSON must be readable by an allowed frontend, and
+  // a preflight must finish before the gate inspects the actual request.
+  preflightContinue: false,
+  exposedHeaders: ["X-Veyra-Request-ID", "X-Veyra-Canonical-URL", "X-Veyra-Challenge", "X-Veyra-Content-Type", "X-Veyra-Session-ID", "X-Veyra-Session-Expires"]
+}));
 // Veyra Access Gate: everything behind an invite-only waitlist until the
 // request carries a valid gate session (cookie or X-Veyra-Gate header),
 // a current rotating invite token, or the admin token.
@@ -408,15 +420,6 @@ app.use((req, res, next) => (accessGate ? accessGate.middleware()(req, res, next
 // by the app. No cookie ever crosses between the user's browser and a
 // Veyra session, or between two Veyra sessions.
 installBrandRoutes(app, { frontendUrl: () => CFG.frontendUrl, version: VEYRA_VERSION, isPreviewBot: ua => shield.isPreviewBot(ua), hasProxiedReferer: req => !!proxiedPageFromReferer(req, { allowCookie: false }) });
-const allowedOrigins = CFG.frontendOrigins.includes("*") ? true : CFG.frontendOrigins;
-app.use(cors({
-  origin: allowedOrigins,
-  methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  // Terminate browser preflights here. If these continue to the API fallback,
-  // the browser sees a 404 and reports the request as a generic fetch failure.
-  preflightContinue: false,
-  exposedHeaders: ["X-Veyra-Request-ID", "X-Veyra-Canonical-URL", "X-Veyra-Challenge", "X-Veyra-Content-Type", "X-Veyra-Session-ID", "X-Veyra-Session-Expires"]
-}));
 
 
 app.use(["/api/resource", "/api/view"], express.raw({ type: () => true, limit: CFG.maxProxyBodyBytes, inflate: true }));
@@ -1380,7 +1383,7 @@ async function fetchBuffer(url, opts = {}) {
   if (!current) throw new Error("Invalid HTTP(S) URL.");
   const maxRedirects = opts.maxRedirects ?? CFG.maxRedirects;
   const limit = opts.limit ?? CFG.maxTextBytesPerResource;
-  const method = String(opts.method || "GET").toUpperCase();
+  let method = String(opts.method || "GET").toUpperCase();
   const headers = new Headers(opts.headers || {});
   headers.set("user-agent", opts.userAgent || CFG.userAgent);
   if (!headers.has("accept")) headers.set("accept", opts.accept || "text/html,application/xhtml+xml,application/xml,text/css,application/javascript,text/javascript,image/avif,image/webp,image/apng,image/svg+xml,font/*,video/*,audio/*,*/*;q=0.05");
@@ -1442,6 +1445,20 @@ async function fetchBuffer(url, opts = {}) {
           if (!loc) throw new Error(`HTTP ${response.status} redirect without Location`);
           const next = resolveNavigation(loc, current);
           if (!next) throw new Error("Invalid redirect destination.");
+          // Match native browser redirects: form POSTs commonly land on a
+          // GET page after login. Never resubmit credentials on those hops.
+          if (([301, 302].includes(response.status) && method === "POST")
+            || (response.status === 303 && method !== "GET" && method !== "HEAD")) {
+            method = "GET";
+            for (const name of ["content-encoding", "content-language", "content-location", "content-type", "content-length", "origin"]) headers.delete(name);
+          }
+          // The destination gets its own session-jar cookies; never forward
+          // explicit credentials supplied for a different origin.
+          if (new URL(next).origin !== new URL(current).origin) {
+            headers.delete("authorization");
+            headers.delete("cookie");
+          }
+          try { void response.body?.cancel().catch(() => {}); } catch {}
           redirectChain.push({ url: current, status: response.status });
           current = next;
           cached = null;
@@ -5247,7 +5264,7 @@ app.post("/api/gate/admin/waitlist/:id/reissue-key", requireAdmin, async (req, r
 app.get('/api/auth/config', (req, res) => {
   const user = authStore.userFromRequest(req);
   const admin = !!(user && authStore.roleFor(user.email) === "admin");
-  res.json({ ok: true, signupEnabled: CFG.authAllowSignup, signupKeyRequired: !!CFG.authSignupKey, sessionTimeLimitMs: admin ? runtimeSessionPolicy.adminTimeLimitMs : runtimeSessionPolicy.guestTimeLimitMs, admin: admin || configEditAllowed(req), testMode: CFG.testMode, testAdmin: CFG.testMode ? authStore.getTestAdminCredentials() : null });
+  res.set("Cache-Control", "no-store").json({ ok: true, signupEnabled: CFG.authAllowSignup, signupKeyRequired: !!CFG.authSignupKey, sessionTimeLimitMs: admin ? runtimeSessionPolicy.adminTimeLimitMs : runtimeSessionPolicy.guestTimeLimitMs, admin: admin || configEditAllowed(req), testMode: CFG.testMode && isAdminRequest(req) });
 });
 
 
@@ -5632,7 +5649,7 @@ app.post('/api/v1/fetch', requirePlatformKey, async (req, res) => {
 
 
 app.post('/api/auth/test-login', (req, res) => {
-  if (!CFG.testMode) return res.status(403).json({ error: 'Test mode is disabled', ok: false });
+  if (!CFG.testMode || !isAdminRequest(req)) return respondError(res, 403, "Test administrator login is not available.", "AUTH_TEST_LOGIN_DISABLED");
   const creds = authStore.getTestAdminCredentials();
   if (!creds) return res.status(403).json({ error: 'Test admin not available', ok: false });
   try {
