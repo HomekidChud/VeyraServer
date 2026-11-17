@@ -5264,7 +5264,16 @@ function platformOwner(user) { return authStore.roleFor(user.email) === "admin";
    raw `vyr_live_…` secret is returned once on create/rotate and never stored. */
 function platformHashKey(raw) { return crypto.createHash("sha256").update(String(raw || "")).digest("hex"); }
 function platformPublicKey(k) {
-  return { id: k.id, name: k.name, last4: k.last4 || k.prefix || null, createdAt: k.createdAt, lastUsedAt: k.lastUsedAt || null, revokedAt: k.revokedAt || null, usage: { requests: k.usage?.requests || 0, last24h: k.usage?.last24h || 0 } };
+  // Hourly request buckets for the rolling 24h window — powers the usage
+  // chart in the developer platform without exposing the raw timestamps.
+  const byHour = {};
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  for (const t of (k.usage?.window || [])) {
+    if (Number(t) <= cutoff) continue;
+    const hour = new Date(Number(t)).toISOString().slice(0, 13) + ":00:00Z";
+    byHour[hour] = (byHour[hour] || 0) + 1;
+  }
+  return { id: k.id, name: k.name, last4: k.last4 || k.prefix || null, createdAt: k.createdAt, lastUsedAt: k.lastUsedAt || null, revokedAt: k.revokedAt || null, usage: { requests: k.usage?.requests || 0, last24h: k.usage?.last24h || 0, byHour } };
 }
 function platformPublicWorkspace(w) { return { id: w.id, name: w.name, slug: w.slug, description: w.description || "", createdAt: w.createdAt, keys: (w.keys || []).filter(k => !k.revokedAt).map(platformPublicKey) }; }
 function platformFindWorkspace(data, id) { return data.platform.workspaces.find(x => x.id === String(id || "")); }
@@ -5524,6 +5533,94 @@ app.get('/api/v1/usage', requirePlatformKey, (req, res) => {
     buckets[hour] = (buckets[hour] || 0) + 1;
   }
   res.json({ ok: true, keyId: k.id, usage: { requests: k.usage?.requests || 0, last24h: k.usage?.last24h || 0, lastUsedAt: k.lastUsedAt || null }, byHour: buckets });
+});
+
+/* ---------- the expanded public API (/api/v1) ----------
+   Every endpoint below is authenticated with an API key
+   (`Authorization: Bearer vyr_live_…`) unless noted otherwise, rate limited
+   to 120 requests/minute, and counted towards that key's usage. */
+
+// GET /api/v1/status — public (no key): API liveness, version and limits.
+app.get('/api/v1/status', (req, res) => {
+  res.json({ ok: true, api: "veyra", version: VEYRA_VERSION, uptimeSeconds: Math.floor(process.uptime()), rateLimit: { max: 120, windowMs: 60000 }, docs: `${CFG.frontendUrl}/dev/platform/` });
+});
+
+// GET /api/v1/verify — lightweight key check: identity + usage snapshot.
+app.get('/api/v1/verify', requirePlatformKey, (req, res) => {
+  const k = req.veyraKey, w = req.veyraKeyWorkspace;
+  res.json({ ok: true, valid: true, key: { id: k.id, name: k.name, last4: k.last4, createdAt: k.createdAt }, workspace: { id: w.id, name: w.name, slug: w.slug }, usage: { requests: k.usage?.requests || 0, last24h: k.usage?.last24h || 0 } });
+});
+
+// GET /api/v1/keys — the keys in this key's workspace (public info only).
+app.get('/api/v1/keys', requirePlatformKey, (req, res) => {
+  const w = req.veyraKeyWorkspace;
+  const keys = (w.keys || []).filter(k => !k.revokedAt);
+  res.json({ ok: true, workspace: { id: w.id, slug: w.slug }, total: keys.length, keys: keys.map(platformPublicKey) });
+});
+
+// GET /api/v1/keys/:id — one key's metadata + usage counters.
+app.get('/api/v1/keys/:id', requirePlatformKey, (req, res) => {
+  const w = req.veyraKeyWorkspace, k = platformFindKey(w, String(req.params.id || ""));
+  if (!k) return respondError(res, 404, "API key not found.", "API_KEY_NOT_FOUND");
+  res.json({ ok: true, key: platformPublicKey(k), usage: k.usage || { requests: 0, last24h: 0 } });
+});
+
+// GET /api/v1/usage/hours — hourly request buckets for the rolling window.
+app.get('/api/v1/usage/hours', requirePlatformKey, (req, res) => {
+  const k = req.veyraKey;
+  const buckets = {};
+  for (const t of (k.usage?.window || [])) {
+    const hour = new Date(Number(t)).toISOString().slice(0, 13) + ":00:00Z";
+    buckets[hour] = (buckets[hour] || 0) + 1;
+  }
+  const hours = {};
+  const now = Date.now();
+  for (let i = 23; i >= 0; i--) {
+    const key = new Date(now - i * 3600000).toISOString().slice(0, 13) + ":00:00Z";
+    hours[key] = buckets[key] || 0;
+  }
+  res.json({ ok: true, keyId: k.id, hours, windowHours: 24 });
+});
+
+// GET /api/v1/search?q= — search the Veyra index with an API key.
+app.get('/api/v1/search', requirePlatformKey, (req, res) => {
+  const query = String(req.query.q || "").trim().slice(0, CFG.maxSearchQueryChars);
+  if (!query) return respondError(res, 400, "Provide a search term: ?q=…", "SEARCH_QUERY_REQUIRED");
+  const offset = Math.max(0, Number(req.query.offset || 0) || 0);
+  const limit = Math.min(CFG.maxSearchResults, Math.max(1, Number(req.query.limit || 10) || 10));
+  try {
+    const started = Date.now();
+    const result = localSearch(query, offset, limit);
+    res.json({ ok: true, ...result, provider: "veyra-index", responseTimeMs: Date.now() - started });
+  } catch (e) { respondError(res, 500, e.message, "SEARCH_ERROR"); }
+});
+
+// GET /api/v1/suggest?q= — search suggestions from the Veyra index.
+app.get('/api/v1/suggest', requirePlatformKey, (req, res) => {
+  const q = String(req.query.q || "").trim().slice(0, CFG.maxSearchQueryChars);
+  res.json({ ok: true, suggestions: localSearchSuggestions(q, 8) });
+});
+
+// POST /api/v1/fetch — fetch any public URL through Veyra's proxy
+// infrastructure (same SSRF guards, DNS checks and caching as the fast
+// proxy) and return the response body as text. Body is capped at 256KB.
+app.post('/api/v1/fetch', requirePlatformKey, async (req, res) => {
+  const url = normalizeUrl(String(req.body?.url || ""));
+  if (!url) return respondError(res, 400, "Provide a public http(s) URL: {\"url\":\"https://example.com\"}", "FETCH_URL_INVALID");
+  if (String(req.body?.format || "text") === "json") {
+    try {
+      const result = await fetchBuffer(url, { sessionId: "", retries: 0, timeout: Math.min(CFG.requestTimeoutMs, 20000), limit: CFG.maxTextBytesPerResource });
+      let parsed = null;
+      try { parsed = JSON.parse(result.body.toString("utf8")); } catch {}
+      if (parsed == null) return respondError(res, 422, "The URL did not return valid JSON.", "FETCH_NOT_JSON");
+      return res.json({ ok: true, status: result.status, url, finalUrl: result.finalUrl, contentType: result.contentType, json: parsed });
+    } catch (e) { return respondError(res, 502, `Veyra could not fetch that URL: ${e.message}`, "FETCH_FAILED", { requestId: req.veyraRequestId }); }
+  }
+  try {
+    const result = await fetchBuffer(url, { sessionId: "", retries: 0, timeout: Math.min(CFG.requestTimeoutMs, 20000), limit: 256 * 1024 });
+    const body = result.body ? result.body.toString("utf8") : "";
+    res.json({ ok: true, status: result.status, url, finalUrl: result.finalUrl, contentType: result.contentType, truncated: body.length >= 256 * 1024, body });
+  } catch (e) { respondError(res, 502, `Veyra could not fetch that URL: ${e.message}`, "FETCH_FAILED", { requestId: req.veyraRequestId }); }
 });
 
 
