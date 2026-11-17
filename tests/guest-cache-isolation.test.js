@@ -15,6 +15,8 @@ process.env.SESSION_CACHE_ENABLED ??= "1";
 process.env.GLOBAL_CACHE_ENABLED ??= "1";
 process.env.ACCESS_GATE = "0";
 process.env.MONGODB_SHARED_CACHE = "1"; // default, but pinned for clarity
+process.env.VPN_ENABLED = "1";
+process.env.VPN_PROFILES_JSON = JSON.stringify([{ id: "env-vpn-fixture", name: "Configured fixture exit", type: "http", server: "http://fixture.invalid:8080" }]);
 process.env.DATA_DIR = (() => { const d = fs.mkdtempSync(path.join(os.tmpdir(), "veyra-guest-cache-")); return d; })();
 
 const { app, CFG, mongoStore, sessionManager, BrowserTaskScheduler, vpnManager } = require("../src/server");
@@ -60,6 +62,7 @@ server.on("listening", async () => {
     assert.equal((await privateOpen.json()).crawlerEnabled, false);
 
     const vpnCatalog = await (await doFetch("/api/vpn/profiles")).json();
+    assert.ok(vpnCatalog.profiles.some(p => p.id === "env-vpn-fixture"), "VPN-enabled startup loads configured exits");
     assert.equal(vpnCatalog.profiles.find(p => p.id === "fixture-london")?.name, "London fixture");
     assert.ok(vpnManager.get("fixture-london"), "persisted profile can actually be selected");
     assert.doesNotMatch(JSON.stringify(vpnCatalog), /fixture-user|fixture-password|fixture\.invalid/);

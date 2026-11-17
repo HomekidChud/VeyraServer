@@ -394,6 +394,9 @@ const DIRECT_HTTP_AGENT = new UndiciAgent({
 const GOOGLE_ACCOUNTS_HTTPS_AGENT = new https.Agent({ keepAlive: true, maxSockets: 16, lookup: createPublicSocketLookup() });
 
 const shield = createShield(process.env, { lean: CFG.leanMode, log: (level, source, message) => setImmediate(() => serverLog(level, source, message)) });
+// VPN profile discovery can log while the server module is still initializing.
+const serverLogs = [];
+let logSeq = 0;
 app.set("trust proxy", true);
 app.disable("x-powered-by");
 app.use(shield.middleware);
@@ -851,11 +854,9 @@ const dnsPublicCache = new Map();
 const searchIndex = new Map();
 const invertedIndex = new Map();
 const termCounts = new Map();
-const serverLogs = [];
 const clientLogs = [];
 const requestLog = [];
 let requestLogSeq = 0;
-let logSeq = 0;
 const serverStartedAt = Date.now();
 const rewriteFailures = [];
 function recordRewriteFailure(url, mode, err) {
