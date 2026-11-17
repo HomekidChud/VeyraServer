@@ -1464,7 +1464,7 @@ async function fetchBuffer(url, opts = {}) {
   if (!current) throw new Error("Invalid HTTP(S) URL.");
   const maxRedirects = opts.maxRedirects ?? CFG.maxRedirects;
   const limit = opts.limit ?? CFG.maxTextBytesPerResource;
-  const method = String(opts.method || "GET").toUpperCase();
+  let method = String(opts.method || "GET").toUpperCase();
   const headers = new Headers(opts.headers || {});
   headers.set("user-agent", opts.userAgent || CFG.userAgent);
   if (!headers.has("accept")) headers.set("accept", opts.accept || "text/html,application/xhtml+xml,application/xml,text/css,application/javascript,text/javascript,image/avif,image/webp,image/apng,image/svg+xml,font/*,video/*,audio/*,*/*;q=0.05");
@@ -1525,6 +1525,20 @@ async function fetchBuffer(url, opts = {}) {
           if (!loc) throw new Error(`HTTP ${response.status} redirect without Location`);
           const next = resolveNavigation(loc, current);
           if (!next) throw new Error("Invalid redirect destination.");
+          // Match native browser redirects: form POSTs commonly land on a
+          // GET page after login. Never resubmit credentials on those hops.
+          if (([301, 302].includes(response.status) && method === "POST")
+            || (response.status === 303 && method !== "GET" && method !== "HEAD")) {
+            method = "GET";
+            for (const name of ["content-encoding", "content-language", "content-location", "content-type", "content-length", "origin"]) headers.delete(name);
+          }
+          // The destination gets its own session-jar cookies; never forward
+          // explicit credentials supplied for a different origin.
+          if (new URL(next).origin !== new URL(current).origin) {
+            headers.delete("authorization");
+            headers.delete("cookie");
+          }
+          try { void response.body?.cancel().catch(() => {}); } catch {}
           redirectChain.push({ url: current, status: response.status });
           current = next;
           cached = null;
