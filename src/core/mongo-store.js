@@ -152,7 +152,7 @@ class MongoStore {
   }
   async loadQueuedNeuralFeedback(limit = 5000, { publicCrawlTraining = false } = {}) {
     const filter = { status: "queued", "context.type": { $ne: "ai-result" } };
-    if (!publicCrawlTraining) filter.source = { $nin: ["public-document", "public-dead-end"] };
+    filter.source = { $nin: publicCrawlTraining ? ["public-proxy-visit"] : ["public-proxy-visit", "public-document", "public-dead-end"] };
     const rows = await this.withDb(db => db.collection("neural_feedback").find(filter, { projection: { _id: 0 } }).sort({ createdAt: 1 }).limit(Math.max(1, Number(limit) || 1000)).toArray());
     this.stats.reads += 1;
     return Array.isArray(rows) ? rows : [];

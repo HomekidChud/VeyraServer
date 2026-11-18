@@ -81,8 +81,8 @@ async function verify() {
   await reader.loadQueuedNeuralFeedback(100);
   await reader.loadQueuedNeuralFeedback(100, { publicCrawlTraining: true });
   assert.deepEqual(filters, [
-    { status: "queued", "context.type": { $ne: "ai-result" }, source: { $nin: ["public-document", "public-dead-end"] } },
-    { status: "queued", "context.type": { $ne: "ai-result" } }
+    { status: "queued", "context.type": { $ne: "ai-result" }, source: { $nin: ["public-proxy-visit", "public-document", "public-dead-end"] } },
+    { status: "queued", "context.type": { $ne: "ai-result" }, source: { $nin: ["public-proxy-visit"] } }
   ], "the flag also gates resuming queued public examples");
 
   const sampleBudget = createPublicCrawlTrainer({ model, enqueue: async () => true, clock: () => 1 });

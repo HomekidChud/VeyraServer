@@ -8,6 +8,9 @@ const { SOURCES } = require("../src/services/neural-training-data");
 const { STAGING_DIR, stagingIsolation } = require("./staging-ranker-baseline");
 const BATCH_PER_PUBLISHER = 3;
 const ROTATION_DAYS = 3;
+// One operator-configured public visit to keep this path observable without
+// using customer traffic. This URL is not part of the scheduled crawl rotation.
+const PROXY_CANARY = "https://docs.python.org/3/library/keyword.html";
 const DATASETS = [
   {
     name: "python-standard-library",
@@ -101,6 +104,7 @@ function aggregate(body) {
   const trainer = body?.trainer || {};
   return {
     enabled: trainer.publicCrawlTraining === true,
+    fastProxyVisitTraining: trainer.fastProxyVisitTraining === true,
     baselineExamples: Number(body?.baseline?.trainingExamples) || 0,
     baselineUpdates: Number(body?.baseline?.optimizerUpdates) || 0,
     trained: Number(trainer.trained) || 0,
@@ -147,6 +151,14 @@ function createRunner({ dataDir, port, token, fetchImpl = fetch, now = () => new
         if (error.code === "EEXIST") return;
         throw error;
       }
+      let proxyVisit = "disabled";
+      if (before.fastProxyVisitTraining) {
+        try {
+          const result = await status("/api/neural/staging/fast-proxy-visit", { url: PROXY_CANARY, publicTraining: true });
+          proxyVisit = result?.ok && ["queued", "duplicate", "limited", "ineligible", "skipped"].includes(result.outcome)
+            ? result.outcome : "unavailable";
+        } catch { proxyVisit = "unavailable"; }
+      }
       const datasets = [];
       for (const {name, seeds} of batchFor(dayIndex)) {
         let completed = 0;
@@ -163,7 +175,7 @@ function createRunner({ dataDir, port, token, fetchImpl = fetch, now = () => new
         await wait(1500);
         after = await stats();
       }
-      log({ phase: "batch", date, datasets, trainedDelta: after.trained - before.trained, ...after });
+      log({ phase: "batch", date, datasets, proxyVisit, trainedDelta: after.trained - before.trained, ...after });
     } catch {
       log({ phase: "unavailable", date });
     } finally {
