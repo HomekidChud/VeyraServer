@@ -80,7 +80,7 @@ class MongoStore {
   }
   async loadUsers() { const rows = await this.withDb(db => db.collection("users").find({}, { projection: { _id: 0 } }).limit(5000).toArray()); return Array.isArray(rows) ? rows : []; }
   async upsertUser(user) {
-    if (!user?.id) return;
+    if (!user?.id || user.isTestAdmin) return;
     const doc = JSON.parse(JSON.stringify(user));
     // MongoDB has databases, collections, and documents rather than folders.
     // storagePath gives each account the requested veyra/users/<name> layout
@@ -332,6 +332,17 @@ class MongoStore {
     if (!state || typeof state !== "object") return;
     this.stats.writes += 1;
     return this.withDb(async db => { await db.collection("gate_state").replaceOne({ _id: "gate" }, { _id: "gate", state: JSON.parse(JSON.stringify(state)) }, { upsert: true }); });
+  }
+  async loadAccessPolicy() {
+    const result = await this.withDb(async db => ({ doc: await db.collection("gate_state").findOne({ _id: "access-policy" }) }));
+    if (!result) throw new Error("Access policy storage unavailable");
+    return result.doc === null ? null : result.doc.state;
+  }
+  async saveAccessPolicy(state) {
+    const result = await this.withDb(db => db.collection("gate_state").replaceOne(
+      { _id: "access-policy" }, { _id: "access-policy", state }, { upsert: true, writeConcern: { w: "majority" } }
+    ));
+    if (!result?.acknowledged) throw new Error("Access policy write was not acknowledged");
   }
   status() { return { configured: !!this.uri, enabled: this.enabled, connected: this.connected, db: this.dbName, poolSize: this.maxPoolSize, cacheBodyMaxBytes: this.cacheBodyMaxBytes, cacheTtlMs: this.cacheTtlMs, retryAfter: this.retryAfter || null, disabledReason: this.disabledReason || null, stats: { ...this.stats } }; }
   async close() { this.connected = false; try { await this.client?.close(); } catch {} this.client = null; this.db = null; }

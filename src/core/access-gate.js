@@ -30,7 +30,7 @@ function constantTimeEqual(a = "", b = "") {
 
 class AccessGate {
   constructor(opts = {}) {
-    this.enabled = opts.enabled !== false;
+    this.defaultEnabled = opts.enabled !== false;
     this.dataDir = opts.dataDir || path.join(__dirname, "..", "..", "data");
     this.file = path.join(this.dataDir, "gate.json");
     this.log = opts.log || (() => {});
@@ -39,7 +39,9 @@ class AccessGate {
     this.graceMs = Math.max(this.rotateMs, Number(opts.graceMs) || this.rotateMs * 2);
     this.sessionTtlMs = Math.max(60 * 1000, Number(opts.sessionTtlMs) || 30 * 24 * 60 * 60 * 1000);
     this.cookieName = String(opts.cookieName || "veyra_gate");
-    this.waitlistOpen = opts.waitlistOpen !== false;
+    this.defaultWaitlistOpen = opts.waitlistOpen !== false;
+    this.policy = opts.policy || null;
+    this.staffRequest = opts.staffRequest || (req => this.isAdminRequest(req));
     this.maxWaitlist = Math.max(10, Number(opts.maxWaitlist) || 100000);
     this.maxSessions = Math.max(10, Number(opts.maxSessions) || 20000);
     this.ownerTokens = new Set(String(opts.ownerTokens || "").split(",").map(s => s.trim()).filter(Boolean));
@@ -59,6 +61,14 @@ class AccessGate {
     this.rotateTimer.unref?.();
     this.cleanupTimer = setInterval(() => this.cleanup(), 5 * 60 * 1000);
     this.cleanupTimer.unref?.();
+  }
+  get enabled() { return this.policy ? this.policy.state.mode !== "public" : this.defaultEnabled; }
+  get staffOnly() { return this.policy?.state.mode === "staff"; }
+  get waitlistOpen() { return this.policy?.state.waitlistOpen ?? this.defaultWaitlistOpen; }
+  canBrowse(req) {
+    if (!this.enabled || this.staffRequest(req)) return true;
+    const invited = !this.staffOnly && !!this.sessionFromRequest(req);
+    return this.policy ? this.policy.decision({ invited }).browse : invited;
   }
 
   /* ---------- persistence ---------- */
@@ -166,7 +176,7 @@ class AccessGate {
     if (header) { const s = this.verifySession(header); if (s) return s; }
     const cookie = String(req?.headers?.cookie || "");
     const m = cookie.match(new RegExp(`(?:^|;\\s*)${this.cookieName}=([^;]+)`));
-    if (m) { const s = this.verifySession(decodeURIComponent(m[1])); if (s) return s; }
+    if (m) { try { return this.verifySession(decodeURIComponent(m[1])); } catch {} }
     return null;
   }
   revokeSession(candidate) { const had = this.sessions.delete(String(candidate || "")); if (had) this.save(); return had; }
@@ -181,11 +191,11 @@ class AccessGate {
     return entry.count > max;
   }
   joinWaitlist(email) {
+    if (!this.waitlistOpen) throw Object.assign(new Error("The waitlist is currently closed."), { status: 403, code: "GATE_WAITLIST_CLOSED" });
     const clean = String(email || "").trim().toLowerCase();
     if (!EMAIL_RE.test(clean)) throw Object.assign(new Error("Enter a valid email address."), { status: 400, code: "GATE_EMAIL_INVALID" });
     const existing = this.waitlist.find(x => x.email === clean);
     if (existing) return { entry: this.publicEntry(existing), alreadyJoined: true };
-    if (!this.waitlistOpen) throw Object.assign(new Error("The waitlist is currently closed."), { status: 403, code: "GATE_WAITLIST_CLOSED" });
     if (this.waitlist.length >= this.maxWaitlist) throw Object.assign(new Error("The waitlist is full."), { status: 403, code: "GATE_WAITLIST_FULL" });
     const entry = { id: crypto.randomUUID(), email: clean, status: "pending", createdAt: new Date().toISOString() };
     this.waitlist.push(entry);
@@ -198,7 +208,10 @@ class AccessGate {
     if (!entry) return null;
     return this.publicEntry(entry);
   }
-  listWaitlist() { return this.waitlist.map(x => this.publicEntry(x)); }
+  listWaitlist() {
+    let position = 0;
+    return this.waitlist.map(x => this.publicEntry(x, x.status === "pending" ? ++position : null));
+  }
   acceptEntry(id) {
     const entry = this.waitlist.find(x => x.id === String(id || ""));
     if (!entry) throw Object.assign(new Error("Waitlist entry not found."), { status: 404, code: "GATE_ENTRY_NOT_FOUND" });
@@ -236,8 +249,8 @@ class AccessGate {
     if (!entry) throw Object.assign(new Error("That access key is not valid."), { status: 403, code: "GATE_KEY_INVALID" });
     return { email: entry.email, sessionToken: this.createSession({ email: entry.email, origin: "access-key" }) };
   }
-  publicEntry(x) {
-    return { id: x.id, email: x.email, status: x.status, position: this.waitlist.filter(w => w.status === "pending").indexOf(x) + 1 || null, createdAt: x.createdAt, acceptedAt: x.acceptedAt || null, keyIssuedAt: x.keyIssuedAt || null, hasKey: !!x.keyHash, emailStatus: x.emailStatus || null, emailSentAt: x.emailSentAt || null };
+  publicEntry(x, position = this.waitlist.filter(w => w.status === "pending").indexOf(x) + 1 || null) {
+    return { id: x.id, email: x.email, status: x.status, position, createdAt: x.createdAt, acceptedAt: x.acceptedAt || null, keyIssuedAt: x.keyIssuedAt || null, hasKey: !!x.keyHash, emailStatus: x.emailStatus || null, emailSentAt: x.emailSentAt || null };
   }
 
   /* ---------- middleware ---------- */
@@ -246,20 +259,23 @@ class AccessGate {
     if (pathname === "/gate" || pathname.startsWith("/gate/")) return true;
     if (pathname === "/api/gate/status" || pathname === "/api/gate/config") return true;
     if (pathname === "/api/gate/waitlist" || pathname === "/api/gate/unlock") return true;
+    if (pathname === "/api/gate/admin/login") return true;
     return false;
   }
   middleware() {
-    return (req, res, next) => {
-      if (!this.enabled) return next();
+    return async (req, res, next) => {
       if (req.method === "OPTIONS") return next();
       let pathname = "/";
       try { pathname = new URL(req.originalUrl || req.url || "/", "http://x").pathname; } catch {}
+      if (pathname === "/health" || pathname === "/api/health") return next();
+      try { await this.policy?.ready(); }
+      catch (e) { return res.status(e.status).set("Cache-Control", "no-store").json({ ok: false, code: e.code, error: e.message }); }
       if (this.isPublicPath(pathname)) return next();
-      if (this.isAdminRequest(req)) return next();
-      if (this.sessionFromRequest(req)) return next();
+      if (this.canBrowse(req)) return next();
+      res.set("Cache-Control", "no-store");
       // Gated: browsers get the waitlist screen, API callers get a JSON 403.
       if (pathname.startsWith("/api/") || pathname.startsWith("/ws")) {
-        res.status(403).json({ ok: false, error: "Veyra is invite-only. Join the waitlist or enter your access key.", code: "GATE_REQUIRED" });
+        res.status(403).json({ ok: false, error: this.staffOnly ? "Veyra is temporarily locked to staff." : "Veyra is invite-only.", code: this.staffOnly ? "GATE_LOCKED" : "GATE_REQUIRED" });
         return;
       }
       res.status(403).type("html").send(this.screenHtml());
@@ -301,21 +317,21 @@ footer{margin-top:18px;text-align:center;color:#5c6472;font-size:12px}
 <main>
 <div class="logo"><svg viewBox="0 0 32 32" fill="none"><path d="M7 8.5l9 16 9-16" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><circle cx="25" cy="8.5" r="2.4" fill="#5b8cff"/></svg><b>Veyra</b></div>
 <div class="card">
-<span class="badge">🔒 Invite only</span>
-<h1>Veyra is in early access</h1>
-<p>Access is by invitation. Join the waitlist and we will email you an access key when a spot opens, or enter your key if you already have one.</p>
-<form id="join">
+<span class="badge">${this.staffOnly ? "Staff only" : "Invite only"}</span>
+<h1>${this.staffOnly ? "Veyra is temporarily locked" : "Veyra is in early access"}</h1>
+<p>${this.staffOnly ? "Browsing is paused for everyone except staff. Existing invites can be used again when browsing reopens." : "Access is by invitation. Enter your key if you already have one."}</p>
+${this.waitlistOpen ? `<form id="join">
 <label for="email">Email address</label>
 <input id="email" type="email" placeholder="you@example.com" autocomplete="email" required>
 <button type="submit" id="joinBtn">Join the waitlist</button>
 <div class="msg" id="joinMsg"></div>
-</form>
-<form id="unlock">
+</form>` : `<p>The waitlist is closed.</p>`}
+${this.staffOnly ? "" : `<form id="unlock">
 <label for="key">Access key</label>
 <input id="key" type="text" placeholder="VY-…" autocomplete="off">
 <button type="submit" id="unlockBtn">Unlock Veyra</button>
 <div class="msg" id="unlockMsg"></div>
-</form>
+</form>`}
 </div>
 <footer>Links to Veyra rotate constantly — only current invite links work.</footer>
 </main>
@@ -327,7 +343,7 @@ function msg(el,text,cls){el.textContent=text;el.className="msg "+(cls||"");}
 function post(path,body){
 return fetch(API+path,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)}).then(function(r){return r.json().then(function(j){return{status:r.status,body:j};});});
 }
-document.getElementById("join").addEventListener("submit",function(e){
+document.getElementById("join")?.addEventListener("submit",function(e){
 e.preventDefault();
 var email=document.getElementById("email").value.trim(),btn=document.getElementById("joinBtn"),el=document.getElementById("joinMsg");
 btn.disabled=true;msg(el,"Joining…");
@@ -337,7 +353,7 @@ else if(r.body&&r.body.alreadyJoined){msg(el,"You're already on the list — pos
 else{msg(el,(r.body&&r.body.error)||"Could not join the waitlist.","err");}
 }).catch(function(){msg(el,"Could not reach Veyra. Try again.","err");}).finally(function(){btn.disabled=false;});
 });
-document.getElementById("unlock").addEventListener("submit",function(e){
+document.getElementById("unlock")?.addEventListener("submit",function(e){
 e.preventDefault();
 var key=document.getElementById("key").value.trim(),btn=document.getElementById("unlockBtn"),el=document.getElementById("unlockMsg");
 btn.disabled=true;msg(el,"Checking…");

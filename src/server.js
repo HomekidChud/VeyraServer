@@ -19,6 +19,7 @@ const VEYRA_VERSION = require("../package.json").version;
 const { SessionManager } = require("./core/session-manager");
 const { AuthStore } = require("./core/auth");
 const { AccessGate } = require("./core/access-gate");
+const { AccessPolicy } = require("./core/access-policy");
 const { WorkerPool } = require("./core/worker-pool");
 const { MongoStore } = require("./core/mongo-store");
 const youtubeCompat = require("./browser/youtube");
@@ -325,7 +326,7 @@ const CFG = Object.freeze({
   authSignupKey: process.env.VEYRA_SIGNUP_KEY || "",
   authTokenTtlMs: numberEnv("VEYRA_AUTH_TOKEN_TTL_MS", 7 * 24 * 60 * 60 * 1000, 10 * 60 * 1000, 90 * 24 * 60 * 60 * 1000),
   adminEmails: String(process.env.VEYRA_ADMIN_EMAILS || "").split(",").map(x => x.trim().toLowerCase()).filter(Boolean),
-  testMode: boolEnv("VEYRA_TEST_MODE", false),
+  testMode: !process.env.RENDER && ![process.env.VEYRA_ENV, process.env.NODE_ENV].some(x => /^(production|prod)$/i.test(String(x || "").trim())) && boolEnv("VEYRA_TEST_MODE", false),
   workDir: process.env.VEYRA_WORK_DIR || path.join(os.tmpdir(), "veyra-browse-jobs"),
   sessionMaxCookieBytes: numberEnv("SESSION_MAX_COOKIE_BYTES", 128 * 1024, 4 * 1024, 4 * 1024 * 1024),
   serverIdleSleepMs: numberEnv("SERVER_IDLE_SLEEP_MS", 10 * 60 * 1000, 0, 24 * 60 * 60 * 1000),
@@ -395,11 +396,10 @@ const shield = createShield(process.env, { lean: CFG.leanMode, log: (level, sour
 app.set("trust proxy", true);
 app.disable("x-powered-by");
 app.use(shield.middleware);
-// Veyra Access Gate: everything behind an invite-only waitlist until the
-// request carries a valid gate session (cookie or X-Veyra-Gate header),
-// a current rotating invite token, or the admin token.
+// Veyra Access Gate: initialized below and applied after CORS, so a denied
+// request is readable by the browser shell as a policy decision.
 let accessGate = null;
-app.use((req, res, next) => (accessGate ? accessGate.middleware()(req, res, next) : next()));
+let gateMiddleware = null;
 // NOTE: the cross-session cookie handoff ("/api/handoff/cookies", the
 // "Bring session back" bookmarklet, the paste-import form) was removed.
 // Sign-in now happens inside the fast proxy itself: the site's login and
@@ -407,7 +407,6 @@ app.use((req, res, next) => (accessGate ? accessGate.middleware()(req, res, next
 // OAuth popups open as proxied Veyra tabs with opener semantics relayed
 // by the app. No cookie ever crosses between the user's browser and a
 // Veyra session, or between two Veyra sessions.
-installBrandRoutes(app, { frontendUrl: () => CFG.frontendUrl, version: VEYRA_VERSION, isPreviewBot: ua => shield.isPreviewBot(ua), hasProxiedReferer: req => !!proxiedPageFromReferer(req, { allowCookie: false }) });
 const allowedOrigins = CFG.frontendOrigins.includes("*") ? true : CFG.frontendOrigins;
 app.use(cors({
   origin: allowedOrigins,
@@ -417,6 +416,8 @@ app.use(cors({
   preflightContinue: false,
   exposedHeaders: ["X-Veyra-Request-ID", "X-Veyra-Canonical-URL", "X-Veyra-Challenge", "X-Veyra-Content-Type", "X-Veyra-Session-ID", "X-Veyra-Session-Expires"]
 }));
+app.use((req, res, next) => gateMiddleware ? gateMiddleware(req, res, next) : next());
+installBrandRoutes(app, { frontendUrl: () => CFG.frontendUrl, version: VEYRA_VERSION, isPreviewBot: ua => shield.isPreviewBot(ua), hasProxiedReferer: req => !!proxiedPageFromReferer(req, { allowCookie: false }) });
 
 
 app.use(["/api/resource", "/api/view"], express.raw({ type: () => true, limit: CFG.maxProxyBodyBytes, inflate: true }));
@@ -471,17 +472,20 @@ const authStore = new AuthStore({
 });
 
 // Access gate — invite-only front door for the whole service.
+const accessPolicy = new AccessPolicy({ dataDir: CFG.authDataDir, enabled: CFG.gateEnabled, waitlistOpen: CFG.gateWaitlistOpen, persistence: mongoStore });
 accessGate = new AccessGate({
   enabled: CFG.gateEnabled, dataDir: CFG.authDataDir,
   rotateMs: CFG.gateRotateMs, graceMs: CFG.gateGraceMs, sessionTtlMs: CFG.gateSessionTtlMs,
   waitlistOpen: CFG.gateWaitlistOpen, ownerTokens: CFG.gateOwnerTokens,
   adminToken: CFG.adminToken, maxSessions: CFG.gateMaxSessions, maxWaitlist: CFG.gateMaxWaitlist,
   frontendUrl: CFG.frontendUrl,
-  persistence: mongoStore,
+  persistence: mongoStore, policy: accessPolicy, staffRequest: isGateStaffRequest,
   log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
 });
+gateMiddleware = accessGate.middleware();
+void accessPolicy.ready().then(() => serverLog("info", "GATE", `Browser access: ${accessPolicy.state.mode}; waitlist ${accessPolicy.state.waitlistOpen ? "open" : "closed"}.`))
+  .catch(e => serverLog("warn", "GATE", e.message));
 void accessGate.hydrateFromPersistence();
-setImmediate(() => serverLog("info", "GATE", `Access gate ${CFG.gateEnabled ? "ENABLED" : "disabled"}. Fetch the current invite link from GET /api/gate/admin/link with the admin token.`));
 
 class Semaphore {
   constructor(limit) { this.limit = Math.max(1, limit); this.active = 0; this.waiters = []; }
@@ -5146,7 +5150,22 @@ function requireAdmin(req, res, next) {
   if (!CFG.adminGate || isAdminRequest(req)) return next();
   respondError(res, 403, "This area is for Veyra administrators only.", "ADMIN_REQUIRED");
 }
-app.post('/api/auth/signup', (req, res) => { try { res.status(201).json({ ok: true, ...authStore.signup(req.body || {}, clientIp(req)) }); } catch (e) { authFail(res, e); } });
+function isGateStaffRequest(req) {
+  if (accessGate?.isAdminRequest(req)) return true;
+  const user = authStore.userFromRequest(req);
+  return !!(user && user.email !== authStore.testAdminEmail && authStore.roleFor(user.email) === "admin");
+}
+function requireGateStaff(req, res, next) {
+  res.set("Cache-Control", "no-store");
+  if (isGateStaffRequest(req)) return next();
+  return respondError(res, 403, "This area is for Veyra administrators only.", "ADMIN_REQUIRED");
+}
+app.post("/api/gate/admin/login", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  try { res.json({ ok: true, ...authStore.login(req.body || {}, clientIp(req), { staffOnly: true }) }); }
+  catch (e) { authFail(res, e); }
+});
+app.post('/api/auth/signup', (req, res) => { try { res.status(201).json({ ok: true, ...authStore.signup(req.body || {}, clientIp(req), { allowAdminEnrollment: accessGate.isAdminRequest(req) }) }); } catch (e) { authFail(res, e); } });
 app.post('/api/auth/login', (req, res) => { try { res.json({ ok: true, ...authStore.login(req.body || {}, clientIp(req)) }); } catch (e) { authFail(res, e); } });
 app.get('/api/auth/me', requireUser, (req, res) => {
   const user = req.veyraUser;
@@ -5164,8 +5183,10 @@ function gateRedirectTarget(token) {
   const sep = base.includes("?") ? "&" : "?";
   return base === "/" || base === "." ? `/?gate=${encodeURIComponent(token)}` : `${base}${sep}gate=${encodeURIComponent(token)}`;
 }
-app.get("/gate", (req, res) => res.status(403).type("html").send(accessGate.enabled ? accessGate.screenHtml() : "<!doctype html><title>Veyra</title>"));
+app.get("/gate", (req, res) => res.set("Cache-Control", "no-store").status(403).type("html").send(accessGate.enabled ? accessGate.screenHtml() : "<!doctype html><title>Veyra</title>"));
 app.get("/gate/:token", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  if (accessGate.staffOnly) return res.status(403).type("html").send(accessGate.screenHtml());
   if (!accessGate.enabled) return res.redirect("/");
   const token = String(req.params.token || "");
   if (!accessGate.validateEntryToken(token)) {
@@ -5177,10 +5198,11 @@ app.get("/gate/:token", (req, res) => {
   res.redirect(gateRedirectTarget(sessionToken));
 });
 app.get("/api/gate/status", (req, res) => {
-  const session = accessGate.enabled ? accessGate.sessionFromRequest(req) : { email: "open" };
-  res.json({ ok: true, gated: accessGate.enabled, unlocked: !!session, waitlistOpen: accessGate.waitlistOpen, email: session ? session.email : null });
+  const unlocked = accessGate.canBrowse(req);
+  const session = unlocked && accessGate.enabled && !accessGate.staffOnly ? accessGate.sessionFromRequest(req) : null;
+  res.set("Cache-Control", "no-store").json({ ok: true, mode: accessPolicy.state.mode, gated: accessGate.enabled, unlocked, waitlistOpen: accessGate.waitlistOpen, email: session?.email || null });
 });
-app.get("/api/gate/config", (req, res) => res.json({ ok: true, gated: accessGate.enabled, waitlistOpen: accessGate.waitlistOpen }));
+app.get("/api/gate/config", (req, res) => res.set("Cache-Control", "no-store").json({ ok: true, mode: accessPolicy.state.mode, gated: accessGate.enabled, waitlistOpen: accessGate.waitlistOpen }));
 app.post("/api/gate/waitlist", async (req, res) => {
   const ip = clientIp(req);
   if (accessGate.limited(`join:${ip}`, 10, 10 * 60 * 1000)) return respondError(res, 429, "Too many waitlist signups from this network. Try again later.", "GATE_RATE_LIMITED");
@@ -5193,6 +5215,8 @@ app.post("/api/gate/waitlist", async (req, res) => {
   } catch (e) { authFail(res, e); }
 });
 app.post("/api/gate/unlock", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  if (accessGate.staffOnly) return respondError(res, 403, "Invites cannot be redeemed while Veyra is locked.", "GATE_LOCKED");
   const ip = clientIp(req);
   if (accessGate.limited(`unlock:${ip}`, 20, 10 * 60 * 1000)) return respondError(res, 429, "Too many unlock attempts from this network. Try again later.", "GATE_RATE_LIMITED");
   try {
@@ -5213,19 +5237,47 @@ app.post("/api/gate/logout", (req, res) => {
   res.setHeader("Set-Cookie", `${accessGate.cookieName}=; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=0`);
   res.json({ ok: true });
 });
-app.get("/api/gate/admin/link", requireAdmin, (req, res) => {
+app.get("/api/gate/admin/policy", requireGateStaff, (req, res) => res.json({ ok: true, policy: accessPolicy.state, report: accessGate.report() }));
+app.put("/api/gate/admin/policy", requireGateStaff, async (req, res) => {
+  const before = accessPolicy.state;
+  try {
+    const policy = await accessPolicy.update(req.body);
+    if (before !== policy) {
+      if (policy.mode === "staff" && before.mode !== "staff") {
+        for (const socket of castServer?.wss?.clients || []) socket.terminate();
+        for (const socket of wsRelay?.wss?.clients || []) socket.terminate();
+      }
+      serverLog("info", "GATE", `Access policy #${policy.revision}: ${policy.mode}; waitlist ${policy.waitlistOpen ? "open" : "closed"}; test mode ${policy.testMode ? "on" : "off"}.`);
+    }
+    res.json({ ok: true, policy, report: accessGate.report() });
+  } catch (e) { authFail(res, e); }
+});
+app.get("/api/gate/admin/checks", requireGateStaff, (req, res) => {
+  if (!accessPolicy.state.testMode) return respondError(res, 403, "Enable access test mode to run checks.", "ACCESS_TEST_MODE_OFF");
+  const cases = [["Public visitor", {}], ["Invite holder", { invited: true }], ["Administrator", { staff: true }]];
+  res.json({ ok: true, revision: accessPolicy.state.revision, checks: cases.map(([label, role]) => ({ label, ...accessPolicy.decision(role) })) });
+});
+app.get("/api/gate/admin/link", requireGateStaff, (req, res) => {
   const token = accessGate.currentToken();
   const origin = `${req.protocol}://${req.get("host")}`;
   res.json({ ok: true, link: `${origin}/gate/${token}`, token, history: accessGate.tokenHistory(), rotatesEveryMs: accessGate.rotateMs, graceMs: accessGate.graceMs, ownerLinks: [...accessGate.ownerTokens].map(t => `${origin}/gate/${t}`) });
 });
-app.post("/api/gate/admin/rotate", requireAdmin, (req, res) => {
+app.post("/api/gate/admin/rotate", requireGateStaff, (req, res) => {
   const rotated = accessGate.rotate(true);
   const origin = `${req.protocol}://${req.get("host")}`;
   res.json({ ok: true, link: `${origin}/gate/${rotated.current}`, previousLinkStillValid: !!rotated.previous });
 });
-app.get("/api/gate/admin/report", requireAdmin, (req, res) => res.json({ ok: true, ...accessGate.report() }));
-app.get("/api/gate/admin/waitlist", requireAdmin, (req, res) => res.json({ ok: true, total: accessGate.waitlist.length, entries: accessGate.listWaitlist() }));
-app.post("/api/gate/admin/waitlist/:id/accept", requireAdmin, async (req, res) => {
+app.get("/api/gate/admin/report", requireGateStaff, (req, res) => res.json({ ok: true, ...accessGate.report() }));
+app.get("/api/gate/admin/waitlist", requireGateStaff, (req, res) => {
+  let entries = accessGate.listWaitlist();
+  const total = entries.length;
+  if (req.query.limit !== undefined) {
+    const offset = Math.max(0, Math.trunc(Number(req.query.offset) || 0));
+    entries = entries.slice(offset, offset + Math.min(100, Math.max(1, Math.trunc(Number(req.query.limit) || 30))));
+  }
+  res.json({ ok: true, total, entries });
+});
+app.post("/api/gate/admin/waitlist/:id/accept", requireGateStaff, async (req, res) => {
   try {
     const result = accessGate.acceptEntry(req.params.id);
     if (result.alreadyAccepted) return res.json({ ok: true, alreadyAccepted: true, entry: result.entry });
@@ -5236,8 +5288,8 @@ app.post("/api/gate/admin/waitlist/:id/accept", requireAdmin, async (req, res) =
     res.json({ ok: true, entry: result.entry, accessKey: result.key, email, message: result.key ? "Share this key with the user — it is shown only once." + (email?.sent ? " It has also been emailed to them." : "") : "" });
   } catch (e) { authFail(res, e); }
 });
-app.post("/api/gate/admin/waitlist/:id/reject", requireAdmin, (req, res) => { try { const r = accessGate.rejectEntry(req.params.id); res.json({ ok: true, entry: r.entry }); } catch (e) { authFail(res, e); } });
-app.post("/api/gate/admin/waitlist/:id/reissue-key", requireAdmin, async (req, res) => {
+app.post("/api/gate/admin/waitlist/:id/reject", requireGateStaff, (req, res) => { try { const r = accessGate.rejectEntry(req.params.id); res.json({ ok: true, entry: r.entry }); } catch (e) { authFail(res, e); } });
+app.post("/api/gate/admin/waitlist/:id/reissue-key", requireGateStaff, async (req, res) => {
   try {
     const r = accessGate.reissueKey(req.params.id);
     const email = r.key && r.entry?.email ? await sendGateKeyEmail(r.entry, r.key, "reissued") : null;
@@ -5247,7 +5299,7 @@ app.post("/api/gate/admin/waitlist/:id/reissue-key", requireAdmin, async (req, r
 app.get('/api/auth/config', (req, res) => {
   const user = authStore.userFromRequest(req);
   const admin = !!(user && authStore.roleFor(user.email) === "admin");
-  res.json({ ok: true, signupEnabled: CFG.authAllowSignup, signupKeyRequired: !!CFG.authSignupKey, sessionTimeLimitMs: admin ? runtimeSessionPolicy.adminTimeLimitMs : runtimeSessionPolicy.guestTimeLimitMs, admin: admin || configEditAllowed(req), testMode: CFG.testMode, testAdmin: CFG.testMode ? authStore.getTestAdminCredentials() : null });
+  res.set("Cache-Control", "no-store").json({ ok: true, signupEnabled: CFG.authAllowSignup, signupKeyRequired: !!CFG.authSignupKey, sessionTimeLimitMs: admin ? runtimeSessionPolicy.adminTimeLimitMs : runtimeSessionPolicy.guestTimeLimitMs, admin: admin || configEditAllowed(req), testMode: CFG.testMode && isGateStaffRequest(req) });
 });
 
 
@@ -5632,7 +5684,9 @@ app.post('/api/v1/fetch', requirePlatformKey, async (req, res) => {
 
 
 app.post('/api/auth/test-login', (req, res) => {
-  if (!CFG.testMode) return res.status(403).json({ error: 'Test mode is disabled', ok: false });
+  res.set("Cache-Control", "no-store");
+  const localFixture = /^test$/i.test(String(process.env.VEYRA_ENV || "")) && /^(::1|127\.0\.0\.1|::ffff:127\.0\.0\.1)$/.test(req.socket?.remoteAddress || "");
+  if (!CFG.testMode || (!isGateStaffRequest(req) && !localFixture)) return res.status(403).json({ error: 'Test mode is disabled', ok: false });
   const creds = authStore.getTestAdminCredentials();
   if (!creds) return res.status(403).json({ error: 'Test admin not available', ok: false });
   try {
@@ -8014,7 +8068,7 @@ function startVeyraServer() {
       
       
       try {
-        castServer = new CastServer(httpServer, (level, source, msg) => serverLog(level, source, msg), { frontendUrl: CFG.frontendUrl });
+        castServer = new CastServer(httpServer, (level, source, msg) => serverLog(level, source, msg), { frontendUrl: CFG.frontendUrl, allowUpgrade: () => accessPolicy.loaded && !accessGate.staffOnly });
         serverLog("info", "CAST", `Cast server upgraded to ${castServer.useWebSocket ? "WebSocket" : "HTTP polling"} mode`);
       } catch (e) { serverLog("warn", "CAST", `Cast WebSocket upgrade kept polling mode: ${e.message}`); }
       try {
@@ -8023,6 +8077,7 @@ function startVeyraServer() {
         // Chromium. Shares the same HTTP server as the cast server.
         wsRelay = new WsRelay({
           log: (level, source, msg) => serverLog(level, source, msg),
+          allowUpgrade: () => accessPolicy.loaded && !accessGate.staffOnly,
           sessionManager: { checkLimit: sid => sessionManager.checkLimit(sid), touch: sid => sessionManager.touch(sid) },
           vpnManager,
           forwardHeaders: ({ sid, target }) => {
