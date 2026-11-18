@@ -1,8 +1,18 @@
 "use strict";
 const assert = require("assert");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 
 // Keep route integration coverage fully local and side-effect-free.
 for (const name of ["AI_API_KEY", "AI_API_BASE_URL", "AI_API_URL", "AI_API_PATH", "AI_API_KEY_HEADER", "AI_API_KEY_PREFIX", "AI_API_HEADERS_JSON", "AI_API_TOKEN_FIELD", "AI_API_STRUCTURED_OUTPUT", "AI_API_OPTIONS_JSON", "AI_API_REQUEST_TEMPLATE_JSON", "AI_API_RESPONSE_PATH", "AI_PROVIDER", "AI_PROVIDER_NAME", "AI_ANSWER_MODEL", "OPENAI_API_KEY", "OPENAI_API_BASE", "GROQ_API_KEY", "GOOGLE_SEARCH_API_KEY", "GOOGLE_API_KEY", "GOOGLE_SEARCH_CX", "GOOGLE_CSE_ID", "BRAVE_SEARCH_API_KEY", "BING_SEARCH_API_KEY"]) delete process.env[name];
+const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "veyra-search-route-"));
+process.env.VEYRA_DATA_DIR = dataDir;
+delete process.env.MONGODB_URI;
+process.env.ACCESS_GATE = "0";
+process.env.VEYRA_ALLOW_SIGNUP = "1";
+process.env.VEYRA_SIGNUP_KEY = "";
+process.env.VEYRA_TEST_MODE = "0";
 process.env.WEB_SEARCH_ORDER = "google";
 process.env.VEYRA_CHROMIUM_ENABLED = "false";
 process.env.INDEX_AI_FINDINGS = "true";
@@ -21,6 +31,10 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
         assert.equal(options.engine, "bing");
         assert.equal(options.limit, 20, "Veyra web search should request 20 results by default");
         return { provider: "mock-provider", results: [{ url: "https://search-fixture.example/result", title: "Mock result", snippet: "Controlled route fixture", provider: "mock-provider" }], attempts: [{ provider: "mock-provider", count: 1 }] };
+      }
+      if (query === "private fixture") {
+        assert.equal(options.noCache, true);
+        return { results: [{ url: "https://search-fixture.example/private", title: "Private fixture" }] };
       }
       assert.equal(options.limit, 20, "answer discovery should request 20 provider results");
       return { provider: "mock-provider", results: [
@@ -43,7 +57,16 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     await new Promise((resolve, reject) => { server.once("listening", resolve); server.once("error", reject); });
     const base = `http://127.0.0.1:${server.address().port}`;
 
-    const webResponse = await fetch(`${base}/api/search/web?q=mock%20web%20route%20query&engine=bing`);
+    const signup = await fetch(`${base}/api/auth/signup`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "search-fixture@example.test", password: "fixture-search-only-42" })
+    });
+    const login = await signup.json();
+    assert.equal(signup.status, 201, JSON.stringify(login));
+    assert.ok(login.token, "the regular fixture account can sign in");
+    const authorization = `Bearer ${login.token}`;
+    const webResponse = await fetch(`${base}/api/search/web?q=mock%20web%20route%20query&engine=bing`, { headers: { authorization } });
     const webPayload = await webResponse.json();
     assert.equal(webResponse.status, 200);
     assert.equal(webPayload.ok, true);
@@ -56,10 +79,18 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     assert.equal(crawlArgs.query, "mock web route query");
     assert.ok(crawlArgs.options.maxPages <= CFG.indexAiMaxPages);
     assert.equal(webSearchCalls, 1);
+    for (const [suffix, headers] of [["", {}], ["&private=1", { authorization }]]) {
+      const privateResponse = await fetch(`${base}/api/search/web?q=private%20fixture${suffix}`, { headers });
+      assert.equal(privateResponse.headers.get("cache-control"), "no-store");
+      assert.equal((await privateResponse.json()).results.length, 1);
+      assert.equal(crawlCalls, 1, "private searches are not queued for indexing");
+    }
+    const guestAnswer = await (await fetch(`${base}/api/search/answer`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ query: "private fixture" }) })).json();
+    assert.equal(guestAnswer.hasAnswer, false, "guest answer is not generated or retained");
 
     const answerResponse = await fetch(`${base}/api/search/answer`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", authorization },
       body: JSON.stringify({ query: "What does the Veyra local route fixture confirm?" })
     });
     const answer = await answerResponse.json();
@@ -75,7 +106,7 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     assert.equal(answer.responseTimeMs, answer.pipeline.responseTimeMs);
     assert.equal(Number.isFinite(answer.pipeline.sourceRetrieval.localSearchMs), true);
     assert.equal(answer.grounding.claims.every(claim => claim.sourceIds.length > 0), true);
-    assert.equal(webSearchCalls, 2);
+    assert.equal(webSearchCalls, 4);
 
     assert.match(answer.observationId, /^obs_[A-Za-z0-9_-]{20,40}$/);
     assert.equal(answer.qualityLearning.calibrated, false, "the learned quality estimate must not be presented as calibrated confidence");
@@ -127,5 +158,6 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     delete app.locals.veyraNeuralRobotPool;
     delete app.locals.veyraYoutubeFetch;
     await new Promise(resolve => server.close(resolve));
+    fs.rmSync(dataDir, { recursive: true, force: true });
   }
 })().catch(error => { console.error(error); process.exitCode = 1; });

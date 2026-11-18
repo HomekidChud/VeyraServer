@@ -157,7 +157,7 @@ GET forms are rewritten to `/api/form-get/:target/:sid` so form fields cannot ov
 - `History.prototype` is patched and a watchdog restores the proxied URL if a page escapes it.
 - Relative-path fallback: root-relative requests that bypass the runtime (DOM-inserted `<script>`, audio, CSS) are resolved from the Referer, or from the `veyra_ctx` cookie. Webpack chunks requested as `/api/<chunk>.js` are resolved against recently proxied script directories. `PROXY_RELATIVE_FALLBACK=true` (default).
 - The JS rewriter no longer rewrites partial dynamic-import prefixes such as `import("./" + chunk)`.
-- Cookie-free YouTube HTML can use a short shared cache (`YT_DOCUMENT_CACHE=true`, default), while cookie-bearing or authenticated sessions remain isolated.
+- YouTube documents are never shared across sessions. Eligible, explicitly public static assets can use the global cache.
 
 ### Known limits
 - YouTube video playback from a datacenter IP (Render, AWS) is blocked by Google's "Sign in to confirm you're not a bot" check. Route the session through a residential `VPN_PROXY_SERVER` profile if you need playback.
@@ -212,6 +212,18 @@ Dev: `npm run dev` (node --watch). In development, `PUT /api/config` from localh
 
 - Proxy sessions are kept in an LRU with an idle TTL (`SESSION_IDLE_TTL_MS`), a hard max age and a cookie byte budget (`SESSION_MAX_COOKIE_BYTES`).
 - When a session expires, its VPN connection, Chromium sessions and script cache are released too.
+
+### Browsing cache scope
+
+| Setting | Default | Scope |
+| --- | --- | --- |
+| `SESSION_CACHE_ENABLED` | `true` | Eligible signed-in, non-incognito proxy responses and fallback page snapshots stay in RAM for that session. They are discarded when it ends. |
+| `GLOBAL_CACHE_ENABLED` | `true` | Proxy responses are shared only for eligible static assets marked `public`, without redirects, credentials, `Vary`, or `Set-Cookie`. Also controls caching of non-private web search results. |
+| `MONGODB_SHARED_CACHE` | `true` | Allows the eligible global proxy cache to use MongoDB when configured. Turning it off leaves the in-process global cache available. |
+
+Guest and incognito proxy traffic bypass these cache scopes, send `Cache-Control: no-store`, and skip background proxy warming. Private web searches skip result caching and indexing, and don't generate AI answers. Session cookies and page snapshots are not persisted or restored from MongoDB. A close request immediately retires the live session and cancels pending proxy work; it also attempts to remove legacy cookie and snapshot rows for that session when MongoDB is available.
+
+These controls apply to Veyra-managed browsing data. They do not erase files you've downloaded, bookmarks deliberately saved outside incognito, older backups, or records kept by sites, search providers, hosting infrastructure, the browser/OS, your network, or a VPN.
 - Under memory pressure, idle sessions are shed first.
 - Frontend: call `POST /api/session/:sid/close` (works with `navigator.sendBeacon`) on tab close to free resources right away.
 - Idle mode: after `SERVER_IDLE_SLEEP_MS` (10 min) with no API traffic, Veyra closes Chromium, drops caches and pauses seed crawls. The next request wakes it. The warm browser also closes after `BROWSER_WARM_IDLE_MS`.

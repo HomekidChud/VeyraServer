@@ -314,7 +314,11 @@ class MongoStore {
   async deleteSessionCookies(sid) {
     if (!sid) return;
     this.stats.writes += 1;
-    void this.withDb(db => db.collection("session_cookies").deleteOne({ sid }));
+    return this.withDb(db => db.collection("session_cookies").deleteOne({ sid }));
+  }
+  async deleteSessionSnapshots(sid) {
+    if (!sid) return;
+    return this.withDb(db => db.collection("snapshots").deleteMany({ proxySid: sid }));
   }
   async loadPlatformWaitlist() {
     const rows = await this.withDb(db => db.collection("platform_waitlist").find({}, { projection: { _id: 0 } }).sort({ createdAt: 1 }).limit(100000).toArray());

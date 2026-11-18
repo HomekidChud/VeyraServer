@@ -59,10 +59,11 @@ const assert = require("node:assert/strict");
   }));
   assert.deepEqual(ctx, { pageUrl: page, sid: made }, "context recovered from a path-based referer");
 
-  // 3. The veyra_ctx cookie carries the last virtual page.
+  // 3. The opaque cookie references the last virtual page held in server RAM.
+  sessionManager.peek(made).routingPage = page;
   ctx = escapedPageContext(fakeReq({
     query: { sid: made },
-    headers: { host: "veyra.example", cookie: `veyra_ctx=${encodeURIComponent(page)}|${made}` },
+    headers: { host: "veyra.example", cookie: `veyra_ctx=${made}` },
   }));
   assert.deepEqual(ctx, { pageUrl: page, sid: made }, "context recovered from the veyra_ctx cookie");
 

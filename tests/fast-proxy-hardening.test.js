@@ -65,13 +65,19 @@ const { fetch: undiciFetch, Agent } = require("undici");
   }
 
   // --- 2. orphaned subresource fallback ---------------------------------------
-  const fakeReq = ({ ip = "203.0.113.10", query = {} } = {}) => ({ ip, query, get: () => null });
-  noteClientResolvedPage(fakeReq({ ip: "203.0.113.10" }), "https://www.youtube.com/watch?v=x");
-  assert.deepEqual(orphanedPageContext(fakeReq({ ip: "203.0.113.10" })), { pageUrl: "https://www.youtube.com/watch?v=x", sid: "" }, "the client's last resolved page becomes the orphan resolution base with a guest sid");
+  const fakeReq = ({ ip = "203.0.113.10", path = "/s/desktop/example/base.js", query = {} } = {}) => ({ ip, path, query, get: () => null });
+  const hintSid = sessionManager.create("originhinttest123456").id;
+  noteClientResolvedPage(fakeReq(), "https://www.youtube.com/watch?v=x", hintSid);
+  assert.deepEqual(orphanedPageContext(fakeReq()), { pageUrl: "https://www.youtube.com/", sid: "" }, "only a YouTube origin can be recovered for public bundles");
   assert.equal(orphanedPageContext(fakeReq({ ip: "198.51.100.9" })), null, "other clients see no context");
   assert.equal(orphanedPageContext(fakeReq({ ip: "" })), null, "no client key means no context");
-  noteClientResolvedPage(fakeReq({ ip: "203.0.113.10" }), ""); // empty page is ignored
-  assert.deepEqual(orphanedPageContext(fakeReq({ ip: "203.0.113.10" })), { pageUrl: "https://www.youtube.com/watch?v=x", sid: "" }, "an empty page note is ignored");
+  assert.equal(orphanedPageContext(fakeReq({ path: "/chunk.js" })), null, "arbitrary resources do not use IP-only routing");
+  sessionManager.close(hintSid);
+  assert.equal(orphanedPageContext(fakeReq()), null, "session close removes the origin hint");
+  const privateSid = sessionManager.create("originhintprivate123", { incognito: true }).id;
+  sessionManager.peek(privateSid).incognito = true;
+  noteClientResolvedPage(fakeReq(), "https://www.youtube.com/watch?v=x", privateSid);
+  assert.equal(orphanedPageContext(fakeReq()), null, "incognito does not create IP hints");
 
   // Live HTTP behavior through the real express app. A private destination
   // makes the proxy fail deterministically with the SSRF guard's message —
@@ -96,8 +102,7 @@ const { fetch: undiciFetch, Agent } = require("undici");
     //    against the remembered page (guest fetch) and proxied.
     r = await fetch(`${base}/chunk.js`, { headers: { "sec-fetch-dest": "script" } });
     body = await r.text();
-    assert.match(body, /Private\/local destinations are blocked/, "the orphaned asset reached the proxy via the remembered page");
-    assert.ok(!/Nothing here/.test(body), "the orphaned asset no longer falls to the brand 404");
+    assert.ok(/Nothing here/.test(body), "a non-YouTube origin never becomes a cross-session orphan fallback");
 
     // c) Per-client isolation: a different client IP (via X-Forwarded-For;
     //    the app trusts the proxy header) must not resolve the orphan.
@@ -152,7 +157,8 @@ const { fetch: undiciFetch, Agent } = require("undici");
     await new Promise((resolve, reject) => { server3.once("listening", resolve); server3.once("error", reject); });
     const base3 = `http://127.0.0.1:${server3.address().port}`;
     const sid = sessionManager.create("framereloadt" + Date.now().toString(16).padStart(8, "0")).id;
-    const ctxCookie = `veyra_ctx=${encodeURIComponent("http://127.0.0.1:9/")}|${encodeURIComponent(sid)}`;
+    sessionManager.peek(sid).routingPage = "http://127.0.0.1:9/";
+    const ctxCookie = `veyra_ctx=${sid}`;
 
     // a) iframe reload WITH a live-session cookie: the landing route passes
     //    through and the escaped middleware re-resolves the cookie's page
@@ -165,7 +171,7 @@ const { fetch: undiciFetch, Agent } = require("undici");
     // b) iframe reload with a cookie naming a DEAD session: the pass-through
     //    happens (cookie present) but recovery fails, so the frame gets the
     //    brand 404 — never the meta-refresh hijack.
-    const deadCookie = `veyra_ctx=${encodeURIComponent("http://127.0.0.1:9/")}|deadSession00000000`;
+    const deadCookie = "veyra_ctx=deadSession00000000";
     r = await fetch(`${base3}/?themeRefresh=1`, { headers: { "sec-fetch-dest": "iframe", cookie: deadCookie } });
     body = await r.text();
     assert.ok(!/http-equiv="refresh"/.test(body), "a dead-session frame reload never meta-refreshes");

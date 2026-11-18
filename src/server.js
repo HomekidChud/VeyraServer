@@ -251,6 +251,8 @@ const CFG = Object.freeze({
   mongoCacheBodyMaxBytes: numberEnv("MONGODB_CACHE_BODY_MAX_BYTES", 768 * 1024, 16 * 1024, 768 * 1024),
   mongoCacheTtlMs: numberEnv("MONGODB_CACHE_TTL_MS", 15 * 60 * 1000, 10 * 1000, 24 * 60 * 60 * 1000),
   mongoSharedCache: boolEnv("MONGODB_SHARED_CACHE", true),
+  sessionCacheEnabled: boolEnv("SESSION_CACHE_ENABLED", true),
+  globalCacheEnabled: boolEnv("GLOBAL_CACHE_ENABLED", true),
   userAgent: process.env.VEYRA_USER_AGENT || `VeyraBrowseCrawler/${VEYRA_VERSION} (+https://github.com/HomekidChud/VeyraServer)`,
   frontendOrigins: csvEnv("FRONTEND_ORIGIN", ["*"]),
   
@@ -393,6 +395,9 @@ const DIRECT_HTTP_AGENT = new UndiciAgent({
 const GOOGLE_ACCOUNTS_HTTPS_AGENT = new https.Agent({ keepAlive: true, maxSockets: 16, lookup: createPublicSocketLookup() });
 
 const shield = createShield(process.env, { lean: CFG.leanMode, log: (level, source, message) => setImmediate(() => serverLog(level, source, message)) });
+// VPN profile discovery can log while the server module is still initializing.
+const serverLogs = [];
+let logSeq = 0;
 app.set("trust proxy", true);
 app.disable("x-powered-by");
 app.use(shield.middleware);
@@ -423,6 +428,11 @@ installBrandRoutes(app, { frontendUrl: () => CFG.frontendUrl, version: VEYRA_VER
 app.use(["/api/resource", "/api/view"], express.raw({ type: () => true, limit: CFG.maxProxyBodyBytes, inflate: true }));
 app.use(express.json({ limit: "256kb" }));
 app.use(express.urlencoded({ extended: false, limit: CFG.maxFormBodyBytes }));
+app.use(["/api/session", "/api/browser/session", "/api/search"], (req, res, next) => {
+  res.set("Cache-Control", "no-store");
+  if (req.query.private === "1" || (req.baseUrl === "/api/search" && !authStore.userFromRequest(req))) req.veyraPrivateTraffic = true;
+  next();
+});
 
 
 app.use((req, res, next) => {
@@ -586,7 +596,6 @@ const failoverController = IS_THREAD_WORKER ? null : new FailoverController({
 
 
 const snapshotStore = IS_THREAD_WORKER ? null : new SnapshotStore({
-  mongo: mongoStore,
   log: (level, source, message) => serverLog(level, source, message)
 });
 
@@ -600,12 +609,8 @@ if (!IS_THREAD_WORKER) {
     },
     onStorageState: (proxySessionId, storageState, chromiumUserAgent = "") => {
       
-      if (storageState?.cookies && proxySessionId) {
+      if (storageState?.cookies && sessionManager.has(proxySessionId) && !sessionManager.checkLimit(proxySessionId)) {
         sessionManager.importPlaywrightCookies(proxySessionId, storageState.cookies, chromiumUserAgent);
-        
-        if (mongoStore.enabled) {
-          mongoStore.putSessionCookies(proxySessionId, storageState.cookies).catch(() => {});
-        }
       }
     },
     onVerification: (session, challenge) => {
@@ -619,6 +624,11 @@ if (!IS_THREAD_WORKER) {
 
 
 sessionManager.on("expire", (sid, rec, reason) => {
+  const suffix = ` | sid=${sid}`;
+  for (const map of [proxyCache, fetchInflight, revalidateInflight]) {
+    for (const key of map.keys()) if (key.endsWith(suffix)) map.delete(key);
+  }
+  for (const [key, context] of clientLastResolvedPage) if (context.sid === sid) clientLastResolvedPage.delete(key);
   try { vpnManager.disconnect?.(sid); } catch {}
   
   try { renewingManager?.clearSession(sid); } catch {}
@@ -630,7 +640,11 @@ sessionManager.on("expire", (sid, rec, reason) => {
   if (failoverController) failoverController.breakers.delete(sid);
   if (snapshotStore) snapshotStore.clearSession(sid);
   
-  if (mongoStore.enabled) mongoStore.deleteSessionCookies(sid).catch(() => {});
+  // Delete legacy rows, if present. Live cookies and snapshots are RAM-only.
+  if (mongoStore.enabled) {
+    void mongoStore.deleteSessionCookies(sid).catch(() => {});
+    void mongoStore.deleteSessionSnapshots(sid).catch(() => {});
+  }
   return browserEngine.stopForProxySession?.(sid);
 });
 sessionManager.on("sleep", async () => {
@@ -647,16 +661,6 @@ if (!IS_THREAD_WORKER) sessionManager.start();
 
 
 
-
-if (!IS_THREAD_WORKER && mongoStore.enabled) {
-  sessionManager.setHydrateFn((sid, rec) => {
-    mongoStore.getSessionCookies(sid).then(cookies => {
-      if (cookies && cookies.length) {
-        sessionManager.importPlaywrightCookies(sid, cookies);
-      }
-    }).catch(() => {});
-  });
-}
 
 const browserEngineTimer = IS_THREAD_WORKER ? null : setInterval(() => {
   browserEngine.expireIdle().catch(() => {});
@@ -748,6 +752,7 @@ class BrowserTaskScheduler {
     }
     if (bestIndex < 0) return null;
     this.queue.splice(bestIndex, 1);
+    best.detachAbort?.();
     return best;
   }
 
@@ -783,6 +788,8 @@ class BrowserTaskScheduler {
   }
 
   request(key, task, meta = {}) {
+    const cancelled = () => Object.assign(new Error("Session deleted."), { code: "SESSION_EXPIRED" });
+    if (meta.signal?.aborted) return Promise.reject(cancelled());
     const k = String(key || `anon-${++this.seq}`);
     const existing = this.inFlight.get(k);
     if (existing) {
@@ -814,6 +821,17 @@ class BrowserTaskScheduler {
     };
     this.inFlight.set(k, promise);
     this.queue.push(item);
+    if (meta.signal) {
+      const abort = () => {
+        const index = this.queue.indexOf(item);
+        if (index < 0) return;
+        this.queue.splice(index, 1);
+        this.inFlight.delete(k);
+        item.reject(cancelled());
+      };
+      item.detachAbort = () => meta.signal.removeEventListener("abort", abort);
+      meta.signal.addEventListener("abort", abort, { once: true });
+    }
     this.stats.queued = Math.max(this.stats.queued, this.queue.length);
     this._pump();
     return promise;
@@ -840,11 +858,9 @@ const dnsPublicCache = new Map();
 const searchIndex = new Map();
 const invertedIndex = new Map();
 const termCounts = new Map();
-const serverLogs = [];
 const clientLogs = [];
 const requestLog = [];
 let requestLogSeq = 0;
-let logSeq = 0;
 const serverStartedAt = Date.now();
 const rewriteFailures = [];
 function recordRewriteFailure(url, mode, err) {
@@ -914,20 +930,7 @@ function jobLog(job, level, message, meta = {}) {
   if (job.logs.length > 250) job.logs.splice(0, job.logs.length - 250);
   serverLog(level, "CRAWLER", message, { jobId: job.id, ...meta });
 }
-function isIncognitoSid(sid) {
-  const id = String(sid || "");
-  if (!id) return false;
-  try { return !!sessionManager.peek(id)?.incognito; } catch { return false; }
-}
-// Guest sessions (created without a signed-in Veyra account) must never feed
-// or read the cross-session shared cache: one guest's fetched content must
-// not be served to another user. Signed-in users keep sharing public static
-// assets; guests stay isolated to their own session's ephemeral cache.
-function isGuestSid(sid) {
-  const id = String(sid || "");
-  if (!id) return false;
-  try { const rec = sessionManager.peek(id); return !!rec && !rec.userId; } catch { return false; }
-}
+const canCacheSession = rec => !!rec?.userId && !rec.incognito;
 function requestLogAdd(entry) {
   requestLog.push({ id: ++requestLogSeq, ...entry });
   if (requestLog.length > CFG.maxRequestLog) requestLog.splice(0, requestLog.length - CFG.maxRequestLog);
@@ -943,6 +946,7 @@ app.use((req, res, next) => {
   req.veyraRequestId = requestId;
   res.setHeader("X-Veyra-Request-ID", requestId);
   res.on("finish", () => {
+    if (req.veyraPrivateTraffic || (req.query?.sid && !canCacheSession(sessionManager.peek(req.query.sid)))) return;
     const ms = Number(process.hrtime.bigint() - start) / 1e6;
     const target = req.query?.url ? sanitizeLogUrl(req.query.url) : "";
     requestLogAdd({
@@ -953,7 +957,7 @@ app.use((req, res, next) => {
       status: res.statusCode,
       ms: Math.round(ms * 10) / 10,
       
-      targetHost: target && !isIncognitoSid(req.query?.sid) ? (() => { try { return new URL(target).hostname; } catch { return ""; } })() : ""
+      targetHost: target ? (() => { try { return new URL(target).hostname; } catch { return ""; } })() : ""
     });
   });
   next();
@@ -1237,7 +1241,10 @@ function storeSetCookies(sessionId, url, response) {
   if (!sessionId || typeof response?.headers?.getSetCookie !== "function") return;
   const values = response.headers.getSetCookie();
   if (!values?.length) return;
-  const session = sessionRecord(sessionId), u = new URL(url);
+  if (sessionManager.checkLimit(sessionId)) return;
+  const session = sessionManager.peek(sessionId);
+  if (!session) return;
+  const u = new URL(url);
   for (const raw of values.slice(0, 50)) {
     const parts = String(raw).split(";").map(x => x.trim());
     const pair = parts.shift();
@@ -1269,7 +1276,9 @@ function storeSetCookies(sessionId, url, response) {
 }
 function cookieHeader(sessionId, url) {
   if (!sessionId) return "";
-  const session = sessionRecord(sessionId), u = new URL(url), pairs = [];
+  const session = sessionManager.peek(sessionId);
+  if (!session) return "";
+  const u = new URL(url), pairs = [];
   for (const [key, cookie] of [...session.cookies.entries()]) {
     if (cookie.expiresAt && cookie.expiresAt <= Date.now()) { session.cookies.delete(key); continue; }
     if (cookie.secure && u.protocol !== "https:") continue;
@@ -1397,14 +1406,12 @@ async function fetchBuffer(url, opts = {}) {
     let lastError = null;
     let retriesUsed = 0;
     for (let attempt = 0; attempt <= (opts.retries ?? CFG.maxRetries); attempt++) {
+      const upstreamSignal = opts.signal;
+      if (upstreamSignal?.aborted) throw Object.assign(new Error("Operation cancelled."), { code: "OPERATION_CANCELLED" });
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), opts.timeout ?? CFG.requestTimeoutMs);
-      const upstreamSignal = opts.signal;
       const onAbort = () => controller.abort();
-      if (upstreamSignal) {
-        if (upstreamSignal.aborted) throw Object.assign(new Error("Operation cancelled."), { code: "OPERATION_CANCELLED" });
-        upstreamSignal.addEventListener("abort", onAbort, { once: true });
-      }
+      upstreamSignal?.addEventListener("abort", onAbort, { once: true });
       try {
         const reqHeaders = new Headers(headers);
         if (sessionId) {
@@ -1434,7 +1441,6 @@ async function fetchBuffer(url, opts = {}) {
           : await upstreamFetch(current, { method, headers: reqHeaders, redirect: "manual", signal: controller.signal, body: requestBody, ...(dispatcher ? { dispatcher } : {}) });
         if (sessionId) storeSetCookies(sessionId, current, response);
         clearTimeout(timer);
-        if (upstreamSignal) upstreamSignal.removeEventListener("abort", onAbort);
         if (response.status === 304) {
           if (cached) return { ...cached.response, status: cached.response.status || 200, revalidated: true, redirectChain };
           
@@ -1519,7 +1525,6 @@ async function fetchBuffer(url, opts = {}) {
         };
       } catch (e) {
         clearTimeout(timer);
-        if (upstreamSignal) upstreamSignal.removeEventListener("abort", onAbort);
         
         
         if (e?.code === "OPERATION_CANCELLED" || upstreamSignal?.aborted) throw Object.assign(new Error("Operation cancelled."), { code: "OPERATION_CANCELLED" });
@@ -1531,6 +1536,9 @@ async function fetchBuffer(url, opts = {}) {
         if (!retryableError) break;
         retriesUsed += 1;
         await sleep(backoffMs(attempt));
+      } finally {
+        clearTimeout(timer);
+        upstreamSignal?.removeEventListener("abort", onAbort);
       }
     }
     if (lastError) throw lastError;
@@ -1767,12 +1775,12 @@ function cacheSafeUrl(raw) {
 }
 function cacheSafeResponse(result, url) {
   if (!result || typeof result !== "object" || !cacheSafeUrl(url) || result.ok === false || result.truncated || result.tooLarge) return false;
-  if (result.status != null && (Number(result.status) < 200 || Number(result.status) >= 300)) return false;
+  if (result.status != null && (Number(result.status) < 200 || Number(result.status) >= 300 || Number(result.status) === 206)) return false;
   const header = name => { try { return result.headers?.get?.(name) || result.headers?.[name] || ""; } catch { return ""; } };
   const cacheControl = String(result.cacheControl || header("cache-control"));
   const vary = String(result.vary || header("vary")).trim();
   const setCookie = String(result.setCookieHeader || header("set-cookie"));
-  if (/(?:^|,)\s*(?:no-store|private)\b/i.test(cacheControl) || vary || setCookie) return false;
+  if (/(?:^|,)\s*(?:no-store|no-cache|private)\b/i.test(cacheControl) || vary || setCookie) return false;
   return true;
 }
 function hasCredentialRequestHeaders(headers) {
@@ -1796,54 +1804,65 @@ async function fetchCached(url, opts = {}) {
   
   
   const userAgentKey = opts.userAgent ? crypto.createHash("sha1").update(String(opts.userAgent)).digest("hex").slice(0, 16) : "default";
-  const baseKey = `proxy-cache:v2 ${method} ${normalized} | ref=${referrerKey} | ua=${userAgentKey}`;
+  const baseKey = `proxy-cache:v3 ${method} ${normalized} | ref=${referrerKey} | ua=${userAgentKey}`;
   const key = `${baseKey} | sid=${sid}`;
-  const sharedKey = `proxy-cache:v2 ${method} ${normalized} | ua=${userAgentKey} | sid=*`;
-  // Guest sessions never read or write the shared (cross-session) cache.
-  const guest = isGuestSid(sid);
-  const isolatedRequest = !cacheSafeUrl(normalized) || !!opts.private || hasCredentialRequestHeaders(opts.headers);
-  const cacheReadAllowed = method === "GET" && !opts.noCache && !opts.streamOversize && !opts.passthroughBinary && !isolatedRequest;
-  const canCoalesce = cacheReadAllowed;
+  const sharedKey = `proxy-cache:v3 ${method} ${normalized} | ua=${userAgentKey} | sid=*`;
+  const rec = sid ? sessionManager.peek(sid) : null;
+  const live = () => !sid || (!!rec && sessionManager.peek(sid) === rec && !sessionManager.checkLimit(sid));
+  const checkLive = () => {
+    if (sid && (rec?.abort.signal.aborted || (rec && !live()) || sessionManager.isTerminated(sid))) {
+      throw Object.assign(new Error("This Veyra session was deleted."), { code: "SESSION_EXPIRED", status: 410 });
+    }
+  };
+  checkLive();
+  const headers = new Headers(opts.headers || {});
+  const safeRequest = method === "GET" && !opts.noCache
+    && !opts.private && cacheSafeUrl(normalized) && !hasCredentialRequestHeaders(headers)
+    && !headers.has("range") && !(sid && (cookieHeader(sid, normalized) || vpnManager.requiresVpnForSession(sid)));
+  const sessionCache = safeRequest && CFG.sessionCacheEnabled && canCacheSession(rec);
+  const sharedCache = safeRequest && CFG.globalCacheEnabled && (!sid || canCacheSession(rec));
+  // Streaming callers may share buffered cache entries, never a live reader.
+  const canCoalesce = (sessionCache || sharedCache) && !opts.streamOversize && !opts.passthroughBinary;
   if (canCoalesce) { const existing = fetchInflight.get(key); if (existing) return existing; }
   const work = (async () => {
-    let cachedEntry = cacheReadAllowed ? await validateCacheEntry(proxyCache.get(key) || null, key, normalized) : null;
-    if (!cachedEntry && cacheReadAllowed && CFG.mongoSharedCache && !guest) cachedEntry = await validateCacheEntry(proxyCache.get(sharedKey) || null, sharedKey, normalized);
-    if (!cachedEntry && cacheReadAllowed && mongoStore.enabled) {
-      const persisted = await mongoStore.getProxyCache(key);
-      if (persisted) { cachedEntry = await validateCacheEntry(persisted, key, normalized); if (cachedEntry) cacheSet(proxyCache, key, cachedEntry, CFG.maxProxyCacheEntries); }
-    }
-    if (!cachedEntry && cacheReadAllowed && CFG.mongoSharedCache && !guest && mongoStore.enabled) {
+    let cachedEntry = sessionCache ? await validateCacheEntry(proxyCache.get(key) || null, key, normalized) : null;
+    if (!cachedEntry && sharedCache) cachedEntry = await validateCacheEntry(proxyCache.get(sharedKey) || null, sharedKey, normalized);
+    if (!cachedEntry && sharedCache && CFG.mongoSharedCache && mongoStore.enabled) {
       const persisted = await mongoStore.getProxyCache(sharedKey);
-      if (persisted) { cachedEntry = await validateCacheEntry(persisted, sharedKey, normalized); if (cachedEntry) cacheSet(proxyCache, sharedKey, cachedEntry, CFG.maxProxyCacheEntries); }
+      checkLive();
+      if (persisted) cachedEntry = await validateCacheEntry(persisted, sharedKey, normalized);
     }
+    checkLive();
     const cacheAge = cachedEntry ? Date.now() - cachedEntry.time : Infinity;
     if (cachedEntry && cacheAge <= CFG.proxyCacheMs && !opts.revalidate) return { ...cachedEntry.response, cacheHit: true, cacheAgeMs: cacheAge };
     if (cachedEntry && !opts.revalidate && CFG.proxyStaleWhileRevalidateMs > 0 && cacheAge <= CFG.proxyCacheMs + CFG.proxyStaleWhileRevalidateMs) {
       if (!revalidateInflight.has(key)) {
-        const refresh = fetchCached(url, { ...opts, revalidate: true, noCache: false }).catch(() => null).finally(() => revalidateInflight.delete(key));
+        const refresh = fetchCached(url, { ...opts, revalidate: true }).catch(() => null).finally(() => revalidateInflight.delete(key));
         revalidateInflight.set(key, refresh);
       }
       return { ...cachedEntry.response, cacheHit: true, stale: true, cacheAgeMs: cacheAge };
     }
     // Local injection point for tests: mock the upstream fetch without touching network.
     const upstreamFetchBuffer = app.locals.veyraProxyFetchBuffer || null;
-    const result = upstreamFetchBuffer ? await upstreamFetchBuffer(url, { ...opts, cached: cachedEntry && method === "GET" ? cachedEntry : null }) : await fetchBuffer(url, { ...opts, cached: cachedEntry && method === "GET" ? cachedEntry : null });
-    if (!opts.noCache && method === "GET" && !opts.passthroughBinary) {
-      const noStore = /no-store/i.test(result.cacheControl || "");
+    const signal = rec ? (opts.signal ? AbortSignal.any([rec.abort.signal, opts.signal]) : rec.abort.signal) : opts.signal;
+    const result = await (upstreamFetchBuffer || fetchBuffer)(url, { ...opts, signal, cached: cachedEntry });
+    if (rec && !live()) {
+      result.stream?.cancel();
+      checkLive();
+    }
+    if (sessionCache || sharedCache) {
       const bodyBytes = Buffer.byteLength(result.body || Buffer.alloc(0));
-      const youtubeDocument = CFG.youtubeDocumentCache && /text\/html|application\/xhtml/i.test(String(result.contentType || "")) && isYoutubeHost(new URL(normalized).hostname) && !result.setCookieHeader && !cookieHeader(sid, normalized);
-      const responseCacheable = cacheSafeResponse(result, normalized) && !isolatedRequest && !opts.noCache && bodyBytes <= CFG.maxCacheBodyBytes;
-      if (responseCacheable) cacheSet(proxyCache, key, { response: result, etag: result.etag, lastModified: result.lastModified }, CFG.maxProxyCacheEntries);
-      else {
-        proxyCache.delete(key); proxyCache.delete(sharedKey);
-        if (mongoStore.enabled) { void mongoStore.deleteProxyCache(key).catch(() => {}); void mongoStore.deleteProxyCache(sharedKey).catch(() => {}); }
+      const responseCacheable = cacheSafeResponse(result, normalized) && cacheSafeUrl(result.finalUrl || normalized)
+        && !result.redirectChain?.length && !result.stream && bodyBytes <= CFG.maxCacheBodyBytes;
+      if (sessionCache && responseCacheable) cacheSet(proxyCache, key, { response: result, etag: result.etag, lastModified: result.lastModified }, CFG.maxProxyCacheEntries);
+      else if (sessionCache) proxyCache.delete(key);
+      const shareableType = /^(?:text\/css|(?:text|application)\/(?:x-)?javascript|font\/|image\/)/i.test(String(result.contentType || ""));
+      const explicitlyPublic = /(?:^|,)\s*public(?:\s*,|\s*$)/i.test(String(result.cacheControl || ""));
+      if (sharedCache && responseCacheable && shareableType && explicitlyPublic) {
+        const sharedResult = { ...result, sessionId: "" };
+        cacheSet(proxyCache, sharedKey, { response: sharedResult, etag: result.etag, lastModified: result.lastModified }, CFG.maxProxyCacheEntries);
+        if (CFG.mongoSharedCache && mongoStore.enabled) void mongoStore.putProxyCache(sharedKey, sharedResult, { url: result.finalUrl || normalized, sessionId: "" });
       }
-      const shareableType = /(?:text\/css|javascript|font\/|image\/|image\/svg\+xml)/i.test(String(result.contentType || ""));
-      const noSessionCookies = !result.setCookieHeader && (!sid || !cookieHeader(sid, normalized));
-      const incognito = isIncognitoSid(sid);
-      const shared = responseCacheable && CFG.mongoSharedCache && (shareableType || youtubeDocument) && noSessionCookies && !noStore && !result.truncated && !result.tooLarge && bodyBytes <= Math.min(CFG.maxCacheBodyBytes, CFG.mongoCacheBodyMaxBytes) && (!incognito || youtubeDocument) && (!guest || youtubeDocument);
-      if (shared) { const sharedResult = { ...result, sessionId: "" }; cacheSet(proxyCache, sharedKey, { response: sharedResult, etag: result.etag, lastModified: result.lastModified }, CFG.maxProxyCacheEntries); void mongoStore.putProxyCache(sharedKey, result, { url: result.finalUrl || normalized, sessionId: "" }); }
-      else if (responseCacheable && !sid && !incognito && !noStore && !result.truncated && !result.tooLarge && bodyBytes <= Math.min(CFG.maxCacheBodyBytes, CFG.mongoCacheBodyMaxBytes)) void mongoStore.putProxyCache(key, result, { url: result.finalUrl || normalized, sessionId: "" });
     }
     return result;
   })();
@@ -2469,7 +2488,7 @@ function injectRuntime(html, original, sid = "") {
   // window.top via topPost — replying to ev.source can loop back into the
   // frame when the page's own SDKs wrap window.postMessage.
   try{addEventListener('message',function(ev){try{if(ev.data&&ev.data.type==='veyra:embed-probe'){topPost({type:'veyra:embed-probe-ack',sessionId:SESSION_ID})}}catch{}})}catch{}
-  function remember(next){virtualUrl=next;window.__VEYRA_PAGE_URL__=next;if(rootProxiedFrame())try{document.cookie='veyra_ctx='+encodeURIComponent(next)+'|'+encodeURIComponent(SESSION_ID)+';path=/;max-age=3600;'+(location.protocol==='https:'?'SameSite=None;Secure;Partitioned':'SameSite=Lax')}catch{}}
+  function remember(next){virtualUrl=next;window.__VEYRA_PAGE_URL__=next}
   function proxyHistory(method,native){return function(state,title,url){
     let next=virtualUrl;try{if(url!=null)next=cleanVeyraParams(fixOwn(new URL(unwrap(String(url)),virtualUrl))).href}catch{}
     remember(next);
@@ -4780,7 +4799,7 @@ app.post('/api/browser/capability', async (req, res) => {
 
   try {
     await assertPublicUrl(raw);
-    const result = await fetchCached(raw, { accept: 'text/html,application/xhtml+xml', limit: Math.min(CFG.maxProxyTextBytes, 1024 * 1024), timeout: CFG.requestTimeoutMs, retries: 0, referrer: '' });
+    const result = await fetchCached(raw, { private: !canCacheSession(sessionManager.peek(proxySessionId)), sessionId: proxySessionId, accept: 'text/html,application/xhtml+xml', limit: Math.min(CFG.maxProxyTextBytes, 1024 * 1024), timeout: CFG.requestTimeoutMs, retries: 0, referrer: '' });
     const signals = browserCapabilitySignals(result.body?.toString('utf8') || '', { 'content-type': result.contentType });
     const challenge = detectChallenge(result.body?.toString('utf8') || '', result.contentType, result.status, { server: result.serverHeader, 'cf-mitigated': result.cfMitigated, finalUrl: result.finalUrl });
     
@@ -4807,7 +4826,8 @@ app.post('/api/browser/capability', async (req, res) => {
     if (mode === 'BROWSER_ENGINE' && failoverInfo && failoverInfo.state === 'open') {
       mode = 'FAST_PROXY';
     }
-    const hasSnapshot = snapshotStore ? await snapshotStore.has(proxySessionId, result.finalUrl || raw) : false;
+    const hasSnapshot = snapshotStore && CFG.sessionCacheEnabled && canCacheSession(sessionManager.peek(proxySessionId))
+      ? await snapshotStore.has(proxySessionId, result.finalUrl || raw) : false;
     res.json({ ok: true, url: result.finalUrl || raw, mode, lean: CFG.leanMode, challenge: challenge ? challenge.type : null, forceBrowser: !!forceBrowser, signals, fullPage: signals.fullPage, status: result.status, contentType: result.contentType, failover: failoverInfo, snapshot: hasSnapshot });
   } catch (e) {
     // When the browser engine is disabled, never fall back to BROWSER_ENGINE;
@@ -4896,10 +4916,27 @@ const vpnErrStatus = code => ({ VPN_DISABLED: 503, VPN_NOT_CONFIGURED: 404, VPN_
 app.get('/health', (req, res) => res.json({ ok: true, uptime: Math.round(process.uptime()), plan: VEYRA_CONFIG.plan.label, time: new Date().toISOString() }));
 app.get('/api/health', (req, res) => res.json({ ok: true, uptime: Math.round(process.uptime()), plan: VEYRA_CONFIG.plan.label, time: new Date().toISOString() }));
 
-app.get('/api/vpn/status', (req, res) => {
-  res.json({ ok: true, ...vpnManager.status() });
+let vpnProfileHydration, vpnProfileRefreshAt = 0;
+function loadConfiguredVpnProfiles() {
+  if (!mongoStore.enabled || Date.now() < vpnProfileRefreshAt) return Promise.resolve();
+  if (vpnProfileHydration) return vpnProfileHydration;
+  vpnProfileHydration = (async () => {
+    for (const row of await mongoStore.loadVpnProfiles()) {
+      const profile = vpnManager.parseProfile(row);
+      if (profile && !vpnManager.get(profile.id)) vpnManager.addProfile(profile);
+    }
+    vpnProfileRefreshAt = Date.now() + 30_000;
+  })().finally(() => { vpnProfileHydration = null; });
+  return vpnProfileHydration;
+}
+app.get('/api/vpn/status', async (req, res) => {
+  await loadConfiguredVpnProfiles().catch(() => {});
+  res.set("Cache-Control", "no-store").json({ ok: true, ...vpnManager.status() });
 });
-app.get('/api/vpn/profiles', (req, res) => res.json({ ok: true, profiles: vpnManager.list(), defaultProfile: vpnManager.defaultProfileId || null }));
+app.get('/api/vpn/profiles', async (req, res) => {
+  await loadConfiguredVpnProfiles().catch(() => {});
+  res.set("Cache-Control", "no-store").json({ ok: true, enabled: vpnManager.enabled, profiles: vpnManager.list(), defaultProfile: vpnManager.defaultProfileId || null });
+});
 app.post('/api/vpn/test', async (req, res) => {
   try {
     const result = await vpnManager.test(String(req.body?.profileId || ''));
@@ -4913,6 +4950,8 @@ app.post('/api/vpn/health', async (req, res) => {
 app.post('/api/vpn/connect', async (req, res) => {
   try {
     const sid = normalizeSessionId(req.body?.sessionId || req.body?.sid);
+    if (sessionManager.checkLimit(sid)) return respondError(res, 410, "Session expired.", "SESSION_EXPIRED");
+    const record = sessionRecord(sid);
     const requested = String(req.body?.profileId || '');
     
     
@@ -4920,8 +4959,9 @@ app.post('/api/vpn/connect', async (req, res) => {
     
     const candidate = vpnManager.get(requested);
     if (candidate) await vpnManager.test(candidate.id);
+    if (record.abort.signal.aborted || sessionManager.checkLimit(sid)) return respondError(res, 410, "Session expired.", "SESSION_EXPIRED");
     const result = vpnManager.connect(sid, requested, { region: String(req.body?.region || ''), group: String(req.body?.group || '') });
-    const ps = sessionRecord(sid); ps.vpnProfileId = result.profile?.id || null;
+    record.vpnProfileId = result.profile?.id || null;
     res.json({ ok:true, ...result, note:'Every request from this Veyra session (proxy, crawler and Chromium) now leaves through the VPN exit. If the tunnel drops, the kill switch blocks traffic instead of falling back to the server IP.' });
   } catch (e) { respondError(res, vpnErrStatus(e.code), e.message, e.code || 'VPN_CONNECT_ERROR'); }
 });
@@ -5024,7 +5064,7 @@ function sessionInfo(sid, rec) {
   return { sessionId: sid, active: true, createdAt: new Date(rec.createdAt).toISOString(), lastUsed: new Date(rec.lastUsed).toISOString(),
     timeLimitMs: (rec.timeLimitMs ?? sessionManager.timeLimitMs) || null, expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null, remainingMs: sessionManager.remainingMs(rec),
     idleExpiresInMs: Math.max(0, sessionManager.idleTtlMs - (Date.now() - rec.lastUsed)), cookies: rec.cookies.size, requests: rec.requests,
-    serverTime: new Date().toISOString(), incognito: !!rec.incognito, vpn: vpnManager.sessionInfo?.(sid) || null };
+    serverTime: new Date().toISOString(), guest: !rec.userId, incognito: !!rec.incognito, vpn: vpnManager.sessionInfo?.(sid) || null };
 }
 app.get('/api/sessions', requireAdmin, (req, res) => res.json({ ok: true, ...sessionManager.report(), vpnConnections: vpnManager.status().connections, browser: { sessions: browserEngine.sessions.size, running: !!browserEngine.browser }, failover: failoverController ? failoverController.report() : null, snapshots: snapshotStore ? snapshotStore.report() : null }));
 function sessionPolicySummary() {
@@ -5796,6 +5836,10 @@ app.post('/api/browser/session', async (req, res) => {
     
     const storageState = sessionManager.getStorageState(proxySessionId);
     const session = await browserEngine.create(tabId, url, jobId, vpnProfile, { proxySessionId, fastStart: !!req.body?.fastStart, storageState });
+    if (sessionManager.checkLimit(proxySessionId) || !sessionManager.has(proxySessionId)) {
+      await browserEngine.stop(session.id);
+      return respondError(res, 410, "Session expired.", "SESSION_EXPIRED");
+    }
     sessionManager.linkBrowser(proxySessionId, session.id);
     
     if (failoverController) failoverController.recordBrowserResult(proxySessionId, true);
@@ -5861,10 +5905,13 @@ app.post('/api/browser/session/:sid/navigate', async (req, res) => {
     if (!url) throw Object.assign(new Error("Invalid browser URL."), { code: "INVALID_URL", status: 400 });
     await browserEngine.navigateSession(s, url, { fast: !!req.body?.fastStart });
     
-    if (snapshotStore && s.proxySessionId) {
+    if (snapshotStore && CFG.sessionCacheEnabled && canCacheSession(sessionManager.peek(s.proxySessionId))) {
       try {
         const html = await s.page.content().catch(() => '');
         const title = await s.page.title().catch(() => s.title || '');
+        if (sessionManager.checkLimit(s.proxySessionId) || !canCacheSession(sessionManager.peek(s.proxySessionId))) {
+          return respondError(res, 410, "Session expired.", "SESSION_EXPIRED");
+        }
         snapshotStore.snapshot(s.proxySessionId, {
           html, url: s.canonicalUrl, title, contentType: 'text/html', status: 200, headers: {}, assets: []
         });
@@ -5932,6 +5979,8 @@ function requestAbortSignal(req, res) {
 }
 app.get('/api/search/web', async (req, res) => {
   const request = requestAbortSignal(req, res);
+  const isPrivate = req.query.private === "1" || !authStore.userFromRequest(req);
+  if (isPrivate) { req.veyraPrivateTraffic = true; res.set("Cache-Control", "no-store"); }
   try {
     const q = String(req.query.q || "").trim().slice(0, 600);
     if (!q) return res.json({ ok: true, provider: "none", results: [], attempts: [], responseTimeMs: 0 });
@@ -5942,8 +5991,8 @@ app.get('/api/search/web', async (req, res) => {
     const lang = String(req.query.lang || "en").slice(0, 16);
     const limit = Math.min(CFG.maxSearchResults, Math.max(1, Number(req.query.limit || 20) || 20));
     const started = Date.now();
-    const result = await (app.locals.veyraWebSearch || webSearch).search(q, { offset, limit, engine: selected, lang, signal: request.signal });
-    queueNeuralIndexFindings(q, result.results || []);
+    const result = await (app.locals.veyraWebSearch || webSearch).search(q, { offset, limit, engine: selected, lang, signal: request.signal, noCache: isPrivate || !CFG.globalCacheEnabled });
+    if (!isPrivate) queueNeuralIndexFindings(q, result.results || []);
     res.json({ ok: true, ...result, source: "web", responseTimeMs: Date.now() - started });
   } catch (e) {
     respondError(res, 502, "Veyra web search is temporarily unavailable.", "SEARCH_WEB_ERROR");
@@ -6023,6 +6072,10 @@ async function persistAIObservation(id, query, results, answer) {
   }));
 }
 app.post('/api/search/answer', async (req, res) => {
+  if (req.query.private === "1" || !authStore.userFromRequest(req)) {
+    req.veyraPrivateTraffic = true;
+    return res.set("Cache-Control", "no-store").json({ hasAnswer: false, reason: "AI answers are off in private browsing." });
+  }
   const routeStartedAt = Date.now();
   const request = requestAbortSignal(req, res);
   try {
@@ -6286,7 +6339,7 @@ function extractWarmUrls(html, base, sid) {
 }
 
 async function warmPageResources(html, base, sid, externalSignal = null) {
-  if (CFG.proxyWarmLimit <= 0 || !html || !base) return;
+  if (CFG.proxyWarmLimit <= 0 || !html || !base || !CFG.sessionCacheEnabled || !canCacheSession(sessionManager.peek(sid))) return;
   const candidates = extractWarmUrls(html, base, sid);
   if (!candidates.length) return;
 
@@ -6540,14 +6593,14 @@ async function streamOversizeResponse(req, res, result, ctx) {
   if (!handle) {
     
     
-    const again = await fetchBuffer(ctx.canonical, { method: ctx.method, headers: ctx.headers, body: ctx.body, referrer: ctx.referrer, sessionId: ctx.sid, retries: 0, limit: 0, limitForContentType: () => 0, streamOversize: true });
+    const again = await fetchBuffer(ctx.canonical, { method: ctx.method, headers: ctx.headers, body: ctx.body, referrer: ctx.referrer, sessionId: ctx.sid, signal: ctx.record.abort.signal, retries: 0, limit: 0, limitForContentType: () => 0, streamOversize: true });
     handle = again.stream ? again.stream.take() : null;
     if (!handle) return respondError(res, 502, "Veyra could not stream this resource.", "PROXY_STREAM_ERROR");
     result = again;
   }
   const type = result.contentType || "application/octet-stream";
   res.setHeader("content-type", type);
-  res.setHeader("cache-control", ctx.download ? "no-store" : "public, max-age=60");
+  res.setHeader("cache-control", "no-store");
   // Mirror the upstream's nosniff decision instead of forcing it on (see
   // fetchBuffer's xContentTypeOptions note); the shield middleware may
   // have pre-set it, so remove it when the upstream did not send it.
@@ -6570,8 +6623,18 @@ async function streamOversizeResponse(req, res, result, ctx) {
   res.setHeader("X-Veyra-Proxy-Mode", "resource-stream");
   res.status(result.status >= 300 && result.status < 400 ? 200 : result.status);
   let closed = false;
-  res.on("close", () => { if (!res.writableFinished) { closed = true; try { handle.reader?.cancel().catch(() => {}); } catch {} } });
-  const write = (buf) => new Promise((resolve) => { if (closed) return resolve(); if (res.write(buf)) resolve(); else res.once("drain", resolve); });
+  const stopReading = () => { closed = true; try { handle.reader?.cancel().catch(() => {}); } catch {} };
+  const abort = () => { stopReading(); if (!res.writableEnded) res.destroy(); };
+  const onClose = () => { if (!res.writableFinished) stopReading(); };
+  const signal = ctx.record.abort.signal;
+  if (signal.aborted) { stopReading(); return sendSessionExpired(req, res, "resource", ctx.sid); }
+  signal.addEventListener("abort", abort, { once: true });
+  res.on("close", onClose);
+  const write = buf => new Promise(resolve => {
+    if (closed || res.write(buf)) return resolve();
+    const done = () => { res.off("drain", done); res.off("close", done); resolve(); };
+    res.once("drain", done); res.once("close", done);
+  });
   try {
     for (const chunk of handle.head) await write(chunk);
     if (handle.reader) {
@@ -6582,9 +6645,12 @@ async function streamOversizeResponse(req, res, result, ctx) {
       }
     }
   } catch {
-    try { handle.reader?.cancel().catch(() => {}); } catch {}
+    stopReading();
     if (!res.writableEnded) res.destroy();
     return;
+  } finally {
+    signal.removeEventListener("abort", abort);
+    res.off("close", onClose);
   }
   if (!res.writableEnded) res.end();
 }
@@ -6635,6 +6701,10 @@ async function maybeCompressProxyPayload(req, payload, contentType) {
   return null;
 }
 async function proxyRequest(req, res, mode) {
+  const sid = normalizeSessionId(req.query.sid);
+  req.veyraPrivateTraffic = !canCacheSession(sessionManager.peek(sid));
+  res.setHeader("Cache-Control", "no-store");
+  if (sessionManager.checkLimit(sid)) return sendSessionExpired(req, res, mode, sid);
   const canonical = mergeStrayProxyParams(req, firstValidUrl([req.query.url, req.query.target, req.query.u], req.get('Origin') || undefined)) || proxyRefererCanonical(req);
   const download = String(req.query.download || "") === "1";
   if (!canonical) return respondError(res, 400, "Missing or invalid public HTTP(S) URL.", "INVALID_URL");
@@ -6653,7 +6723,7 @@ async function proxyRequest(req, res, mode) {
   const ytDirectRefererOk = refererOrigin && refererOrigin === (() => { try { return new URL(canonical).origin; } catch { return ""; } })();
   if (mode === "resource" && !download && (method === "GET" || method === "HEAD") && isDirectYoutubeStaticUrl(canonical) && ytDirectRefererOk) {
     res.setHeader("location", canonical);
-    res.setHeader("cache-control", "public, max-age=300");
+    res.setHeader("cache-control", req.veyraPrivateTraffic ? "no-store" : "public, max-age=300");
     res.setHeader("x-veyra-direct-asset", "youtube-cdn");
     return res.status(302).end();
   }
@@ -6667,7 +6737,6 @@ async function proxyRequest(req, res, mode) {
   const sourceUrl = (() => { try { const u = new URL(String(req.query.from || "")); return /^https?:$/.test(u.protocol) ? u.href : ""; } catch { return ""; } })();
   const referrer = sourceUrl || "";
   const sourceOrigin = sourceUrl ? new URL(sourceUrl).origin : "";
-  const sid = normalizeSessionId(req.query.sid);
   if (sessionManager.checkLimit(sid)) return sendSessionExpired(req, res, mode, sid);
   
   
@@ -6684,7 +6753,8 @@ async function proxyRequest(req, res, mode) {
       }
     } catch {}
   }
-  { const rec = sessionManager.touch(sid); const exp = sessionManager.expiresAt(rec); if (exp) res.setHeader("X-Veyra-Session-Expires", new Date(exp).toISOString());
+  const record = sessionManager.touch(sid);
+  { const rec = record; const exp = sessionManager.expiresAt(rec); if (exp) res.setHeader("X-Veyra-Session-Expires", new Date(exp).toISOString());
     
     if (rec.prefs?.blockTrackers && isTrackerHost(new URL(canonical).hostname)) {
       rec.blocked = (rec.blocked || 0) + 1;
@@ -6753,7 +6823,6 @@ async function proxyRequest(req, res, mode) {
     return CFG.maxProxyOtherBytes;
   };
   try {
-    const browserKey = `${method} ${canonical}|ref=${referrer}|sid=${sid}|range=${headers.range || ""}|body=${body ? require("crypto").createHash("sha1").update(body).digest("hex") : ""}`;
     const browserPriority = mode === "view" ? 1000 : (looksLikeApiResource(canonical, accept, method) ? 980 : (/css|javascript|font|svg/i.test(accept) ? 900 : /image/i.test(accept) ? 800 : 700));
     const isNextRsc = /text\/x-component|text\/x-react-server-components/i.test(String(accept || "")) || !!req.get("RSC") || !!req.get("Next-Router-State-Tree") || !!req.get("Next-Action") || !!req.get("Next-Url");
     const requestLimit = mediaRequest ? CFG.maxProxyMediaBytes : (looksLikeApiResource(canonical, accept, method) || isNextRsc ? CFG.proxyApiBodyBytes : CFG.maxProxyBodyBytes);
@@ -6769,7 +6838,10 @@ async function proxyRequest(req, res, mode) {
     const mobileYoutubeRequest = (() => { try { return /^m\.youtube\.com$/i.test(new URL(canonical).hostname); } catch { return false; } })();
     const effectiveUserAgent = mobileYoutubeRequest ? "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36" : (sessionManager.chromiumUaFor(sid, canonical) || requestUserAgent);
     const hasAuthorization = !!req.get("Authorization");
-    const result = await browserScheduler.request(browserKey, () => fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, requestId: req.veyraRequestId, userAgent: effectiveUserAgent || undefined, limit: requestLimit, retries, limitForContentType, noCache: method !== "GET" || mediaRequest || hasAuthorization || isNextRsc, timeout: mediaRequest ? CFG.mediaRequestTimeoutMs : CFG.requestTimeoutMs, bodyTimeoutMs: mediaRequest ? CFG.mediaBodyTimeoutMs : CFG.bodyTimeoutMs, streamOversize: mode === "resource", passthroughBinary: mode === "resource" && !download && CFG.proxyPassthroughBinary }), { priority: browserPriority + (mediaRequest ? 30 : 0), host: hostOf(canonical), url: canonical });
+    const result = await browserScheduler.request(null, () => {
+      if (record.abort.signal.aborted || sessionManager.checkLimit(sid)) throw Object.assign(new Error("Session deleted."), { code: "SESSION_EXPIRED" });
+      return fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, requestId: req.veyraRequestId, userAgent: effectiveUserAgent || undefined, limit: requestLimit, retries, limitForContentType, noCache: download || method !== "GET" || mediaRequest || hasAuthorization || isNextRsc, timeout: mediaRequest ? CFG.mediaRequestTimeoutMs : CFG.requestTimeoutMs, bodyTimeoutMs: mediaRequest ? CFG.mediaBodyTimeoutMs : CFG.bodyTimeoutMs, streamOversize: mode === "resource", passthroughBinary: mode === "resource" && !download && CFG.proxyPassthroughBinary });
+    }, { priority: browserPriority + (mediaRequest ? 30 : 0), host: hostOf(canonical), signal: record.abort.signal });
   
   
   
@@ -6778,7 +6850,7 @@ async function proxyRequest(req, res, mode) {
   const streamNow = result.stream && (result.tooLarge || result.passthrough) && streamable && CFG.proxyStreamOversize && !(download && result.bytes > CFG.maxDownloadBytes);
   if (streamNow) {
     if (/javascript|ecmascript/i.test(result.contentType || "")) noteScriptDir(sid, result.finalUrl || canonical);
-    return streamOversizeResponse(req, res, result, { canonical, method, headers, body, referrer, sid, download });
+    return streamOversizeResponse(req, res, result, { canonical, method, headers, body, referrer, sid, download, record });
   }
   if (result.stream) result.stream.cancel();
   if (result.tooLarge || (download && result.bytes > CFG.maxDownloadBytes)) return respondError(res, 413, "The upstream response exceeds Veyra's safety limit.", "RESPONSE_TOO_LARGE");
@@ -6789,7 +6861,7 @@ async function proxyRequest(req, res, mode) {
   const staticResource = mode === "resource" && !download && !result.setCookieHeader && !requestHasAuth && !privateResponse && !cookieHeader(sid, canonical) && /^(?:text\/css|application\/(?:javascript|x-javascript)|text\/javascript|image\/|font\/)/i.test(result.contentType || "");
   const upstreamHeaders = {
     "content-type": result.contentType || (mode === "view" ? "text/html; charset=utf-8" : "application/octet-stream"),
-    "cache-control": download ? "no-store" : mode === "view" ? "no-store" : staticResource ? "public, max-age=60, stale-while-revalidate=300" : "public, max-age=15",
+    "cache-control": req.veyraPrivateTraffic || download || !staticResource ? "no-store" : "private, max-age=60",
     ...(download ? { "content-disposition": `attachment; filename="${safeDownloadFilename(result.finalUrl || canonical, result.contentType)}"` } : {}),
     // Mirror the upstream's own nosniff decision instead of forcing it on:
     // CDNs that serve scripts as binary/octet-stream without nosniff rely on
@@ -6821,7 +6893,7 @@ async function proxyRequest(req, res, mode) {
   const ytDirectRefererOk = (() => { try { const r = String(req.get("Referer") || ""); return r ? new URL(r).origin === new URL(result.finalUrl || canonical).origin : false; } catch { return false; } })();
   if (mode === "resource" && !download && result.status >= 200 && result.status < 300 && shouldDirectYoutubeStaticAsset(result.finalUrl || canonical, result.contentType) && ytDirectRefererOk) {
     res.setHeader("location", result.finalUrl || canonical);
-    res.setHeader("cache-control", "public, max-age=300");
+    res.setHeader("cache-control", req.veyraPrivateTraffic ? "no-store" : "public, max-age=300");
     res.setHeader("x-veyra-direct-asset", "youtube-cdn");
     return res.status(302).end();
   }
@@ -6857,7 +6929,7 @@ async function proxyRequest(req, res, mode) {
     
     
     
-    recordRewriteFailure(result.finalUrl || canonical, mode, rewriteErr);
+    if (!req.veyraPrivateTraffic) recordRewriteFailure(result.finalUrl || canonical, mode, rewriteErr);
     payload = result.body;
   }
   if (!download && method === "GET") {
@@ -6875,6 +6947,11 @@ async function proxyRequest(req, res, mode) {
   // executing them anyway, and forcing nosniff makes Chrome refuse them.
   if (!result.xContentTypeOptions) res.removeHeader("x-content-type-options");
   const exposedCanonical = mode === "view" ? virtualPageUrl(canonical, result.finalUrl || canonical) : (result.finalUrl || canonical);
+  if (record.abort.signal.aborted || sessionManager.checkLimit(sid)) return sendSessionExpired(req, res, mode, sid);
+  if (mode === "view" && documentNavigation(req) && !download) {
+    record.routingPage = exposedCanonical;
+    res.append("Set-Cookie", `veyra_ctx=${sid}; Path=/; HttpOnly; ${req.secure ? "SameSite=None; Secure; Partitioned" : "SameSite=Lax"}`);
+  }
   res.setHeader("X-Veyra-Canonical-URL", exposedCanonical);
   res.setHeader("X-Veyra-Session-ID", sid);
   res.setHeader("X-Veyra-Content-Type", result.contentType || "application/octet-stream");
@@ -6891,13 +6968,14 @@ async function proxyRequest(req, res, mode) {
     if (outLength) res.setHeader("content-length", outLength);
   }
   res.status(outputStatus).send(payload);
-  if (mode === "view" && !result.truncated && !result.tooLarge && /html|xhtml|^$/i.test(result.contentType || "")) {
+  if (mode === "view" && !req.veyraPrivateTraffic && CFG.sessionCacheEnabled && !result.truncated && !result.tooLarge && /html|xhtml|^$/i.test(result.contentType || "")) {
     if (shouldWarmPageResources(result.finalUrl || canonical)) {
       void warmPageResources(result.body.toString("utf8"), result.finalUrl || canonical, sid);
     }
   }
-  } finally {
-    
+  } catch (error) {
+    if (!res.headersSent && (record.abort.signal.aborted || error.code === "SESSION_EXPIRED")) return sendSessionExpired(req, res, mode, sid);
+    throw error;
   }
 }
 
@@ -6940,7 +7018,7 @@ app.get("/api/view", async (req, res) => { try { await proxyRequest(req, res, "v
   
   const snapSid = normalizeSessionId(req.query.sid);
   const snapUrl = mergeStrayProxyParams(req, firstValidUrl([req.query.url, req.query.target, req.query.u], req.get('Origin') || undefined)) || proxyRefererCanonical(req);
-  if (snapshotStore && snapSid && snapUrl) {
+  if (snapshotStore && CFG.sessionCacheEnabled && canCacheSession(sessionManager.peek(snapSid)) && !sessionManager.checkLimit(snapSid) && snapUrl) {
     const snap = await snapshotStore.get(snapSid, snapUrl);
     if (snap) {
       res.setHeader("X-Veyra-Snapshot", "1");
@@ -6953,7 +7031,7 @@ app.get("/api/view", async (req, res) => { try { await proxyRequest(req, res, "v
   const message = e.upstreamMessage || e.message;
   const upstreamCode = e.upstreamCode || networkErrorCode(e) || null;
   const publicCode = e.code === "VPN_KILL_SWITCH" ? "VPN_KILL_SWITCH" : /^UPSTREAM_[A-Z0-9_]+$/.test(String(e.code || "")) ? e.code : "PROXY_VIEW_ERROR";
-  serverLog("warn", "PROXY", `View failed for ${sanitizeLogUrl(req.query?.url || "")} — ${message}`, { requestId: req.veyraRequestId, code: publicCode, upstreamCode, upstreamPhase: e.upstreamPhase || null, targetHost: e.upstreamHost || hostOf(req.query?.url || "") });
+  if (!req.veyraPrivateTraffic) serverLog("warn", "PROXY", `View failed for ${sanitizeLogUrl(req.query?.url || "")} — ${message}`, { requestId: req.veyraRequestId, code: publicCode, upstreamCode, upstreamPhase: e.upstreamPhase || null, targetHost: e.upstreamHost || hostOf(req.query?.url || "") });
   respondError(res, e.code === "VPN_KILL_SWITCH" ? 503 : 502, `Veyra could not load this page: ${message}`, publicCode, { requestId: req.veyraRequestId, legacyCode: "PROXY_VIEW_ERROR", upstreamCode, upstreamPhase: e.upstreamPhase || null });
 } });
 // A proxied page can issue any normal HTTP request through fetch/XHR. Keep the
@@ -7001,8 +7079,14 @@ function shouldStartCrawlerForEngineMode(mode) {
 app.post("/api/open", async (req, res) => {
   try {
     const root = normalizeUrl(String(req.body?.url || "")); if (!root) return respondError(res, 400, "Please provide a valid public HTTP(S) URL.", "INVALID_URL");
-    await assertPublicUrl(root);
+    const openSid = String(req.body?.sessionId || req.body?.sid || "");
     const engineMode = normalizeOpenEngineMode(req.body?.engineMode);
+    if (openSid && sessionManager.checkLimit(openSid)) return respondError(res, 410, "This Veyra session reached its time limit and was deleted.", "SESSION_EXPIRED");
+    if (openSid && !canCacheSession(sessionManager.peek(openSid))) {
+      req.veyraPrivateTraffic = true;
+      return res.set("Cache-Control", "no-store").json({ ok: true, jobId: null, state: "disabled", engineMode, crawlerEnabled: false });
+    }
+    await assertPublicUrl(root);
     const crawlerEnabled = shouldStartCrawlerForEngineMode(engineMode);
     const oldId = activeByRoot.get(root); const old = oldId && jobs.get(oldId);
     const wantsPageAccelerator = engineMode !== "exhaustive";
@@ -7014,7 +7098,6 @@ app.post("/api/open", async (req, res) => {
       const cached = await mongoStore.getLatestCrawlSummary(root);
       if (cached) return res.status(200).json({ ok: true, jobId: null, url: root, viewUrl: makeViewUrl(root), state: "cached", cached: true, cachedAt: cached.finishedAt || cached.createdAt || null, counts: cached.counts || {}, engineMode, crawlerEnabled: true });
     }
-    const openSid = String(req.body?.sessionId || req.body?.sid || "");
     if (openSid && sessionManager.checkLimit(openSid)) return respondError(res, 410, "This Veyra session reached its time limit and was deleted.", "SESSION_EXPIRED");
     if (!crawlerEnabled) return res.status(200).json({ ok: true, jobId: null, url: root, viewUrl: makeViewUrl(root), state: "disabled", engineMode, crawlerEnabled: false });
     
@@ -7211,6 +7294,9 @@ const STATUS_VAR_DEFS = [
   { group: "Network / retries", key: "sitemapTimeoutMs", label: "Sitemap timeout (ms)", kind: "number", names: ["SITEMAP_TIMEOUT_MS"], fallback: 12000, min: 1000, max: 60000 },
   { group: "Network / retries", key: "maxSitemapFiles", label: "Max sitemap files", kind: "number", names: ["MAX_SITEMAP_FILES"], fallback: 50, min: 1, max: 1000 },
   { group: "Network / retries", key: "maxSitemapUrls", label: "Max sitemap URLs", kind: "number", names: ["MAX_SITEMAP_URLS"], fallback: 50000, min: 100, max: 500000 },
+  { group: "Cache & logs", key: "sessionCacheEnabled", label: "Session cache", kind: "bool", names: ["SESSION_CACHE_ENABLED"], fallback: true },
+  { group: "Cache & logs", key: "globalCacheEnabled", label: "Global cache", kind: "bool", names: ["GLOBAL_CACHE_ENABLED"], fallback: true },
+  { group: "Cache & logs", key: "mongoSharedCache", label: "MongoDB backing for the global proxy cache", kind: "bool", names: ["MONGODB_SHARED_CACHE"], fallback: true },
   { group: "Cache & logs", key: "proxyCacheMs", label: "Proxy cache TTL (ms)", kind: "number", names: ["CACHE_TTL_MS"], fallback: 10000, min: 0, max: 300000 },
   { group: "Cache & logs", key: "maxCacheBodyBytes", label: "Max cached response body bytes", kind: "number", names: ["MAX_CACHE_BODY_BYTES"], fallback: 4 * 1024 * 1024, min: 64 * 1024, max: 16 * 1024 * 1024 },
   { group: "Proxy sessions", key: "proxySessionTtlMs", label: "Proxy session TTL (ms)", kind: "number", names: ["PROXY_SESSION_TTL_MS"], fallback: 30 * 60 * 1000, min: 60 * 1000, max: 24 * 60 * 60 * 1000 },
@@ -7754,9 +7840,11 @@ app.get("/console", (req, res) => res.set("Cache-Control", "no-store").type("htm
 function proxiedPageFromCookie(req) {
   const m = String(req.get("Cookie") || "").match(/(?:^|;\s*)veyra_ctx=([^;]+)/);
   if (!m) return null;
-  const [page, sid] = m[1].split("|").map(x => { try { return decodeURIComponent(x); } catch { return ""; } });
-  const pageUrl = normalizeUrl(page || "");
-  return pageUrl ? { pageUrl, sid: sid || "" } : null;
+  // The cookie holds an opaque session reference, never a destination URL.
+  // Treat the old format as a session reference only during the transition.
+  const sid = liveSessionId(m[1].split("|").at(-1));
+  const pageUrl = sid && sessionManager.peek(sid)?.routingPage;
+  return pageUrl ? { pageUrl, sid } : null;
 }
 function proxiedPageFromReferer(req, { allowCookie = true } = {}) {
   const raw = String(req.get("Referer") || "");
@@ -7778,7 +7866,7 @@ function proxiedPageFromReferer(req, { allowCookie = true } = {}) {
 
 const scriptDirsBySession = new Map();
 function noteScriptDir(sid, url) {
-  if (!sid) return;
+  if (!sessionManager.has(sid) || sessionManager.checkLimit(sid)) return;
   let dir; try { const u = new URL(url); dir = u.origin + u.pathname.replace(/[^/]*$/, ""); } catch { return; }
   const list = (scriptDirsBySession.get(sid) || []).filter(d => d !== dir);
   list.unshift(dir); if (list.length > 8) list.length = 8;
@@ -7866,18 +7954,30 @@ function escapedPageContext(req, { allowCookie = true } = {}) {
 // as a GUEST fetch: a fresh guest session per request (empty sid), no
 // session cookies, so nothing leaks across sessions or clients.
 const clientLastResolvedPage = new Map();
-function noteClientResolvedPage(req, pageUrl) {
+function noteClientResolvedPage(req, pageUrl, sid) {
   const key = String(req.ip || "");
-  if (!key || !pageUrl) return;
-  if (clientLastResolvedPage.get(key) === pageUrl) return;
+  if (!key || !sid) return;
+  const rec = sessionManager.peek(sid);
+  if (!rec || sessionManager.checkLimit(sid)) return;
+  // Never retain a private page at IP scope. A short-lived YouTube origin
+  // hint is enough for its cookie-less public app bundles, not its video URL.
+  let url;
+  try { url = new URL(pageUrl); } catch { return; }
+  if (rec.incognito || !isYoutubeHost(url.hostname)) return;
   clientLastResolvedPage.delete(key);
-  clientLastResolvedPage.set(key, pageUrl);
+  clientLastResolvedPage.set(key, { origin: url.origin, sid, expires: Date.now() + 15_000 });
   while (clientLastResolvedPage.size > 4000) clientLastResolvedPage.delete(clientLastResolvedPage.keys().next().value);
 }
 function orphanedPageContext(req) {
   const key = String(req.ip || "");
-  const pageUrl = clientLastResolvedPage.get(key) || "";
-  return pageUrl ? { pageUrl, sid: "" } : null;
+  const context = clientLastResolvedPage.get(key);
+  if (!context) return null;
+  if (Date.now() >= context.expires || !liveSessionId(context.sid)) {
+    clientLastResolvedPage.delete(key);
+    return null;
+  }
+  if (!/^\/s\/(?:desktop|player)\//.test(req.path || "") || !/\.(?:m?js|css)$/i.test(req.path)) return null;
+  return { pageUrl: context.origin + "/", sid: "" };
 }
 // Resolve an escaped (path-based) request path onto the real site URL. The
 // site copies its own query string when it builds links, and the runtime's
@@ -7949,10 +8049,9 @@ app.use(async (req, res, next) => {
   // Orphaned subresource fallback: remember the page this client last
   // resolved so cookie-less, origin-only-referer asset requests can still
   // be resolved (as guest fetches) instead of 404ing.
-  if (ctx) noteClientResolvedPage(req, ctx.pageUrl);
+  if (ctx && (dest === "iframe" || dest === "frame" || topLevel)) noteClientResolvedPage(req, ctx.pageUrl, ctx.sid);
   if (!ctx && !topLevel && !reserved) ctx = orphanedPageContext(req);
   if (!ctx) return next();
-  if (process.env.VEYRA_DEBUG_ESCAPED) console.log("[escaped-debug]", JSON.stringify({ path: req.path, query: Object.fromEntries(Object.entries(req.query || {}).map(([k, v]) => [k, String(v).slice(0, 90)])), referer: String(req.get("Referer") || "").slice(0, 140), cookie: String(req.get("Cookie") || "").slice(0, 90), ctx }));
   let target = null;
   if (escaped !== req.originalUrl && /[.](m?js|css|wasm|json|map)([?#]|$)/i.test(req.path)) target = await resolveEscapedChunk(ctx.sid, escaped);
   if (!target) target = resolveEscapedTarget(escaped, ctx.pageUrl);
@@ -8033,16 +8132,7 @@ function startVeyraServer() {
 
       if (mongoStore.enabled) {
         try {
-          const dbProfiles = await mongoStore.loadVpnProfiles();
-          let loaded = 0;
-          for (const p of dbProfiles) {
-            const candidate = vpnManager.parseProfile(p);
-            if (candidate && !vpnManager.profiles.has(candidate.id)) {
-              vpnManager.addProfile(candidate);
-              loaded++;
-            }
-          }
-          serverLog('info', 'VPN', `Loaded ${loaded} VPN profile(s) from MongoDB.`);
+          await loadConfiguredVpnProfiles();
         } catch (e) { serverLog('warn', 'VPN', `Failed to load VPN profiles from MongoDB: ${e.message}`); }
       }
       await hydrateSearchFromMongo();
