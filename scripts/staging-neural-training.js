@@ -6,7 +6,8 @@ const { setTimeout: pause } = require("node:timers/promises");
 const { SOURCES } = require("../src/services/neural-training-data");
 
 const { STAGING_DIR, stagingIsolation } = require("./staging-ranker-baseline");
-const BATCH_PER_PUBLISHER = 4;
+const BATCH_PER_PUBLISHER = 3;
+const ROTATION_DAYS = 3;
 const DATASETS = [
   {
     name: "python-standard-library",
@@ -36,7 +37,37 @@ const DATASETS = [
   {
     name: "usgs-earth-science",
     base: "https://www.usgs.gov/",
-    pages: "programs/earthquake-hazards programs/volcano-hazards programs/water-resources programs/land-change-science-program programs/national-geospatial-program programs/coastal-and-marine-hazards-and-resources-program programs/geomagnetism programs/land-remote-sensing-program programs/national-cooperative-geologic-mapping-program programs/energy-resources-program programs/mineral-resources-program programs/biological-threats-and-invasive-species-research-program programs/national-land-imaging-program programs/ecosystems".split(" ")
+    pages: "programs/earthquake-hazards programs/volcano-hazards programs/water-resources programs/land-change-science-program programs/national-geospatial-program programs/coastal-and-marine-hazards-and-resources-program programs/geomagnetism programs/land-remote-sensing-program programs/national-cooperative-geologic-mapping-program programs/energy-resources-program programs/mineral-resources-program water-science-school programs/national-land-imaging-program programs/ecosystems".split(" ")
+  },
+  {
+    name: "pandas-data-analysis",
+    base: "https://pandas.pydata.org/docs/user_guide/",
+    pages: "index 10min dsintro basics indexing missing_data groupby merging reshaping timeseries timedeltas categorical visualization io options scaling enhancingperf sparse text".split(" ").map(name => `${name}.html`)
+  },
+  {
+    name: "nist-statistical-methods",
+    base: "https://www.itl.nist.gov/div898/handbook/",
+    pages: "eda/index.htm eda/section2/eda21.htm eda/section3/eda33.htm eda/section3/eda35.htm mpc/index.htm ppc/index.htm pri/index.htm pmd/index.htm pmc/index.htm apr/index.htm prc/index.htm toolaids/pff/index.htm".split(" ")
+  },
+  {
+    name: "nws-weather-education",
+    base: "https://www.weather.gov/jetstream/",
+    pages: "index atmosphere ocean clouds satellites radar synoptic thunderstorms lightning tornado tropical global".split(" ")
+  },
+  {
+    name: "numpy-numerical-computing",
+    base: "https://numpy.org/doc/stable/user/",
+    pages: "absolute_beginners quickstart basics.creation basics.indexing basics.broadcasting basics.types basics.copies basics.ufuncs basics.rec basics.dispatch".split(" ").map(name => `${name}.html`)
+  },
+  {
+    name: "r-statistics-and-data",
+    base: "https://stat.ethz.ch/R-manual/R-devel/library/stats/html/",
+    pages: "cor lm glm anova density filter acf arima prcomp hclust kmeans median quantile sd t.test chisq.test p.adjust predict aggregate smooth.spline".split(" ").map(name => `${name}.html`)
+  },
+  {
+    name: "noaa-ocean-education",
+    base: "https://oceanservice.noaa.gov/education/tutorial_",
+    pages: "tides/ tides/tides01_intro.html tides/tides02_cause.html tides/tides03_gravity.html currents/ currents/01whatis.html currents/02tidal1.html currents/04currents1.html geodesy/ corals/ estuaries/ pollution/".split(" ")
   }
 ];
 
@@ -50,20 +81,20 @@ function scheduleAt(now) {
   return {
     date: `${year}-${month}-${day}`,
     dayIndex: Math.floor(Date.UTC(+year, +month - 1, +day) / 86400000),
-    inWindow: hour === "13" && Number(minute) >= 30
+    // The free service may be asleep at 13:30. Catch up on the same local date.
+    inWindow: Number(hour) * 60 + Number(minute) >= 13 * 60 + 30
   };
 }
 
 function batchFor(dayIndex) {
-  const alternate = ((dayIndex % 2) + 2) % 2;
-  const group = DATASETS.slice(alternate * 3, alternate * 3 + 3);
-  const cycleLength = Math.ceil(Math.max(...group.map(d => d.pages.length)) / BATCH_PER_PUBLISHER);
-  const turn = Math.floor(dayIndex / 2);
-  const startIndex = ((turn % cycleLength + cycleLength) % cycleLength) * BATCH_PER_PUBLISHER;
-  return group.map(d => ({
-    name: d.name,
-    seeds: d.pages.slice(startIndex, startIndex + BATCH_PER_PUBLISHER).map(page => d.base + page)
-  })).filter(d => d.seeds.length);
+  const modulo = (n, length) => (n % length + length) % length;
+  const alternate = modulo(dayIndex, ROTATION_DAYS);
+  const turn = Math.floor(dayIndex / ROTATION_DAYS);
+  return DATASETS.filter((_, i) => i % ROTATION_DAYS === alternate).map(d => {
+    const cycle = Math.ceil(d.pages.length / BATCH_PER_PUBLISHER);
+    const startIndex = modulo(turn, cycle) * BATCH_PER_PUBLISHER;
+    return { name: d.name, seeds: d.pages.slice(startIndex, startIndex + BATCH_PER_PUBLISHER).map(page => d.base + page) };
+  });
 }
 
 function aggregate(body) {
@@ -122,7 +153,7 @@ function createRunner({ dataDir, port, token, fetchImpl = fetch, now = () => new
         try {
           const result = await status("/api/neural/index", { seeds, maxPages: seeds.length, maxDepth: 1 });
           if (result?.ok && Array.isArray(result.results)) {
-            completed = Math.min(seeds.length, result.results.filter(x => x.status === "fulfilled").length);
+            completed = Math.min(seeds.length, result.results.filter(x => x.status === "fulfilled" && Number(x.stats?.pagesCrawled) > 0).length);
           }
         } catch { /* One publisher must not block the other datasets. */ }
         datasets.push({ name, attempted: seeds.length, completed });

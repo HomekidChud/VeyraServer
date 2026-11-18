@@ -12,14 +12,13 @@ async function main() {
   assert.equal(start({ RENDER_SERVICE_ID: "production" }), false);
   assert.equal(start({ RENDER_SERVICE_ID: "srv-dbuqerg8v5cc739sq830", VEYRA_DATA_DIR: "/tmp/veyra-neural-staging", MONGODB_URI: "mongodb://not-staging" }), false);
   assert.equal(scheduleAt(new Date("2026-11-18T13:30:00Z")).inWindow, true);
-  assert.equal(scheduleAt(new Date("2026-11-18T14:00:00Z")).inWindow, false);
+  assert.equal(scheduleAt(new Date("2026-11-18T14:00:00Z")).inWindow, true, "a free staging instance can catch up after waking late");
   assert.equal(scheduleAt(new Date("2026-07-18T12:30:00Z")).inWindow, true, "the time window follows British Summer Time");
-  const batches = Array.from({ length: 16 }, (_, i) => i).filter(i => i % 2 === 0 || i < 10).map(batchFor);
+  const batches = Array.from({ length: 36 }, (_, i) => batchFor(i));
   const rotation = batches.flat(2).flatMap(x => x.seeds);
-  assert.equal(rotation.length, 138);
-  assert.equal(new Set(rotation).size, 138);
-  assert.equal(new Set(batches.flat().map(d => d.name)).size, 6);
-  assert(batches.every(day => day.every(x => x.seeds.length <= 4)));
+  assert.equal(new Set(rotation).size, 223);
+  assert.equal(new Set(batches.flat().map(d => d.name)).size, 12);
+  assert(batches.every(day => day.length === 4 && day.every(x => x.seeds.length >= 1 && x.seeds.length <= 3)));
   assert(batches.every(day => day.reduce((n, d) => n + d.seeds.length, 0) <= 12));
 
   const baseline = trainBaseline(), model = new NeuralCrawlerModel();
@@ -51,12 +50,12 @@ async function main() {
       }
       assert(url.endsWith("/api/neural/index"));
       const {seeds, maxPages, maxDepth} = JSON.parse(options.body);
-      assert(seeds.length <= 4);
+      assert(seeds.length <= 3);
       assert.equal(maxPages, seeds.length);
       assert.equal(maxDepth, 1);
       crawlCalls++;
       queued += seeds.length;
-      return Response.json({ ok: true, results: seeds.map(() => ({ status: "fulfilled" })) });
+      return Response.json({ ok: true, results: seeds.map((_, i) => ({ status: "fulfilled", stats: { pagesCrawled: Number(i !== 0) } })) });
     }
   };
   try {
@@ -67,9 +66,10 @@ async function main() {
     date = "2026-11-18T13:35:00Z";
     await Promise.all([run(), run()]);
     await createRunner(options)();
-    assert.equal(crawlCalls, 3, "neither overlapping calls nor a restart on the same disk repeats a batch");
+    assert.equal(crawlCalls, 4, "neither overlapping calls nor a restart on the same disk repeats a batch");
     const report = logs.find(x => x.phase === "batch");
     assert.equal(report.trained, trained);
+    assert(report.datasets.every(row => row.completed === row.attempted - 1), "empty or blocked crawls don't count as completed");
     assert.equal(report.bySource["public-document"], trained);
     assert.equal(report.bySource["public-dead-end"], 0);
     assert(!Object.hasOwn(report.bySource, "unknown"));
@@ -78,7 +78,7 @@ async function main() {
     enabled = false;
     date = "2026-11-19T13:35:00Z";
     await run();
-    assert.equal(crawlCalls, 3, "disabled flag prevents the next batch");
+    assert.equal(crawlCalls, 4, "disabled flag prevents the next batch");
   } finally {
     fs.rmSync(dataDir, { recursive: true, force: true });
   }
