@@ -11,6 +11,7 @@
     "diagnostics:network": "node scripts/network-diagnostics.js",
     "benchmark:search": "node scripts/bench-search-orchestration.js",
     "evaluate:neural": "node scripts/evaluate-neural-training.js",
+    "evaluate:answer-quality": "node scripts/evaluate-answer-quality.js",
     "dev": "node --watch src/server.js",
     "config": "node src/config/index.js",
     "check": "node scripts/verify-source.js",
