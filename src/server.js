@@ -28,7 +28,8 @@ const { isMainThread } = require("worker_threads");
 const { NeuralRobotPool } = require("./services/neural-robots");
 const { NeuralCrawlerModel } = require("./services/neural-crawler");
 const { NeuralLearningWorker } = require("./services/neural-learning");
-const { createPublicCrawlTrainer, trainingUrl } = require("./services/neural-training-data");
+const { createPublicCrawlTrainer, responseTrainingPolicy, trainingUrl } = require("./services/neural-training-data");
+const { createProxyVisitTrainer } = require("./services/neural-proxy-visit");
 const { ChallengeSolver } = require("./browser/challenge-solver");
 const { CastServer, InternetConnectionManager } = require("./network/cast-server");
 const { WsRelay } = require("./network/ws-relay");
@@ -476,6 +477,9 @@ const neuralTrainer = new NeuralLearningWorker({
   log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
 });
 const learnFromPublicCrawls = boolEnv("NEURAL_PUBLIC_CRAWL_TRAINING", false);
+const stagingFastProxyConfigured = learnFromPublicCrawls && boolEnv("NEURAL_FAST_PROXY_VISIT_TRAINING", false) &&
+  require("../scripts/staging-ranker-baseline").stagingIsolation(process.env, !!CFG.mongoUri);
+const stagingFastProxyEnabled = () => stagingFastProxyConfigured && accessGate.staffOnly && !!CFG.adminToken;
 const stagingRankerBaseline = process.env.RENDER_SERVICE_ID === "srv-dbuqerg8v5cc739sq830"
   ? require("../scripts/staging-ranker-baseline").applyStagingBaseline(neuralModel, {
     loaded: neuralModelLoadedFromDisk, enabled: learnFromPublicCrawls, mongoConfigured: !!CFG.mongoUri
@@ -1450,7 +1454,11 @@ async function fetchBuffer(url, opts = {}) {
           ? await requestGoogleAccounts(current, { method, headers: reqHeaders, body: requestBody, agent: GOOGLE_ACCOUNTS_HTTPS_AGENT, signal: controller.signal })
           : await upstreamFetch(current, { method, headers: reqHeaders, redirect: "manual", signal: controller.signal, body: requestBody, ...(dispatcher ? { dispatcher } : {}) });
         if (sessionId) storeSetCookies(sessionId, current, response);
-        clearTimeout(timer);
+        if (!opts.trainingObservation) clearTimeout(timer);
+        if (opts.trainingObservation && response.status >= 300 && response.status < 400) {
+          try { await response.body?.cancel(); } catch {}
+          return { status: response.status, finalUrl: current };
+        }
         if (response.status === 304) {
           if (cached) return { ...cached.response, status: cached.response.status || 200, revalidated: true, redirectChain };
           
@@ -1508,6 +1516,7 @@ async function fetchBuffer(url, opts = {}) {
           acceptRanges: response.headers.get("accept-ranges") || "",
           linkHeader: response.headers.get("link") || "",
           contentDisposition: response.headers.get("content-disposition") || "",
+          ...(opts.trainingObservation ? { trainingPolicy: responseTrainingPolicy(response.headers) } : {}),
           setCookieHeader: response.headers.get("set-cookie") || "",
           retryAfterMs: retryAfterMs(response.headers),
           contentEncoding: upstreamEncoding,
@@ -7642,7 +7651,28 @@ const neuralRobotPool = new NeuralRobotPool({
   log: (level, source, msg) => serverLog(level, source, msg),
   onPageFound: page => indexNeuralPage(page, page?.query || "")
 });
-app.get("/api/neural/stats", (req, res) => res.json({ ok: true, mongo: mongoStore.status(), model: neuralModel.report(), trainer: { ...neuralTrainer.report(), publicCrawlTraining: learnFromPublicCrawls }, ...(stagingRankerBaseline ? { baseline: stagingRankerBaseline } : {}) }));
+const trainProxyVisit = stagingFastProxyConfigured ? createProxyVisitTrainer({
+  enabled: stagingFastProxyEnabled,
+  fetchPage: (url, opts) => fetchBuffer(url, { ...opts, upstreamFetch: app.locals.veyraTrainingUpstream }),
+  learn: observePublicCrawl
+}) : null;
+app.post("/api/neural/staging/fast-proxy-visit", async (req, res) => {
+  req.veyraPrivateTraffic = true;
+  res.set("Cache-Control", "no-store");
+  if (!stagingFastProxyEnabled()) return respondError(res, 404, "Staging visit training is unavailable.", "STAGING_VISIT_UNAVAILABLE");
+  if (!accessGate.isAdminRequest(req)) return respondError(res, 403, "This area is for Veyra administrators only.", "ADMIN_REQUIRED");
+  // A dedicated staff command, not an observation of an existing browse session.
+  // Never accept credentials, cookies, target context or private-session flags.
+  if (Object.keys(req.query).length || !req.is("application/json") ||
+      ["authorization", "proxy-authorization", "cookie", "referer", "origin"].some(name => req.get(name) !== undefined) ||
+      req.body?.publicTraining !== true || typeof req.body.url !== "string" || Object.keys(req.body).length !== 2) {
+    return respondError(res, 400, "Use an explicit public training visit with no browser session.", "PUBLIC_VISIT_REQUIRED");
+  }
+  const outcome = await trainProxyVisit(req.body.url);
+  if (outcome === "unsupported") return respondError(res, 400, "Use an allowlisted public HTTPS document without parameters or a fragment.", "PUBLIC_VISIT_URL_REQUIRED");
+  return res.json({ ok: true, outcome });
+});
+app.get("/api/neural/stats", (req, res) => res.json({ ok: true, mongo: mongoStore.status(), model: neuralModel.report(), trainer: { ...neuralTrainer.report(), publicCrawlTraining: learnFromPublicCrawls, fastProxyVisitTraining: stagingFastProxyEnabled() }, ...(stagingRankerBaseline ? { baseline: stagingRankerBaseline } : {}) }));
 app.post("/api/neural/feedback", async (req, res) => {
   if (!trainingUrl(req.body?.url) || typeof req.body?.positive !== "boolean" || req.body?.accepted === false) {
     return res.status(400).json({ ok: false, error: "A public HTTP(S) URL and a boolean feedback value are required." });

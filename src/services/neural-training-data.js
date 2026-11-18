@@ -1,6 +1,7 @@
 "use strict";
 
 const { isIP } = require("node:net");
+const { createHmac, randomBytes } = require("node:crypto");
 const { NUM_FEATURES } = require("./neural-crawler");
 
 const SOURCES = Object.freeze({
@@ -8,6 +9,7 @@ const SOURCES = Object.freeze({
   "robot-feedback": 1,
   "public-document": 0.25,
   "public-dead-end": 0.18,
+  "public-proxy-visit": 0.15,
   "offline-fixture": 1,
   "legacy-feedback": 1
 });
@@ -89,22 +91,24 @@ function classifyCrawlObservation(observation = {}) {
 
 function createPublicCrawlTrainer({ model, enqueue, clock = Date.now, windowMs = 3_600_000, perHost = 12, globalLimit = 75 } = {}) {
   const seen = new Map(), hosts = new Map(), hostDeadEnds = new Map();
+  const dedupSecret = randomBytes(32);
   const maxRemembered = 3000, repeatMs = 24 * 3_600_000;
   let slot = -1, count = 0, deadEnds = 0;
-  return async function publicCrawlTraining(observation) {
+  return async function publicCrawlTraining(observation, fromProxyVisit = false) {
     const example = classifyCrawlObservation(observation);
-    if (!example) return false;
+    if (!example || (fromProxyVisit && !example.positive)) return false;
     const now = clock(), currentSlot = Math.floor(now / windowMs);
     if (currentSlot !== slot) { slot = currentSlot; count = 0; deadEnds = 0; hosts.clear(); hostDeadEnds.clear(); }
-    const key = example.url.href, host = example.url.hostname;
+    const url = example.url.href, host = example.url.hostname;
+    const key = createHmac("sha256", dedupSecret).update(url).digest("hex");
     const hostCount = hosts.get(host) || 0;
     if ((seen.has(key) && now - seen.get(key) < repeatMs) || hostCount >= perHost || count >= globalLimit) return false;
     const hostDeadEndCount = hostDeadEnds.get(host) || 0;
     if (!example.positive && (deadEnds >= 12 || hostDeadEndCount >= 2)) return false;
-    const raw = model.extractFeatures(key, { type: "html", internal: Number(example.depth) > 0 });
+    const raw = model.extractFeatures(url, { type: "html", internal: Number(example.depth) > 0 });
     // Preserve inference features but avoid capturing a previous model score or
     // a host's user-derived click/visit state in public training rows.
-    raw[0] = model.baseAuthority(key);
+    raw[0] = model.baseAuthority(url);
     raw[8] = 0.5; raw[9] = 0.5;
     const features = trainingFeatures(raw);
     if (!features) return false;
@@ -112,8 +116,9 @@ function createPublicCrawlTrainer({ model, enqueue, clock = Date.now, windowMs =
     if (seen.size > maxRemembered) seen.delete(seen.keys().next().value);
     hosts.set(host, hostCount + 1); count += 1;
     if (!example.positive) { hostDeadEnds.set(host, hostDeadEndCount + 1); deadEnds += 1; }
-    return enqueue({ features, positive: example.positive, source: example.source, weight: SOURCES[example.source] });
+    const source = fromProxyVisit ? "public-proxy-visit" : example.source;
+    return enqueue({ features, positive: example.positive, source, weight: SOURCES[source] });
   };
 }
 
-module.exports = { SOURCES, trainingUrl, trainingFeatures, responseTrainingPolicy, classifyCrawlObservation, createPublicCrawlTrainer };
+module.exports = { SOURCES, trainingUrl, allowedPublicRoute, trainingFeatures, responseTrainingPolicy, classifyCrawlObservation, createPublicCrawlTrainer };
