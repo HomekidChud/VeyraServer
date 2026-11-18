@@ -344,12 +344,12 @@ class AIAnswerEngine {
     this.acquisitionManager = opts.acquisitionManager || null;
     this.qualityModel = opts.qualityModel || new AnswerQualityModel();
   }
-  async answer(query, searchResults = [], { signal, retrievalDiagnostics = null } = {}) {
+  async answer(query, searchResults = [], { signal, retrievalDiagnostics = null, allowSource = () => true } = {}) {
     const started = Date.now(), q = cleanText(query, 600);
     const intent = this.detectIntent(q);
     if (!q) return { hasAnswer: false, reason: "No query provided" };
-    const results = this.normalizeResults(searchResults).slice(0, this.maxPagesToRead);
-    const contents = await this.fetchContents(results, signal);
+    const results = this.normalizeResults(searchResults).filter(allowSource).slice(0, this.maxPagesToRead);
+    const contents = await this.fetchContents(results, signal, allowSource);
     const evidence = this.buildEvidence(q, intent, contents, results);
     if (!evidence.length) return { hasAnswer: false, reason: "No readable source evidence found", query: q, intent, pipeline: { retrieved: results.length, fetched: contents.length, selected: 0, sourceRetrieval: retrievalDiagnostics } };
     const local = this.localSynthesis(q, intent, evidence);
@@ -406,7 +406,7 @@ class AIAnswerEngine {
     return { type: "explore", subject: q };
   }
   extractSubject(q) { return String(q).replace(/^what\s+(is|are|was|were)\s+/i, "").replace(/^what\s+does\s+/i, "").replace(/\s+mean\??$/i, "").replace(/^what's\s+/i, "").replace(/^define\s+/i, "").replace(/^meaning\s+of\s+/i, "").replace(/\s+(meaning|definition)\??$/i, "").trim() || q; }
-  async fetchContents(results, signal) {
+  async fetchContents(results, signal, allowSource = () => true) {
     // Read many candidate pages with bounded concurrency so the answer is built
     // from broad evidence, not just the first handful of search hits.
     const out = [];
@@ -417,7 +417,7 @@ class AIAnswerEngine {
         try {
           const indexed = String(r.contentText || "");
           const content = indexed.length >= 80 ? { ...this.parseContent(indexed, r.canonicalUrl || r.url), extractionStatus: "local-index", extractionQuality: 0.7 } : await this.fetchPageContent(r.url, { signal });
-          if (content?.text?.length >= 80) out.push({ ...content, url: r.url, canonicalUrl: r.canonicalUrl || content.canonicalUrl || r.url, title: r.title || content.title, snippet: r.snippet, rank: r.rank, sourceIdentity: r.sourceIdentity || host(r.url), provider: r.provider || r.source?.provider || r.source, retrievedAt: r.retrievedAt || new Date().toISOString(), extractionStatus: content.extractionStatus || "extracted" });
+          if (content?.text?.length >= 80 && allowSource(content)) out.push({ ...content, url: r.url, canonicalUrl: content.canonicalUrl || r.canonicalUrl || r.url, title: r.title || content.title, snippet: r.snippet, rank: r.rank, sourceIdentity: r.sourceIdentity || host(r.url), provider: r.provider || r.source?.provider || r.source, retrievedAt: r.retrievedAt || new Date().toISOString(), extractionStatus: content.extractionStatus || "extracted" });
         } catch {}
       }
     });

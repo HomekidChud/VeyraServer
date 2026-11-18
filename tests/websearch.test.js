@@ -1,6 +1,7 @@
 "use strict";
 const assert = require("assert");
 const { createWebSearch, classifyGoogleResponse } = require("../src/services/websearch");
+const { parseSiteScope, allowsSiteUrl } = require("../src/services/search-site-scope");
 
 (async () => {
   const unconfigured = createWebSearch({ env: {}, fetchText: async () => ({ ok: true, status: 200, text: "" }) });
@@ -32,6 +33,26 @@ const { createWebSearch, classifyGoogleResponse } = require("../src/services/web
   assert.deepEqual(result.results[0].providers, ["duckduckgo", "bing"]);
   assert.equal(result.results[0].snippet, "A longer snippet from Bing.");
   assert.equal(result.attempts.length, 3);
+
+  const scopedUrls = ["https://nasa.gov/", "https://science.nasa.gov/moon", "https://nasa.gov.evil.example/moon", "https://notnasa.gov/moon", "https://other.example/nasa.gov/moon"];
+  let scopeCalls = 0;
+  const scoped = createWebSearch({ env: { WEB_SEARCH_ORDER: "brave", BRAVE_SEARCH_API_KEY: "fixture" }, fetchText: async url => {
+    scopeCalls++;
+    assert.match(new URL(url).searchParams.get("q"), /site:/i);
+    return { ok: true, status: 200, text: JSON.stringify({ query: { more_results_available: true },
+      web: { results: scopedUrls.map((url, i) => ({ url, title: i ? "Moon phases" : "NASA homepage" })) } }) };
+  } });
+  const nasa = await scoped.search("SITE:nasa.gov Moon phases");
+  assert.deepEqual(nasa.results.map(row => row.url), [scopedUrls[1], scopedUrls[0]]);
+  assert.equal(nasa.nextOffset, 20);
+  assert.equal(nasa.total, null, "provider totals are not trusted for scoped queries");
+  assert.deepEqual((await scoped.search("SITE:nasa.gov Moon phases", { offset: nasa.nextOffset })).results.map(row => row.url), [scopedUrls[1], scopedUrls[0]]);
+  assert.deepEqual((await scoped.search("Moon site:example.org")).results, [], "do not fall back to outside sites");
+  assert.deepEqual((await scoped.search("Moon site:")).results, [], "invalid operators must not broaden the query");
+  assert.equal(scopeCalls, 3);
+  assert.equal(allowsSiteUrl(parseSiteScope('site:"nasa.gov" -site:science.nasa.gov Moon'), scopedUrls[1]), false);
+  assert.equal(allowsSiteUrl(parseSiteScope('site:nasa.gov site:science.nasa.gov Moon'), scopedUrls[0]), false);
+  assert.equal(parseSiteScope('"site:nasa.gov" syntax').active, false, "a quoted literal is not a site operator");
 
   const bingPageStarts = [];
   const bingTwenty = createWebSearch({ env: { WEB_SEARCH_ORDER: "bing", WEB_SEARCH_CACHE_TTL_MS: "0" }, fetchText: async url => {
