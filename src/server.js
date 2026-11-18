@@ -467,7 +467,7 @@ const neuralModel = new NeuralCrawlerModel({
   savePath: process.env.NEURAL_MODEL_PATH || path.join(CFG.authDataDir, "neural-model.json"),
   saveIntervalMs: numberEnv("NEURAL_MODEL_SAVE_INTERVAL_MS", 60000, 5000, 86400000)
 });
-neuralModel.load();
+const neuralModelLoadedFromDisk = neuralModel.load();
 const neuralTrainer = new NeuralLearningWorker({
   model: neuralModel, persistence: mongoStore, modelId: "relevance-v1",
   intervalMs: numberEnv("NEURAL_TRAIN_INTERVAL_MS", 5000, 250, 300000),
@@ -476,6 +476,10 @@ const neuralTrainer = new NeuralLearningWorker({
   log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
 });
 const learnFromPublicCrawls = boolEnv("NEURAL_PUBLIC_CRAWL_TRAINING", false);
+const stagingRankerBaseline = process.env.RENDER_SERVICE_ID === "srv-dbuqerg8v5cc739sq830"
+  ? require("../scripts/staging-ranker-baseline").applyStagingBaseline(neuralModel, {
+    loaded: neuralModelLoadedFromDisk, enabled: learnFromPublicCrawls, mongoConfigured: !!CFG.mongoUri
+  }) : null;
 const observePublicCrawl = learnFromPublicCrawls ? createPublicCrawlTrainer({
   model: neuralModel,
   enqueue: example => neuralTrainer.enqueuePersistent(example)
@@ -7638,7 +7642,7 @@ const neuralRobotPool = new NeuralRobotPool({
   log: (level, source, msg) => serverLog(level, source, msg),
   onPageFound: page => indexNeuralPage(page, page?.query || "")
 });
-app.get("/api/neural/stats", (req, res) => res.json({ ok: true, mongo: mongoStore.status(), model: neuralModel.report(), trainer: { ...neuralTrainer.report(), publicCrawlTraining: learnFromPublicCrawls } }));
+app.get("/api/neural/stats", (req, res) => res.json({ ok: true, mongo: mongoStore.status(), model: neuralModel.report(), trainer: { ...neuralTrainer.report(), publicCrawlTraining: learnFromPublicCrawls }, ...(stagingRankerBaseline ? { baseline: stagingRankerBaseline } : {}) }));
 app.post("/api/neural/feedback", async (req, res) => {
   if (!trainingUrl(req.body?.url) || typeof req.body?.positive !== "boolean" || req.body?.accepted === false) {
     return res.status(400).json({ ok: false, error: "A public HTTP(S) URL and a boolean feedback value are required." });

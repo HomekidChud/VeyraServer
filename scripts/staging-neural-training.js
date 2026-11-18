@@ -5,8 +5,7 @@ const { join } = require("node:path");
 const { setTimeout: pause } = require("node:timers/promises");
 const { SOURCES } = require("../src/services/neural-training-data");
 
-const STAGING_ID = "srv-dbuqerg8v5cc739sq830";
-const STAGING_DIR = "/tmp/veyra-neural-staging";
+const { STAGING_DIR, stagingIsolation } = require("./staging-ranker-baseline");
 const BATCH_PER_PUBLISHER = 4;
 const DATASETS = [
   {
@@ -23,6 +22,21 @@ const DATASETS = [
     name: "web-platform-reference",
     base: "https://developer.mozilla.org/en-US/docs/Web/API/",
     pages: "URL URLSearchParams AbortController Blob File FileReader FormData Headers Request Response Fetch_API Event EventTarget CustomEvent Document Element Node DOMParser DOMTokenList Range TreeWalker MutationObserver IntersectionObserver ResizeObserver Canvas_API Web_Animations_API History Location Performance TextEncoder".split(" ")
+  },
+  {
+    name: "w3c-web-standards",
+    base: "https://www.w3.org/TR/",
+    pages: "WCAG22 wai-aria-1.2 accname-1.2 css-syntax-3 css-color-4 css-cascade-5 css-values-4 css-grid-1 css-flexbox-1 css-contain-2 css-display-3 css-overflow-3 css-transforms-1 css-writing-modes-3 webaudio webvtt pointerevents3 screen-orientation".split(" ").map(name => `${name}/`)
+  },
+  {
+    name: "nasa-science",
+    base: "https://science.nasa.gov/",
+    pages: "solar-system/ solar-system/planets/ solar-system/moons/ solar-system/asteroids/ solar-system/comets/ solar-system/meteors-meteorites/ solar-system/kuiper-belt/ solar-system/oort-cloud/ universe/ universe/black-holes/ universe/galaxies/ universe/stars/ universe/exoplanets/ universe/cosmic-microwave-background/ universe/dark-matter-dark-energy/ universe/neutron-stars/".split(" ")
+  },
+  {
+    name: "usgs-earth-science",
+    base: "https://www.usgs.gov/",
+    pages: "programs/earthquake-hazards programs/volcano-hazards programs/water-resources programs/land-change-science-program programs/national-geospatial-program programs/coastal-and-marine-hazards-and-resources-program programs/geomagnetism programs/land-remote-sensing-program programs/national-cooperative-geologic-mapping-program programs/energy-resources-program programs/mineral-resources-program programs/biological-threats-and-invasive-species-research-program programs/national-land-imaging-program programs/ecosystems".split(" ")
   }
 ];
 
@@ -41,9 +55,12 @@ function scheduleAt(now) {
 }
 
 function batchFor(dayIndex) {
-  const cycleLength = Math.ceil(Math.max(...DATASETS.map(d => d.pages.length)) / BATCH_PER_PUBLISHER);
-  const startIndex = ((dayIndex % cycleLength + cycleLength) % cycleLength) * BATCH_PER_PUBLISHER;
-  return DATASETS.map(d => ({
+  const alternate = ((dayIndex % 2) + 2) % 2;
+  const group = DATASETS.slice(alternate * 3, alternate * 3 + 3);
+  const cycleLength = Math.ceil(Math.max(...group.map(d => d.pages.length)) / BATCH_PER_PUBLISHER);
+  const turn = Math.floor(dayIndex / 2);
+  const startIndex = ((turn % cycleLength + cycleLength) % cycleLength) * BATCH_PER_PUBLISHER;
+  return group.map(d => ({
     name: d.name,
     seeds: d.pages.slice(startIndex, startIndex + BATCH_PER_PUBLISHER).map(page => d.base + page)
   })).filter(d => d.seeds.length);
@@ -53,6 +70,8 @@ function aggregate(body) {
   const trainer = body?.trainer || {};
   return {
     enabled: trainer.publicCrawlTraining === true,
+    baselineExamples: Number(body?.baseline?.trainingExamples) || 0,
+    baselineUpdates: Number(body?.baseline?.optimizerUpdates) || 0,
     trained: Number(trainer.trained) || 0,
     queued: Number(trainer.queueSize) || 0,
     bySource: Object.fromEntries(Object.keys(SOURCES).map(name => [name, Number(trainer.bySource?.[name]) || 0]))
@@ -124,8 +143,7 @@ function createRunner({ dataDir, port, token, fetchImpl = fetch, now = () => new
 
 function start(env = process.env) {
   const port = Number(env.PORT || 10000);
-  if (env.RENDER_SERVICE_ID !== STAGING_ID || env.VEYRA_DATA_DIR !== STAGING_DIR ||
-      env.MONGODB_URI || env.MONGO_URI || !/^[0-9a-f]{64}$/.test(env.VEYRA_ADMIN_TOKEN || "") ||
+  if (!stagingIsolation(env) || !/^[0-9a-f]{64}$/.test(env.VEYRA_ADMIN_TOKEN || "") ||
       !Number.isInteger(port) || port < 1 || port > 65535) return false;
   const run = createRunner({ dataDir: STAGING_DIR, port, token: env.VEYRA_ADMIN_TOKEN });
   setTimeout(run, 2000).unref();

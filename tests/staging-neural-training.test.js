@@ -5,6 +5,8 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { batchFor, createRunner, scheduleAt, start } = require("../scripts/staging-neural-training");
+const { trainBaseline, applyStagingBaseline, STAGING_ID, STAGING_DIR } = require("../scripts/staging-ranker-baseline");
+const { NeuralCrawlerModel } = require("../src/services/neural-crawler");
 
 async function main() {
   assert.equal(start({ RENDER_SERVICE_ID: "production" }), false);
@@ -12,11 +14,26 @@ async function main() {
   assert.equal(scheduleAt(new Date("2026-11-18T13:30:00Z")).inWindow, true);
   assert.equal(scheduleAt(new Date("2026-11-18T14:00:00Z")).inWindow, false);
   assert.equal(scheduleAt(new Date("2026-07-18T12:30:00Z")).inWindow, true, "the time window follows British Summer Time");
-  const batches = Array.from({ length: 8 }, (_, i) => batchFor(i));
+  const batches = Array.from({ length: 16 }, (_, i) => i).filter(i => i % 2 === 0 || i < 10).map(batchFor);
   const rotation = batches.flat(2).flatMap(x => x.seeds);
-  assert.equal(rotation.length, 90);
-  assert.equal(new Set(rotation).size, 90);
+  assert.equal(rotation.length, 138);
+  assert.equal(new Set(rotation).size, 138);
+  assert.equal(new Set(batches.flat().map(d => d.name)).size, 6);
   assert(batches.every(day => day.every(x => x.seeds.length <= 4)));
+  assert(batches.every(day => day.reduce((n, d) => n + d.seeds.length, 0) <= 12));
+
+  const baseline = trainBaseline(), model = new NeuralCrawlerModel();
+  const stage = { RENDER_SERVICE_ID: STAGING_ID, VEYRA_DATA_DIR: STAGING_DIR };
+  assert.equal(baseline.accepted, true);
+  assert.equal(baseline.report.trainingExamples, 640);
+  assert.equal(baseline.report.holdoutExamples, 128);
+  assert.equal(applyStagingBaseline(model, { env: { ...stage, RENDER_SERVICE_ID: "production" }, enabled: true }), null);
+  assert.equal(applyStagingBaseline(model, { env: stage, enabled: false }), null);
+  assert.equal(applyStagingBaseline(model, { env: stage, enabled: true, mongoConfigured: true }), null);
+  assert.equal(applyStagingBaseline(model, { env: stage, enabled: true, loaded: true }), null);
+  assert.equal(model.trainingExamples, 0);
+  assert.deepEqual(applyStagingBaseline(model, { env: stage, enabled: true }), baseline.report);
+  assert.equal(model.trainingExamples, baseline.report.optimizerUpdates);
 
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "veyra-stage-test-"));
   let date = "2026-11-18T13:20:00Z", enabled = true, queued = 0, trained = 0, crawlCalls = 0;
