@@ -7,6 +7,7 @@ const { upstreamHeaderCapOptions } = require("../network/header-cap");
 const { URL } = require("url");
 const { fetch: undiciFetch, Agent } = require("undici");
 const cheerio = require("cheerio");
+const { responseTrainingPolicy } = require("./neural-training-data");
 
 function ipv4Number(value) { return String(value).split(".").reduce((n, part) => (n * 256n) + BigInt(Number(part)), 0n); }
 function ipv4In(address, network, bits) { const mask = (0xffffffffn << BigInt(32 - bits)) & 0xffffffffn; return (ipv4Number(address) & mask) === (ipv4Number(network) & mask); }
@@ -298,7 +299,12 @@ class AcquisitionManager {
             const type = String(response.headers.get("content-type") || "").toLowerCase();
             if (response.status < 200 || response.status >= 300) {
               this.stats.httpFailures += 1;
-              if (!retryable(response.status) || attempt >= (opts.retries ?? this.maxRetries)) throw Object.assign(new Error(`HTTP ${response.status}`), { status: response.status });
+              if (!retryable(response.status) || attempt >= (opts.retries ?? this.maxRetries)) {
+                const details = opts.observeCrawlResponses && !redirectChain.length &&
+                  (response.status === 404 || response.status === 410)
+                  ? { crawlFinalUrl: url, crawlPolicy: responseTrainingPolicy(response.headers) } : {};
+                throw Object.assign(new Error(`HTTP ${response.status}`), { status: response.status, ...details });
+              }
               const delay = retryDelay(response, attempt, opts.maxRetryAfterMs ?? 5000);
               if (delay == null) throw Object.assign(new Error(`HTTP ${response.status}; Retry-After exceeds the configured retry budget.`), { status: response.status, noRetry: true });
               this.stats.retries += 1;

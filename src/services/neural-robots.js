@@ -22,6 +22,7 @@
  */
 
 const { URL } = require("url");
+const { responseTrainingPolicy } = require("./neural-training-data");
 
 
 let cheerio = null;
@@ -61,6 +62,7 @@ class NeuralRobot {
     this.onPageFound = opts.onPageFound || (() => {});
     this.onLinkFound = opts.onLinkFound || (() => {});
     this.onFeedback = opts.onFeedback || (() => {});
+    this.onCrawlObservation = opts.onCrawlObservation || null;
     this.fetchPage = typeof opts.fetchPage === "function" ? opts.fetchPage : null;
   }
 
@@ -71,14 +73,26 @@ class NeuralRobot {
     if (!this.fetchPage) throw Object.assign(new Error("Crawler fetch is unavailable until a socket-validated fetcher is configured."), { code: "SAFE_FETCH_REQUIRED" });
     const response = await this.fetchPage(url, opts);
     const statusCode = Number(response?.statusCode || response?.status || 0);
-    if (!response || statusCode < 200 || statusCode >= 300) throw Object.assign(new Error(`HTTP ${statusCode || "fetch failed"}`), { status: statusCode || 502 });
+    if (!response || statusCode < 200 || statusCode >= 300) throw Object.assign(new Error(`HTTP ${statusCode || "fetch failed"}`), {
+      status: statusCode || 502,
+      crawlFinalUrl: response?.redirectChain?.length || response?.cacheHit ? undefined : response?.finalUrl || response?.url,
+      crawlPolicy: responseTrainingPolicy(response?.headers)
+    });
     const finalUrl = String(response.finalUrl || response.url || url);
     const contentType = String(response.contentType || response.headers?.get?.("content-type") || "").toLowerCase();
     const isRobots = new URL(finalUrl).pathname.toLowerCase() === "/robots.txt";
     if (!/(?:text\/html|application\/xhtml\+xml)/i.test(contentType) && !isRobots) throw Object.assign(new Error(`Not HTML: ${contentType || "unknown content type"}`), { code: "CONTENT_TYPE_UNSUPPORTED" });
     const body = Buffer.isBuffer(response.body) ? response.body : Buffer.from(String(response.html || response.body || ""), "utf8");
     if (body.length > (opts.maxBytes || 8 * 1024 * 1024)) throw Object.assign(new Error("Page too large"), { code: "RESPONSE_TOO_LARGE" });
-    return { url: finalUrl, html: body.toString("utf8"), statusCode, headers: response.headers || {}, bytes: body.length, contentType };
+    return { url: finalUrl, html: body.toString("utf8"), statusCode, headers: response.headers || {}, bytes: body.length, contentType,
+      cached: !!response.cacheHit, redirected: !!response.redirectChain?.length };
+  }
+
+  observeCrawl(observation) {
+    if (this.onCrawlObservation) {
+      // Learning must not change crawl success, scheduling or HTTP latency.
+      void Promise.resolve().then(() => this.onCrawlObservation(observation)).catch(() => {});
+    }
   }
 
   /**
@@ -205,6 +219,9 @@ class NeuralRobot {
     try {
       const res = await this.fetchRaw(robotsUrl, { timeoutMs: 5000 });
       const rules = this.parseRobots(res.html);
+      if (res.statusCode === 200 && res.url === robotsUrl && !res.redirected && /^text\/plain(?:\s*;|$)/i.test(res.contentType)) {
+        rules.verifiedTrainingOrigin = u.origin;
+      }
       this.robotsCache.set(u.host, rules);
       return rules.isAllowed(u.pathname);
     } catch {
@@ -248,10 +265,15 @@ class NeuralRobot {
       this.status = "idle";
       return null;
     }
+    const crawlOrigin = this.onCrawlObservation && this.respectRobots ? new URL(url) : null;
+    const robotsVerified = !!crawlOrigin && this.robotsCache.get(crawlOrigin.host)?.verifiedTrainingOrigin === crawlOrigin.origin;
 
     try {
       const res = await this.fetchRaw(url);
       const parsed = this.parseHtml(res.html, res.url || url);
+      if (robotsVerified && !res.cached && !res.redirected) this.observeCrawl({
+        requestedUrl: url, fetchedUrl: res.url, status: res.statusCode, depth, page: parsed, robotsVerified, ...responseTrainingPolicy(res.headers)
+      });
       const score = this.scorePage(parsed, query, depth);
       const latency = Date.now() - start;
 
@@ -285,6 +307,9 @@ class NeuralRobot {
       this.currentUrl = null;
       return page;
     } catch (e) {
+      if (robotsVerified && e.crawlFinalUrl && (e.status === 404 || e.status === 410)) this.observeCrawl({
+        requestedUrl: url, fetchedUrl: e.crawlFinalUrl, status: e.status, depth, robotsVerified, ...e.crawlPolicy
+      });
       this.stats.errors++;
       this.status = "idle";
       this.currentUrl = null;
