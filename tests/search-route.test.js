@@ -1,13 +1,21 @@
 "use strict";
 const assert = require("assert");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 
 // Keep route integration coverage fully local and side-effect-free.
 for (const name of ["AI_API_KEY", "AI_API_BASE_URL", "AI_API_URL", "AI_API_PATH", "AI_API_KEY_HEADER", "AI_API_KEY_PREFIX", "AI_API_HEADERS_JSON", "AI_API_TOKEN_FIELD", "AI_API_STRUCTURED_OUTPUT", "AI_API_OPTIONS_JSON", "AI_API_REQUEST_TEMPLATE_JSON", "AI_API_RESPONSE_PATH", "AI_PROVIDER", "AI_PROVIDER_NAME", "AI_ANSWER_MODEL", "OPENAI_API_KEY", "OPENAI_API_BASE", "GROQ_API_KEY", "GOOGLE_SEARCH_API_KEY", "GOOGLE_API_KEY", "GOOGLE_SEARCH_CX", "GOOGLE_CSE_ID", "BRAVE_SEARCH_API_KEY", "BING_SEARCH_API_KEY"]) delete process.env[name];
+const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "veyra-search-route-"));
+process.env.DATA_DIR = dataDir;
+process.env.ACCESS_GATE = "0";
+process.env.VEYRA_ALLOW_SIGNUP = "1";
+process.env.VEYRA_SIGNUP_KEY = "";
+process.env.VEYRA_TEST_MODE = "0";
 process.env.WEB_SEARCH_ORDER = "google";
 process.env.VEYRA_CHROMIUM_ENABLED = "false";
 process.env.INDEX_AI_FINDINGS = "true";
 process.env.AI_ANSWER_ALLOW_EXTRACTIVE_FALLBACK = "true";
-process.env.VEYRA_TEST_MODE = "1";
 
 const { app, indexDocument, mongoStore, CFG } = require("../src/server");
 (async () => {
@@ -48,8 +56,14 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     await new Promise((resolve, reject) => { server.once("listening", resolve); server.once("error", reject); });
     const base = `http://127.0.0.1:${server.address().port}`;
 
-    const login = await (await fetch(`${base}/api/auth/test-login`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" })).json();
-    assert.ok(login.token, "test login succeeds");
+    const signup = await fetch(`${base}/api/auth/signup`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "search-fixture@example.test", password: "fixture-search-only-42" })
+    });
+    const login = await signup.json();
+    assert.equal(signup.status, 201, JSON.stringify(login));
+    assert.ok(login.token, "the regular fixture account can sign in");
     const authorization = `Bearer ${login.token}`;
     const webResponse = await fetch(`${base}/api/search/web?q=mock%20web%20route%20query&engine=bing`, { headers: { authorization } });
     const webPayload = await webResponse.json();
@@ -143,5 +157,6 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     delete app.locals.veyraNeuralRobotPool;
     delete app.locals.veyraYoutubeFetch;
     await new Promise(resolve => server.close(resolve));
+    fs.rmSync(dataDir, { recursive: true, force: true });
   }
 })().catch(error => { console.error(error); process.exitCode = 1; });

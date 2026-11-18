@@ -169,6 +169,7 @@ class CastServer {
         try {
           const pathname = req.url.split("?")[0];
           if (pathname !== "/ws/cast") return;
+          if (opts.allowUpgrade && !opts.allowUpgrade()) { socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"); return; }
           this.wss.handleUpgrade(req, socket, head, ws => this.wss.emit("connection", ws, req));
         } catch { try { socket.destroy(); } catch {} }
       });

@@ -284,6 +284,20 @@ Expired session IDs are tombstoned, so clients can't reuse them. `POST /api/sess
 - An admin is an account listed in `VEYRA_ADMIN_EMAILS`.
 - In non-production mode, loopback requests also count as admin.
 
+### Browser access and rollout
+
+The browser admin panel manages a single server's access policy. The policy endpoints require a real administrator account or `VEYRA_ADMIN_TOKEN`; the local development bypass and fixture administrators do not qualify. Existing staff accounts can use **Administrator sign-in** on the gate screen. To enroll a new configured staff email, use the ordinary signup endpoint with the configured admin-token header, plus the normal signup key if required. Regular signup credentials alone cannot enroll a staff email.
+
+| Setting | Behavior |
+| --- | --- |
+| Public | Anyone can reach the browser API. |
+| Invite only | Visitors need a valid invite or existing gate session. |
+| Staff only | New browsing requests from visitors and invite holders are denied, including on already-open tabs. Invite redemption and WebSocket streams pause. Previously rendered pages and downloads are not erased. |
+| Waitlist signups | Independently accepts or rejects new browser applications without deleting the existing queue. It does not change the developer-platform waitlist. |
+| Access test mode | Enables read-only policy checks for staff. It does not create identities, bypass authentication or modify public behavior. This is separate from the development-only `VEYRA_TEST_MODE` auth fixture. |
+
+`GATE_ENABLED` and `GATE_WAITLIST_OPEN` are first-run defaults. After an administrator saves a policy, it takes precedence and survives a restart: the server uses MongoDB if configured, otherwise `access-policy.json` under `VEYRA_DATA_DIR`. Use MongoDB or a persistent disk in hosted environments. If the persisted policy cannot be loaded, the server returns an unavailable status rather than assuming public access. The health endpoint remains available. This console assumes a single application instance; it does not synchronize live decisions across replicas.
+
 ### Fixes
 
 - The page runtime injected into proxied pages had double-escaped regexes, so it failed to parse on every page. That broke navigation reporting and DevTools. A regression test now checks that it parses.

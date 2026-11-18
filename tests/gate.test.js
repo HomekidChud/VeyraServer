@@ -4,11 +4,17 @@
 process.env.GATE_ENABLED = "true";
 process.env.VEYRA_ADMIN_TOKEN = "test-admin-token-123456";
 process.env.VEYRA_ENV = "test";
+process.env.VEYRA_ADMIN_EMAILS = "staff@example.test";
+process.env.VEYRA_SIGNUP_KEY = "fixture-signup-key";
+delete process.env.MONGODB_URI;
 const assert = require("assert");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { AccessGate } = require("../src/core/access-gate");
+const { AccessPolicy } = require("../src/core/access-policy");
+const apiDir = fs.mkdtempSync(path.join(os.tmpdir(), "veyra-policy-http-"));
+process.env.VEYRA_DATA_DIR = apiDir;
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "veyra-gate-"));
 try {
@@ -106,7 +112,70 @@ try {
     // 10. Bad keys are rejected.
     const badKey = await fetchJson("/api/gate/unlock", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ key: "VY-forged" }) });
     assert.equal(badKey.status, 403);
+    // Provision disposable staff and regular accounts with the fixture signup key.
+    const account = async (email, admin = false) => {
+      const body = { email, password: "FixtureOnly123!", signupKey: process.env.VEYRA_SIGNUP_KEY };
+      const r = await fetchJson("/api/auth/signup", { method: "POST", headers: { "content-type": "application/json", "x-veyra-gate": headerToken, ...(admin ? { "x-veyra-admin-token": process.env.VEYRA_ADMIN_TOKEN } : {}) }, body: JSON.stringify(body) });
+      assert.equal(r.status, 201);
+      return { body, token: r.json.token };
+    };
+    const attemptedStaff = await fetchJson("/api/auth/signup", { method: "POST", headers: { "content-type": "application/json", "x-veyra-gate": headerToken }, body: JSON.stringify({ email: "staff@example.test", password: "FixtureOnly123!", signupKey: process.env.VEYRA_SIGNUP_KEY }) });
+    assert.equal(attemptedStaff.status, 400, "a normal signup key does not enroll staff");
+    const staff = await account("staff@example.test", true), member = await account("member@example.test");
+    const staffHeaders = { authorization: `Bearer ${staff.token}`, "content-type": "application/json" };
+    const memberHeaders = { authorization: `Bearer ${member.token}`, "x-veyra-gate": headerToken };
+    const initial = (await fetchJson("/api/gate/admin/policy", { headers: staffHeaders })).json.policy;
+    assert.equal(initial.mode, "invite");
+    assert.equal(initial.testMode, false);
+    assert.equal((await fetchJson("/api/gate/admin/policy", { headers: memberHeaders })).status, 403);
+    assert.equal((await fetchJson("/api/gate/admin/checks", { headers: staffHeaders })).json.code, "ACCESS_TEST_MODE_OFF");
+    const setPolicy = (payload, headers = staffHeaders) => fetchJson("/api/gate/admin/policy", { method: "PUT", headers, body: JSON.stringify(payload) });
+    const desired = { ...initial, mode: "staff", waitlistOpen: false, testMode: true };
+    assert.equal((await setPolicy(desired, { ...memberHeaders, "content-type": "application/json" })).status, 403);
+    assert.equal((await setPolicy({ ...desired, waitlistOpen: "false" })).status, 400);
+    const saved = await setPolicy(desired);
+    assert.equal(saved.status, 200);
+    assert.equal(saved.json.report.waitlist.total, 1);
+    const locked = saved.json.policy;
+    assert.equal(locked.revision, initial.revision + 1);
+    assert.equal((await setPolicy(desired)).status, 409);
+    assert.equal((await fetchJson("/api/config", { headers: memberHeaders })).json.code, "GATE_LOCKED");
+    assert.equal((await fetchJson("/api/config", { headers: staffHeaders })).status, 200);
+    assert.equal((await fetchJson(`/gate/${gate.currentToken()}`, { redirect: "manual" })).status, 403);
+    const post = (route, body) => fetchJson(route, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    assert.equal((await post("/api/gate/unlock", { key: accepted.json.accessKey })).json.code, "GATE_LOCKED");
+    assert.equal((await post("/api/gate/waitlist", { email: "new@example.test" })).json.code, "GATE_WAITLIST_CLOSED");
+    assert.equal((await post("/api/gate/admin/login", member.body)).status, 401);
+    assert.equal((await post("/api/gate/admin/login", staff.body)).json.user.role, "admin");
+    assert.equal((await post("/api/auth/test-login", {})).status, 403);
+    const screenLocked = await fetchJson("/gate");
+    assert.match(screenLocked.text, /Staff only/);
+    assert.doesNotMatch(screenLocked.text, /<form id="(?:join|unlock)">/);
+    const status = await fetchJson("/api/gate/status", { headers: staffHeaders });
+    assert.equal(status.json.unlocked, true);
+    assert.equal(status.json.testMode, undefined);
+    assert.match(status.headers.get("cache-control"), /no-store/);
+    assert.equal((await fetchJson("/api/gate/admin/checks", { headers: memberHeaders })).status, 403);
+    const checks = (await fetchJson("/api/gate/admin/checks", { headers: staffHeaders })).json.checks;
+    assert.deepStrictEqual(checks.map(c => [c.browse, c.waitlist, c.redeemInvite]), [[false, false, false], [false, false, false], [true, false, false]]);
+    const reload = new AccessPolicy({ dataDir: apiDir, enabled: false, waitlistOpen: true });
+    await reload.ready();
+    assert.deepStrictEqual(reload.state, locked);
+    // A failed persistence write must not change the effective policy.
+    const broken = new AccessPolicy({ dataDir: apiDir, enabled: false, waitlistOpen: true, persistence: {
+      enabled: true, async loadAccessPolicy() { return locked; }, async saveAccessPolicy() { throw new Error("Unavailable"); }
+    } });
+    await assert.rejects(broken.update({ ...locked, mode: "public" }), { code: "ACCESS_POLICY_UNAVAILABLE" });
+    assert.deepStrictEqual(broken.state, locked);
+    const reopen = await setPolicy({ ...locked, mode: "invite", waitlistOpen: true, testMode: false });
+    assert.equal(reopen.status, 200);
+    assert.equal((await fetchJson("/api/config", { headers: memberHeaders })).status, 200);
+    assert.equal((await fetchJson("/api/config")).status, 403);
+    assert.equal((await post("/api/gate/waitlist", { email: "new@example.test" })).status, 201);
+    assert.equal((await setPolicy({ ...reopen.json.policy, mode: "public" })).status, 200);
+    assert.equal((await fetchJson("/api/config")).status, 200);
     server.close();
+    server.closeAllConnections();
     console.log("Access Gate end-to-end tests passed");
   });
 })().catch(e => { console.error(e); process.exit(1); });

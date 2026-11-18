@@ -9,6 +9,7 @@ const path = require("path");
 
 for (const name of ["AI_API_KEY", "AI_API_BASE_URL", "OPENAI_API_KEY", "BRAVE_SEARCH_API_KEY", "BING_SEARCH_API_KEY", "GOOGLE_SEARCH_API_KEY", "MONGODB_URI"]) delete process.env[name];
 process.env.VEYRA_TEST_MODE = "1";
+process.env.VEYRA_ENV = "test";
 process.env.VEYRA_CHROMIUM_ENABLED = "false";
 process.env.BROWSER_ENABLED = "0";
 process.env.SESSION_CACHE_ENABLED ??= "1";

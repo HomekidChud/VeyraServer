@@ -123,6 +123,7 @@ async function openUpstreamSocket({ vpnManager, sid, host, port, secure, connect
 class WsRelay {
   constructor(deps = {}) {
     this.log = deps.log || (() => {});
+    this.allowUpgrade = deps.allowUpgrade || (() => true);
     this.sessionManager = deps.sessionManager;                  // { checkLimit(sid), touch(sid) }
     this.vpnManager = deps.vpnManager;                          // { route(sid,host), openTunnel(...) }
     this.forwardHeaders = deps.forwardHeaders || (() => ({}));   // virtual-page-aware header mapper (cookies, UA)
@@ -153,6 +154,7 @@ class WsRelay {
       try {
         const pathname = req.url.split("?")[0];
         if (pathname !== RELAY_PATH) return;
+        if (!this.allowUpgrade()) { socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"); return; }
         this.wss.handleUpgrade(req, socket, head, ws => this.wss.emit("connection", ws, req));
       } catch { try { socket.destroy(); } catch {} }
     });
