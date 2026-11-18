@@ -9,8 +9,8 @@
  *   - Weight vector: a simple single-layer neural model (logistic regression
  *     with a learned bias). Weights are updated with AdamW from ranking
  *     feedback signals; this is local URL-ranker training, not LLM fine-tuning.
- *   - Feedback signals: clicks on search results, bookmarks, time spent on
- *     a page, tab opens, reloads, and explicit "useful" / "not useful" votes.
+ *   - Feedback signals: existing browser clicks and bookmarks, and optional
+ *     independent observations from existing public-page crawls.
  *   - Priority queue: the crawler's frontier is re-ranked by the neural
  *     model's predicted relevance score.
  *   - Persistence: the weight vector is saved to disk periodically and
@@ -96,17 +96,19 @@ class NeuralCrawlerModel {
   }
 
   
+  baseAuthority(url) {
+    const host = safeHost(url);
+    const baseHost = host.split(".").slice(-2).join(".");
+    return HIGH_AUTHORITY_DOMAINS.has(host) || HIGH_AUTHORITY_DOMAINS.has(baseHost) ? 0.9 : 0.1;
+  }
+
   extractFeatures(url, context = {}) {
     const host = safeHost(url);
     const urlPath = safePath(url);
     const scheme = safeScheme(url);
 
     
-    let domainAuthority = 0.1;
-    const baseHost = host.split(".").slice(-2).join(".");
-    if (HIGH_AUTHORITY_DOMAINS.has(host) || HIGH_AUTHORITY_DOMAINS.has(baseHost)) {
-      domainAuthority = 0.9;
-    }
+    let domainAuthority = this.baseAuthority(url);
     
     const clickCount = this.domainClickCounts.get(host) || 0;
     if (clickCount > 0) domainAuthority = Math.min(1, domainAuthority + 0.1 * Math.log(1 + clickCount));
@@ -194,9 +196,9 @@ class NeuralCrawlerModel {
   
   train(feedback) {
     const url = feedback.url;
-    if (!url) return;
-
-    const features = this.urlFeatures.get(url) || this.extractFeatures(url, feedback.context || {});
+    const features = Array.isArray(feedback.features) ? feedback.features :
+      url ? this.urlFeatures.get(url) || this.extractFeatures(url, feedback.context || {}) : null;
+    if (!features || features.length !== NUM_FEATURES || !features.every(n => Number.isFinite(n) && n >= 0 && n <= 1)) return false;
     const target = feedback.positive ? 1 : 0;
     const weight = feedback.weight || 1.0;
 
@@ -225,19 +227,20 @@ class NeuralCrawlerModel {
     
     const host = safeHost(url);
     if (feedback.positive) {
-      this.domainClickCounts.set(host, (this.domainClickCounts.get(host) || 0) + 1);
+      if (host && !feedback.features) this.domainClickCounts.set(host, (this.domainClickCounts.get(host) || 0) + 1);
       this.stats.positiveFeedback++;
     } else {
       this.stats.negativeFeedback++;
     }
 
     
-    this.feedbackHistory.push({ url, positive: feedback.positive, weight, ts: now() });
+    this.feedbackHistory.push({ positive: feedback.positive, weight, ts: now() });
     if (this.feedbackHistory.length > this.maxHistory) this.feedbackHistory.shift();
 
     this.trainingExamples += 1;
     this.stats.trained++;
     this.maybeSave();
+    return true;
   }
 
   

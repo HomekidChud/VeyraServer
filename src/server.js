@@ -28,6 +28,7 @@ const { isMainThread } = require("worker_threads");
 const { NeuralRobotPool } = require("./services/neural-robots");
 const { NeuralCrawlerModel } = require("./services/neural-crawler");
 const { NeuralLearningWorker } = require("./services/neural-learning");
+const { createPublicCrawlTrainer, trainingUrl } = require("./services/neural-training-data");
 const { ChallengeSolver } = require("./browser/challenge-solver");
 const { CastServer, InternetConnectionManager } = require("./network/cast-server");
 const { WsRelay } = require("./network/ws-relay");
@@ -474,6 +475,11 @@ const neuralTrainer = new NeuralLearningWorker({
   maxQueue: numberEnv("NEURAL_TRAIN_QUEUE_MAX", 5000, 100, 100000),
   log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
 });
+const learnFromPublicCrawls = boolEnv("NEURAL_PUBLIC_CRAWL_TRAINING", false);
+const observePublicCrawl = learnFromPublicCrawls ? createPublicCrawlTrainer({
+  model: neuralModel,
+  enqueue: example => neuralTrainer.enqueuePersistent(example)
+}) : null;
 const authStore = new AuthStore({
   dataDir: CFG.authDataDir, secret: CFG.authSecret, tokenTtlMs: CFG.authTokenTtlMs,
   adminEmails: CFG.adminEmails, allowSignup: CFG.authAllowSignup, signupKey: CFG.authSignupKey, persistence: mongoStore, testMode: CFG.testMode,
@@ -6061,15 +6067,9 @@ function rememberAIAnswerForFeedback(id, answer) {
 async function persistAIObservation(id, query, results, answer) {
   if (!mongoStore.enabled) return;
   const rows = Array.isArray(results) ? results.slice(0, 24) : [];
-  const used = new Set((answer?.sources || []).map(s => normalizeUrl(s?.url || s)).filter(Boolean));
+  // An unselected source is not necessarily irrelevant. Do not train the
+  // relevance model on its own retrieval/answer decisions as ground truth.
   await mongoStore.recordAIObservation({ id, query, answer: answer?.answer || "", hasAnswer: !!answer?.hasAnswer, generatedBy: answer?.generatedBy || "", sources: answer?.sources || [], results: rows, pipeline: answer?.pipeline || {}, grounding: answer?.grounding || {} });
-  await Promise.all(rows.map((row, index) => {
-    const url = normalizeUrl(row?.url); if (!url) return null;
-    return neuralTrainer.enqueuePersistent({
-      id: `${id}_${index}`, url, positive: used.has(url), weight: used.has(url) ? 1.5 : Math.max(0.1, 1 - index / Math.max(1, rows.length)),
-      context: { type: "ai-result", query: String(query || "").slice(0, 600), rank: index + 1, selectedByAnswer: used.has(url), sourceCount: rows.length }
-    });
-  }));
 }
 app.post('/api/search/answer', async (req, res) => {
   if (req.query.private === "1" || !authStore.userFromRequest(req)) {
@@ -7628,24 +7628,28 @@ app.get("/api/debug/system", requireAdmin, (req, res) => {
 const neuralRobotPool = new NeuralRobotPool({
   maxWorkers: 8,
   neuralModel,
+  onCrawlObservation: observePublicCrawl,
   fetchPage: async (url, opts = {}) => acquisitionManager.fetch(url, {
     engine: "neural-crawler", timeoutMs: Math.min(CFG.requestTimeoutMs, Math.max(1000, Number(opts.timeoutMs) || CFG.requestTimeoutMs)),
     maxBytes: Math.min(CFG.maxProxyTextBytes, Math.max(65536, Number(opts.maxBytes) || CFG.maxProxyTextBytes)), retries: 0,
-    skipRobots: new URL(url).pathname.toLowerCase() === "/robots.txt"
+    skipRobots: new URL(url).pathname.toLowerCase() === "/robots.txt",
+    observeCrawlResponses: learnFromPublicCrawls
   }),
   log: (level, source, msg) => serverLog(level, source, msg),
   onPageFound: page => indexNeuralPage(page, page?.query || "")
 });
-app.get("/api/neural/stats", (req, res) => res.json({ ok: true, mongo: mongoStore.status(), model: neuralModel.report(), trainer: neuralTrainer.report() }));
+app.get("/api/neural/stats", (req, res) => res.json({ ok: true, mongo: mongoStore.status(), model: neuralModel.report(), trainer: { ...neuralTrainer.report(), publicCrawlTraining: learnFromPublicCrawls } }));
 app.post("/api/neural/feedback", async (req, res) => {
+  if (!trainingUrl(req.body?.url) || typeof req.body?.positive !== "boolean" || req.body?.accepted === false) {
+    return res.status(400).json({ ok: false, error: "A public HTTP(S) URL and a boolean feedback value are required." });
+  }
   const accepted = await neuralTrainer.enqueuePersistent({
     url: req.body?.url,
     positive: req.body?.positive,
     weight: req.body?.weight,
-    context: req.body?.context,
-    accepted: req.body?.accepted
+    source: "browser-feedback"
   });
-  if (!accepted) return res.status(400).json({ ok: false, error: "A public http(s) URL is required." });
+  if (!accepted) return res.status(429).json({ ok: false, error: "The training queue is full. Try again later." });
   res.json({ ok: true, queued: neuralTrainer.report().queueSize, durable: mongoStore.connected });
 });
 app.post("/api/neural/reset", (req, res) => { neuralTrainer.queue.length = 0; neuralModel.reset(); neuralModel.save(); res.json({ ok: true }); });
@@ -7676,8 +7680,11 @@ app.post("/api/neural/index", async (req, res) => {
 });
 app.post("/api/robots/feedback", async (req, res) => {
   try {
-    const accepted = await neuralTrainer.enqueuePersistent({ url: req.body.url, positive: !!req.body.clicked, weight: req.body.relevance || 0.5, context: { type: "html", source: "robot" } });
-    if (!accepted) return res.status(400).json({ ok: false, error: "A public http(s) URL is required." });
+    if (!trainingUrl(req.body?.url) || typeof req.body?.clicked !== "boolean") {
+      return res.status(400).json({ ok: false, error: "A public HTTP(S) URL and a boolean click value are required." });
+    }
+    const accepted = await neuralTrainer.enqueuePersistent({ url: req.body.url, positive: req.body.clicked, weight: req.body.relevance || 0.5, source: "robot-feedback" });
+    if (!accepted) return res.status(429).json({ ok: false, error: "The training queue is full. Try again later." });
     res.json({ ok: true, queued: neuralTrainer.report().queueSize, durable: mongoStore.connected });
   }
   catch (e) { res.status(500).json({ error: e.message }); }
@@ -8106,7 +8113,7 @@ async function hydrateNeuralFromMongo() {
     if (snapshot && neuralModel.loadData(snapshot)) modelLoaded = true;
     const qualitySnapshot = await mongoStore.loadNeuralModel("answer-quality-v1");
     const qualityLoaded = !!(qualitySnapshot && aiAnswerEngine.qualityModel.loadData(qualitySnapshot));
-    const queued = await mongoStore.loadQueuedNeuralFeedback(neuralTrainer.maxQueue);
+    const queued = await mongoStore.loadQueuedNeuralFeedback(neuralTrainer.maxQueue, { publicCrawlTraining: learnFromPublicCrawls });
     for (const item of queued) if (neuralTrainer.enqueue(item)) feedbackLoaded += 1;
     if (modelLoaded || feedbackLoaded || qualityLoaded) serverLog("info", "NEURAL", `Hydrated relevance=${modelLoaded}, answer-quality=${qualityLoaded}, queued feedback=${feedbackLoaded} from MongoDB.`);
   } catch (e) { serverLog("warn", "NEURAL", `Mongo neural hydration skipped: ${e.message}`); }

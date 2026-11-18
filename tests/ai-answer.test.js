@@ -68,6 +68,17 @@ assert.equal(restoredQualityLearner.loadData(qualitySnapshot), true);
 assert.equal(restoredQualityLearner.report().optimizerSteps, qualityLearner.report().optimizerSteps);
 assert.ok(Math.abs(restoredQualityLearner.predict(goodAnswerFeatures) - qualityLearner.predict(goodAnswerFeatures)) < 1e-12, "saved weights and AdamW moments should restore deterministically");
 
+const qualityCorpus = require("./fixtures/answer-quality-corpus");
+const qualityEvaluation = require("../scripts/evaluate-answer-quality").run();
+assert.equal(new Set(qualityCorpus.map(row => row.id)).size, qualityCorpus.length);
+assert.equal(new Set(qualityCorpus.map(row => row.domain)).size, qualityCorpus.length);
+assert.ok(qualityCorpus.every(row => row.candidates.filter(candidate => candidate.helpful).length === 1));
+assert.equal(qualityEvaluation.trainingExamples, 126);
+assert.equal(qualityEvaluation.holdoutExamples, 54);
+assert.equal(qualityEvaluation.after.pairCount, 48);
+assert.equal(qualityEvaluation.after.byCase["invented-citation"].overlapPassed, 0);
+assert.ok(qualityEvaluation.after.logLoss < qualityEvaluation.before.logLoss, "offline scorer should improve fixture loss");
+
 (async () => {
   const feedbackStore = new MongoStore({ uri: "" });
   let feedbackWrite = null;
