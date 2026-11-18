@@ -7,7 +7,8 @@ const path = require("node:path");
 // Keep route integration coverage fully local and side-effect-free.
 for (const name of ["AI_API_KEY", "AI_API_BASE_URL", "AI_API_URL", "AI_API_PATH", "AI_API_KEY_HEADER", "AI_API_KEY_PREFIX", "AI_API_HEADERS_JSON", "AI_API_TOKEN_FIELD", "AI_API_STRUCTURED_OUTPUT", "AI_API_OPTIONS_JSON", "AI_API_REQUEST_TEMPLATE_JSON", "AI_API_RESPONSE_PATH", "AI_PROVIDER", "AI_PROVIDER_NAME", "AI_ANSWER_MODEL", "OPENAI_API_KEY", "OPENAI_API_BASE", "GROQ_API_KEY", "GOOGLE_SEARCH_API_KEY", "GOOGLE_API_KEY", "GOOGLE_SEARCH_CX", "GOOGLE_CSE_ID", "BRAVE_SEARCH_API_KEY", "BING_SEARCH_API_KEY"]) delete process.env[name];
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), "veyra-search-route-"));
-process.env.DATA_DIR = dataDir;
+process.env.VEYRA_DATA_DIR = dataDir;
+delete process.env.MONGODB_URI;
 process.env.ACCESS_GATE = "0";
 process.env.VEYRA_ALLOW_SIGNUP = "1";
 process.env.VEYRA_SIGNUP_KEY = "";
