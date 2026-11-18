@@ -1,4 +1,5 @@
 "use strict";
+const { parseSiteScope, allowsSiteUrl } = require("./search-site-scope");
 
 const cheerio = require("cheerio");
 
@@ -193,7 +194,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
     google: { available: () => !!(googleKey && googleCx), async run(q, { offset, lang, signal }) {
       const u = new URL("https://www.googleapis.com/customsearch/v1"); u.searchParams.set("key", googleKey); u.searchParams.set("cx", googleCx); u.searchParams.set("q", q); u.searchParams.set("num", "10"); if (offset) u.searchParams.set("start", String(Math.min(91, offset + 1))); if (lang) u.searchParams.set("hl", lang);
       const r = await fetchText(u.href, { accept: "application/json", signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Google Custom Search API request failed"), { status: r.status, retryAfterMs: r.retryAfterMs });
-      const json = JSON.parse(r.text); return { results: parseGoogleApi(json), total: json.searchInformation?.totalResults ?? null };
+      const json = JSON.parse(r.text); return { results: parseGoogleApi(json), total: json.searchInformation?.totalResults ?? null, more: !!json.queries?.nextPage?.length, stride: 10 };
     } },
     brave: { available: () => !!braveKey, async run(q, { offset, lang, signal }) {
       const u = new URL("https://api.search.brave.com/res/v1/web/search"); u.searchParams.set("q", q); u.searchParams.set("count", "20"); if (offset) u.searchParams.set("offset", String(Math.min(9, Math.floor(offset / 20)))); if (lang) u.searchParams.set("search_lang", lang);
@@ -220,7 +221,8 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
         return { results, total: null, more: results.length >= requestedLimit, pagesFetched: pages.filter(page => page.status === "fulfilled").length };
       }
       const r = await fetchText(u.href, { accept: bingKey ? "application/json" : "text/html", headers: bingKey ? { "Ocp-Apim-Subscription-Key": bingKey } : {}, signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Bing search request failed"), { status: r.status, retryAfterMs: r.retryAfterMs });
-      const json = JSON.parse(r.text); return { results: parseBingApi(json), total: json?.webPages?.totalEstimatedMatches ?? null };
+      const json = JSON.parse(r.text); const results = parseBingApi(json);
+      return { results, total: json?.webPages?.totalEstimatedMatches ?? null, more: results.length >= requestedLimit };
     } },
     mojeek: { available: () => true, async run(q, { offset, lang, signal }) {
       const u = new URL("https://www.mojeek.com/search"); u.searchParams.set("q", q); u.searchParams.set("t", String(Math.min(50, 10 + (Number(offset) || 0)))); if (lang) u.searchParams.set("lb", lang);
@@ -285,10 +287,11 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       if (controller.signal.aborted) throw Object.assign(new Error("Operation cancelled."), { code: "OPERATION_CANCELLED" });
       const abortPromise = new Promise((_, reject) => { abortListener = () => reject(Object.assign(new Error("Provider request cancelled"), { name: "AbortError" })); controller.signal.addEventListener("abort", abortListener, { once: true }); });
       const packed = await Promise.race([providers[name].run(q, { ...params, signal: controller.signal }), abortPromise, new Promise((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(Object.assign(new Error("Provider deadline exceeded"), { name: "AbortError" })); }, timeoutMs); })]);
-      const results = dedupe(packed.results || []); const ms = Date.now() - started;
+      const rawResults = dedupe(packed.results || []);
+      const results = params.filterRows(rawResults); const ms = Date.now() - started;
       if (results.length) params.onResults?.(Date.now());
-      recordSuccess(name, results, ms);
-      return { name, results, total: packed.total ?? null, more: !!packed.more, ms };
+      recordSuccess(name, rawResults, ms);
+      return { name, results, total: packed.total ?? null, more: !!packed.more, stride: packed.stride || params.limit, ms };
     } catch (e) {
       const ms = Date.now() - started;
       if (params.isCancelled?.()) return { name, results: [], ms, error: "cancelled", cancelled: true };
@@ -303,6 +306,8 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
     const requestStartedAt = Date.now(); let firstResultAt = null;
     const requestedLimit = Math.max(1, Math.min(50, Number(limit) || 20));
     const q = cleanText(query, 600); if (!q) return { provider: "none", results: [], attempts: [], responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: null };
+    const scope = parseSiteScope(q);
+    if (scope.invalid) return { provider: "none", results: [], attempts: [], more: false, siteFilter: { invalid: true }, responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: null };
     const requested = engine && providers[engine] ? [engine] : order.filter(name => providers[name]);
     const key = `${requested.join(",")}|${offset}|${requestedLimit}|${lang}|${q.toLowerCase()}`; const hit = noCache ? null : cache.get(key);
     if (hit && Date.now() - hit.time < cacheTtlMs) return { ...hit.value, cached: true, responseTimeMs: Date.now() - requestStartedAt };
@@ -322,12 +327,13 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
     const requestController = new AbortController();
     let callerCancelled = false, deadlineExpired = false, earlyCancelled = false;
     const observedResultKeys = new Set();
+    const scopedRows = rows => scope.active ? rows.filter(result => allowsSiteUrl(scope, result.url)) : rows;
     const deadlineAt = Date.now() + overallDeadlineMs;
     const abortForCaller = () => { callerCancelled = true; requestController.abort(); };
     if (signal?.aborted) abortForCaller(); else signal?.addEventListener("abort", abortForCaller, { once: true });
     const deadlineTimer = setTimeout(() => { deadlineExpired = true; requestController.abort(); }, overallDeadlineMs);
     const settled = new Array(eligible.length); let cursor = 0;
-    async function worker() { while (cursor < eligible.length && !requestController.signal.aborted) { const index = cursor++; const item = await runProvider(eligible[index], q, { offset, limit: requestedLimit, lang, signal: requestController.signal, isCancelled: () => callerCancelled, isDeadlineExpired: () => deadlineExpired, isEarlyCancel: () => earlyCancelled, onResults: at => { if (firstResultAt == null) firstResultAt = at; } }); settled[index] = item; for (const result of item.results) { const key = canonicalKey(result.url); if (key) observedResultKeys.add(key); } if (!callerCancelled && !deadlineExpired && !earlyCancelled && observedResultKeys.size >= earlyResultThreshold && deadlineAt - Date.now() <= earlyCancelWindowMs) { earlyCancelled = true; requestController.abort(); } } }
+    async function worker() { while (cursor < eligible.length && !requestController.signal.aborted) { const index = cursor++; const item = await runProvider(eligible[index], q, { offset, limit: requestedLimit, lang, filterRows: scopedRows, signal: requestController.signal, isCancelled: () => callerCancelled, isDeadlineExpired: () => deadlineExpired, isEarlyCancel: () => earlyCancelled, onResults: at => { if (firstResultAt == null) firstResultAt = at; } }); settled[index] = item; for (const result of item.results) { const key = canonicalKey(result.url); if (key) observedResultKeys.add(key); } if (!callerCancelled && !deadlineExpired && !earlyCancelled && observedResultKeys.size >= earlyResultThreshold && deadlineAt - Date.now() <= earlyCancelWindowMs) { earlyCancelled = true; requestController.abort(); } } }
     try { await Promise.all(Array.from({ length: Math.min(parallelism, eligible.length) }, worker)); }
     finally { clearTimeout(deadlineTimer); signal?.removeEventListener("abort", abortForCaller); }
     const successful = settled.filter(Boolean);
@@ -340,9 +346,17 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
     }
     // Rank the merged provider results by token relevance to the query so the
     // most on-topic pages surface first instead of raw provider arrival order.
-    const results = rankResultsByRelevance(q, [...merged.values()]).slice(0, requestedLimit);
+    const results = rankResultsByRelevance(scope.active ? scope.text : q, [...merged.values()]).slice(0, requestedLimit);
     const source = successful.find(x => x.results.length)?.name || "none";
     const value = { provider: source, results, ranking: { method: "token-relevance" }, total: successful.reduce((n, x) => n + (x.total || x.results.length), 0) || null, more: successful.some(x => x.more), attempts, googleConfigured: configured("google"), braveConfigured: configured("brave"), bingConfigured: configured("bing"), providersUsed: successful.filter(x => x.results.length).map(x => x.name), cancelled: callerCancelled, earlyCancelled, deadlineExceeded: deadlineExpired, responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: firstResultAt == null ? null : firstResultAt - requestStartedAt, diagnostics: { providerCount: eligible.length, parallelism: Math.min(parallelism, eligible.length), overallDeadlineMs, earlyCancelWindowMs, earlyResultThreshold, providers: Object.fromEntries(Object.keys(providers).map(name => [name, healthSummary(name)])), google: healthSummary("google") } };
+    if (scope.active) {
+      value.total = null;
+      value.siteFilter = { include: scope.include, exclude: scope.exclude };
+      const nextOffset = offset + Math.min(requestedLimit, ...successful.filter(item => item.more).map(item => item.stride));
+      value.more = value.more && nextOffset < 60;
+      if (value.more) value.nextOffset = nextOffset;
+      if (!results.length) value.timeToFirstResultMs = null;
+    }
     if (!noCache && !callerCancelled && results.length && cacheTtlMs) { cache.set(key, { time: Date.now(), value }); while (cache.size > MAX_CACHE) cache.delete(cache.keys().next().value); }
     return value;
   }

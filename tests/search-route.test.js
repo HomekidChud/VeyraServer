@@ -108,6 +108,27 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     assert.equal(answer.grounding.claims.every(claim => claim.sourceIds.length > 0), true);
     assert.equal(webSearchCalls, 4);
 
+    const scopedWeb = await (await fetch(`${base}/api/search/web?q=${encodeURIComponent("site:search-fixture.example controlled")}`)).json();
+    assert.deepEqual(scopedWeb.results.map(row => row.url), ["https://search-fixture.example/result"]);
+    assert.deepEqual(scopedWeb.siteFilter.include, ["search-fixture.example"]);
+    assert.equal(scopedWeb.total, null);
+    const invalidWeb = await (await fetch(`${base}/api/search/web?q=${encodeURIComponent("site: controlled")}`)).json();
+    assert.equal(invalidWeb.siteFilter.invalid, true);
+    assert.deepEqual(invalidWeb.results, []);
+    assert.equal(webSearchCalls, 5, "invalid scopes do not call upstream providers");
+    const scopedIndex = await (await fetch(`${base}/api/search?q=${encodeURIComponent("site:fixture-search-route.test -site:fixture-search-route.test fixture")}`)).json();
+    assert.deepEqual(scopedIndex.results, []);
+    const scopedAnswer = await (await fetch(`${base}/api/search/answer`, {
+      method: "POST", headers: { "content-type": "application/json", authorization },
+      body: JSON.stringify({ query: "site:fixture-search-route.test What does the Veyra local route fixture confirm?", results: [
+        { url, contentText: article },
+        { url: "https://outside.example/", contentText: article },
+        { url: "https://fixture-search-route.test/fake", canonicalUrl: "https://outside.example/", contentText: article }
+      ] })
+    })).json();
+    assert.equal(scopedAnswer.hasAnswer, true);
+    assert.deepEqual(scopedAnswer.sources.map(row => row.url), [url]);
+
     assert.match(answer.observationId, /^obs_[A-Za-z0-9_-]{20,40}$/);
     assert.equal(answer.qualityLearning.calibrated, false, "the learned quality estimate must not be presented as calibrated confidence");
     const feedbackResponse = await fetch(`${base}/api/search/answer/feedback`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ observationId: answer.observationId, rating: "unhelpful" }) });
