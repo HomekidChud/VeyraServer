@@ -1477,7 +1477,10 @@ async function fetchBuffer(url, opts = {}) {
         }
         const contentType = response.headers.get("content-type") || "";
         const bodyLimit = typeof opts.limitForContentType === "function" ? opts.limitForContentType(contentType, response.headers) : limit;
-        const passthroughBinary = !!opts.passthroughBinary && /^(?:video\/|audio\/|font\/|application\/(?:pdf|zip|x-7z-compressed|octet-stream|wasm|mpegurl|dash\+xml))/i.test(contentType);
+        // Playlists are text, even when served with an audio/* MIME type.
+        // Buffer them for URI rewriting instead of streaming them unchanged.
+        const passthroughBinary = !!opts.passthroughBinary && !isHlsPlaylistType(contentType)
+          && /^(?:video\/|audio\/|font\/|application\/(?:pdf|zip|x-7z-compressed|octet-stream|wasm|dash\+xml))/i.test(contentType);
         const body = await readBodyLimited(response, bodyLimit, !!opts.streamOversize || passthroughBinary, opts.bodyTimeoutMs ?? CFG.bodyTimeoutMs, upstreamSignal, passthroughBinary);
         const upstreamEncoding = response.headers.get("content-encoding") || "";
         const headerLength = response.headers.get("content-length") || "";
@@ -2171,13 +2174,14 @@ function escapeHtml(s) { return String(s).replace(/[&<>"']/g, m => ({ "&": "&amp
 
 function rewriteCssText(text, base, sid = "") {
   const src = String(text || "");
+  // url(...) already covers both property values and @import url(...).
   const withUrls = src.replace(/url\(\s*(["']?)([^"')]+)\1\s*\)/gi, (m, quote, value) => {
     const u = resolveResource(value.trim(), base);
     return u ? `url("${makeResourceUrl(u, base, sid)}")` : m;
   });
-  return withUrls.replace(/@import\s+(?:url\(\s*)?(["'])([^"']+)\1\s*\)?/gi, (m, quote, value) => {
+  return withUrls.replace(/(@import\s+)(["'])([^"']+)\2/gi, (m, prefix, quote, value) => {
     const u = resolveResource(value.trim(), base);
-    return u ? `@import "${makeResourceUrl(u, base, sid)}"` : m;
+    return u ? `${prefix}"${makeResourceUrl(u, base, sid)}"` : m;
   });
 }
 function rewriteJsText(text, base, sid = "") {
@@ -3854,9 +3858,31 @@ function discoverMediaManifest(job, text, base) {
   if(isHls){for(const line of src.split(/\r?\n/)){const raw=line.trim();if(!raw||raw.startsWith('#'))continue;const u=resolveResource(raw,base);if(u)addLink(job,u,'media',base,'media-manifest');}return;}
   if(/<MPD[\s>]/i.test(src)||/dash\+xml|\.mpd(?:$|[?#])/i.test(base)){for(const m of src.matchAll(/(?:media|initialization|sourceURL|href)\s*=\s*["']([^"']+)["']/gi)){const u=resolveResource(m[1],base);if(u)addLink(job,u,'media',base,'media-manifest');}for(const m of src.matchAll(/<BaseURL[^>]*>([^<]+)<\/BaseURL>/gi)){const u=resolveResource(m[1].trim(),base);if(u)addLink(job,u,'media',base,'media-manifest');}}
 }
+function isHlsPlaylistType(contentType) {
+  return /^(?:application|audio)\/(?:vnd\.apple\.|x-)?mpegurl(?:\s*;|$)/i.test(String(contentType || "").trim());
+}
 function rewriteMediaManifest(text, base, sid='') {
   const src=String(text||'');
-  if(/^#EXTM3U/m.test(src)||/mpegurl|\.m3u8(?:$|[?#])/i.test(base))return src.split(/\r?\n/).map(line=>{const raw=line.trim();if(!raw||raw.startsWith('#'))return line;const u=resolveResource(raw,base);return u?makeResourceUrl(u,base,sid):line;}).join('\n');
+  if (/^\uFEFF?#EXTM3U(?:\r?\n|$)/.test(src)) {
+    const proxyUri = raw => {
+      if (/\{\$[A-Za-z0-9_-]+\}/.test(raw)) return raw;
+      const url = resolveResource(raw, base);
+      return url ? makeResourceUrl(url, base, sid) : raw;
+    };
+    return src.split(/(\r?\n)/).map((line, i) => {
+      if (i % 2) return line;
+      const raw = line.trim();
+      if (!raw) return line;
+      if (!raw.startsWith("#")) return proxyUri(raw);
+      // Some references are in attributes rather than on their own line
+      // (alternate renditions, initialization maps, low-latency parts).
+      // Consume whole quoted values so commas inside NAME, VALUE or URI
+      // aren't mistaken for attribute separators.
+      return line.replace(/^(\s*#EXT-X-[A-Z0-9-]+:)(.*)$/, (_, prefix, attributes) =>
+        prefix + attributes.replace(/(^|,)([A-Z0-9-]+)=("[^"]*"|[^,]*)/g, (attr, separator, name, value) =>
+          name === "URI" && /^"[^"]*"$/.test(value) ? `${separator}URI="${proxyUri(value.slice(1, -1))}"` : attr));
+    }).join("");
+  }
   if(/<MPD[\s>]/i.test(src)||/dash\+xml|\.mpd(?:$|[?#])/i.test(base)){const $=cheerio.load(src,{decodeEntities:false,xmlMode:true});$('[media],[initialization],[sourceURL],[href],BaseURL').each((_,el)=>{if(String(el.tagName||'').toLowerCase()==='baseurl'){const raw=$(el).text().trim();const u=resolveResource(raw,base);if(u)$(el).text(makeResourceUrl(u,base,sid));return;}for(const attr of ['media','initialization','sourceURL','href']){const raw=$(el).attr(attr);if(raw){const u=resolveResource(raw,base);if(u)$(el).attr(attr,makeResourceUrl(u,base,sid));}}});return $.xml();}
   return src;
 }
@@ -6749,7 +6775,8 @@ async function proxyRequest(req, res, mode) {
   const accept = proxyAcceptForResource(req, mode);
   const method = req.method.toUpperCase();
   const mediaRequest = mode === "resource" && (
-    !!req.get("Range") || /video|audio/i.test(accept) || /googlevideo\.com/i.test(canonical) || /videoplayback/i.test(canonical)
+    !!req.get("Range") || /video|audio|mpegurl/i.test(accept) || /^(?:video|audio)$/i.test(req.get("Sec-Fetch-Dest") || "")
+    || /\.m3u8(?:$|[?#])/i.test(canonical) || /googlevideo\.com/i.test(canonical) || /videoplayback/i.test(canonical)
   );
   if (!safeMethod(method)) return respondError(res, 405, "Unsupported proxy method.", "PROXY_METHOD_NOT_ALLOWED");
   // The 302 redirect is only safe for native-tab requests (same-origin). In
@@ -6854,7 +6881,7 @@ async function proxyRequest(req, res, mode) {
   });
   const limitForContentType = (ct) => {
     const type = String(ct || "").toLowerCase();
-    if (type.includes("text/html") || type.includes("application/xhtml") || type.includes("text/css") || /javascript|ecmascript|json|xml|x-component|react-server/i.test(type)) return CFG.maxProxyTextBytes;
+    if (isHlsPlaylistType(type) || type.includes("text/html") || type.includes("application/xhtml") || type.includes("text/css") || /javascript|ecmascript|json|xml|x-component|react-server/i.test(type)) return CFG.maxProxyTextBytes;
     if (type.startsWith("image/") || type.includes("svg")) return CFG.maxProxyImageBytes;
     if (type.startsWith("video/") || type.startsWith("audio/") || type.includes("application/pdf")) return CFG.maxProxyMediaBytes;
     return CFG.maxProxyOtherBytes;
@@ -6960,7 +6987,10 @@ async function proxyRequest(req, res, mode) {
       const workerDest = /^(?:worker|sharedworker)$/.test(String(req.get("Sec-Fetch-Dest") || "").toLowerCase());
       if (workerDest) payload = Buffer.from(workerScopePrelude(result.finalUrl || canonical, sid) + payload.toString("utf8"), "utf8");
     }
-    else if (!download && mode === "resource" && /mpegurl|dash\+xml/i.test(result.contentType.toLowerCase())) payload = Buffer.from(rewriteMediaManifest(payload.toString("utf8"), result.finalUrl || canonical, sid), "utf8");
+    else if (!download && method === "GET" && mode === "resource" && result.status === 200 && !result.contentRange
+      && (isHlsPlaylistType(result.contentType) || /dash\+xml/i.test(result.contentType))) {
+      payload = Buffer.from(rewriteMediaManifest(payload.toString("utf8"), result.finalUrl || canonical, sid), "utf8");
+    }
   } catch (rewriteErr) {
     
     
