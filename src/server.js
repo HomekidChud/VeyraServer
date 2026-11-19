@@ -5544,6 +5544,14 @@ async function sendPlatformEmail({ to, subject, html }) {
     return { sent: true, status: "sent" };
   } catch (e) { serverLog("warn", "PLATFORM_EMAIL", `Could not send email to ${to}: ${e.message}`); return { sent: false, status: "failed", error: e.message }; }
 }
+const { createYouTubeEligibility } = require("./services/youtube-eligibility");
+const youtubeEligibility = createYouTubeEligibility({ key: String(process.env.YOUTUBE_DATA_API_KEY || "").trim(), request: undiciFetch });
+app.get("/api/media/youtube/:id", platformRateLimit({ max: 30, windowMs: 60_000 }), async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  const state = await youtubeEligibility(req.params.id);
+  if (state === "invalid") return respondError(res, 400, "Invalid YouTube video ID.", "INVALID_YOUTUBE_ID");
+  res.json({ state });
+});
 /* Rate limits for every developer-platform route: 120 requests/minute per IP for
    session-authenticated management calls, and a much tighter budget for the public
    waitlist form so it cannot be used to spam confirmation emails. */
