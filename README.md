@@ -334,3 +334,7 @@ The browser admin panel manages a single server's access policy. The policy endp
 | `VEYRA_ADMIN_EMAILS` | (none) | Comma-separated admin emails for `/dev` and `#console` |
 
 Render's filesystem is ephemeral. Without a persistent disk mounted at `VEYRA_DATA_DIR`, accounts are lost on each deploy.
+
+## YouTube playback eligibility
+
+Set `YOUTUBE_DATA_API_KEY` in the deployment environment to enable `GET /api/media/youtube/:id`. Restrict the key to the YouTube Data API v3; never put it in a client bundle or browser query string. The endpoint uses Google's [Made for Kids status lookup](https://developers.google.com/youtube/data/guides/made_for_kids_status) and returns `ready` only for an explicitly embeddable video that is not Made for Kids. Without a key, or on upstream failure, it returns `unavailable`; ineligible videos return `external`.
