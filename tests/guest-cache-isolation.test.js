@@ -144,7 +144,6 @@ server.on("listening", async () => {
     await ready;
     const rec = sessionManager.peek(guest1.sessionId);
     rec.cookies.set("test", { name: "test", value: "fixture" });
-    rec.routingPage = "https://example.com/";
     const close = await doFetch(`/api/session/${guest1.sessionId}/close`, { method: "POST" });
     assert.equal((await close.json()).closed, true);
     release();
@@ -153,7 +152,6 @@ server.on("listening", async () => {
     assert.equal((await doFetch(getAsset(guest1.sessionId))).status, 410);
     assert.ok(!sessionManager.peek(guest1.sessionId));
     assert.equal(rec.cookies.size, 0);
-    assert.equal(rec.routingPage, null);
     assert.deepEqual(legacyDeletes, [["cookies", guest1.sessionId], ["snapshots", guest1.sessionId]]);
 
     const queue = new BrowserTaskScheduler(1, 1);

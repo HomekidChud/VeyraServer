@@ -147,35 +147,25 @@ const { fetch: undiciFetch, Agent } = require("undici");
   }
 
   // --- 4. embedded frame reload of the escaped root ---------------------------
-  // YouTube's desktop build reloads the escaped root with ?themeRefresh=1,
-  // losing every routing param. The runtime's veyra_ctx cookie still names
-  // the page + session: an embedded (iframe-dest) reload of a reserved path
-  // must re-resolve the real page through the escaped middleware instead of
-  // swapping the brand landing in mid-browse.
+  // A site can navigate to a bare root with ?themeRefresh=1. The referring
+  // document identifies the upstream; a shared cookie never can.
   const server3 = app.listen(0, "127.0.0.1");
   try {
     await new Promise((resolve, reject) => { server3.once("listening", resolve); server3.once("error", reject); });
     const base3 = `http://127.0.0.1:${server3.address().port}`;
     const sid = sessionManager.create("framereloadt" + Date.now().toString(16).padStart(8, "0")).id;
-    sessionManager.peek(sid).routingPage = "http://127.0.0.1:9/";
     const ctxCookie = `veyra_ctx=${sid}`;
+    const referer = `${base3}/?${new URLSearchParams({ __veyra_url: "http://127.0.0.1:9/", __veyra_sid: sid })}`;
 
-    // a) iframe reload WITH a live-session cookie: the landing route passes
-    //    through and the escaped middleware re-resolves the cookie's page
-    //    (the private URL then fails the SSRF guard — proving the proxy
-    //    machinery handled it, not the landing).
-    let r = await fetch(`${base3}/?themeRefresh=1`, { headers: { "sec-fetch-dest": "iframe", cookie: ctxCookie } });
+    // A complete referer reaches the proxy (the private destination is blocked).
+    let r = await fetch(`${base3}/?themeRefresh=1`, { headers: { "sec-fetch-dest": "iframe", referer } });
     let body = await r.text();
-    assert.match(body, /Private\/local destinations are blocked/, "an embedded frame reload re-resolves the cookie's page instead of showing the landing");
+    assert.match(body, /Private\/local destinations are blocked/, "an embedded frame uses its own referer");
 
-    // b) iframe reload with a cookie naming a DEAD session: the pass-through
-    //    happens (cookie present) but recovery fails, so the frame gets the
-    //    brand 404 — never the meta-refresh hijack.
-    const deadCookie = "veyra_ctx=deadSession00000000";
-    r = await fetch(`${base3}/?themeRefresh=1`, { headers: { "sec-fetch-dest": "iframe", cookie: deadCookie } });
+    r = await fetch(`${base3}/?themeRefresh=1`, { headers: { "sec-fetch-dest": "iframe", cookie: ctxCookie } });
     body = await r.text();
-    assert.ok(!/http-equiv="refresh"/.test(body), "a dead-session frame reload never meta-refreshes");
-    assert.ok(!/Veyra server is online/.test(body), "a dead-session frame reload does not get the landing");
+    assert.ok(!/http-equiv="refresh"/.test(body), "the frame never meta-refreshes into the app");
+    assert.ok(/Veyra server is online/.test(body), "a cookie alone never chooses a site");
 
     // c) iframe reload with NO cookie: the landing still shows (no hijack).
     r = await fetch(`${base3}/?themeRefresh=1`, { headers: { "sec-fetch-dest": "iframe" } });
