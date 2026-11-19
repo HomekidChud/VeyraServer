@@ -56,6 +56,12 @@ function youtubeHomeHtml() {
   });
 
   try {
+    const frames = await fetch(`${base}/api/browser/session/disabled-test/frames`, {
+      headers: { Origin: "https://homekidchud.github.io" },
+    });
+    assert.equal(frames.status, 503);
+    assert.equal((await frames.json()).code, "BROWSER_ENGINE_UNAVAILABLE");
+
     let parsed = await capability("https://www.youtube.com/");
     // Mode must never be BROWSER_ENGINE regardless of lean flag, since the engine is disabled.
     assert.equal(parsed.mode, "ACCELERATED_PROXY", "YouTube home must not request BROWSER_ENGINE when Chromium is disabled");

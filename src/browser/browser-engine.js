@@ -574,17 +574,18 @@ class BrowserEngine {
     }
   }
 
-  async input(sid, action) {
+  async input(sid, action, { interactive = false } = {}) {
     const s = this.get(sid), p = s.page;
     if (s.status === 'CLOSED') throw new Error('Browser session is closed.');
     s.lastUsed = Date.now();
     const wasVerifying = s.status === 'VERIFICATION_REQUIRED';
     const kind = String(action?.type || '');
+    const live = interactive && s.frameLease?.active && s.status === 'NORMAL' && !s.navigationActive;
     
     
     
     if (kind === 'click') {
-      await p.mouse.move(Number(action.x) || 0, Number(action.y) || 0, { steps: 5 });
+      await p.mouse.move(Number(action.x) || 0, Number(action.y) || 0, { steps: live ? 1 : 5 });
       await p.mouse.click(Number(action.x) || 0, Number(action.y) || 0, { button: action.button || 'left' });
     }
     else if (kind === 'dblclick') await p.mouse.dblclick(Number(action.x) || 0, Number(action.y) || 0);
@@ -593,6 +594,12 @@ class BrowserEngine {
     else if (kind === 'key') await p.keyboard.press(String(action.key || '').slice(0, 100));
     else if (kind === 'hover') await p.mouse.move(Number(action.x) || 0, Number(action.y) || 0, { steps: 5 });
     else throw new Error('Unsupported browser input action.');
+    if (live) {
+      // Render updates come from screencast events. Avoid a timed sleep,
+      // screenshot and repeated metadata reads for each input.
+      s.checkAfterInput = true;
+      return this.summary(s);
+    }
     
     
     
@@ -700,8 +707,28 @@ class BrowserEngine {
 
   async screenshot(sid) {
     const s = this.get(sid);
-    await this.capture(s, true);
-    return s.screenshot;
+    if (s.screenshotPending) return s.screenshotPending;
+    s.screenshotPending = this.capture(s, true).then(() => s.screenshot);
+    try { return await s.screenshotPending; } finally { s.screenshotPending = null; }
+  }
+
+  async refreshInteractive(s) {
+    if (s.metadataPending) return s.metadataPending;
+    s.checkAfterInput = false;
+    const page = s.page;
+    s.metadataPending = (async () => {
+      const title = await page.title().catch(() => s.title);
+      const challenge = await this.detectVerification(page);
+      if (s.page !== page || s.status !== 'NORMAL' || s.navigationActive) return;
+      s.canonicalUrl = safeUrl(page.url()) || s.canonicalUrl;
+      s.title = title;
+      if (challenge) { s.status = 'VERIFICATION_REQUIRED'; s.verification = challenge; }
+    })();
+    try { await s.metadataPending; } finally { s.metadataPending = null; }
+  }
+
+  summary(s) {
+    return { id: s.id, canonicalUrl: safeUrl(s.page?.url()) || s.canonicalUrl, title: s.title || '', status: s.status, lastError: s.error || '' };
   }
 
   public(s) {

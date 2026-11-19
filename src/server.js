@@ -418,6 +418,7 @@ const allowedOrigins = CFG.frontendOrigins.includes("*") ? true : CFG.frontendOr
 app.use(cors({
   origin: allowedOrigins,
   methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  maxAge: 600,
   // Terminate browser preflights here. If these continue to the API fallback,
   // the browser sees a 404 and reports the request as a generic fetch failure.
   preflightContinue: false,
@@ -5886,7 +5887,9 @@ app.get('/api/browser/session/:sid', async (req, res) => {
       if (session.status === 'NORMAL' && s.proxySessionId) sessionManager.resumeFromVerification(s.proxySessionId);
       return res.json({ ok: true, session });
     }
-    res.json({ ok: true, session: browserEngine.public(s) });
+    const lightweight = req.query.summary === '1';
+    if (s.status === 'NORMAL' && !s.navigationActive && (s.checkAfterInput || s.metadataPending)) await browserEngine.refreshInteractive(s);
+    res.json({ ok: true, session: lightweight ? browserEngine.summary(s) : browserEngine.public(s) });
   }
   catch (e) { respondError(res, e.status || 404, e.message, e.code || "BROWSER_SESSION_NOT_FOUND"); }
 });
@@ -5929,7 +5932,11 @@ app.post('/api/browser/session/:sid/navigate', async (req, res) => {
   } catch (e) { respondError(res, e.status || 502, e.message, e.code || "BROWSER_NAVIGATION_ERROR"); }
 });
 app.post('/api/browser/session/:sid/input', async (req, res) => {
-  try { browserSessionOrThrow(req.params.sid); const session = await browserEngine.input(req.params.sid, req.body || {}); res.json({ ok: true, session }); }
+  try {
+    browserSessionOrThrow(req.params.sid);
+    const session = await browserEngine.input(req.params.sid, req.body || {}, { interactive: req.body?.interactive === true });
+    res.json({ ok: true, session });
+  }
   catch (e) { respondError(res, e.status || 502, e.message, e.code || "BROWSER_INPUT_ERROR"); }
 });
 app.post('/api/browser/session/:sid/history', async (req, res) => {
@@ -5952,6 +5959,22 @@ app.delete('/api/browser/session/:sid', async (req, res) => {
 app.get('/api/browser/session/:sid/screenshot', async (req, res) => {
   try { browserSessionOrThrow(req.params.sid); const image = await browserEngine.screenshot(req.params.sid); if (!image) return res.status(503).type('text/plain').send('Chromium screenshot unavailable.'); res.setHeader('Cache-Control', 'no-store'); res.type('jpeg').send(image); }
   catch (e) { respondError(res, e.status || 404, e.message, e.code || "BROWSER_SCREENSHOT_ERROR"); }
+});
+const { framePreset, serveFrames } = require('./browser/frame-stream');
+app.get('/api/browser/session/:sid/frames', async (req, res) => {
+  const checkLive = () => {
+    const session = browserSessionOrThrow(req.params.sid);
+    if (!session.proxySessionId || req.get('x-veyra-proxy-session') !== session.proxySessionId) {
+      throw Object.assign(new Error('Browser session not found.'), { code: 'BROWSER_SESSION_NOT_FOUND', status: 404 });
+    }
+    return session;
+  };
+  try {
+    if (!CFG.browserEnabled) return respondError(res, 503, 'Chromium streaming is disabled.', 'BROWSER_ENGINE_UNAVAILABLE');
+    await serveFrames(res, checkLive(), framePreset(req.query.quality), checkLive);
+  } catch (e) {
+    if (!res.headersSent && !res.destroyed) respondError(res, e.status || 503, 'Chromium frame stream unavailable.', e.code || 'FRAME_STREAM_UNAVAILABLE');
+  }
 });
 
 
