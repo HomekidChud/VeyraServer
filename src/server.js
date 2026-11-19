@@ -5544,7 +5544,7 @@ app.get("/api/media/youtube/:id", platformRateLimit({ max: 30, windowMs: 60_000 
   res.setHeader("Cache-Control", "no-store");
   const state = await youtubeEligibility(req.params.id);
   if (state === "invalid") return respondError(res, 400, "Invalid YouTube video ID.", "INVALID_YOUTUBE_ID");
-  res.json({ state });
+  res.json({ state, inlineWatch: true });
 });
 /* Rate limits for every developer-platform route: 120 requests/minute per IP for
    session-authenticated management calls, and a much tighter budget for the public
