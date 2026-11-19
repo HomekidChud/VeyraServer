@@ -1,6 +1,7 @@
 "use strict";
 const assert = require("assert");
-const { fetchBuffer } = require("../src/server");
+const { once } = require("node:events");
+const { app, fetchBuffer, sessionManager } = require("../src/server");
 
 // Minimal stand-in for undici's Response covering the surface fetchBuffer
 // reads: status, headers.get(), and a body via arrayBuffer().
@@ -71,5 +72,60 @@ const dnsCache = new Map([
     /refused|failed/i
   );
 
-  console.log("Proxy fetch retry/redirect regression tests passed");
+  // Exercise the real HTTP redirect into the path-shaped document lane.
+  // A fixture supplies network outcomes without sending requests to a site.
+  const sid = "escapedretryfixture1234";
+  sessionManager.touch(sid);
+  const callsByPath = new Map();
+  const server = app.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  app.locals.veyraProxyFetchBuffer = async target => {
+    const path = new URL(target).pathname;
+    const count = (callsByPath.get(path) || 0) + 1;
+    callsByPath.set(path, count);
+    if (path === "/denied") return { status: 403, finalUrl: target, contentType: "text/html", body: Buffer.from("<html><head></head><body>Denied by site</body></html>") };
+    if (path !== "/" || count === 1) {
+      throw Object.assign(new Error("fixture connection closed"), {
+        code: "UPSTREAM_NETWORK_ERROR", upstreamCode: path === "/certificate" ? "CERT_HAS_EXPIRED" : "ECONNRESET"
+      });
+    }
+    return { status: 200, finalUrl: target, contentType: "text/html", body: Buffer.from("<html><head></head><body>Recovered document</body></html>") };
+  };
+  try {
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const headers = { "sec-fetch-dest": "iframe", accept: "text/html" };
+    const getDoc = path => fetch(`${base}/api/view?${new URLSearchParams({ url: "https://example.com" + path, sid })}`, { headers });
+    const recovered = await getDoc("/");
+    assert.equal(recovered.status, 200);
+    assert.equal(new URL(recovered.url).pathname, "/");
+    assert.match(await recovered.text(), /Recovered document/);
+    assert.equal(callsByPath.get("/"), 2);
+
+    const failed = await getDoc("/offline");
+    assert.equal(failed.status, 502);
+    assert.equal((await failed.json()).upstreamCode, "ECONNRESET");
+    assert.equal(callsByPath.get("/offline"), 2, "retry is bounded");
+
+    const denied = await getDoc("/denied");
+    assert.equal(denied.status, 403);
+    await denied.text();
+    assert.equal(callsByPath.get("/denied"), 1, "respect the upstream denial");
+
+    const cert = await getDoc("/certificate");
+    assert.equal(cert.status, 502);
+    await cert.json();
+    assert.equal(callsByPath.get("/certificate"), 1, "do not retry a certificate failure");
+
+    const post = new URL("/submit", base);
+    post.search = new URLSearchParams({ __veyra_url: "https://example.com/submit", __veyra_sid: sid });
+    const submitted = await fetch(post, { method: "POST", headers });
+    assert.equal(submitted.status, 502);
+    await submitted.json();
+    assert.equal(callsByPath.get("/submit"), 1, "never retry a form submission in this lane");
+  } finally {
+    delete app.locals.veyraProxyFetchBuffer;
+    await new Promise(resolve => server.close(resolve));
+  }
+
+  console.log("Proxy fetch retry, redirects, and escaped document regression tests passed");
 })().catch(error => { console.error(error); process.exit(1); });
