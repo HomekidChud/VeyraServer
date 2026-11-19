@@ -282,7 +282,6 @@ class SessionManager {
     else if (reason === "client") this.stats.closedByClient += 1;
     rec.cookies.clear();
     rec.chromiumUaByHost.clear();
-    rec.routingPage = null;
     for (const fn of this.hooks.expire) { try { const r = fn(sid, rec, reason); if (r?.catch) r.catch(() => {}); } catch {} }
     return true;
   }

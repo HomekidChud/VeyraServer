@@ -31,7 +31,8 @@ assert.match(out, /if\(!window\.polytrackModConfiguration\)window\.polytrackModC
 
 // Sanity: the runtime still anchors the page URL and is injected as a script.
 assert.match(out, /<script data-veyra-runtime>/);
-assert.match(out, /window\.__VEYRA_PAGE_URL__=CANONICAL;/);
+assert.match(out, /let virtualUrl=CANONICAL;/);
+assert.match(out, /window\.__VEYRA_PAGE_URL__=virtualUrl;/);
 
 // The escaped path is the website's real path. A root-relative API request
 // must keep /api/, not fall through to a Next.js 404 page in the game portal.

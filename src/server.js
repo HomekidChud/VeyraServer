@@ -425,7 +425,7 @@ app.use(cors({
   exposedHeaders: ["X-Veyra-Request-ID", "X-Veyra-Canonical-URL", "X-Veyra-Challenge", "X-Veyra-Content-Type", "X-Veyra-Session-ID", "X-Veyra-Session-Expires"]
 }));
 app.use((req, res, next) => gateMiddleware ? gateMiddleware(req, res, next) : next());
-installBrandRoutes(app, { frontendUrl: () => CFG.frontendUrl, version: VEYRA_VERSION, isPreviewBot: ua => shield.isPreviewBot(ua), hasProxiedReferer: req => !!proxiedPageFromReferer(req, { allowCookie: false }) });
+installBrandRoutes(app, { frontendUrl: () => CFG.frontendUrl, version: VEYRA_VERSION, isPreviewBot: ua => shield.isPreviewBot(ua), hasProxiedReferer: req => !!proxiedPageFromReferer(req) });
 
 
 app.use(["/api/resource", "/api/view"], express.raw({ type: () => true, limit: CFG.maxProxyBodyBytes, inflate: true }));
@@ -1118,6 +1118,15 @@ function escapedPathFor(target) {
     if (/\.(?:m?js|css|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|otf|mp4|webm|mp3|ogg|wasm|json|map|pdf|zip)(?:\/|$)/i.test(p)) return null;
     return u;
   } catch { return null; }
+}
+function markEscapedNavigation(req, res, url, sid) {
+  const sep = url.search ? "&" : "?";
+  const loc = requestOrigin(req) + url.pathname + url.search
+    + `${sep}__veyra_url=${encodeURIComponent(url.href)}&__veyra_sid=${encodeURIComponent(sid)}` + url.hash;
+  res.setHeader("location", loc);
+  res.setHeader("cache-control", "no-store");
+  res.setHeader("x-veyra-escaped-path", "1");
+  return res.status(302).end();
 }
 // ---------- In-proxy sign-in (fast proxy, no Chromium) ----------
 // Sign-in happens inside the fast proxy: the site's login/OAuth pages load
@@ -2362,7 +2371,9 @@ function injectRuntime(html, original, sid = "") {
   const API_ORIGIN=${JSON.stringify(process.env.PUBLIC_API_ORIGIN || "")};
   const ESCAPED_DOCUMENT=location.pathname!=='/api/view';
   let virtualUrl=CANONICAL;
-  window.__VEYRA_PAGE_URL__=CANONICAL;
+  // The browser does not send its fragment with the document request.
+  try{if(location.hash){const u=new URL(virtualUrl);u.hash=location.hash;virtualUrl=u.href}}catch{}
+  window.__VEYRA_PAGE_URL__=virtualUrl;
   window.__VEYRA_PROXY__=true;
   function unwrap(v){
     let raw=String(v||'');
@@ -2385,7 +2396,13 @@ function injectRuntime(html, original, sid = "") {
   // in the query. Site code copies its own query string when it builds
   // links, so the params would spread into every navigation and the
   // reported virtual URL. Strip them wherever a URL becomes virtual.
-  function cleanVeyraParams(u){try{if(u&&u.searchParams){u.searchParams.delete('__veyra_url');u.searchParams.delete('__veyra_sid')}}catch{}return u}
+  function cleanVeyraParams(u){try{
+    if(u&&u.search&&(u.searchParams.has('__veyra_url')||u.searchParams.has('__veyra_sid'))){
+      u.search=u.search.slice(1).split('&').filter(value=>{
+        try{return !/^__veyra_(url|sid)$/.test(decodeURIComponent(value.split('=')[0]))}catch{return true}
+      }).join('&');
+    }
+  }catch{}return u}
   const VEYRA_ROUTES=/^[/]api[/](view|resource|download|form-get|open|crawl|search|suggest|browser|debug|session|vpn|status|health)([/?#]|$)/;
   function fixOwn(u){try{if(!ownOrigin(u.origin))return u;
     if(!/^[/]api[/]/.test(u.pathname))return cleanVeyraParams(new URL(u.pathname+u.search+u.hash,virtualUrl));
@@ -2437,6 +2454,22 @@ function injectRuntime(html, original, sid = "") {
   function canonicalizeMaybeProxy(href){try{const raw=unwrap(href);if(!raw)return null;const u=toVirtual(raw);if(!/^https?:$/.test(u.protocol))return null;return u.href}catch{return null}}
   const HP=(typeof History!=='undefined'&&History.prototype)||null;
   const nativeReplaceState=HP?HP.replaceState:history.replaceState;
+  function escapedHistoryUrl(next){
+    const u=new URL(next);
+    if(/^[/]api[/]/.test(u.pathname))return proxy('view',next);
+    const markers=SESSION_ID?(u.search?'&':'?')+'__veyra_url='+encodeURIComponent(u.href)+'&__veyra_sid='+encodeURIComponent(SESSION_ID):'';
+    return location.origin+u.pathname+u.search+markers+u.hash;
+  }
+  function keepEscapedContext(next){
+    try{
+      if(!SESSION_ID||/^[/]api[/]/.test(location.pathname))return;
+      const shown=escapedHistoryUrl(next);
+      if(location.href!==shown)nativeReplaceState.call(history,history.state,'',shown);
+    }catch{}
+  }
+  // An upstream redirect or a native relative navigation can change the
+  // target. Anchor the current document before the site's scripts reload it.
+  keepEscapedContext(virtualUrl);
   function rootProxiedFrame(){try{return window.parent===window||!window.parent.__VEYRA_PROXY__}catch{return true}}
   // The main proxied page is embedded in the Veyra app, but its parent is
   // cross-origin (the app lives on another origin), so rootProxiedFrame()
@@ -2516,21 +2549,11 @@ function injectRuntime(html, original, sid = "") {
   try{addEventListener('message',function(ev){try{if(ev.data&&ev.data.type==='veyra:embed-probe'){topPost({type:'veyra:embed-probe-ack',sessionId:SESSION_ID})}}catch{}})}catch{}
   function remember(next){virtualUrl=next;window.__VEYRA_PAGE_URL__=next}
   function proxyHistory(method,native){return function(state,title,url){
-    let next=virtualUrl;try{if(url!=null)next=cleanVeyraParams(fixOwn(new URL(unwrap(String(url)),virtualUrl))).href}catch{}
+    const next=url==null?virtualUrl:resolve(url);
+    // Preserve the real pathname for SPAs, but keep routing markers in every
+    // iframe history entry. The app only sees the clean virtual URL.
+    try{native.call(this||history,state,title,/^[/]api[/]/.test(location.pathname)?proxy('view',next):escapedHistoryUrl(next))}catch{return}
     remember(next);
-    // When the page was served via escaped navigation (path-based URL, not
-    // /api/view), keep the same path shape for the history entry so that
-    // location.pathname keeps reporting the real site path. MSN Casual Games
-    // extracts its game ID from location.pathname, so rewriting it back to
-    // /api/view during hydration breaks the game data fetch.
-    let showUrl=null;try{const u=new URL(unwrap(String(url??''),virtualUrl));
-      // Only the root frame shows a clean URL: nested frames keep the
-      // __veyra routing params in their visible URL so their Referer still
-      // carries the exact virtual base for relative subresource requests
-      // (the escaped-path fallback resolves those against the referer).
-      const shown=rootProxiedFrame()?cleanVeyraParams(u):u;
-      showUrl=/^[/]api[/]/.test(location.pathname)?proxy('view',next):(location.origin+shown.pathname+shown.search+shown.hash)}catch{}
-    try{native.call(this||history,state,title,showUrl||proxy('view',next))}catch{}
     emit('history.'+method,next);return undefined;
   }}
   // Patch the prototype (not just the instance): apps such as YouTube call
@@ -2546,7 +2569,7 @@ function injectRuntime(html, original, sid = "") {
   // re-broke those apps before their boot code could read the path. Now we
   // keep the escaped path as the visible URL and only remember the virtual
   // URL, so pathname stays the real site path for the lifetime of the page.
-  function heal(){try{if(!/^[/]api[/]/.test(location.pathname)){const next=cleanVeyraParams(new URL(location.pathname+location.search+location.hash,virtualUrl)).href;if(next!==virtualUrl){remember(next);emit('history.heal',next)}}}catch{}}
+  function heal(){try{if(!/^[/]api[/]/.test(location.pathname)){const next=cleanVeyraParams(new URL(location.pathname+location.search+location.hash,virtualUrl)).href;keepEscapedContext(next);if(next!==virtualUrl){remember(next);emit('history.heal',next)}}}catch{}}
   try{setInterval(heal,300);addEventListener('popstate',()=>{try{const u=canonicalizeMaybeProxy(location.href);if(u&&u!==virtualUrl){remember(u);emit('history.popstate',u)}}catch{}})}catch{}
   try{
     const LP=Location&&Location.prototype;
@@ -3206,8 +3229,8 @@ function rewriteHtml(html, base, sid = "") {
     // attribute and recompute chunk keys from it; /api/resource?url=... proxy
     // URLs break that key match and hydration silently hangs (browser.lol).
     // Path-form srcs match the runtime's expectations natively, and the
-    // escaped-path fallback middleware resolves them against the session's
-    // page URL (sid recovered from the Referer / veyra_ctx cookie).
+    // escaped-path fallback middleware resolves them against the referring
+    // document's virtual page URL and session.
     let scriptUrl = null;
     // /cdn-cgi/ (Cloudflare challenge platform) scripts are proxied, never
     // left in path form: the proxy host's own Cloudflare edge would serve its
@@ -6860,18 +6883,10 @@ async function proxyRequest(req, res, mode) {
   // target travels in __veyra_url/__veyra_sid params (stripped from the
   // resolved target by resolveEscapedTarget), so the context survives even
   // when third-party cookies are blocked.
-  if (mode === "view" && method === "GET" && !download && req.path === "/api/view" && escapedPathFor(canonical)) {
+  if (mode === "view" && method === "GET" && !download && req.path === "/api/view") {
+    const escaped = escapedPathFor(canonical);
     const liveSid = liveSessionId(sid);
-    if (liveSid && documentNavigation(req)) {
-      const u = new URL(canonical);
-      const sep = u.search ? "&" : "?";
-      const loc = requestOrigin(req) + u.pathname + u.search +
-        `${sep}__veyra_url=${encodeURIComponent(u.href)}&__veyra_sid=${encodeURIComponent(liveSid)}` + u.hash;
-      res.setHeader("location", loc);
-      res.setHeader("cache-control", "no-store");
-      res.setHeader("x-veyra-escaped-path", "1");
-      return res.status(302).end();
-    }
+    if (escaped && liveSid && documentNavigation(req)) return markEscapedNavigation(req, res, escaped, liveSid);
   }
   const headers = forwardProxyBrowserHeaders(req, canonical, sourceUrl, mode, {
     accept,
@@ -7037,10 +7052,6 @@ async function proxyRequest(req, res, mode) {
   if (!result.xContentTypeOptions) res.removeHeader("x-content-type-options");
   const exposedCanonical = mode === "view" ? virtualPageUrl(canonical, result.finalUrl || canonical) : (result.finalUrl || canonical);
   if (record.abort.signal.aborted || sessionManager.checkLimit(sid)) return sendSessionExpired(req, res, mode, sid);
-  if (mode === "view" && documentNavigation(req) && !download) {
-    record.routingPage = exposedCanonical;
-    res.append("Set-Cookie", `veyra_ctx=${sid}; Path=/; HttpOnly; ${req.secure ? "SameSite=None; Secure; Partitioned" : "SameSite=Lax"}`);
-  }
   res.setHeader("X-Veyra-Canonical-URL", exposedCanonical);
   res.setHeader("X-Veyra-Session-ID", sid);
   res.setHeader("X-Veyra-Content-Type", result.contentType || "application/octet-stream");
@@ -7923,27 +7934,27 @@ app.get("/console", (req, res) => res.set("Cache-Control", "no-store").type("htm
 
 
 
-function proxiedPageFromCookie(req) {
-  const m = String(req.get("Cookie") || "").match(/(?:^|;\s*)veyra_ctx=([^;]+)/);
-  if (!m) return null;
-  // The cookie holds an opaque session reference, never a destination URL.
-  // Treat the old format as a session reference only during the transition.
-  const sid = liveSessionId(m[1].split("|").at(-1));
-  const pageUrl = sid && sessionManager.peek(sid)?.routingPage;
+function proxyRoutingPair(url, session) {
+  const sid = liveSessionId(session);
+  const pageUrl = sid && typeof url === "string" && normalizeUrl(url);
   return pageUrl ? { pageUrl, sid } : null;
 }
-function proxiedPageFromReferer(req, { allowCookie = true } = {}) {
+function proxiedPageFromReferer(req) {
   const raw = String(req.get("Referer") || "");
-  const fromCookie = () => allowCookie ? proxiedPageFromCookie(req) : null;
-  if (!raw) return fromCookie();
+  if (!raw) return null;
   try {
     const r = new URL(raw);
-    if (!/^[/]api[/](view|resource|form-get)/.test(r.pathname)) return fromCookie();
-    let page = r.searchParams.get("url") || r.searchParams.get("target") || r.searchParams.get("u") || "";
-    if (!page && r.pathname.startsWith("/api/form-get/")) page = decodePathToken(r.pathname.split("/")[3] || "");
-    const pageUrl = normalizeUrl(page);
-    if (!pageUrl) return null;
-    return { pageUrl, sid: r.searchParams.get("sid") || (r.pathname.startsWith("/api/form-get/") ? decodePathToken(r.pathname.split("/")[4] || "") : "") };
+    if (r.origin !== requestOrigin(req)) return null;
+    const q = r.searchParams;
+    if (r.pathname.startsWith("/api/form-get/")) {
+      const [, , , target, sid] = r.pathname.split("/");
+      return proxyRoutingPair(decodePathToken(target || ""), decodePathToken(sid || ""));
+    }
+    if (r.pathname === "/api/view" || r.pathname === "/api/resource") {
+      return proxyRoutingPair(q.get("url") || q.get("target") || q.get("u"), q.get("sid"));
+    }
+    return proxyRoutingPair(q.get("__veyra_url"), q.get("__veyra_sid"))
+      || proxyRoutingPair(q.get("url"), q.get("sid"));
   } catch { return null; }
 }
 
@@ -7959,8 +7970,9 @@ function noteScriptDir(sid, url) {
   scriptDirsBySession.delete(sid); scriptDirsBySession.set(sid, list);
   while (scriptDirsBySession.size > 2000) scriptDirsBySession.delete(scriptDirsBySession.keys().next().value);
 }
-async function resolveEscapedChunk(sid, relative) {
-  const dirs = scriptDirsBySession.get(sid) || [];
+async function resolveEscapedChunk(sid, relative, pageUrl) {
+  const origin = new URL(pageUrl).origin;
+  const dirs = (scriptDirsBySession.get(sid) || []).filter(dir => new URL(dir).origin === origin);
   for (const dir of dirs.slice(0, 6)) {
     let candidate; try { candidate = normalizeUrl(new URL(relative, dir).href); } catch { continue; }
     if (!candidate) continue;
@@ -7971,65 +7983,17 @@ async function resolveEscapedChunk(sid, relative) {
   }
   return null;
 }
-// Recover the proxied-page context for an escaped (path-based) navigation.
-// After the runtime keeps the escaped path shape (MSN Casual Games etc. do a
-// history.pushState to the site's real path, and location.href assignments
-// then navigate to that same shape), the referring page is itself a
-// path-based URL — not /api/view — so proxiedPageFromReferer cannot parse it
-// and every subsequent in-page navigation (button clicks, form GETs,
-// reloads) fell through to a 404. These requests still identify the session:
-// the runtime bakes ?url=<previous page>&sid=<session> into the path URL
-// (the site copies its own query string when building links), and the
-// veyra_ctx cookie always carries the last virtual page. Recover both, and
-// only accept a sid that matches a live session.
+// Multiple tabs can share a session. Recover only complete routing pairs
+// from this request or its own referer, never another tab's last page.
 function liveSessionId(value) {
   const sid = String(value || "").trim();
   return /^[A-Za-z0-9_-]{16,80}$/.test(sid) && !sessionManager.isTerminated(sid) && sessionManager.has(sid) ? sid : "";
 }
-function escapedPageContext(req, { allowCookie = true } = {}) {
-  const sids = [];
-  // Escaped-path redirects bake the exact target and session into
-  // __veyra_url/__veyra_sid (never colliding with the site's own params,
-  // which MSN Casual Games also uses: url= and sid=). The request's own
-  // params are exact and win over every other source: the referer only
-  // carries the site's own url param once the runtime has stripped Veyra's
-  // params from the visible URL, and that param names a DIFFERENT page
-  // (e.g. the MSN play landing page, not the game frame's CDN host).
-  const qVeyraSid = liveSessionId(req.query?.__veyra_sid);
-  if (qVeyraSid) sids.push(qVeyraSid);
-  let pageUrl = normalizeUrl(String(req.query?.__veyra_url || "")) || "";
-  const qSid = liveSessionId(req.query?.sid);
-  if (qSid) sids.push(qSid);
-  const raw = String(req.get("Referer") || "");
-  if (raw) {
-    try {
-      const r = new URL(raw);
-      if (r.origin === requestOrigin(req)) {
-        const rSid = liveSessionId(r.searchParams.get("sid"));
-        if (rSid) sids.push(rSid);
-        const rVeyraSid = liveSessionId(r.searchParams.get("__veyra_sid"));
-        if (rVeyraSid) sids.push(rVeyraSid);
-        // A path-based referer renders the page in its own ?url= param (the
-        // runtime keeps it there), so it is the best resolution base when
-        // the request itself carries no exact target.
-        if (!pageUrl) pageUrl = normalizeUrl(r.searchParams.get("__veyra_url") || "") || (normalizeUrl(r.searchParams.get("url") || "") || "");
-      }
-    } catch {}
-  }
-  if (!pageUrl && allowCookie) {
-    const cookieCtx = proxiedPageFromCookie(req);
-    if (cookieCtx) {
-      const cSid = liveSessionId(cookieCtx.sid);
-      if (cSid) sids.push(cSid);
-      pageUrl = cookieCtx.pageUrl;
-    }
-  }
-  // Last resort: the site's own ?url= param is the page the site's link
-  // came from (the runtime bakes the previous page into escaped URLs).
-  if (!pageUrl) pageUrl = normalizeUrl(String(req.query?.url || "")) || "";
-  if (!pageUrl) return null;
-  const sid = sids.find(s => !!s);
-  return sid ? { pageUrl, sid } : null;
+function escapedPageContext(req, { allowLegacyQuery = true } = {}) {
+  const q = req.query || {};
+  return proxyRoutingPair(q.__veyra_url, q.__veyra_sid)
+    || proxiedPageFromReferer(req)
+    || (allowLegacyQuery ? proxyRoutingPair(q.url, q.sid) : null);
 }
 // Orphaned subresources: pages loaded inside the app's sandboxed third-party
 // iframe send asset requests with an origin-only Referer and no cookies
@@ -8073,8 +8037,15 @@ function orphanedPageContext(req) {
 function resolveEscapedTarget(escaped, pageUrl) {
   try {
     const parsed = new URL(escaped, "http://veyra.escaped.invalid");
-    for (const k of [...parsed.searchParams.keys()]) {
-      if (/^__veyra/i.test(k) || ((k === "sid" || k === "from") && liveSessionId(parsed.searchParams.get(k)))) parsed.searchParams.delete(k);
+    if (parsed.search) {
+      const strip = new Set([...parsed.searchParams.keys()].filter(k => /^__veyra/i.test(k)
+        || ((k === "sid" || k === "from") && liveSessionId(parsed.searchParams.get(k)))));
+      if (strip.size) {
+        parsed.search = parsed.search.slice(1).split("&").filter(value => {
+          try { return !strip.has(decodeURIComponent(value.split("=")[0].replace(/\+/g, " "))); }
+          catch { return true; }
+        }).join("&");
+      }
     }
     return normalizeUrl(new URL(parsed.pathname + parsed.search + parsed.hash, pageUrl).href);
   } catch { return null; }
@@ -8096,53 +8067,24 @@ app.use(async (req, res, next) => {
   
   
   
-  const dest = String(req.get("Sec-Fetch-Dest") || "").toLowerCase();
-  const topLevel = dest === "document" || (!dest && /text\/html/i.test(String(req.get("Accept") || "")) && !req.get("Referer"));
+  const isDocument = documentNavigation(req);
   const reserved = isReservedOriginPath(req.path);
-  // Escaped-path redirects bake the exact target into __veyra_url with a
-  // live __veyra_sid. That pair is authoritative — it must win over the
-  // veyra_ctx cookie (which names the PARENT page, e.g. the MSN play page
-  // while the request is for the game frame's CDN host) and over the
-  // referer's site-owned url param. Without this, iframe navigations
-  // resolved against the parent page and 404'd on the origin.
-  let ctx = null;
-  {
-    const exactSid = liveSessionId(req.query?.__veyra_sid);
-    const exactUrl = exactSid ? normalizeUrl(String(req.query?.__veyra_url || "")) : "";
-    if (exactUrl) ctx = { pageUrl: exactUrl, sid: exactSid };
-  }
-  if (!ctx) ctx = proxiedPageFromReferer(req, { allowCookie: false });
-  // The context cookie describes the outer proxy frame. Prefer a nested
-  // document's explicit escaped referer before consulting that cookie, so a
-  // game frame's scripts go to the game host, not the embedding site's host.
-  if (!ctx && !reserved) ctx = escapedPageContext(req, { allowCookie: false });
-  if (!ctx && !topLevel && !reserved && !shield.isPreviewBot(req.get("User-Agent"))) ctx = proxiedPageFromCookie(req);
-  // Escaped (path-based) navigations: the referer is itself a path URL once
-  // the runtime keeps the escaped path shape, so recover the session and
-  // resolution base from the sid/url params the page carries and the
-  // veyra_ctx cookie instead of falling through to a 404.
-  if (!ctx) ctx = reserved ? null : escapedPageContext(req);
-  // A frame that reloaded a reserved path (YouTube's desktop build reloads
-  // the escaped root with ?themeRefresh=1 after a theme change) has lost
-  // every routing param, but the runtime's veyra_ctx cookie still names the
-  // page and session. Recover it so the reload re-resolves the real page
-  // instead of swapping the brand landing in mid-browse. The cookie's sid
-  // must be live, so a stale cookie can never hijack a direct landing visit.
-  if (!ctx && reserved && (dest === "iframe" || dest === "frame")) {
-    const cookieCtx = proxiedPageFromCookie(req);
-    if (cookieCtx && liveSessionId(cookieCtx.sid)) ctx = { pageUrl: cookieCtx.pageUrl, sid: cookieCtx.sid };
-  }
+  let ctx = escapedPageContext(req, { allowLegacyQuery: !reserved });
   // Orphaned subresource fallback: remember the page this client last
   // resolved so cookie-less, origin-only-referer asset requests can still
   // be resolved (as guest fetches) instead of 404ing.
-  if (ctx && (dest === "iframe" || dest === "frame" || topLevel)) noteClientResolvedPage(req, ctx.pageUrl, ctx.sid);
-  if (!ctx && !topLevel && !reserved) ctx = orphanedPageContext(req);
+  if (ctx && isDocument) noteClientResolvedPage(req, ctx.pageUrl, ctx.sid);
+  if (!ctx && !isDocument && !reserved) ctx = orphanedPageContext(req);
   if (!ctx) return next();
   let target = null;
-  if (escaped !== req.originalUrl && /[.](m?js|css|wasm|json|map)([?#]|$)/i.test(req.path)) target = await resolveEscapedChunk(ctx.sid, escaped);
+  if (escaped !== req.originalUrl && /[.](m?js|css|wasm|json|map)([?#]|$)/i.test(req.path)) target = await resolveEscapedChunk(ctx.sid, escaped, ctx.pageUrl);
   if (!target) target = resolveEscapedTarget(escaped, ctx.pageUrl);
   if (!target) return next();
-  const mode = dest === "document" || dest === "iframe" || dest === "frame" ? "view" : "resource";
+  const mode = isDocument ? "view" : "resource";
+  // Mark referer-only navigations before returning HTML. Browsers can start
+  // loading relative assets before any injected runtime updates the URL.
+  const mark = isDocument && req.method === "GET" && !req.query?.__veyra_url && !req.query?.__veyra_sid && escapedPathFor(target);
+  if (mark && ctx.sid) return markEscapedNavigation(req, res, mark, ctx.sid);
   Object.defineProperty(req, "query", { value: { url: target, sid: ctx.sid, from: ctx.pageUrl }, writable: true, configurable: true });
   try {
     if (mode === "view" && req.method === "GET") await proxyViewGet(req, res);
