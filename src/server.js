@@ -1417,6 +1417,9 @@ function oversizeStream(response, head, reader) {
     cancel() { if (taken) return; taken = true; try { (reader ? reader.cancel() : response.body?.cancel())?.catch?.(() => {}); } catch {} }
   };
 }
+function discardUpstreamBody(response) {
+  try { void response.body?.cancel().catch(() => {}); } catch {}
+}
 async function readBodyLimited(response, limit, keepStream = false, bodyTimeoutMs = CFG.bodyTimeoutMs, signal = null, passthrough = false) {
   // Fast-proxy passthrough: binary bodies (media, archives, wasm, ...) are
   // piped to the client byte-for-byte without buffering the whole resource
@@ -1467,21 +1470,31 @@ async function fetchBuffer(url, opts = {}) {
   const maxRedirects = opts.maxRedirects ?? CFG.maxRedirects;
   const limit = opts.limit ?? CFG.maxTextBytesPerResource;
   let method = String(opts.method || "GET").toUpperCase();
+  // A failed write may have already reached the upstream; never replay it
+  // automatically. Redirects still follow the HTTP method rules below.
+  const retriesAllowed = ["GET", "HEAD", "OPTIONS"].includes(method) ? (opts.retries ?? CFG.maxRetries) : 0;
   const headers = new Headers(opts.headers || {});
   headers.set("user-agent", opts.userAgent || CFG.userAgent);
   if (!headers.has("accept")) headers.set("accept", opts.accept || "text/html,application/xhtml+xml,application/xml,text/css,application/javascript,text/javascript,image/avif,image/webp,image/apng,image/svg+xml,font/*,video/*,audio/*,*/*;q=0.05");
   if (opts.range && !headers.has("range")) headers.set("range", String(opts.range).slice(0, 200));
+  if (headers.has("range") && !headers.has("accept-encoding")) headers.set("accept-encoding", "identity");
   const sessionId = String(opts.sessionId || "");
   const redirectChain = [];
+  const upstreamSignal = opts.signal;
+  const canceled = () => Object.assign(new Error("Operation cancelled."), { code: "OPERATION_CANCELLED" });
+  const retryWait = ms => wait(ms, undefined, { signal: upstreamSignal }).catch(error => {
+    if (upstreamSignal?.aborted) throw canceled();
+    throw error;
+  });
   let cached = opts.cached || null;
   for (let redirect = 0; redirect <= maxRedirects; redirect++) {
+    if (upstreamSignal?.aborted) throw canceled();
     await assertPublicUrl(current, opts.dnsCache || dnsPublicCache);
     if (redirect > 0) await opts.beforeRedirect?.(current);
     let lastError = null;
     let retriesUsed = 0;
-    for (let attempt = 0; attempt <= (opts.retries ?? CFG.maxRetries); attempt++) {
-      const upstreamSignal = opts.signal;
-      if (upstreamSignal?.aborted) throw Object.assign(new Error("Operation cancelled."), { code: "OPERATION_CANCELLED" });
+    for (let attempt = 0; attempt <= retriesAllowed; attempt++) {
+      if (upstreamSignal?.aborted) throw canceled();
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), opts.timeout ?? CFG.requestTimeoutMs);
       const onAbort = () => controller.abort();
@@ -1521,9 +1534,9 @@ async function fetchBuffer(url, opts = {}) {
           
           
           
-        } else if (response.status >= 300 && response.status < 400) {
+        } else if ([301, 302, 303, 307, 308].includes(response.status)) {
           const loc = response.headers.get("location");
-          await response.body?.cancel().catch(() => {});
+          discardUpstreamBody(response);
           if (!loc) throw new Error(`HTTP ${response.status} redirect without Location`);
           const next = resolveNavigation(loc, current);
           if (!next) throw new Error("Invalid redirect destination.");
@@ -1537,10 +1550,8 @@ async function fetchBuffer(url, opts = {}) {
           // The destination gets its own session-jar cookies; never forward
           // explicit credentials supplied for a different origin.
           if (new URL(next).origin !== new URL(current).origin) {
-            headers.delete("authorization");
-            headers.delete("cookie");
+            for (const name of [...headers.keys()]) if (isCredentialRequestHeader(name)) headers.delete(name);
           }
-          try { void response.body?.cancel().catch(() => {}); } catch {}
           redirectChain.push({ url: current, status: response.status });
           current = next;
           cached = null;
@@ -1550,20 +1561,23 @@ async function fetchBuffer(url, opts = {}) {
           lastError = null;
           break;
         }
-        if (retryableStatus(response.status) && attempt < (opts.retries ?? CFG.maxRetries)) {
+        if (retryableStatus(response.status) && attempt < retriesAllowed) {
           lastError = Object.assign(new Error(`HTTP ${response.status}`), { status: response.status });
           retriesUsed += 1;
-          await response.body?.cancel().catch(() => {});
-          await wait(backoffMs(attempt, retryAfterMs(response.headers)), undefined, { signal: upstreamSignal });
+          discardUpstreamBody(response);
+          await retryWait(backoffMs(attempt, retryAfterMs(response.headers)));
           continue;
         }
         const contentType = response.headers.get("content-type") || "";
         const bodyLimit = typeof opts.limitForContentType === "function" ? opts.limitForContentType(contentType, response.headers) : limit;
         // Playlists are text, even when served with an audio/* MIME type.
         // Buffer them for URI rewriting instead of streaming them unchanged.
-        const passthroughBinary = !!opts.passthroughBinary && !isHlsPlaylistType(contentType)
-          && /^(?:video\/|audio\/|font\/|application\/(?:pdf|zip|x-7z-compressed|octet-stream|wasm|dash\+xml))/i.test(contentType);
-        const body = await readBodyLimited(response, bodyLimit, !!opts.streamOversize || passthroughBinary, opts.bodyTimeoutMs ?? CFG.bodyTimeoutMs, upstreamSignal, passthroughBinary);
+        const passthrough = (opts.passthroughEventStream && isProxyEventStream(contentType))
+          || (!!opts.passthroughBinary && !isHlsPlaylistType(contentType)
+          && /^(?:video\/|audio\/|font\/|application\/(?:pdf|zip|x-7z-compressed|octet-stream|wasm|dash\+xml))/i.test(contentType));
+        const body = method === "HEAD" || response.status === 304
+          ? { body: Buffer.alloc(0), bytes: 0, truncated: false, tooLarge: false }
+          : await readBodyLimited(response, bodyLimit, !!opts.streamOversize || passthrough, opts.bodyTimeoutMs ?? CFG.bodyTimeoutMs, upstreamSignal, passthrough);
         const upstreamEncoding = response.headers.get("content-encoding") || "";
         const headerLength = response.headers.get("content-length") || "";
         
@@ -1592,6 +1606,7 @@ async function fetchBuffer(url, opts = {}) {
           allow: response.headers.get("allow") || "",
           linkHeader: response.headers.get("link") || "",
           contentDisposition: response.headers.get("content-disposition") || "",
+          allow: response.headers.get("allow") || "",
           setCookieHeader: response.headers.get("set-cookie") || "",
           retryAfter: response.headers.get("retry-after") || "",
           retryAfterMs: retryAfterMs(response.headers),
@@ -1620,17 +1635,18 @@ async function fetchBuffer(url, opts = {}) {
         };
       } catch (e) {
         clearTimeout(timer);
+        controller.abort();
         
         
-        if (e?.code === "OPERATION_CANCELLED" || upstreamSignal?.aborted) throw Object.assign(new Error("Operation cancelled."), { code: "OPERATION_CANCELLED" });
+        if (e?.code === "OPERATION_CANCELLED" || upstreamSignal?.aborted) throw canceled();
         
         const vpnCause = e?.cause?.code && String(e.cause.code).startsWith("VPN_") ? e.cause : (String(e?.code || "").startsWith("VPN_") ? e : null);
         if (vpnCause) throw Object.assign(new Error(vpnCause.message), { code: vpnCause.code, status: vpnCause.code === "VPN_KILL_SWITCH" ? 503 : 502, upstreamCode: vpnCause.code, upstreamPhase: 'vpn', upstreamMessage: vpnCause.message });
         lastError = decorateUpstreamError(e, current);
-        const retryableError = isRetryableNetworkError(e) && attempt < (opts.retries ?? CFG.maxRetries);
+        const retryableError = isRetryableNetworkError(e) && attempt < retriesAllowed;
         if (!retryableError) break;
         retriesUsed += 1;
-        await wait(backoffMs(attempt), undefined, { signal: upstreamSignal });
+        await retryWait(backoffMs(attempt));
       } finally {
         clearTimeout(timer);
         upstreamSignal?.removeEventListener("abort", onAbort);
@@ -1923,11 +1939,14 @@ function cacheSafeResponse(result, url) {
   if (/(?:^|,)\s*(?:no-store|no-cache|private)\b/i.test(cacheControl) || vary || setCookie) return false;
   return true;
 }
+function isCredentialRequestHeader(name) {
+  return /^(?:authorization|cookie2?|proxy-authorization|api[-_]key|x-(?:(?:[\w-]+-)?(?:api[-_]key|auth[-_]token|access[-_]token|authorization)|csrf[-_]token|xsrf[-_]token))$/i.test(name);
+}
 function hasCredentialRequestHeaders(headers) {
   const names = [];
   if (headers && typeof headers.forEach === "function") headers.forEach((_value, name) => names.push(name));
   else names.push(...Object.keys(headers || {}));
-  return names.some(name => /^(?:authorization|cookie|proxy-authorization)$/i.test(name));
+  return names.some(isCredentialRequestHeader);
 }
 async function validateCacheEntry(entry, key, url) {
   if (!entry || cacheSafeResponse(entry.response, url)) return entry;
@@ -7095,7 +7114,7 @@ function forwardProxyBrowserHeaders(req, targetUrl, sourceUrl, mode, baseHeaders
       const value = req.get(name);
       if (value) out[name] = String(value).slice(0, 20000);
     }
-    for (const name of ["if-none-match", "if-modified-since", "if-match", "if-unmodified-since", "sec-purpose"]) {
+    for (const name of ["if-none-match", "if-modified-since", "if-match", "if-unmodified-since", "sec-purpose", "last-event-id"]) {
       const value = req.get(name);
       if (value) out[name] = String(value).slice(0, 4000);
     }
@@ -7214,19 +7233,15 @@ function looksLikeApiResource(url, accept = "", method = "GET") {
 
 
 
+function isProxyEventStream(type) { return /^text\/event-stream(?:\s*;|$)/i.test(String(type || "").trim()); }
 async function streamOversizeResponse(req, res, result, ctx) {
-  let handle = result.stream ? result.stream.take() : null;
-  if (!handle) {
-    
-    
-    const again = await fetchBuffer(ctx.canonical, { method: ctx.method, headers: ctx.headers, body: ctx.body, referrer: ctx.referrer, sessionId: ctx.sid, signal: ctx.record.abort.signal, retries: 0, limit: 0, limitForContentType: () => 0, streamOversize: true });
-    handle = again.stream ? again.stream.take() : null;
-    if (!handle) return respondError(res, 502, "Veyra could not stream this resource.", "PROXY_STREAM_ERROR");
-    result = again;
-  }
+  const handle = result.stream?.take();
+  if (!handle) return respondError(res, 502, "Veyra could not stream this resource.", "PROXY_STREAM_ERROR");
   const type = result.contentType || "application/octet-stream";
+  const eventStream = !ctx.download && isProxyEventStream(type);
   res.setHeader("content-type", type);
   res.setHeader("cache-control", "no-store");
+  if (eventStream) res.setHeader("X-Accel-Buffering", "no");
   // Mirror the upstream's nosniff decision instead of forcing it on (see
   // fetchBuffer's xContentTypeOptions note); the shield middleware may
   // have pre-set it, so remove it when the upstream did not send it.
@@ -7250,7 +7265,7 @@ async function streamOversizeResponse(req, res, result, ctx) {
   res.setHeader("X-Veyra-Session-ID", ctx.sid);
   res.setHeader("X-Veyra-Content-Type", type);
   res.setHeader("X-Veyra-Proxy-Mode", "resource-stream");
-  res.status(result.status >= 300 && result.status < 400 ? 200 : result.status);
+  res.status(result.status);
   let closed = false;
   const stopReading = () => { closed = true; try { handle.reader?.cancel().catch(() => {}); } catch {} };
   const abort = () => { stopReading(); if (!res.writableEnded) res.destroy(); };
@@ -7259,18 +7274,39 @@ async function streamOversizeResponse(req, res, result, ctx) {
   if (signal.aborted) { stopReading(); return sendSessionExpired(req, res, "resource", ctx.sid); }
   signal.addEventListener("abort", abort, { once: true });
   res.on("close", onClose);
+  let sentBytes = 0;
   const write = buf => new Promise(resolve => {
     if (closed || res.write(buf)) return resolve();
     const done = () => { res.off("drain", done); res.off("close", done); resolve(); };
     res.once("drain", done); res.once("close", done);
   });
+  const writeChunk = async chunk => {
+    if (ctx.download && sentBytes + chunk.length > CFG.maxDownloadBytes) {
+      stopReading();
+      if (res.headersSent) res.destroy();
+      else {
+        res.removeHeader("Content-Disposition");
+        res.removeHeader("Content-Length");
+        res.removeHeader("Content-Range");
+        res.removeHeader("Content-Type");
+        respondError(res, 413, "The upstream response exceeds Veyra's safety limit.", "RESPONSE_TOO_LARGE");
+      }
+      return;
+    }
+    sentBytes += chunk.length;
+    await write(chunk);
+  };
   try {
-    for (const chunk of handle.head) await write(chunk);
+    if (eventStream) res.flushHeaders();
+    for (const chunk of handle.head) {
+      if (closed) break;
+      await writeChunk(chunk);
+    }
     if (handle.reader) {
       while (!closed) {
-        const { done, value } = await withTimeout(handle.reader.read(), CFG.bodyTimeoutMs, "Response body timed out.");
+        const { done, value } = await withTimeout(handle.reader.read(), ctx.bodyTimeoutMs, "Response body timed out.");
         if (done) break;
-        await write(Buffer.from(value));
+        await writeChunk(Buffer.from(value));
       }
     }
   } catch {
@@ -7281,7 +7317,7 @@ async function streamOversizeResponse(req, res, result, ctx) {
     signal.removeEventListener("abort", abort);
     res.off("close", onClose);
   }
-  if (!res.writableEnded) res.end();
+  if (!res.writableEnded && !res.destroyed) res.end();
 }
 
 
@@ -7293,11 +7329,19 @@ function mergeStrayProxyParams(req, canonical) {
   let extra;
   try { extra = new URL(req.originalUrl, "http://x").searchParams; } catch { return canonical; }
   let target; try { target = new URL(canonical); } catch { return canonical; }
+  const included = new Map();
+  for (const [name, value] of target.searchParams) {
+    const id = JSON.stringify([name, value]);
+    included.set(id, (included.get(id) || 0) + 1);
+  }
   let changed = false;
   for (const [k, v] of extra) {
     if (PROXY_OWN_PARAMS.has(k) || /^__veyra/i.test(k)) continue;
-    if (target.searchParams.getAll(k).includes(v)) continue;
-    target.searchParams.set(k, v); changed = true;
+    const id = JSON.stringify([k, v]);
+    const count = included.get(id) || 0;
+    if (count) { included.set(id, count - 1); continue; }
+    target.searchParams.append(k, v);
+    changed = true;
   }
   return changed ? target.href : canonical;
 }
@@ -7316,29 +7360,29 @@ const gzipAsync = (buf, opts) => new Promise((resolve, reject) => zlib.gzip(buf,
 const brotliAsync = (buf, params) => new Promise((resolve, reject) => zlib.brotliCompress(buf, params, (err, out) => (err ? reject(err) : resolve(out))));
 async function maybeCompressProxyPayload(req, payload, contentType) {
   if (!payload || !Buffer.isBuffer(payload) || payload.length < PROXY_COMPRESS_MIN_BYTES) return null;
-  const accept = String(req.headers["accept-encoding"] || "");
-  if (!/\b(?:br|gzip|deflate)\b/.test(accept)) return null;
   if (!proxyCompressibleContentType(contentType)) return null;
-  if (/\bbr\b/.test(accept)) {
+  const coding = express.request.acceptsEncodings.call(req, "br", "gzip", "identity");
+  if (coding === "br") {
     const body = await brotliAsync(payload, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 4 } }).catch(() => null);
     if (body && body.length < payload.length) return { body, encoding: "br" };
   }
-  if (/\bgzip\b/.test(accept)) {
+  if (coding === "gzip") {
     const body = await gzipAsync(payload, { level: 5 }).catch(() => null);
     if (body && body.length < payload.length) return { body, encoding: "gzip" };
   }
   return null;
 }
-async function proxyRequest(req, res, mode, options = {}) {
-  const sid = normalizeSessionId(req.query.sid);
+async function proxyRequest(req, res, mode, { formRouting, download: downloadOption = false, forceDownload = false } = {}) {
+  const query = formRouting || req.query;
+  const sid = normalizeSessionId(query.sid);
   req.veyraPrivateTraffic = !canCacheSession(sessionManager.peek(sid));
   res.setHeader("Cache-Control", "no-store");
   if (sessionManager.checkLimit(sid)) return sendSessionExpired(req, res, mode, sid);
   // Resource URLs are transport addresses, not crawler deduplication keys.
   // Keep their encoded query and order (e.g. signed media playlist URLs).
   const preserveQuery = mode === "resource";
-  const canonical = mergeStrayProxyParams(req, firstValidUrl([req.query.url, req.query.target, req.query.u], req.get('Origin') || undefined, { preserveQuery })) || proxyRefererCanonical(req);
-  const download = options.download === true || String(req.query.download || "") === "1";
+  const canonical = formRouting?.url || mergeStrayProxyParams(req, firstValidUrl([query.url, query.target, query.u], req.get('Origin') || undefined, { preserveQuery })) || proxyRefererCanonical(req);
+  const download = downloadOption === true || forceDownload || String(query.download || "") === "1";
   if (!canonical) return respondError(res, 400, "Missing or invalid public HTTP(S) URL.", "INVALID_URL");
   await assertPublicUrl(canonical);
   const accept = proxyAcceptForResource(req, mode);
@@ -7367,7 +7411,7 @@ async function proxyRequest(req, res, mode, options = {}) {
     return typeof req.body === "string" ? req.body : undefined;
   })();
   if (body && Buffer.byteLength(body) > CFG.maxProxyBodyBytes) return respondError(res, 413, "Proxy request body is too large.", "PROXY_BODY_TOO_LARGE");
-  const sourceUrl = (() => { try { const u = new URL(String(req.query.from || "")); return /^https?:$/.test(u.protocol) ? u.href : ""; } catch { return ""; } })();
+  const sourceUrl = (() => { try { const u = new URL(String(query.from || "")); return /^https?:$/.test(u.protocol) ? u.href : ""; } catch { return ""; } })();
   const referrer = sourceUrl || "";
   const sourceOrigin = sourceUrl ? new URL(sourceUrl).origin : "";
   if (sessionManager.checkLimit(sid)) return sendSessionExpired(req, res, mode, sid);
@@ -7454,7 +7498,7 @@ async function proxyRequest(req, res, mode, options = {}) {
     // googlevideo URLs are signed and commonly IP-bound. Retrying a 403
     // cannot change that decision and only doubles queue pressure.
     const signedYoutubeMedia = mediaRequest && /(?:googlevideo\.com|videoplayback)/i.test(canonical);
-    const retries = signedYoutubeMedia ? 0 : (mediaRequest ? 1 : (looksLikeApiResource(canonical, accept, method) || isNextRsc ? CFG.proxyApiRetries : CFG.maxRetries));
+    const retries = signedYoutubeMedia || !["GET", "HEAD", "OPTIONS"].includes(method) ? 0 : (mediaRequest ? 1 : (looksLikeApiResource(canonical, accept, method) || isNextRsc ? CFG.proxyApiRetries : CFG.maxRetries));
     const requestUserAgent = (req.get("User-Agent") ? String(req.get("User-Agent")).slice(0, 2000) : "");
     // m.youtube.com must be fetched with a mobile UA. Otherwise YouTube serves the
     // desktop build, its client JS sees the mobile URL + desktop build mismatch and
@@ -7462,20 +7506,23 @@ async function proxyRequest(req, res, mode, options = {}) {
     // m.youtube.com, and the page reloads forever on its skeleton.
     const mobileYoutubeRequest = (() => { try { return /^m\.youtube\.com$/i.test(new URL(canonical).hostname); } catch { return false; } })();
     const effectiveUserAgent = mobileYoutubeRequest ? "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36" : (sessionManager.chromiumUaFor(sid, canonical) || requestUserAgent);
-    const hasAuthorization = !!req.get("Authorization");
+    const hasAuthorization = hasCredentialRequestHeaders(headers);
+    const bodyTimeoutMs = mediaRequest ? CFG.mediaBodyTimeoutMs : CFG.bodyTimeoutMs;
     const result = await browserScheduler.request(null, () => {
       if (record.abort.signal.aborted || sessionManager.checkLimit(sid)) throw Object.assign(new Error("Session deleted."), { code: "SESSION_EXPIRED" });
-      return fetchCached(canonical, { method, headers, body, referrer, preserveQuery, sessionId: sid, requestId: req.veyraRequestId, userAgent: effectiveUserAgent || undefined, limit: requestLimit, retries, limitForContentType, noCache: download || method !== "GET" || mediaRequest || hasAuthorization || isNextRsc, timeout: mediaRequest ? CFG.mediaRequestTimeoutMs : CFG.requestTimeoutMs, bodyTimeoutMs: mediaRequest ? CFG.mediaBodyTimeoutMs : CFG.bodyTimeoutMs, streamOversize: mode === "resource", passthroughBinary: mode === "resource" && !download && CFG.proxyPassthroughBinary });
+      return fetchCached(canonical, { method, headers, body, referrer, preserveQuery, sessionId: sid, requestId: req.veyraRequestId, userAgent: effectiveUserAgent || undefined, limit: requestLimit, retries, limitForContentType, noCache: download || method !== "GET" || mediaRequest || hasAuthorization || isNextRsc, timeout: mediaRequest ? CFG.mediaRequestTimeoutMs : CFG.requestTimeoutMs, bodyTimeoutMs, streamOversize: mode === "resource", passthroughBinary: mode === "resource" && !download && CFG.proxyPassthroughBinary, passthroughEventStream: mode === "resource" && !download });
     }, { priority: browserPriority + (mediaRequest ? 30 : 0), host: hostOf(canonical), signal: record.abort.signal });
   
   
   
   const streamable = mode === "resource" || !/html|xhtml/i.test(String(result.contentType || ""));
   // Stream binary resources straight through — no full-resource buffering.
-  const streamNow = result.stream && (result.tooLarge || result.passthrough) && streamable && CFG.proxyStreamOversize && !(download && result.bytes > CFG.maxDownloadBytes);
+  const eventStream = mode === "resource" && !download && isProxyEventStream(result.contentType);
+  const streamNow = result.stream && (result.tooLarge || result.passthrough) && streamable
+    && (CFG.proxyStreamOversize || eventStream) && !(download && result.bytes > CFG.maxDownloadBytes);
   if (streamNow) {
     if (/javascript|ecmascript/i.test(result.contentType || "")) noteScriptDir(sid, result.finalUrl || canonical);
-    return streamOversizeResponse(req, res, result, { canonical, method, headers, body, referrer, sid, download, record });
+    return streamOversizeResponse(req, res, result, { canonical, sid, download, record, bodyTimeoutMs: eventStream ? Math.max(bodyTimeoutMs, 60_000) : bodyTimeoutMs });
   }
   if (result.stream) result.stream.cancel();
   if (result.tooLarge || (download && result.bytes > CFG.maxDownloadBytes)) return respondError(res, 413, "The upstream response exceeds Veyra's safety limit.", "RESPONSE_TOO_LARGE");
@@ -7484,7 +7531,7 @@ async function proxyRequest(req, res, mode, options = {}) {
   if (retryAfter) res.setHeader("Retry-After", retryAfter);
   if (result.allow) res.setHeader("Allow", result.allow);
   const responseVary = String(result.vary || "").toLowerCase();
-  const requestHasAuth = !!req.get("Authorization");
+  const requestHasAuth = hasAuthorization;
   const privateResponse = /(?:^|[\s,])(?:private|no-store)(?:[=\s,]|$)/i.test(responseCacheControl) || /(?:^|[\s,])cookie(?:[\s,]|$)/i.test(responseVary);
   const staticResource = mode === "resource" && !download && !result.setCookieHeader && !requestHasAuth && !privateResponse && !cookieHeader(sid, canonical) && /^(?:text\/css|application\/(?:javascript|x-javascript)|text\/javascript|image\/|font\/)/i.test(result.contentType || "");
   const upstreamHeaders = {
@@ -7496,10 +7543,13 @@ async function proxyRequest(req, res, mode, options = {}) {
     // the browser executing them anyway (see fetchBuffer's note).
     ...(result.xContentTypeOptions ? { "x-content-type-options": result.xContentTypeOptions } : {}),
     "referrer-policy": mode === "view" ? "same-origin" : "no-referrer",
+    ...(result.allow ? { allow: result.allow } : {}),
     ...(result.contentRange ? { "content-range": result.contentRange } : {}),
     ...(result.acceptRanges ? { "accept-ranges": result.acceptRanges } : {})
   };
-  const challenge = mode === "view" ? detectChallenge(result.body.toString("utf8"), result.contentType, result.status, { server: result.serverHeader, "cf-mitigated": result.cfMitigated, finalUrl: result.finalUrl }) : null;
+  const partial = result.status === 206 || !!result.contentRange;
+  const mayTransform = !download && !partial && method !== "HEAD" && ![204, 205, 304].includes(result.status);
+  const challenge = mode === "view" && mayTransform ? detectChallenge(result.body.toString("utf8"), result.contentType, result.status, { server: result.serverHeader, "cf-mitigated": result.cfMitigated, finalUrl: result.finalUrl }) : null;
   if (challenge) {
     // Google's captcha wall can never be completed through a proxy, so it
     // keeps its card (with the alternative-search links). Every other
@@ -7529,7 +7579,7 @@ async function proxyRequest(req, res, mode, options = {}) {
   let payload = result.body;
   let fullPageEnhanced = false;
   try {
-    if (!download && mode === "view" && (/html|xhtml|^$/.test(result.contentType.toLowerCase()))) {
+    if (mayTransform && mode === "view" && (/html|xhtml|^$/.test(result.contentType.toLowerCase()))) {
       
       
       
@@ -7555,8 +7605,8 @@ async function proxyRequest(req, res, mode, options = {}) {
       const rewritten = await rewriteOffThread("rewriteHtml", payload.toString("utf8"), [pageUrl, sid, watchPlayer], rewriteHtml);
       payload = Buffer.from(challenge ? rewritten : announceProxyStatus(rewritten, result.status, pageUrl, sid), "utf8");
     }
-    else if (!download && mode === "resource" && result.contentType.toLowerCase().includes("text/css")) payload = Buffer.from(await rewriteOffThread("rewriteCss", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteCssText), "utf8");
-    else if (!download && mode === "resource" && /javascript|ecmascript/.test(result.contentType.toLowerCase()) && !shouldSkipYoutubeStaticJsRewrite(result.finalUrl || canonical, result.contentType)) {
+    else if (mayTransform && mode === "resource" && result.contentType.toLowerCase().includes("text/css")) payload = Buffer.from(await rewriteOffThread("rewriteCss", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteCssText), "utf8");
+    else if (mayTransform && mode === "resource" && /javascript|ecmascript/.test(result.contentType.toLowerCase()) && !shouldSkipYoutubeStaticJsRewrite(result.finalUrl || canonical, result.contentType)) {
       payload = Buffer.from(await rewriteOffThread("rewriteJs", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteJsText), "utf8");
       // Worker scripts (physics/AI simulation bundles) resolve their own
       // subresources (importScripts, WASM) against the proxy URL, which 404s
@@ -7565,7 +7615,7 @@ async function proxyRequest(req, res, mode, options = {}) {
       const workerDest = /^(?:worker|sharedworker)$/.test(String(req.get("Sec-Fetch-Dest") || "").toLowerCase());
       if (workerDest) payload = Buffer.from(workerScopePrelude(result.finalUrl || canonical, sid) + payload.toString("utf8"), "utf8");
     }
-    else if (!download && method === "GET" && mode === "resource" && result.status === 200 && !result.contentRange
+    else if (mayTransform && method === "GET" && mode === "resource" && result.status === 200
       && (isHlsPlaylistType(result.contentType) || /dash\+xml/i.test(result.contentType))) {
       payload = Buffer.from(rewriteMediaManifest(payload.toString("utf8"), result.finalUrl || canonical, sid), "utf8");
     }
@@ -7577,12 +7627,12 @@ async function proxyRequest(req, res, mode, options = {}) {
     if (!req.veyraPrivateTraffic) recordRewriteFailure(result.finalUrl || canonical, mode, rewriteErr);
     payload = result.body;
   }
-  if (!download && method === "GET") {
+  if (mayTransform && method === "GET" && proxyCompressibleContentType(result.contentType || (mode === "view" ? "text/html" : ""))) {
+    res.vary("Accept-Encoding");
     const compressed = await maybeCompressProxyPayload(req, payload, result.contentType || (mode === "view" ? "text/html" : "")).catch(() => null);
     if (compressed) {
       payload = compressed.body;
       res.setHeader("content-encoding", compressed.encoding);
-      res.setHeader("vary", "accept-encoding");
     }
   }
   for (const [k,v] of Object.entries(upstreamHeaders)) if (v) res.setHeader(k, v);
@@ -7600,15 +7650,20 @@ async function proxyRequest(req, res, mode, options = {}) {
   if (fullPageEnhanced) res.setHeader("X-Veyra-Full-Page", "1");
   if (result.etag) res.setHeader("ETag", result.etag);
   if (result.lastModified) res.setHeader("Last-Modified", result.lastModified);
-  const outputStatus = (result.status >= 300 && result.status < 400) ? 200 : result.status;
   const transformedText = (mode === "view" && /html|xhtml|^$/i.test(result.contentType || "")) || (mode === "resource" && /(?:text\/css|javascript|ecmascript)/i.test(result.contentType || ""));
+  if (method === "HEAD") {
+    // The GET representation may be rewritten. Preserve the origin's size
+    // only when it describes the same representation this proxy would serve.
+    if ((download || partial || !transformedText) && /^\d+$/.test(result.contentLength || "") && ![204, 205, 304].includes(result.status)) res.setHeader("Content-Length", result.contentLength);
+    return res.status(result.status).end();
+  }
   
   
   if (!transformedText && !result.truncated) {
     const outLength = payload && payload.length ? payload.length : Number(result.contentLength) || 0;
     if (outLength) res.setHeader("content-length", outLength);
   }
-  res.status(outputStatus).send(payload);
+  res.status(result.status).send(payload);
   if (mode === "view" && !req.veyraPrivateTraffic && CFG.sessionCacheEnabled && !result.truncated && !result.tooLarge && /html|xhtml|^$/i.test(result.contentType || "")) {
     if (shouldWarmPageResources(result.finalUrl || canonical)) {
       void warmPageResources(result.body.toString("utf8"), result.finalUrl || canonical, sid);
@@ -7629,17 +7684,13 @@ app.get("/api/form-get/:target/:sid", async (req, res) => {
     
     
     
-    for (const [key, value] of Object.entries(req.query || {})) {
-      const values = Array.isArray(value) ? value : [value];
-      for (const item of values) {
-        if (typeof item === "string") u.searchParams.append(String(key), item);
-      }
-    }
-    req.query.url = u.href;
-    req.query.sid = normalizeSessionId(decodePathToken(req.params.sid || ""));
-    const referer = proxyRefererCanonical(req);
-    if (referer) req.query.from = referer;
-    await proxyRequest(req, res, "view");
+    const incoming = new URL(req.originalUrl, "http://veyra.invalid").searchParams;
+    for (const [key, value] of incoming) u.searchParams.append(key, value);
+    await proxyRequest(req, res, "view", { formRouting: {
+      url: u.href,
+      sid: decodePathToken(req.params.sid || ""),
+      from: proxiedPageFromReferer(req)?.pageUrl || ""
+    } });
   } catch (e) {
     respondError(res, 502, `Veyra could not submit this form: ${e.message}`, "PROXY_FORM_GET_ERROR", { requestId: req.veyraRequestId });
   }
@@ -7692,7 +7743,7 @@ app.options(["/api/view", "/api/resource"], async (req, res) => {
   // Access-Control-* headers to the target site. A bare OPTIONS request is
   // an actual upstream request and should follow the same proxy contract as
   // GET/POST/PUT/PATCH/DELETE.
-  if (req.get("Access-Control-Request-Method") || req.get("Access-Control-Request-Headers")) return res.status(204).end();
+  if (req.get("Access-Control-Request-Method")) return res.status(204).end();
   const mode = req.path === "/api/view" ? "view" : "resource";
   try { await proxyRequest(req, res, mode); }
   catch (e) { respondError(res, 502, `Veyra ${mode} OPTIONS request failed: ${e.message}`, "PROXY_OPTIONS_ERROR", { requestId: req.veyraRequestId }); }
