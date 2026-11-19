@@ -64,7 +64,7 @@ test("the HTTP route works with no key and rejects invalid video IDs", async () 
     const response = await fetch(base + id);
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("cache-control"), "no-store");
-    assert.deepEqual(await response.json(), { state: "unavailable" });
+    assert.deepEqual(await response.json(), { state: "unavailable", inlineWatch: true });
     assert.equal((await fetch(base + "not-an-id")).status, 400);
   } finally {
     await new Promise(resolve => server.close(resolve));

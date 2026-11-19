@@ -33,6 +33,7 @@ const { AccessPolicy } = require("./core/access-policy");
 const { WorkerPool } = require("./core/worker-pool");
 const { MongoStore } = require("./core/mongo-store");
 const youtubeCompat = require("./browser/youtube");
+const { watchVideo, installWatchPlayer } = require("./browser/youtube-watch-player");
 const mediaErrors = require("./browser/media-errors");
 const { watchEmptyProxyShell, announceProxyStatus } = require("./browser/proxy-shell");
 const { isMainThread } = require("worker_threads");
@@ -1157,8 +1158,9 @@ function escapedPathFor(target) {
 function markEscapedNavigation(req, res, url, sid) {
   const sep = url.search ? "&" : "?";
   const popup = req.query?.veyra_popup === "1" ? "&veyra_popup=1" : "";
+  const player = req.query?.__veyra_youtube_inline === "1" && watchVideo(url.href) ? "&__veyra_youtube_inline=1" : "";
   const loc = requestOrigin(req) + url.pathname + url.search
-    + `${sep}__veyra_url=${encodeURIComponent(url.href)}&__veyra_sid=${encodeURIComponent(sid)}${popup}` + url.hash;
+    + `${sep}__veyra_url=${encodeURIComponent(url.href)}&__veyra_sid=${encodeURIComponent(sid)}${popup}${player}` + url.hash;
   res.setHeader("location", loc);
   res.setHeader("cache-control", "no-store");
   res.setHeader("x-veyra-escaped-path", "1");
@@ -2531,10 +2533,14 @@ function rewriteSrcset(raw, base, sid = "") {
     return parts.join(" ");
   }).join(", ");
 }
-function injectRuntime(html, original, sid = "") {
+function injectRuntime(html, original, sid = "", watchPlayer = null) {
   const code = `<script data-veyra-runtime>(function(){
   const CANONICAL=${JSON.stringify(original)};
   const SESSION_ID=${JSON.stringify(sid)};
+  const watchPlayer=${JSON.stringify(watchPlayer)};
+  const directElements=new WeakSet();
+  let watchNavigate=null;
+  const watchMarker=u=>watchPlayer&&u.pathname==='/watch'&&u.searchParams.get('v')===watchPlayer.videoId&&u.hostname===new URL(CANONICAL).hostname?'&__veyra_youtube_inline=1':'';
   const API_ORIGIN=${JSON.stringify(process.env.PUBLIC_API_ORIGIN || "")};
   const ESCAPED_DOCUMENT=location.pathname!=='/api/view';
   const POPUP_FRAME=window.parent!==window&&/[?&]veyra_popup=1(?:&|$)/.test(String(location.search||''));
@@ -2565,9 +2571,9 @@ function injectRuntime(html, original, sid = "") {
   // links, so the params would spread into every navigation and the
   // reported virtual URL. Strip them wherever a URL becomes virtual.
   function cleanVeyraParams(u){try{
-    if(u&&u.search&&(u.searchParams.has('__veyra_url')||u.searchParams.has('__veyra_sid'))){
+    if(u&&u.search&&(u.searchParams.has('__veyra_url')||u.searchParams.has('__veyra_sid')||u.searchParams.has('__veyra_youtube_inline'))){
       u.search=u.search.slice(1).split('&').filter(value=>{
-        try{return !/^__veyra_(url|sid)$/.test(decodeURIComponent(value.split('=')[0]))}catch{return true}
+        try{return !/^__veyra_(url|sid|youtube_inline)$/.test(decodeURIComponent(value.split('=')[0]))}catch{return true}
       }).join('&');
     }
   }catch{}return u}
@@ -2611,7 +2617,7 @@ function injectRuntime(html, original, sid = "") {
   function toVirtual(raw){if(/^[?#]/.test(raw))return cleanVeyraParams(new URL(raw,virtualUrl));const u=new URL(raw,location.href);return cleanVeyraParams(fixDerivedHost(ownOrigin(u.origin)?fixOwn(u):u))}
   function resolve(v){try{const raw=unwrap(realUrl(v));return (raw===''?new URL(virtualUrl):toVirtual(raw)).href}catch{return String(v||'')}}
   function shouldProxy(v){try{const u=new URL(unwrap(v));return /^https?:$/.test(u.protocol)}catch{return false}}
-  function proxy(kind,u){const prefix=API_ORIGIN || location.origin;const base=prefix+(kind==='view'?'/api/view?url=':'/api/resource?url=')+encodeURIComponent(u);const from=encodeURIComponent(new URL(virtualUrl).href);return kind==='view'?base+'&sid='+encodeURIComponent(SESSION_ID)+(POPUP_FRAME?'&veyra_popup=1':''):base+'&from='+from+'&sid='+encodeURIComponent(SESSION_ID)}
+  function proxy(kind,u){const prefix=API_ORIGIN || location.origin;const base=prefix+(kind==='view'?'/api/view?url=':'/api/resource?url=')+encodeURIComponent(u);const from=encodeURIComponent(new URL(virtualUrl).href);return kind==='view'?base+'&sid='+encodeURIComponent(SESSION_ID)+(POPUP_FRAME?'&veyra_popup=1':'')+(watchPlayer?watchMarker(new URL(u,virtualUrl)):''):base+'&from='+from+'&sid='+encodeURIComponent(SESSION_ID)}
   function topPost(msg){try{window.top.postMessage(msg,'*')}catch{}}
   function emit(source,url,extra){if(!url)return;topPost({type:'veyra:navigate',url,source,sessionId:SESSION_ID,...extra})}
   let netSeq=0;
@@ -2625,7 +2631,7 @@ function injectRuntime(html, original, sid = "") {
   function escapedHistoryUrl(next){
     const u=new URL(next);
     if(/^[/]api[/]/.test(u.pathname))return proxy('view',next);
-    const markers=SESSION_ID?(u.search?'&':'?')+'__veyra_url='+encodeURIComponent(u.href)+'&__veyra_sid='+encodeURIComponent(SESSION_ID)+(POPUP_FRAME?'&veyra_popup=1':''):'';
+    const markers=SESSION_ID?(u.search?'&':'?')+'__veyra_url='+encodeURIComponent(u.href)+'&__veyra_sid='+encodeURIComponent(SESSION_ID)+(POPUP_FRAME?'&veyra_popup=1':'')+watchMarker(u):'';
     return location.origin+u.pathname+u.search+markers+u.hash;
   }
   function keepEscapedContext(next){
@@ -2730,7 +2736,7 @@ function injectRuntime(html, original, sid = "") {
   // window.top via topPost — replying to ev.source can loop back into the
   // frame when the page's own SDKs wrap window.postMessage.
   try{addEventListener('message',function(ev){try{if(ev.data&&ev.data.type==='veyra:embed-probe'){topPost({type:'veyra:embed-probe-ack',sessionId:SESSION_ID})}}catch{}})}catch{}
-  function remember(next){virtualUrl=next;window.__VEYRA_PAGE_URL__=next}
+  function remember(next){virtualUrl=next;window.__VEYRA_PAGE_URL__=next;if(watchNavigate)watchNavigate(next)}
   function proxyHistory(method,native){return function(state,title,url){
     const next=url==null?virtualUrl:resolve(url);
     // Preserve the real pathname for SPAs, but keep routing markers in every
@@ -3009,6 +3015,7 @@ function injectRuntime(html, original, sid = "") {
       var FIX_SEL=Object.keys(FIX_ATTRS).join(',');
       function fixAttr(el,attr){
         try{
+          if(directElements.has(el))return;
           var v=el.getAttribute(attr);
           if(v&&v.indexOf('javascript:')!==0&&v.indexOf('/api/')!==0&&v.charAt(0)!=='#'&&!/^(data|blob|about|mailto|tel):/i.test(v))
             el.setAttribute(attr,v);
@@ -3308,14 +3315,18 @@ ${pageActionsRuntime()}
     // The anchor can live inside shadow DOM (MSN casual-game cards), where
     // ev.target is retargeted to the shadow host and closest() never finds
     // it — resolve through the composed path instead.
-    const a=anchorFromEvent(ev);if(!a)return;
+    const a=anchorFromEvent(ev);if(!a||directElements.has(a))return;
+    const raw=a.getAttribute('href')||'';
+    // In the app-embedded root frame, pure-hash links keep their native
+    // scroll-to-anchor behaviour instead of a full proxy reload.
+    if(rootProxiedFrame()&&raw.charAt(0)==='#')return;
     const tgt=String(a.getAttribute('target')||'').toLowerCase();
     if(tgt&&tgt!=='_self')return;
     // In the app-embedded root frame, same-frame links navigate the iframe
     // natively to their rewritten href; only nested proxied frames need the
     // document-navigation message (their parent is another proxied page).
     if(rootProxiedFrame())return;
-    const u=canonicalizeMaybeProxy(a.getAttribute('href'));if(!u)return;
+    const u=canonicalizeMaybeProxy(raw);if(!u)return;
     ev.preventDefault();ev.stopPropagation();
     emit('document-navigation',u);
   },true);
@@ -3350,6 +3361,7 @@ ${pageActionsRuntime()}
     }
   },true);
   document.addEventListener('click',function(ev){if(rootProxiedFrame())return;try{const el=ev.target&&ev.target.closest?ev.target.closest('button[type=submit],input[type=submit],button[formaction]'):null;if(!el||el.disabled)return;const form=el.form;if(!form)return;if(String(form.method||'get').toUpperCase()!=='GET')return;if(submitTarget(form,el)){ev.preventDefault();ev.stopPropagation();emitGetForm(form,el,'form.click')}}catch{}},true);
+  ${watchPlayer ? `watchNavigate=(${installWatchPlayer.toString()})(watchPlayer,directElements);` : ""}
   window.addEventListener('load',function(){
     try{const icon=document.querySelector('link[rel~=' + JSON.stringify('icon') + '],link[rel~=' + JSON.stringify('shortcut icon') + ']');let favicon=icon&&icon.getAttribute('href')||'';try{if(favicon.startsWith('/api/resource?url='))favicon=new URLSearchParams(favicon.split('?')[1]).get('url')||favicon;else favicon=new URL(favicon,virtualUrl).href}catch{}const title=document.title||new URL(virtualUrl).hostname;emit('document-navigation',virtualUrl,{title,favicon})}catch{emit('document-navigation',virtualUrl)}
   });
@@ -3382,7 +3394,7 @@ function restoreAndRewriteInlineScriptBlocks(html, originals, base, sid = "") {
   }
   return out;
 }
-function rewriteHtml(html, base, sid = "") {
+function rewriteHtml(html, base, sid = "", watchPlayer = null) {
   const protectedScripts = protectInlineScriptBlocks(html);
   const $ = cheerio.load(protectedScripts.html, { decodeEntities: false });
   const declaredBase = $("base[href]").first().attr("href");
@@ -3534,7 +3546,7 @@ function rewriteHtml(html, base, sid = "") {
     if (preloadMarkup) $("head").first().prepend(preloadMarkup);
   }
 
-  return injectRuntime(restoreAndRewriteInlineScriptBlocks($.html(), protectedScripts.originals, effectiveBase, sid), base, sid);
+  return injectRuntime(restoreAndRewriteInlineScriptBlocks($.html(), protectedScripts.originals, effectiveBase, sid), base, sid, watchPlayer);
 }
 
 const SEARCH_STOP_WORDS = new Set([
@@ -5934,9 +5946,10 @@ const { createYouTubeEligibility } = require("./services/youtube-eligibility");
 const youtubeEligibility = createYouTubeEligibility({ key: String(process.env.YOUTUBE_DATA_API_KEY || "").trim(), request: undiciFetch });
 app.get("/api/media/youtube/:id", platformRateLimit({ max: 30, windowMs: 60_000 }), async (req, res) => {
   res.setHeader("Cache-Control", "no-store");
-  const state = await youtubeEligibility(req.params.id);
+  const check = app.locals.veyraYoutubeWatchEligibility || youtubeEligibility;
+  const state = await check(req.params.id);
   if (state === "invalid") return respondError(res, 400, "Invalid YouTube video ID.", "INVALID_YOUTUBE_ID");
-  res.json({ state });
+  res.json({ state, inlineWatch: true });
 });
 /* Rate limits for every developer-platform route: 120 requests/minute per IP for
    session-authenticated management calls, and a much tighter budget for the public
@@ -7510,9 +7523,22 @@ async function proxyRequest(req, res, mode, options = {}) {
       
       
       const pageUrl = virtualPageUrl(canonical, result.finalUrl || canonical);
-      const enhanced = fullPage.enhanceFullPage(payload.toString("utf8"), pageUrl);
+      const html = payload.toString("utf8");
+      const enhanced = fullPage.enhanceFullPage(html, pageUrl);
       if (enhanced.enhanced) { payload = Buffer.from(enhanced.html, "utf8"); fullPageEnhanced = true; }
-      const rewritten = await rewriteOffThread("rewriteHtml", payload.toString("utf8"), [pageUrl, sid], rewriteHtml);
+      let watchPlayer = null;
+      if (req.query.__veyra_youtube_inline === "1" && method === "GET" && result.status === 200
+        && !result.truncated && !challenge && !record.incognito && liveSessionId(sid)
+        && !vpnManager.requiresVpnForSession(sid) && documentNavigation(req)) {
+        const requestedVideo = watchVideo(canonical);
+        const finalVideo = watchVideo(result.finalUrl || canonical);
+        if (requestedVideo && finalVideo?.videoId === requestedVideo.videoId && !youtubeCompat.classifyWatchPageBlock(html)) {
+          const check = app.locals.veyraYoutubeWatchEligibility || youtubeEligibility;
+          if (await check(requestedVideo.videoId) === "ready" && !res.destroyed && !record.abort.signal.aborted
+            && !vpnManager.requiresVpnForSession(sid)) watchPlayer = requestedVideo;
+        }
+      }
+      const rewritten = await rewriteOffThread("rewriteHtml", payload.toString("utf8"), [pageUrl, sid, watchPlayer], rewriteHtml);
       payload = Buffer.from(challenge ? rewritten : announceProxyStatus(rewritten, result.status, pageUrl, sid), "utf8");
     }
     else if (!download && mode === "resource" && result.contentType.toLowerCase().includes("text/css")) payload = Buffer.from(await rewriteOffThread("rewriteCss", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteCssText), "utf8");
@@ -8609,7 +8635,11 @@ app.use(async (req, res, next) => {
   // loading relative assets before any injected runtime updates the URL.
   const mark = isDocument && req.method === "GET" && !req.query?.__veyra_url && !req.query?.__veyra_sid && escapedPathFor(target);
   if (mark && ctx.sid) return markEscapedNavigation(req, res, mark, ctx.sid);
-  Object.defineProperty(req, "query", { value: { url: target, sid: ctx.sid, from: ctx.pageUrl }, writable: true, configurable: true });
+  const exact = isDocument && req.query?.__veyra_youtube_inline === "1"
+    ? proxyRoutingPair(req.query?.__veyra_url, req.query?.__veyra_sid) : null;
+  const exactVideo = exact && watchVideo(exact.pageUrl);
+  const inline = exactVideo && watchVideo(target)?.videoId === exactVideo.videoId ? "1" : undefined;
+  Object.defineProperty(req, "query", { value: { url: target, sid: ctx.sid, from: ctx.pageUrl, __veyra_youtube_inline: inline }, writable: true, configurable: true });
   try {
     if (mode === "view" && req.method === "GET") await proxyViewGet(req, res);
     else await proxyRequest(req, res, mode);
@@ -8820,7 +8850,7 @@ if (require.main === module) startVeyraServer();
 
 
 const __workerOps = {
-  rewriteHtml: (text, base, sid) => rewriteHtml(text, base, sid),
+  rewriteHtml: (text, base, sid, watchPlayer) => rewriteHtml(text, base, sid, watchPlayer),
   rewriteCss: (text, base, sid) => rewriteCssText(text, base, sid),
   rewriteJs: (text, base, sid) => rewriteJsText(text, base, sid),
   discover: (text, kind, base, contentType) => collectDiscovery(text, kind, base, contentType)
