@@ -1330,6 +1330,20 @@ function isRetryableNetworkError(err) {
   const code = networkErrorCode(err);
   return /^(?:EAI_AGAIN|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|UND_ERR_CONNECT_TIMEOUT|UND_ERR_SOCKET|UND_ERR_HEADERS_TIMEOUT)$/i.test(code) || /fetch failed/i.test(String(err?.message || ''));
 }
+async function proxyViewGet(req, res) {
+  try {
+    return await proxyRequest(req, res, "view");
+  } catch (error) {
+    // Both URL shapes are the same GET navigation. The path-shaped lane
+    // used to skip this last retry after following /api/view's redirect.
+    const retryable = error?.code !== "VPN_KILL_SWITCH" && (error?.code === "UPSTREAM_NETWORK_ERROR"
+      ? isRetryableNetworkError({ code: error.upstreamCode }) : isRetryableNetworkError(error));
+    if (!retryable || req.aborted || res.destroyed || res.headersSent) throw error;
+    await new Promise(resolve => setTimeout(resolve, 350));
+    if (req.aborted || res.destroyed || res.headersSent) throw error;
+    return proxyRequest(req, res, "view");
+  }
+}
 function decorateUpstreamError(err, url) {
   const e = err instanceof Error ? err : new Error(String(err));
   e.upstreamCode = networkErrorCode(err) || 'UPSTREAM_NETWORK_ERROR';
@@ -7070,17 +7084,7 @@ app.get("/api/form-get/:target/:sid", async (req, res) => {
     respondError(res, 502, `Veyra could not submit this form: ${e.message}`, "PROXY_FORM_GET_ERROR", { requestId: req.veyraRequestId });
   }
 });
-app.get("/api/view", async (req, res) => { try { await proxyRequest(req, res, "view"); } catch (e) {
-  // Render/browser cold starts can occasionally lose the first upstream
-  // connection even though the target is healthy a moment later. fetchCached
-  // already retries individual upstream attempts; this outer retry covers a
-  // scheduler/connect failure before a response is produced, without turning
-  // persistent failures into an unbounded loop.
-  if (!res.headersSent && req._veyraViewRetries !== 1 && isRetryableNetworkError(e)) {
-    req._veyraViewRetries = 1;
-    await new Promise(resolve => setTimeout(resolve, 350));
-    try { return await proxyRequest(req, res, "view"); } catch (retryError) { e = retryError; }
-  }
+app.get("/api/view", async (req, res) => { try { await proxyViewGet(req, res); } catch (e) {
   
   
   const snapSid = normalizeSessionId(req.query.sid);
@@ -8132,8 +8136,17 @@ app.use(async (req, res, next) => {
   if (!target) return next();
   const mode = dest === "document" || dest === "iframe" || dest === "frame" ? "view" : "resource";
   Object.defineProperty(req, "query", { value: { url: target, sid: ctx.sid, from: ctx.pageUrl }, writable: true, configurable: true });
-  try { await proxyRequest(req, res, mode); }
-  catch (e) { respondError(res, 502, `Veyra resource error: ${e.message}`, "PROXY_RELATIVE_FALLBACK_ERROR", { requestId: req.veyraRequestId }); }
+  try {
+    if (mode === "view" && req.method === "GET") await proxyViewGet(req, res);
+    else await proxyRequest(req, res, mode);
+  } catch (e) {
+    if (res.headersSent) return next(e);
+    const isView = mode === "view";
+    respondError(res, e.code === "VPN_KILL_SWITCH" ? 503 : 502,
+      `${isView ? "Veyra could not load this page" : "Veyra resource error"}: ${e.upstreamMessage || e.message}`,
+      isView && /^UPSTREAM_[A-Z0-9_]+$/.test(String(e.code || "")) ? e.code : "PROXY_RELATIVE_FALLBACK_ERROR",
+      { requestId: req.veyraRequestId, upstreamCode: e.upstreamCode || networkErrorCode(e) || null });
+  }
 });
 
 
