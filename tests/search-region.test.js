@@ -96,6 +96,36 @@ test("Web feed uses provider-specific offsets without repeating first-page-only 
   assert.equal((await service.search("railway", { offset: 90, feed: true })).nextOffset, null);
 });
 
+test("Web feeds can use relevant Wikipedia articles when the search provider returns unrelated links", async () => {
+  const calls = [];
+  const service = createWebSearch({ env: { WEB_SEARCH_ORDER: "bing", BING_SEARCH_API_KEY: "fixture" }, fetchText: async raw => {
+    const url = new URL(raw);
+    calls.push(url);
+    if (url.hostname === "api.bing.microsoft.com") {
+      return response({ webPages: { value: [{ url: "https://example.in/fruit", name: "Apple orchard" }] } });
+    }
+    assert.equal(url.hostname, "hi.wikipedia.org");
+    assert.equal(url.searchParams.get("srnamespace"), "0");
+    assert.equal(url.searchParams.get("srsearch"), "जयपुर");
+    const offset = Number(url.searchParams.get("sroffset"));
+    return response({ ...(!offset ? { continue: { sroffset: 10 } } : {}), query: { search: [
+      { ns: 0, title: offset ? "जयपुर ज़िला" : "जयपुर", snippet: "भारत का <span>जयपुर</span> &amp; राजस्थान" },
+      { ns: 2, title: "जयपुर (user page)" }
+    ] } });
+  } });
+  const options = { feed: true, reference: true, region: "IN" };
+  const first = await service.search("जयपुर", options);
+  assert.equal(first.provider, "wikipedia", "the label follows displayed, not rejected, results");
+  assert.deepEqual(first.results.map(r => r.snippet), ["भारत का जयपुर & राजस्थान"]);
+  assert.equal(first.nextOffset, 10);
+  const next = await service.search("जयपुर", { ...options, offset: first.nextOffset });
+  assert.deepEqual(next.results.map(r => r.title), ["जयपुर ज़िला"]);
+  assert.equal(next.nextOffset, null);
+  await service.search("site:example.in जयपुर", options);
+  await service.search("जयपुर", { ...options, engine: "bing" });
+  assert.deepEqual(calls.filter(url => url.hostname === "hi.wikipedia.org").map(url => url.searchParams.get("sroffset")), ["0", "10"]);
+});
+
 test("India applies to image mix, video and news requests without inventing research market filters", async () => {
   const calls = [];
   const service = createVerticalSearch({ env: { BRAVE_SEARCH_API_KEY: "fixture", VEYRA_YOUTUBE_SEARCH: "1", YOUTUBE_DATA_API_KEY: "fixture" }, indexedImages: () => [], fetchText: async raw => {

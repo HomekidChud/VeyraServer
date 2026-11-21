@@ -258,6 +258,7 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     app.locals.veyraWebSearch = { async search(query, options) {
       assert.equal(query, `site:feed-fixture.example ${feedTerm}`);
       assert.equal(options.feed, true);
+      assert.equal(options.reference, true);
       assert.equal(options.region, "IN");
       offsets.push(options.offset);
       const more = options.offset === 0;
