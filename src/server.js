@@ -15,10 +15,10 @@ const { pageActionsRuntime } = require("./browser/page-actions-runtime");
 const { VpnManager } = require("./network/vpn");
 const { createShield } = require("./network/shield");
 const { upstreamHeaderCapOptions } = require("./network/header-cap");
-const { createWebSearch, WEB_FEED_STEP, WEB_FEED_INDEX_OFFSET, canonicalKey } = require("./services/websearch");
+const { createWebSearch, WEB_FEED_STEP, WEB_FEED_INDEX_OFFSET, canonicalKey, rankResultsByRelevance, isTopicalResult, diversifyWebResults, minimumMatches } = require("./services/websearch");
 const { languageTag, normalizeSearchText, unicodeWords } = require("./services/search-language");
 const { walkSitemap, hasRel } = require("./services/crawl-sitemap");
-const { india, indiaAffinity } = require("./services/search-region");
+const { india, indiaAffinity, isIndianProductUrl } = require("./services/search-region");
 const { createVerticalSearch, TYPES: SEARCH_VERTICALS, lastVerticalPage, indexedWatchPage, safeUrl: verticalResultUrl } = require("./services/vertical-search");
 const { publicImageUrl, imageIdentity } = require("./services/crawl-page-data");
 const { parseSiteScope, allowsSiteUrl } = require("./services/search-site-scope");
@@ -1639,13 +1639,14 @@ const verticalSearch = createVerticalSearch({
   webSearch: (query, opts) => (app.locals.veyraWebSearch || webSearch).search(query, opts),
   indexedImages: localImageSearch,
   indexedVideos: localVideoSearch,
+  indexedProducts: (q, offset, limit, region) => localSearch(q, offset, limit, { region, topical: true, requireTerms: true, onlyIndianProducts: true }),
   fetchText: async (url, opts) => {
     const r = await fetchBuffer(url, {
       method: opts.method, body: opts.body, headers: opts.headers, accept: opts.accept || "application/json",
       timeout: opts.timeoutMs, signal: opts.signal, retries: 0, maxRedirects: 0, limit: 1024 * 1024,
       userAgent: `VeyraSearch/${VEYRA_VERSION} (+https://github.com/HomekidChud/VeyraServer)`
     });
-    return { ok: r.ok && !r.truncated, status: r.status, text: r.body.toString("utf8") };
+    return { ok: r.ok && !r.truncated, status: r.status, text: r.body.toString("utf8"), retryAfterMs: r.retryAfterMs };
   }
 });
 
@@ -3672,10 +3673,18 @@ function localSearch(query, offset, limit, options = {}) {
     const doc = searchIndex.get(url); if (!doc) continue;
     if (options.onlyWithImages && !doc.searchImages?.length) continue;
     if (options.onlyWatchPages && !indexedWatchPage(doc.url)) continue;
+    if (options.onlyIndianProducts && !isIndianProductUrl(doc.url)) continue;
     if (!allowsSiteUrl(parsed.siteScope, doc.url)) continue;
     if (parsed.filters.intitle && !searchFieldHas(doc, "title", parsed.filters.intitle)) continue;
     if (parsed.filters.inurl && !searchFieldHas(doc, "url", parsed.filters.inurl)) continue;
     if (parsed.negativeTerms.some(term => doc.termFreq.has(term) || searchFieldHas(doc, "url", term))) continue;
+    if (options.topical && parsed.terms.length) {
+      const matched = parsed.terms.filter(term => doc.termFreq.has(term));
+      if (matched.length < minimumMatches(parsed.terms.length) || parsed.terms.some(term => /\d/.test(term) && !doc.termFreq.has(term))) continue;
+      const headingWords = new Set(tokenizeSearch(`${doc.title} ${doc.headings} ${doc.url}`));
+      if (!matched.some(term => headingWords.has(term)) && !(parsed.terms.length > 1 &&
+        ` ${tokenizeSearch(`${doc.description} ${doc.text}`).join(" ")} `.includes(` ${parsed.terms.join(" ")} `))) continue;
+    }
     let score = 0;
     for (const term of parsed.terms) {
       const postings = invertedIndex.get(term); const tf = postings?.get(doc.url) || 0; const df = postings?.size || 0;
@@ -3724,7 +3733,7 @@ function isReferenceImageSource(url) {
     .some(domain => host === domain || host.endsWith(`.${domain}`));
 }
 function localVideoSearch(query, offset, limit, region) {
-  return localSearch(query, offset, limit, { region, onlyWatchPages: true, requireTerms: true });
+  return localSearch(query, offset, limit, { region, onlyWatchPages: true, requireTerms: true, topical: true });
 }
 function localImageSearch(query, region) {
   const parsed = parseSearchQuery(query);
@@ -6318,7 +6327,7 @@ app.get('/api/search', (req, res) => {
     const offset = Math.max(0, Number(req.query.offset || 0) || 0);
     const limit = Math.min(CFG.maxSearchResults, Math.max(1, Number(req.query.limit || 20) || 20));
     const started = Date.now();
-    const result = localSearch(query, offset, limit, { region: req.query.region });
+    const result = localSearch(query, offset, limit, { region: req.query.region, topical: true });
     res.json({ ok: true, ...result, provider: "veyra-index", responseTimeMs: Date.now() - started });
   } catch (e) { respondError(res, 500, e.message, "SEARCH_ERROR"); }
 });
@@ -6365,8 +6374,9 @@ app.get('/api/search/web', async (req, res) => {
     const started = Date.now();
     const scope = parseSiteScope(input);
     if (scope.invalid) return res.json({ ok: true, results: [], provider: "none", siteFilter: { invalid: true }, more: false, source: "web", responseTimeMs: Date.now() - started });
+    const indexOptions = { region: req.query.region, requireTerms: !scope.active, topical: true };
     const fromIndex = indexOffset => {
-      const local = localSearch(q, indexOffset, limit, { region: req.query.region, requireTerms: !scope.active });
+      const local = localSearch(q, indexOffset, limit, indexOptions);
       const next = indexOffset + local.results.length;
       const more = local.results.length > 0 && next < local.total;
       return { ...local, provider: "veyra-index", results: local.results.map(row => ({ ...row, canonicalUrl: canonicalKey(row.url) || row.url })),
@@ -6374,16 +6384,27 @@ app.get('/api/search/web', async (req, res) => {
     };
     const reply = result => res.json({ ok: true, ...result, ...(scope.active ? { total: null, siteFilter: { include: scope.include, exclude: scope.exclude } } : {}), source: "web", responseTimeMs: Date.now() - started });
     if (feed && (!Number.isSafeInteger(offset) || offset > WEB_FEED_INDEX_OFFSET + CFG.maxIndexDocs || (offset < WEB_FEED_INDEX_OFFSET && offset % WEB_FEED_STEP))) return respondError(res, 400, "Invalid search feed offset.", "INVALID_SEARCH_OFFSET");
+    if (feed && selected && offset >= WEB_FEED_INDEX_OFFSET) return respondError(res, 400, "Index offsets are not available for an explicit engine.", "INVALID_SEARCH_OFFSET");
     if (feed && offset >= WEB_FEED_INDEX_OFFSET) return reply(fromIndex(offset - WEB_FEED_INDEX_OFFSET));
     const result = await (app.locals.veyraWebSearch || webSearch).search(q, { offset, limit, engine: selected, lang, region: req.query.region,
       signal: request.signal, noCache: isPrivate || !CFG.globalCacheEnabled, feed, reference: true });
-    const results = (result.results || []).filter(row => row && allowsSiteUrl(scope, row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl)));
-    if (!isPrivate && (!feed || !offset)) queueNeuralIndexFindings(q, results);
-    if (feed && !results.length) return reply(fromIndex(0));
-    if (feed && !result.nextOffset && (localSearch(q, 0, 1, { region: req.query.region, requireTerms: !scope.active }).total > 0)) {
-      return reply({ ...result, results, nextOffset: WEB_FEED_INDEX_OFFSET, more: true });
+    const external = (result.results || []).filter(row => row && canonicalKey(row.url) && allowsSiteUrl(scope, row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl)));
+    if (!isPrivate && (!feed || !offset)) queueNeuralIndexFindings(q, external);
+    if (feed && !selected) {
+      const local = fromIndex(0);
+      if (!external.length && !result.nextOffset && local.results.length) return reply(local);
+      let results = external;
+      if (!offset && !scope.active && external.length && limit >= 8 && local.results.length) {
+        const merged = new Map(external.map(row => [canonicalKey(row.url), row]));
+        for (const row of local.results.slice(0, 4)) {
+          if (!merged.has(row.canonicalUrl) && isTopicalResult(scope.text, row, { requireTitle: true })) merged.set(row.canonicalUrl, row);
+        }
+        if (merged.size > external.length) results = diversifyWebResults(rankResultsByRelevance(scope.text, [...merged.values()], req.query.region), limit);
+      }
+      return reply({ ...result, results, ...(results.length ? { status: "ok" } : {}),
+        ...(!result.nextOffset && local.results.length ? { nextOffset: WEB_FEED_INDEX_OFFSET, more: true } : {}) });
     }
-    reply({ ...result, results });
+    reply({ ...result, results: external });
   } catch (e) {
     respondError(res, 502, "Veyra web search is temporarily unavailable.", "SEARCH_WEB_ERROR");
   } finally { request.dispose(); }
@@ -8570,6 +8591,23 @@ function startVeyraServer() {
       }
       await hydrateSearchFromMongo();
       serverLog("info", "SYSTEM", "Persistence hydration completed.");
+      if (boolEnv("INDEX_REFERENCE_BOOTSTRAP", process.env.RENDER === "true") && CFG.indexSeedCrawl && !sessionManager.sleeping) {
+        // A small deployment-time baseline, independent of guest searches.
+        // The existing public crawler enforces robots, URL safety and noindex.
+        const sources = [
+          "https://docs.python.org/3/tutorial/datastructures.html",
+          "https://pandas.pydata.org/docs/reference/index.html",
+          "https://developer.mozilla.org/en-US/docs/Web/JavaScript",
+          "https://www.indianrail.gov.in/enquiry/StaticPages/StaticEnquiry.jsp?StaticPage=index.html",
+          "https://www.india.gov.in/services/details/passport-seva-apply-for-ordinary-passport",
+          "https://www.isro.gov.in/LaunchMissions.html",
+          "https://www.tajmahal.gov.in/"
+        ].filter(url => !searchIndex.has(normalizeUrl(url)));
+        // One short crawl per source, sequential to leave workers for user requests.
+        void (async () => {
+          for (const url of sources) await neuralRobotPool.startCrawl([url], "", { maxDepth: 1, maxPages: 5 });
+        })().catch(error => serverLog("warn", "SEARCH", `Reference bootstrap skipped: ${error.message}`));
+      }
     } catch (err) {
       serverLog("warn", "SYSTEM", `Persistence hydration skipped: ${err.stack || err}`);
     }
