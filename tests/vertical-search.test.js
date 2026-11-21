@@ -1,6 +1,7 @@
 "use strict";
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
+const { setTimeout: delay } = require("node:timers/promises");
 const { createVerticalSearch, safeUrl } = require("../src/services/vertical-search");
 const checkpoint = require("../src/services/vertical-ranker-weights.json");
 const { trainModel, evaluate } = require("../scripts/train-vertical-ranker");
@@ -54,6 +55,25 @@ test("image fallback validates artwork, license, provenance, cache and scoped pa
   assert.equal(service.calls.at(-1).url.searchParams.get("gsrsearch"), "Welsh lake");
   await service.search("images", "site: Welsh lake");
   assert.equal(service.calls.length, 5);
+});
+
+test("a stalled provider body times out and leaves time for a fallback", async () => {
+  const service = createVerticalSearch({
+    env: { BRAVE_SEARCH_API_KEY: "fixture" },
+    providerTimeoutMs: 30,
+    async fetchText(rawUrl, { signal }) {
+      if (new URL(rawUrl).hostname === "api.search.brave.com") {
+        await assert.rejects(delay(1000, null, { signal }), { name: "AbortError" });
+        assert.equal(signal.reason.name, "TimeoutError");
+        throw signal.reason;
+      }
+      return { ok: true, text: '<rss><channel><item><title>Fallback report</title><link>https://news.google.com/rss/articles/fixture</link></item></channel></rss>' };
+    },
+    async webSearch() { assert.fail("Web discovery is not needed for news"); }
+  });
+  const result = await service.search("news", "report");
+  assert.equal(result.provider, "google-news-rss");
+  assert.equal(result.results[0].title, "Fallback report");
 });
 
 test("eBay supplies real listing fields; discovery fallback never invents prices", async () => {

@@ -62,14 +62,29 @@ function queryUrl(origin, params) {
   return url.href;
 }
 
-function createVerticalSearch({ fetchText, webSearch, env = process.env }) {
+function waitForToken(promise, signal) {
+  if (!signal) return promise;
+  signal.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
+}
+
+function createVerticalSearch({ fetchText, webSearch, env = process.env, providerTimeoutMs = TIMEOUT }) {
   const cache = new Map(), cooldown = new Map();
   let ebayToken, ebayTokenPromise;
   const braveKey = String(env.BRAVE_SEARCH_API_KEY || "").trim();
   const market = /^[A-Z]{2}$/.test(String(env.VEYRA_EBAY_MARKET || "")) ? env.VEYRA_EBAY_MARKET : "GB";
   async function get(url, signal, options = {}) {
-    if (signal?.aborted) throw new Error("Cancelled");
-    const response = await fetchText(url, { signal, timeoutMs: TIMEOUT, ...options });
+    const deadline = AbortSignal.timeout(providerTimeoutMs);
+    const requestSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
+    requestSignal.throwIfAborted();
+    // The shared fetcher times receipt of headers. Keep the abort signal
+    // active during the body read as well, so a stalled feed can't block fallback.
+    const response = await fetchText(url, { signal: requestSignal, timeoutMs: providerTimeoutMs, ...options });
+    requestSignal.throwIfAborted();
     if (!response.ok) throw Object.assign(new Error("Provider request failed"), { status: response.status });
     return options.raw ? response.text : JSON.parse(response.text);
   }
@@ -164,7 +179,7 @@ function createVerticalSearch({ fetchText, webSearch, env = process.env }) {
           return ebayToken = { value: json.access_token, until: Date.now() + Math.max(0, Math.min(7200, Number(json.expires_in)) - 30) * 1000 };
         }).finally(() => { ebayTokenPromise = null; });
       }
-      await ebayTokenPromise;
+      await waitForToken(ebayTokenPromise, signal);
     }
     let json;
     try {
