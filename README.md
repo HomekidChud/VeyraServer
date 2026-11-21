@@ -34,6 +34,18 @@ When Mongo persistence is enabled, the acquisition manager can reuse public text
 
 For supported model endpoints, where to create provider keys, and how to configure a custom API protocol, see [`docs/AI_PROVIDER_SETUP.md`](docs/AI_PROVIDER_SETUP.md). The integration accepts OpenAI-compatible endpoints and custom HTTP JSON request/response templates. For Groq, set only `GROQ_API_KEY`; Veyra detects Groq and chooses an active chat model automatically.
 
+### Search categories and summaries
+
+`GET /api/search/vertical?q=...&type=images|videos|news|shopping|research|discussions` returns attributed results. `type=all` returns up to three preview cards per category with three concurrent category requests. Continue a category using its `nextPage` and `provider`; paging is limited to four pages and stays on the same category adapter. Empty results and unavailable providers are separate states. Guest and private requests bypass the shared result cache. Searches are still sent to the upstream providers used for the selected category.
+
+- **Images, video and news:** `BRAVE_SEARCH_API_KEY` enables Brave where the API plan supports the selected category. Otherwise the adapters can use Wikimedia Commons, PeerTube via Sepia Search, and Google News RSS. Signed-in or guest users can use the Videos tab; the optional YouTube Data API fallback is enabled with `VEYRA_YOUTUBE_SEARCH=1` and `YOUTUBE_DATA_API_KEY` and is skipped for mixed previews.
+- **Shopping:** Set `EBAY_CLIENT_ID` and `EBAY_CLIENT_SECRET` for eBay Browse API listings (default `VEYRA_EBAY_MARKET=GB`). Without these, configured web providers may surface supported merchant product URLs, but Veyra cannot verify prices, inventory, or coverage. Never add provider keys to frontend code.
+- **Research and discussions:** Crossref indexes papers and DOI links; Hacker News supplies community threads. The result labels describe these scopes, not the entire research or discussion web.
+- **AI:** Signed-in `POST /api/search/answer` accepts an optional `vertical` category. It rediscovers URLs server-side and checks summaries against readable pages rather than card snippets. If it cannot fetch sufficient text or ground a model response, it returns no summary. Category queries and summaries are not added to the answer-observation store. Optional signed-in helpfulness feedback updates the existing answer-quality scorer from numeric features, not the generative model.
+- **Ranking:** `npm run train:vertical-ranker` writes the checked-in category model; `npm run evaluate:vertical-ranker` reports its held-out comparison with provider order. The 24 training and 12 test pairs are hand-written interaction-free fixtures covering the six categories. The test checks the training pipeline, not live search quality. It does not use scraped provider content, queries, or browsing logs, and it does not fine-tune the generative model.
+
+For rollout, deploy this backend first; smoke-test `/health`, `/api/search/web`, one request per category, and the signed-in category answer in staging before deploying the browser client. No database migration is required.
+
 ## Google search
 
 Google's public HTML search often challenges cloud datacenter IPs. Veyra does not bypass that challenge or rotate IPs to evade it. The preferred solution is the official Google Programmable Search JSON API: set `GOOGLE_SEARCH_API_KEY` and `GOOGLE_SEARCH_CX` as secret Render environment variables. No residential IP is needed for that API path. If those variables are absent, an explicit `engine=google` request reports `not-configured` instead of silently returning another provider's results; ordinary search may still use the configured Bing, Brave, or other permitted provider.
