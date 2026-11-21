@@ -48,6 +48,7 @@ const IS_THREAD_WORKER = !isMainThread && process.env.VEYRA_THREAD_WORKER === "1
 const { fetch: undiciFetch, Agent: UndiciAgent } = require("undici");
 const https = require("node:https");
 const zlib = require("node:zlib");
+const { setTimeout: wait } = require("node:timers/promises");
 const { isGoogleAccountsUrl, requestGoogleAccounts } = require("./network/google-accounts-transport");
 const veyraConfigModule = require("./config");
 
@@ -418,15 +419,23 @@ let gateMiddleware = null;
 // by the app. No cookie ever crosses between the user's browser and a
 // Veyra session, or between two Veyra sessions.
 const allowedOrigins = CFG.frontendOrigins.includes("*") ? true : CFG.frontendOrigins;
-app.use(cors({
+const browserCorsOptions = {
   origin: allowedOrigins,
   methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   maxAge: 600,
   // Terminate browser preflights here. If these continue to the API fallback,
   // the browser sees a 404 and reports the request as a generic fetch failure.
   preflightContinue: false,
-  exposedHeaders: ["X-Veyra-Request-ID", "X-Veyra-Canonical-URL", "X-Veyra-Challenge", "X-Veyra-Content-Type", "X-Veyra-Session-ID", "X-Veyra-Session-Expires"]
-}));
+  exposedHeaders: ["X-Veyra-Request-ID", "X-Veyra-Canonical-URL", "X-Veyra-Challenge", "X-Veyra-Content-Type", "X-Veyra-Session-ID", "X-Veyra-Session-Expires", "Retry-After"]
+};
+const browserCors = cors(browserCorsOptions);
+const proxyOptionsCors = cors({ ...browserCorsOptions, preflightContinue: true });
+app.use((req, res, next) => {
+  // A real OPTIONS request to a proxied resource is not a CORS preflight.
+  if (req.method === "OPTIONS" && /^\/api\/(?:view|resource)\/?$/i.test(req.path) &&
+      !req.get("Access-Control-Request-Method") && !req.get("Access-Control-Request-Headers")) return proxyOptionsCors(req, res, next);
+  return browserCors(req, res, next);
+});
 app.use((req, res, next) => gateMiddleware ? gateMiddleware(req, res, next) : next());
 installBrandRoutes(app, { frontendUrl: () => CFG.frontendUrl, version: VEYRA_VERSION, isPreviewBot: ua => shield.isPreviewBot(ua), hasProxiedReferer: req => !!proxiedPageFromReferer(req) });
 
@@ -884,17 +893,28 @@ fs.mkdirSync(ROOT, { recursive: true });
 
 const sourceStore = {
   async write(job, resourceId, text) {
-    if (job.sourceFiles >= CFG.maxSourceFiles) return null;
-    const remaining = Math.max(0, CFG.maxScanBytes - job.textBytesStored);
-    if (!remaining) return null;
-    const safe = String(text).slice(0, Math.min(CFG.maxTextBytesPerResource, remaining));
+    if (job.sourceFiles + job.pendingSourceFiles >= CFG.maxSourceFiles) return null;
+    const remaining = Math.min(CFG.maxTextBytesPerResource, CFG.maxScanBytes - job.textBytesStored - job.pendingSourceBytes);
+    if (remaining <= 0) return null;
+    const binary = Buffer.from(text);
+    let end = Math.min(binary.length, remaining);
+    while (end < binary.length && (binary[end] & 0xc0) === 0x80) end--;
+    const safe = binary.subarray(0, end);
     const file = path.join(job.sourceDir, `${resourceId}.txt`);
-    await fsp.writeFile(file, safe, "utf8");
-    job.sourceFiles += 1;
-    job.textBytesStored += Buffer.byteLength(safe);
-    return file;
+    job.pendingSourceFiles++;
+    job.pendingSourceBytes += safe.length;
+    try {
+      await fsp.writeFile(file, safe);
+      job.sourceFiles++;
+      job.textBytesStored += safe.length;
+      return file;
+    } finally {
+      job.pendingSourceFiles--;
+      job.pendingSourceBytes -= safe.length;
+    }
   },
   async read(job, resource) {
+    if (resource?.sourcePending) await resource.sourcePending;
     if (!resource?.sourceFile) return resource?.inlinePreview || "";
     try { return await fsp.readFile(resource.sourceFile, "utf8"); }
     catch { return resource.inlinePreview || ""; }
@@ -1325,6 +1345,10 @@ function retryAfterMs(headers) {
   const t = Date.parse(raw);
   return Number.isFinite(t) ? Math.max(0, Math.min(30000, t - Date.now())) : 0;
 }
+function proxyRetryAfter(result) {
+  if (result.status !== 429 && result.status !== 503) return "";
+  return result.retryAfter || (result.retryAfterMs > 0 ? String(Math.ceil(result.retryAfterMs / 1000)) : "");
+}
 function backoffMs(attempt, retryAfter = 0) {
   if (retryAfter) return retryAfter;
   return Math.min(10000, CFG.retryBaseMs * 2 ** attempt + Math.random() * CFG.retryBaseMs);
@@ -1443,6 +1467,7 @@ async function fetchBuffer(url, opts = {}) {
   let cached = opts.cached || null;
   for (let redirect = 0; redirect <= maxRedirects; redirect++) {
     await assertPublicUrl(current, opts.dnsCache || dnsPublicCache);
+    if (redirect > 0) await opts.beforeRedirect?.(current);
     let lastError = null;
     let retriesUsed = 0;
     for (let attempt = 0; attempt <= (opts.retries ?? CFG.maxRetries); attempt++) {
@@ -1489,6 +1514,7 @@ async function fetchBuffer(url, opts = {}) {
           
         } else if (response.status >= 300 && response.status < 400) {
           const loc = response.headers.get("location");
+          await response.body?.cancel().catch(() => {});
           if (!loc) throw new Error(`HTTP ${response.status} redirect without Location`);
           const next = resolveNavigation(loc, current);
           if (!next) throw new Error("Invalid redirect destination.");
@@ -1504,7 +1530,8 @@ async function fetchBuffer(url, opts = {}) {
         if (retryableStatus(response.status) && attempt < (opts.retries ?? CFG.maxRetries)) {
           lastError = Object.assign(new Error(`HTTP ${response.status}`), { status: response.status });
           retriesUsed += 1;
-          await sleep(backoffMs(attempt, retryAfterMs(response.headers)));
+          await response.body?.cancel().catch(() => {});
+          await wait(backoffMs(attempt, retryAfterMs(response.headers)), undefined, { signal: upstreamSignal });
           continue;
         }
         const contentType = response.headers.get("content-type") || "";
@@ -1539,9 +1566,11 @@ async function fetchBuffer(url, opts = {}) {
           expires: response.headers.get("expires") || "",
           contentRange: response.headers.get("content-range") || "",
           acceptRanges: response.headers.get("accept-ranges") || "",
+          allow: response.headers.get("allow") || "",
           linkHeader: response.headers.get("link") || "",
           contentDisposition: response.headers.get("content-disposition") || "",
           setCookieHeader: response.headers.get("set-cookie") || "",
+          retryAfter: response.headers.get("retry-after") || "",
           retryAfterMs: retryAfterMs(response.headers),
           contentEncoding: upstreamEncoding,
           contentLength,
@@ -1578,7 +1607,7 @@ async function fetchBuffer(url, opts = {}) {
         const retryableError = isRetryableNetworkError(e) && attempt < (opts.retries ?? CFG.maxRetries);
         if (!retryableError) break;
         retriesUsed += 1;
-        await sleep(backoffMs(attempt));
+        await wait(backoffMs(attempt), undefined, { signal: upstreamSignal });
       } finally {
         clearTimeout(timer);
         upstreamSignal?.removeEventListener("abort", onAbort);
@@ -1872,6 +1901,7 @@ async function fetchCached(url, opts = {}) {
   checkLive();
   const headers = new Headers(opts.headers || {});
   const safeRequest = method === "GET" && !opts.noCache
+    && !opts.beforeRedirect
     && !opts.private && cacheSafeUrl(normalized) && !hasCredentialRequestHeaders(headers)
     && !headers.has("range") && !(sid && (cookieHeader(sid, normalized) || vpnManager.requiresVpnForSession(sid)));
   const sessionCache = safeRequest && CFG.sessionCacheEnabled && canCacheSession(rec);
@@ -2064,51 +2094,84 @@ function parseRobots(text) {
     const value = line.slice(idx + 1).trim();
     if (key === "user-agent") {
       const agent = value.toLowerCase();
+      if (!/^(?:\*|[a-z_-]+)$/.test(agent)) continue;
       if (!current || current.closed) { current = { agents: [], allow: [], disallow: [], crawlDelayMs: 0, sitemaps: [], closed: false }; groups.push(current); }
       current.agents.push(agent);
-    } else if (current) {
+    } else if (current && ["allow", "disallow", "crawl-delay", "sitemap"].includes(key)) {
       if (key === "allow" && value) current.allow.push(value);
       else if (key === "disallow" && value) current.disallow.push(value);
       else if (key === "crawl-delay" && Number.isFinite(Number(value))) current.crawlDelayMs = Math.min(60000, Math.max(0, Number(value) * 1000));
       else if (key === "sitemap" && value) current.sitemaps.push(value);
+      if (key !== "sitemap") current.closed = true;
     }
-    if (key !== "user-agent") current.closed = true;
   }
   return groups;
 }
 function robotsMatchGroup(groups) {
-  const agent = CFG.userAgent.toLowerCase();
-  const exact = groups.filter(g => g.agents.some(a => a !== "*" && agent.includes(a))).sort((a,b) => b.agents.join("").length - a.agents.join("").length);
-  if (exact.length) return exact[0];
-  return groups.find(g => g.agents.includes("*")) || null;
+  const agent = CFG.userAgent.toLowerCase().split(/[\s/]/, 1)[0];
+  const ranked = groups.map(group => ({ group, specificity: group.agents.reduce((max, token) =>
+    token !== "*" && agent.includes(token) ? Math.max(max, token.length) : max, 0) }));
+  const best = ranked.reduce((max, item) => Math.max(max, item.specificity), 0);
+  const matches = ranked.filter(item => best ? item.specificity === best : item.group.agents.includes("*")).map(item => item.group);
+  if (!matches.length) return null;
+  return { allow: matches.flatMap(g => g.allow), disallow: matches.flatMap(g => g.disallow),
+    crawlDelayMs: matches.reduce((max, g) => Math.max(max, g.crawlDelayMs), 0) };
+}
+function normalizedRobotsPath(value) {
+  return String(value).replace(/%[0-9a-f]{2}/gi, part => {
+    const char = String.fromCharCode(parseInt(part.slice(1), 16));
+    return /^[a-z0-9._~-]$/i.test(char) ? char : part.toUpperCase();
+  }).replace(/[^\x00-\x7f]/gu, char => encodeURIComponent(char));
 }
 function pathMatchesRule(pathname, rule) {
   if (!rule) return false;
-  const escaped = String(rule).replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
-  try { return new RegExp(`^${escaped}`).test(pathname); } catch { return false; }
+  const end = rule.endsWith("$");
+  const parts = (end ? rule.slice(0, -1) : rule).split("*");
+  if (parts.length === 1) return end ? pathname === parts[0] : pathname.startsWith(parts[0]);
+  const prefix = parts.shift();
+  if (!pathname.startsWith(prefix)) return false;
+  const suffix = end ? parts.pop() : "";
+  if (!pathname.endsWith(suffix)) return false;
+  const boundary = pathname.length - suffix.length;
+  let offset = prefix.length;
+  for (const part of parts) {
+    if (!part) continue;
+    const found = pathname.indexOf(part, offset);
+    if (found < 0 || found + part.length > boundary) return false;
+    offset = found + part.length;
+  }
+  return offset <= boundary;
 }
 function robotsAllowed(url, robots) {
   if (!robots) return true;
+  if (robots.unreachable) return false;
   try {
     const group = robots.group;
     if (!group) return true;
     const u = new URL(url);
-    const target = `${u.pathname}${u.search}` || "/";
-    const disallow = group.disallow.filter(Boolean).map(x => ({ rule: x, len: x.length })).sort((a,b) => b.len - a.len);
-    const allow = group.allow.filter(Boolean).map(x => ({ rule: x, len: x.length })).sort((a,b) => b.len - a.len);
-    const d = disallow.find(x => pathMatchesRule(target, x.rule));
-    const a = allow.find(x => pathMatchesRule(target, x.rule));
-    if (a && (!d || a.len >= d.len)) return true;
-    return !d;
-  } catch { return true; }
+    const target = normalizedRobotsPath(`${u.pathname}${u.search}` || "/");
+    const best = rules => rules.reduce((max, value) => {
+      const rule = normalizedRobotsPath(value);
+      return rule.length > max && pathMatchesRule(target, rule) ? rule.length : max;
+    }, 0);
+    return best(group.allow) >= best(group.disallow);
+  } catch { return false; }
 }
 
-async function loadRobots(job) {
+async function readRobots(job, origin) {
   try {
-    const robotsUrl = new URL("/robots.txt", job.root).href;
-    const r = await fetchCached(robotsUrl, { timeout: CFG.robotsTimeoutMs, limit: 512 * 1024, accept: "text/plain,*/*;q=0.1" });
-    if (r.status >= 400) throw new Error(`HTTP ${r.status}`);
+    const robotsUrl = new URL("/robots.txt", origin).href;
+    const r = await fetchCached(robotsUrl, { timeout: CFG.robotsTimeoutMs, limit: 512 * 1024, maxRedirects: 5,
+      accept: "text/plain,*/*;q=0.1", retries: 0, signal: job.controller.signal });
+    if (r.status >= 500 || [401, 403, 429].includes(r.status) || r.tooLarge || r.truncated) {
+      throw new Error(`HTTP ${r.status} or unreadable robots response`);
+    }
+    if (r.status >= 400 && r.status < 500) return { groups: [], group: null, sitemaps: [] };
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const text = r.body.toString("utf8");
+    if (detectChallenge(text, r.contentType, r.status, { server: r.serverHeader, "cf-mitigated": r.cfMitigated })) {
+      throw new Error("robots.txt requires site verification");
+    }
     const groups = parseRobots(text);
     const group = robotsMatchGroup(groups);
     const sitemaps = [];
@@ -2116,16 +2179,43 @@ async function loadRobots(job) {
       const u = normalizeUrl(line[1], robotsUrl); if (u) sitemaps.push(u);
     }
     for (const g of groups) for (const sm of (g.sitemaps || [])) { const u = normalizeUrl(sm, robotsUrl); if (u) sitemaps.push(u); }
-    job.robots = { groups, group, sitemaps: [...new Set(sitemaps)] };
-    job.robotsReady = true;
-    if (group?.crawlDelayMs) job.hostDelayMs = Math.max(job.hostDelayMs, group.crawlDelayMs);
-    for (const sm of job.robots.sitemaps) job.sitemaps.add(sm);
-    jobLog(job, "debug", "robots.txt processed", { crawlDelayMs: job.hostDelayMs });
+    jobLog(job, "debug", "robots.txt processed", { origin, crawlDelayMs: group?.crawlDelayMs || 0 });
+    return { groups, group, sitemaps: [...new Set(sitemaps)] };
   } catch (e) {
-    job.robots = { groups: [], group: null, sitemaps: [] };
-    job.robotsReady = true;
-    jobLog(job, "debug", `robots.txt unavailable: ${e.message}`);
+    if (!job.controller.signal.aborted) jobLog(job, "debug", `robots.txt unreachable on ${origin}: ${e.message}; deferring requests`);
+    return { unreachable: true, groups: [], group: null, sitemaps: [] };
   }
+}
+async function crawlRobots(job, url) {
+  const origin = new URL(url).origin;
+  if (!job.robotsByOrigin.has(origin)) {
+    if (job.robotsByOrigin.size >= Math.max(2, CFG.maxCrossOriginResources + 2)) return { unreachable: true };
+    job.robotsByOrigin.set(origin, readRobots(job, origin));
+  }
+  return job.robotsByOrigin.get(origin);
+}
+async function assertCrawlAllowed(job, url, pageFrom = "") {
+  const signal = job.controller.signal;
+  signal.throwIfAborted();
+  if (pageFrom && !crawlOriginAllowed(job, url) && !sameRedirectHost(url, pageFrom)) {
+    throw Object.assign(new Error("Page redirect left the crawl scope."), { code: "CRAWL_POLICY" });
+  }
+  const policy = await crawlRobots(job, url);
+  signal.throwIfAborted();
+  if (!robotsAllowed(url, policy)) throw Object.assign(new Error("Crawl deferred by robots.txt policy."), { code: "CRAWL_POLICY" });
+  const spacing = policy.group?.crawlDelayMs || 0;
+  if (spacing) {
+    const origin = new URL(url).origin;
+    const start = Math.max(Date.now(), job.hostLastRequested.get(origin) || 0);
+    job.hostLastRequested.set(origin, start + spacing);
+    const remaining = start - Date.now();
+    if (remaining > 0) await wait(remaining, undefined, { signal });
+  }
+}
+async function loadRobots(job) {
+  job.robots = await crawlRobots(job, job.root);
+  job.robotsReady = true;
+  for (const sitemap of job.robots.sitemaps) if (crawlOriginAllowed(job, sitemap)) job.sitemaps.add(sitemap);
 }
 async function loadSitemaps(job) {
   const pending = [...new Set([
@@ -2137,10 +2227,12 @@ async function loadSitemaps(job) {
   const pendingSet = new Set(pending);
   let files = 0, urls = 0;
   async function processSitemap(sm) {
-    if (seen.has(sm) || files >= CFG.maxSitemapFiles || urls >= CFG.maxSitemapUrls || job.stopRequested) return;
+    if (seen.has(sm) || files >= CFG.maxSitemapFiles || urls >= CFG.maxSitemapUrls || job.stopRequested || !crawlOriginAllowed(job, sm)) return;
     seen.add(sm); files += 1;
     try {
-      const r = await fetchCached(sm, { timeout: CFG.sitemapTimeoutMs, limit: 8 * 1024 * 1024, accept: "application/xml,text/xml,text/plain,*/*;q=0.1" });
+      await assertCrawlAllowed(job, sm, sm);
+      const r = await fetchCached(sm, { timeout: CFG.sitemapTimeoutMs, limit: 8 * 1024 * 1024, accept: "application/xml,text/xml,text/plain,*/*;q=0.1",
+        signal: job.controller.signal, beforeRedirect: url => assertCrawlAllowed(job, url, sm) });
       if (r.status >= 400 || r.tooLarge) throw new Error(`HTTP ${r.status}`);
       const xml = r.body.toString("utf8");
       for (const match of xml.matchAll(/<loc>\s*([^<]+?)\s*<\/loc>/gi)) {
@@ -2149,7 +2241,7 @@ async function loadSitemaps(job) {
         if (crawlOriginAllowed(job, u)) { addLink(job, u, "html", sm, "sitemap"); urls += 1; }
         if (urls >= CFG.maxSitemapUrls) break;
       }
-    } catch (e) { jobLog(job, "debug", `Sitemap failed: ${sm} — ${e.message}`); }
+    } catch (e) { if (!job.controller.signal.aborted && e.code !== "CRAWL_POLICY") jobLog(job, "debug", `Sitemap failed: ${sm} — ${e.message}`); }
   }
   while (pending.length && files < CFG.maxSitemapFiles && urls < CFG.maxSitemapUrls && !job.stopRequested) {
     const batch = pending.splice(0, CFG.sitemapConcurrency);
@@ -3755,7 +3847,7 @@ function addLink(job, rawUrl, hint, source, reason = "discovered") {
     
     
     if (job.pageAccelerator && u !== job.root) return true;
-    if (job.pagesDiscovered >= CFG.maxPages || !robotsAllowed(u, job.robots)) return true;
+    if (job.pagesDiscovered >= CFG.maxPages || (sameOrigin(u, job.root) && !robotsAllowed(u, job.robots))) return true;
     job.pagesDiscovered += 1;
     job.pageFrontier.add({ url: u, type, source: source || null, reason, priority }, priority, key);
     return true;
@@ -4053,15 +4145,16 @@ function createJob(root, options = {}) {
   return {
     id, root, url: root, createdAt: now(), pageAccelerator, pageAcceleratorWarmMs: pageWarmMs, pageAcceleratorHardMs: pageHardMs, warmDeadlineAt: pageAccelerator ? Date.now() + pageWarmMs : 0, pageAcceleratorHardDeadlineAt: pageAccelerator ? Date.now() + pageHardMs : 0, fastPhaseComplete: false, finishedAt: null, done: false, stopRequested: false, status: "queued", statusText: "Queued",
     pageFrontier: new PriorityFrontier(CFG.maxPendingQueue), resourceFrontier: new PriorityFrontier(CFG.maxPendingQueue), criticalResourceFrontier: new PriorityFrontier(Math.min(CFG.maxPendingQueue, CFG.criticalResourceBudget * 4)), visited: new Set(), discovered: new Set(), retryCounts: new Map(),
-    resources: [], links: [], logs: [], logSeq: 0, sourceDir: path.join(ROOT, id), sourceFiles: 0, textBytesStored: 0,
+    resources: [], links: [], logs: [], logSeq: 0, sourceDir: path.join(ROOT, id), sourceFiles: 0, textBytesStored: 0, pendingSourceFiles: 0, pendingSourceBytes: 0,
     activeWorkers: 0, activeHtmlWorkers: 0, activeAssetWorkers: 0, processed: 0, pagesDiscovered: 0, resourcesScheduled: 0, crossOriginResources: 0, sitemapLoading: false, browserDiscoveredCount: 0, browserDiscoveredHosts: new Set(),
     crawlOrigins: new Set([new URL(root).origin]),
     hostPolicy: new Map(),
-    robots: null, robotsReady: false, sitemaps: new Set(), challengeHosts: new Set(), hostActive: new Map(), hostCooldowns: new Map(), hostLastRequested: new Map(), hostFailures: new Map(), hostDelayMs: 0, stopReason: null, backgroundPaused: false,
+    robots: null, robotsByOrigin: new Map(), robotsReady: false, sitemaps: new Set(), challengeHosts: new Set(), hostActive: new Map(), hostCooldowns: new Map(), hostLastRequested: new Map(), hostFailures: new Map(), stopReason: null, backgroundPaused: false,
     counts: { htmlPages: 0, renderedHtmlPages: 0, css: 0, js: 0, data: 0, assets: 0, links: 0, bytesScanned: 0, bytesStored: 0, bytesDiscarded: 0, requestCount: 0, retries: 0, challenges: 0, errors: 0 },
     controller: new AbortController(),
     dnsCache: new Map(),
     robotPool: null,
+    finalRobotReport: null,
     robotEvents: []
   };
 }
@@ -4078,7 +4171,7 @@ function publicJob(job) {
     searchIndex: searchIndexStats(),
     robotsLoaded: job.robotsReady, sitemapsFound: job.sitemaps.size, sourceFiles: job.sourceFiles, textBytesStored: job.textBytesStored,
     resourceCount: job.resources.length, linkCount: job.links.length, browserDiscovered: job.browserDiscoveredCount || 0, browserDiscoveredHosts: job.browserDiscoveredHosts?.size || 0, criticalQueue: job.criticalResourceFrontier.size, logs: job.logs.slice(-120),
-    robotMesh: job.robotPool ? { summary: job.robotPool.report(1).summary } : null,
+    robotMesh: job.robotPool || job.finalRobotReport ? { summary: job.robotPool?.report(1).summary || job.finalRobotReport.summary } : null,
     queue: { critical: job.criticalResourceFrontier.snapshot().slice(0, 50), pages: job.pageFrontier.snapshot().slice(0, 50), resources: job.resourceFrontier.snapshot().slice(0, 50) }
   };
 }
@@ -4127,6 +4220,8 @@ async function fetchResourceProbe(item, opts) {
   const headOpts = { ...opts, method: "HEAD", body: undefined, retries: Math.min(1, opts.retries ?? 0) };
   const head = await fetchCached(item.url, headOpts);
   if (head.status >= 200 && head.status < 400 && (head.contentType || head.contentLength)) return head;
+  if (head.status === 429 || head.status >= 500) return head;
+  await opts.beforeProbe?.(item.url);
   const rangeOpts = { ...opts, method: "GET", range: "bytes=0-65535", limit: 64 * 1024, limitForContentType: () => 64 * 1024, retries: Math.min(1, opts.retries ?? 0) };
   return fetchCached(item.url, rangeOpts);
 }
@@ -4165,19 +4260,19 @@ async function processItem(job, item) {
   if (job.stopRequested) return;
   const key = linkKey(item.type, item.url); if (job.visited.has(key)) return;
   job.visited.add(key);
-  if (item.type === "html" && (!crawlOriginAllowed(job, item.url) || !robotsAllowed(item.url, job.robots))) return;
+  if (item.type === "html" && !crawlOriginAllowed(job, item.url)) return;
   if (job.counts.bytesScanned >= CFG.maxScanBytes) { job.stopRequested = true; job.stopReason = "scan-byte-limit"; return; }
   const host = hostOf(item.url);
   if (job.challengeHosts.has(host)) return;
-  const previousCooldown = job.hostCooldowns.get(host) || 0;
-  if (previousCooldown > Date.now()) await sleep(previousCooldown - Date.now());
-  const last = job.hostLastRequested.get(host) || 0;
-  if (job.hostDelayMs && last + job.hostDelayMs > Date.now()) await sleep(last + job.hostDelayMs - Date.now());
-  job.hostLastRequested.set(host, Date.now());
   const accept = item.type === "html" ? "text/html,application/xhtml+xml,application/xml,text/plain;q=0.4,*/*;q=0.05" : "text/css,application/javascript,text/javascript,application/json,image/avif,image/webp,image/apng,image/svg+xml,image/*,font/*,video/*,audio/*,*/*;q=0.05";
   try {
+    const checkPolicy = url => assertCrawlAllowed(job, url, item.type === "html" ? item.url : "");
+    const remainingCooldown = (job.hostCooldowns.get(host) || 0) - Date.now();
+    if (remainingCooldown > 0) await wait(remainingCooldown, undefined, { signal: job.controller.signal });
+    await checkPolicy(item.url);
     job.counts.requestCount += 1;
-    const r = await fetchResourceProbe(item, { accept, limit: CFG.maxTextBytesPerResource, limitForContentType: crawlLimitForContentType, timeout: job.pageAccelerator ? Math.min(CFG.requestTimeoutMs, LEAN_MODE ? 3500 : 8000) : CFG.requestTimeoutMs, retries: job.pageAccelerator ? Math.min(1, CFG.maxRetries) : CFG.maxRetries, referrer: item.source || "", dnsCache: job.dnsCache, signal: job.controller.signal, bodyTimeoutMs: job.pageAccelerator ? Math.min(CFG.bodyTimeoutMs, LEAN_MODE ? 4000 : 8000) : CFG.bodyTimeoutMs });
+    const r = await fetchResourceProbe(item, { accept, limit: CFG.maxTextBytesPerResource, limitForContentType: crawlLimitForContentType, timeout: job.pageAccelerator ? Math.min(CFG.requestTimeoutMs, LEAN_MODE ? 3500 : 8000) : CFG.requestTimeoutMs, retries: job.pageAccelerator ? Math.min(1, CFG.maxRetries) : CFG.maxRetries, referrer: item.source || "", dnsCache: job.dnsCache, signal: job.controller.signal, beforeRedirect: checkPolicy, beforeProbe: checkPolicy, bodyTimeoutMs: job.pageAccelerator ? Math.min(CFG.bodyTimeoutMs, LEAN_MODE ? 4000 : 8000) : CFG.bodyTimeoutMs });
+    if (job.controller.signal.aborted) return;
     job.counts.bytesScanned += r.bytes;
     if (r.retries) job.counts.retries += r.retries;
     if (r.truncated || r.tooLarge) { job.counts.bytesDiscarded += r.bytes; jobLog(job, "warn", `Response skipped after size limit: ${item.url}`); return; }
@@ -4190,14 +4285,13 @@ async function processItem(job, item) {
     if (challenge) {
       job.counts.challenges += 1;
       job.challengeHosts.add(host);
-      job.status = "challenge";
-      if (item.url === job.root) job.stopRequested = true;
+      if (item.url === job.root) { job.status = "challenge"; job.stopRequested = true; }
       jobLog(job, "warn", `Security verification detected; crawl branch stopped: ${item.url}`);
       return;
     }
     if (!r.ok) {
-      job.counts.errors += 1;
       if ([400,401,403,404,405,410,422].includes(r.status)) {
+        job.counts.errors += 1;
         const resourceLike = item.type !== "html";
         jobLog(job, resourceLike ? "debug" : "warn", resourceLike ? `HTTP ${r.status}; resource unavailable: ${item.url}` : `HTTP ${r.status}; page not indexed: ${item.url}`, { type: item.type, source: item.source || null });
         return;
@@ -4218,13 +4312,23 @@ async function processItem(job, item) {
     const isTextType = type === "html" || type === "css" || type === "js" || type === "data";
     const text = isTextType ? r.body.toString("utf8") : "";
     const id = job.resources.length;
-    const sourceFile = isTextType ? await sourceStore.write(job, id, text) : null;
     const resource = {
       id, url: r.finalUrl || item.url, requestedUrl: item.url, type, status: r.status, contentType: r.contentType,
-      bytes: r.bytes, bytesLabel: bytesLabel(r.bytes), truncated: r.truncated, sourceFile, inlinePreview: sourceFile ? "" : (isTextType ? text.slice(0, 8000) : ""), sourceId: item.source || null,
+      bytes: r.bytes, bytesLabel: bytesLabel(r.bytes), truncated: r.truncated, sourceFile: null, inlinePreview: isTextType ? text.slice(0, 8000) : "", sourceId: item.source || null,
       redirectChain: r.redirectChain || [], revalidated: !!r.revalidated
     };
+    // Reserve the array index synchronously. Reads of a published row wait only for its own write.
     job.resources.push(resource);
+    if (isTextType) {
+      resource.sourcePending = sourceStore.write(job, id, text).then(file => {
+        resource.sourceFile = file;
+        if (file) resource.inlinePreview = "";
+      }).catch(error => {
+        jobLog(job, "warn", `Could not store crawl source ${id}: ${error.code || error.message}`);
+      });
+      await resource.sourcePending;
+      delete resource.sourcePending;
+    }
     const link = job.links.find(x => x.url === item.url || x.url === resource.url); if (link) { link.captured = true; link.redirectChain = resource.redirectChain; link.url = resource.url; }
     job.hostFailures.set(host, 0); job.hostCooldowns.delete(host); noteHostSuccess(job, host);
     if (type === "html") {
@@ -4268,6 +4372,7 @@ async function processItem(job, item) {
     }
     if (job.processed && job.processed % 100 === 0) jobLog(job, "debug", `Processed ${job.processed.toLocaleString()} resources; ${bytesLabel(job.counts.bytesScanned)} scanned.`);
   } catch (e) {
+    if (job.controller.signal.aborted || e.code === "OPERATION_CANCELLED" || e.code === "CRAWL_POLICY") return;
     job.counts.errors += 1;
     const failures = (job.hostFailures.get(host) || 0) + 1;
     job.hostFailures.set(host, failures);
@@ -4746,18 +4851,18 @@ async function runCrawl(job) {
   job.robotFleet = CFG.logicalRobots;
   job.networkSlots = CFG.maxActiveFetches;
   job.robotPool = new CooperativeRobotPool(job);
+  let sitemapPass;
   try {
     await loadRobots(job);
-    if (!job.stopRequested && !job.pageAccelerator) {
+    if (!job.stopRequested && !job.pageAccelerator && !job.robots.unreachable) {
       job.sitemapLoading = true;
-      void loadSitemaps(job).catch(e => jobLog(job, "debug", `Sitemap pass failed: ${e.message}`)).finally(() => { job.sitemapLoading = false; });
+      sitemapPass = loadSitemaps(job).catch(e => jobLog(job, "debug", `Sitemap pass failed: ${e.message}`)).finally(() => { job.sitemapLoading = false; });
     }
     job.status = "crawling";
     job.statusText = job.pageAccelerator
       ? `Fast page warm-up with ${effectiveCrawlerConcurrency(job)} network workers…`
       : `Exhaustive same-origin crawl with ${CFG.logicalRobots.toLocaleString()} cooperative robots…`;
     await job.robotPool.run();
-    job.done = true; job.finishedAt = now();
     if (job.status === "challenge") job.statusText = "Security verification required; crawl stopped.";
     else if (job.stopRequested && job.stopReason === "scan-byte-limit") { job.status = "done"; job.statusText = `Scan budget reached (${bytesLabel(CFG.maxScanBytes)}).`; }
     else if (job.stopRequested && job.stopReason === "resource-limit") { job.status = "done"; job.statusText = `Resource safety limit reached (${CFG.maxResources.toLocaleString()}).`; }
@@ -4766,11 +4871,20 @@ async function runCrawl(job) {
     else if (job.stopRequested && job.stopReason === "abandoned") { job.status = "stopped"; job.statusText = "Stopped automatically — nobody has checked this crawl for a while (CRAWL_ABANDON_MS)."; }
     else if (job.stopRequested && job.stopReason === "shutdown") { job.status = "stopped"; job.statusText = "Stopped — server is shutting down."; }
     else if (job.stopRequested) { job.status = "stopped"; job.statusText = "Stopped by user."; }
+    else if (job.robots.unreachable) { job.status = "deferred"; job.statusText = "Crawl deferred: robots.txt was unreachable."; }
     else { job.status = "done"; job.statusText = `Complete — ${job.processed.toLocaleString()} resources scanned.`; }
-    jobLog(job, job.status === "done" ? "info" : "warn", job.statusText, { robots: job.robotPool.report(12).summary });
-    void mongoStore.saveCrawlSummary(job);
   } catch (e) {
-    job.done = true; job.finishedAt = now(); job.status = "error"; job.statusText = e.message || "Crawler error"; jobLog(job, "error", e.stack || e.message);
+    job.stopRequested = true;
+    job.status = "error"; job.statusText = e.message || "Crawler error"; jobLog(job, "error", e.stack || e.message);
+  } finally {
+    if (job.stopRequested) job.controller.abort();
+    if (sitemapPass) await sitemapPass;
+    if (job.robotPool.activePromises.size) await Promise.allSettled([...job.robotPool.activePromises]);
+    job.finalRobotReport = job.robotPool.report(100);
+    job.robotPool = null;
+    job.robotsByOrigin.clear();
+    job.done = true; job.finishedAt = now();
+    jobLog(job, job.status === "done" ? "info" : "warn", job.statusText, { robots: job.finalRobotReport.summary });
     void mongoStore.saveCrawlSummary(job);
   }
 }
@@ -6897,6 +7011,9 @@ async function streamOversizeResponse(req, res, result, ctx) {
   if (result.contentLength) res.setHeader("content-length", result.contentLength);
   if (result.etag) res.setHeader("ETag", result.etag);
   if (result.lastModified) res.setHeader("Last-Modified", result.lastModified);
+  const retryAfter = proxyRetryAfter(result);
+  if (retryAfter) res.setHeader("Retry-After", retryAfter);
+  if (result.allow) res.setHeader("Allow", result.allow);
   res.setHeader("X-Veyra-Canonical-URL", result.finalUrl || ctx.canonical);
   res.setHeader("X-Veyra-Session-ID", ctx.sid);
   res.setHeader("X-Veyra-Content-Type", type);
@@ -6980,7 +7097,7 @@ async function maybeCompressProxyPayload(req, payload, contentType) {
   }
   return null;
 }
-async function proxyRequest(req, res, mode) {
+async function proxyRequest(req, res, mode, options = {}) {
   const sid = normalizeSessionId(req.query.sid);
   req.veyraPrivateTraffic = !canCacheSession(sessionManager.peek(sid));
   res.setHeader("Cache-Control", "no-store");
@@ -6989,7 +7106,7 @@ async function proxyRequest(req, res, mode) {
   // Keep their encoded query and order (e.g. signed media playlist URLs).
   const preserveQuery = mode === "resource";
   const canonical = mergeStrayProxyParams(req, firstValidUrl([req.query.url, req.query.target, req.query.u], req.get('Origin') || undefined, { preserveQuery })) || proxyRefererCanonical(req);
-  const download = String(req.query.download || "") === "1";
+  const download = options.download === true || String(req.query.download || "") === "1";
   if (!canonical) return respondError(res, 400, "Missing or invalid public HTTP(S) URL.", "INVALID_URL");
   await assertPublicUrl(canonical);
   const accept = proxyAcceptForResource(req, mode);
@@ -7131,6 +7248,9 @@ async function proxyRequest(req, res, mode) {
   if (result.stream) result.stream.cancel();
   if (result.tooLarge || (download && result.bytes > CFG.maxDownloadBytes)) return respondError(res, 413, "The upstream response exceeds Veyra's safety limit.", "RESPONSE_TOO_LARGE");
   const responseCacheControl = String(result.cacheControl || "").toLowerCase();
+  const retryAfter = proxyRetryAfter(result);
+  if (retryAfter) res.setHeader("Retry-After", retryAfter);
+  if (result.allow) res.setHeader("Allow", result.allow);
   const responseVary = String(result.vary || "").toLowerCase();
   const requestHasAuth = !!req.get("Authorization");
   const privateResponse = /(?:^|[\s,])(?:private|no-store)(?:[=\s,]|$)/i.test(responseCacheControl) || /(?:^|[\s,])cookie(?:[\s,]|$)/i.test(responseVary);
@@ -7318,7 +7438,7 @@ app.get("/api/resource", async (req, res) => { try { await proxyRequest(req, res
   const code = /^UPSTREAM_[A-Z0-9_]+$/.test(String(e.code || "")) ? e.code : "PROXY_RESOURCE_ERROR";
   respondError(res, e.code === "VPN_KILL_SWITCH" ? 503 : 502, `Veyra resource error: ${e.upstreamMessage || e.message}`, code, { requestId: req.veyraRequestId, upstreamCode, upstreamPhase: e.upstreamPhase || null, targetHost: e.upstreamHost || hostOf(req.query?.url || "") });
 } });
-app.get("/api/download", async (req, res) => { try { req.query.download = "1"; await proxyRequest(req, res, "resource"); } catch (e) { respondError(res, 502, `Veyra download error: ${e.message}`, "DOWNLOAD_ERROR", { requestId: req.veyraRequestId }); } });
+app.get("/api/download", async (req, res) => { try { await proxyRequest(req, res, "resource", { download: true }); } catch (e) { if (!res.headersSent) respondError(res, 502, `Veyra download error: ${e.message}`, "DOWNLOAD_ERROR", { requestId: req.veyraRequestId }); } });
 app.post("/api/resource", async (req, res) => { try { await proxyRequest(req, res, "resource"); } catch (e) { respondError(res, 502, `Veyra resource request failed: ${e.message}`, "PROXY_RESOURCE_POST_ERROR", { requestId: req.veyraRequestId }); } });
 for (const method of ["put","patch","delete","head"]) app[method]("/api/resource", async (req,res)=>{ try { await proxyRequest(req,res,"resource"); } catch(e) { respondError(res,502,`Veyra resource ${method.toUpperCase()} request failed: ${e.message}`,"PROXY_RESOURCE_METHOD_ERROR",{requestId:req.veyraRequestId}); } });
 app.options(["/api/view", "/api/resource"], async (req, res) => {
@@ -7341,6 +7461,11 @@ function shouldStartCrawlerForEngineMode(mode) {
   return mode === "auto" || mode === "crawler" || mode === "exhaustive" || mode === "combined";
 }
 
+function openJobResponse(job, engineMode) {
+  const state = job.started ? "running" : "queued";
+  return { jobId: job.id, url: job.root, viewUrl: makeViewUrl(job.root), state, scheduler: state,
+    queuePosition: job.queuePosition || 0, engineMode, crawlerEnabled: true };
+}
 app.post("/api/open", async (req, res) => {
   try {
     const root = normalizeUrl(String(req.body?.url || "")); if (!root) return respondError(res, 400, "Please provide a valid public HTTP(S) URL.", "INVALID_URL");
@@ -7354,11 +7479,8 @@ app.post("/api/open", async (req, res) => {
     await assertPublicUrl(root);
     const crawlerEnabled = shouldStartCrawlerForEngineMode(engineMode);
     const oldId = activeByRoot.get(root); const old = oldId && jobs.get(oldId);
-    const wantsPageAccelerator = engineMode !== "exhaustive";
-    
-    
-    
-    if (crawlerEnabled && old && !old.done && !old.stopRequested && (!CFG.crawlerPageAccelerator || old.pageAccelerator)) return res.status(202).json({ jobId: old.id, url: root, viewUrl: makeViewUrl(root), engineMode, crawlerEnabled: true });
+    const pageAccelerator = engineMode !== "exhaustive" && CFG.crawlerPageAccelerator;
+    if (crawlerEnabled && old && !old.done && !old.stopRequested && old.pageAccelerator === pageAccelerator) return res.status(202).json(openJobResponse(old, engineMode));
     if (crawlerEnabled && !old && mongoStore.enabled && engineMode !== "exhaustive") {
       const cached = await mongoStore.getLatestCrawlSummary(root);
       if (cached) return res.status(200).json({ ok: true, jobId: null, url: root, viewUrl: makeViewUrl(root), state: "cached", cached: true, cachedAt: cached.finishedAt || cached.createdAt || null, counts: cached.counts || {}, engineMode, crawlerEnabled: true });
@@ -7367,20 +7489,39 @@ app.post("/api/open", async (req, res) => {
     if (!crawlerEnabled) return res.status(200).json({ ok: true, jobId: null, url: root, viewUrl: makeViewUrl(root), state: "disabled", engineMode, crawlerEnabled: false });
     
     
-    const fullSiteCrawl = engineMode === "exhaustive";
-    const job = createJob(root, { pageAccelerator: !fullSiteCrawl && CFG.crawlerPageAccelerator });
+    const job = createJob(root, { pageAccelerator });
     if (/^[A-Za-z0-9_-]{16,80}$/.test(openSid)) job.sessionId = openSid;
     let state;
     try { state = scheduleCrawl(job); } catch (e) { return respondError(res, 503, e.message, e.code || "CRAWLER_CAPACITY_BUSY", { maxActiveJobs: effectiveMaxActiveJobs(), queued: crawlQueue.length }); }
     jobs.set(job.id, job); activeByRoot.set(root, job.id);
     jobLog(job, "info", state === "running" ? "Background crawl started." : `Background crawl queued (position ${job.queuePosition}).`);
-    res.status(202).json({ jobId: job.id, url: root, viewUrl: makeViewUrl(root), state: "queued", scheduler: state, queuePosition: job.queuePosition || 0, engineMode, crawlerEnabled: true });
+    res.status(202).json(openJobResponse(job, engineMode));
   } catch (e) { respondError(res, 400, e.message, "OPEN_FAILED"); }
 });
 
 app.get("/api/crawl/:id", (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); res.json(publicJob(j)); });
-app.post("/api/crawl/:id/stop", (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); if (!j.started && !j.done) { dequeueCrawl(j); j.stopRequested = true; j.stopReason = "user"; j.done = true; j.finishedAt = now(); j.status = "stopped"; j.statusText = "Removed from queue."; return res.json(publicJob(j)); } j.stopRequested = true; j.stopReason = "user"; j.status = "stopping"; j.statusText = "Stopping…"; j.controller.abort(); jobLog(j, "warn", "Stop requested."); res.json({ ok: true }); });
-app.get("/api/crawl/:id/robots", requireAdmin, (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); if (!j.robotPool) return res.json({ summary: { logicalRobots: j.robotFleet || CFG.logicalRobots, activeRobots: 0, multitaskingRobots: 0, idleRobots: j.robotFleet || CFG.logicalRobots, queuedRobotTasks: 0, globalPageQueue: j.pageFrontier.size, globalResourceQueue: j.resourceFrontier.size, networkActive: fetchSemaphore.active, networkLimit: CFG.maxActiveFetches, helpRequests: 0, helpAccepted: 0, helpDeclined: 0, helpGiven: 0 }, robots: [], events: [] }); const limit = Math.min(100, Math.max(1, Number(req.query.limit || 48) || 48)); res.json(j.robotPool.report(limit)); });
+app.post("/api/crawl/:id/stop", (req, res) => {
+  const j = jobs.get(req.params.id);
+  if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND");
+  if (j.done || j.stopRequested) return res.json({ ok: true });
+  j.stopRequested = true;
+  j.stopReason = "user";
+  j.controller.abort();
+  if (!j.started) {
+    dequeueCrawl(j); j.done = true; j.finishedAt = now(); j.status = "stopped"; j.statusText = "Removed from queue.";
+    return res.json(publicJob(j));
+  }
+  j.status = "stopping"; j.statusText = "Stopping…"; jobLog(j, "warn", "Stop requested.");
+  res.json({ ok: true });
+});
+app.get("/api/crawl/:id/robots", requireAdmin, (req, res) => {
+  const j = jobs.get(req.params.id);
+  if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND");
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit || 48) || 48));
+  if (j.robotPool) return res.json(j.robotPool.report(limit));
+  if (j.finalRobotReport) return res.json({ ...j.finalRobotReport, robots: j.finalRobotReport.robots.slice(0, limit) });
+  res.json({ summary: { logicalRobots: j.robotFleet || CFG.logicalRobots, activeRobots: 0, multitaskingRobots: 0, idleRobots: j.robotFleet || CFG.logicalRobots, queuedRobotTasks: 0, globalPageQueue: j.pageFrontier.size, globalResourceQueue: j.resourceFrontier.size, networkActive: fetchSemaphore.active, networkLimit: CFG.maxActiveFetches, helpRequests: 0, helpAccepted: 0, helpDeclined: 0, helpGiven: 0 }, robots: [], events: [] });
+});
 app.get("/api/crawl/:id/resources", (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); res.json({ resources: j.resources.map(r => ({ id: r.id, url: r.url, requestedUrl: r.requestedUrl, type: r.type, status: r.status, contentType: r.contentType, bytes: r.bytes, bytesLabel: r.bytesLabel, truncated: r.truncated, sourceId: r.sourceId })) }); });
 app.get("/api/crawl/:id/source/:resourceId", async (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); const id = Number(req.params.resourceId); const r = j.resources[id]; if (!r) return respondError(res, 404, "Resource not found.", "RESOURCE_NOT_FOUND"); res.json({ id: r.id, url: r.url, type: r.type, source: await sourceStore.read(j, r) }); });
 app.get("/api/crawl/:id/links", (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); const offset = Math.max(0, Number(req.query.offset || 0) || 0); const limit = Math.min(10000, Math.max(1, Number(req.query.limit || 1000) || 1000)); res.json({ total: j.links.length, offset, limit, links: j.links.slice(offset, offset + limit) }); });
@@ -8303,6 +8444,14 @@ app.use((req, res, next) => {
 app.use((err, req, res, next) => {
   if (res.headersSent) return next(err);
   const isApi = req.path.startsWith("/api/") || req.path === "/health";
+  if (err.type === "entity.parse.failed" && err.status === 400) {
+    if (isApi) return respondError(res, 400, "Malformed request body.", "INVALID_REQUEST_BODY", { requestId: req.veyraRequestId });
+    return res.status(400).type("text/plain").send("Malformed request body.");
+  }
+  if (err.type === "entity.too.large" && err.status === 413) {
+    if (isApi) return respondError(res, 413, "Request body exceeds Veyra's size limit.", "REQUEST_BODY_TOO_LARGE", { requestId: req.veyraRequestId });
+    return res.status(413).type("text/plain").send("Request body too large.");
+  }
   serverLog("error", "HTTP", err.stack || err.message || String(err), { requestId: req.veyraRequestId });
   if (isApi) return respondError(res, 500, "Veyra encountered an internal server error.", "INTERNAL_ERROR", { requestId: req.veyraRequestId });
   res.status(500).type("text/plain").send("Veyra server error.");
