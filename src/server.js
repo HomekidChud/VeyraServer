@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const cheerio = require("cheerio");
+const { parse: parseModuleImports } = require("es-module-lexer");
 const crypto = require("crypto");
 const dns = require("dns").promises;
 const net = require("net");
@@ -2320,29 +2321,42 @@ function rewriteCssText(text, base, sid = "") {
     return u ? `${prefix}"${makeResourceUrl(u, base, sid)}"` : m;
   });
 }
+function rewriteModuleSpecifiers(source, base, sid) {
+  if (!/\b(?:import|export)\b/.test(source)) return source;
+  let imports, sourceOrigin;
+  try { [imports] = parseModuleImports(source); sourceOrigin = new URL(base).origin; } catch { return source; }
+  const chunks = [];
+  let cursor = 0;
+  for (const entry of imports) {
+    const { type, specifier } = entry;
+    // Bare import-map keys and computed dynamic imports are not URLs we can resolve here.
+    if (!specifier || !/^(?:https?:\/\/|\/|\.{1,2}\/)/i.test(specifier)) continue;
+    const target = resolveResource(specifier, base);
+    if (!target) continue;
+    const dynamic = type === "dynamic";
+    if (dynamic && entry.glob) continue;
+    const start = dynamic ? entry.start : entry.start - 1;
+    const end = dynamic ? entry.end : entry.end + 1;
+    const quote = source[start];
+    if (start < cursor || !["'", '"', "`"].includes(quote) || source[end - 1] !== quote) continue;
+    // Browsers key ESM instances by URL. Sibling importers on the same site
+    // must generate the same URL for shared modules (e.g. React singletons).
+    // Use an origin-only referrer without changing the session or target.
+    chunks.push(source.slice(cursor, start), JSON.stringify(makeResourceUrl(target, sourceOrigin, sid)));
+    cursor = end;
+  }
+  if (!cursor) return source;
+  chunks.push(source.slice(cursor));
+  return chunks.join("");
+}
 function rewriteJsText(text, base, sid = "") {
-  const patterns = [
-    
-    
-    
-    /(\bimport\s*\(\s*)(["'`])([^"'`$]+)\2(?=\s*[,)])/g,
-    /(\bimport\s+(?:[^'"`;()]*?\s+from\s+)?|\bexport\s+[^'"`;()]*?\s+from\s+)(["'])([^"']+)\2(?=\s*(?:;|$|\n|\r|assert\b|with\b))/gm
-  ];
-  let out = String(text || "");
-  
-  
+  let out = rewriteModuleSpecifiers(String(text || ""), base, sid);
   // Neutralise service-worker registration inside proxied JS. The replacement
   // must stay valid in *expression* position (e.g. `await navigator
   // .serviceWorker.register(...)` in MSN/casual-games bundles) — a bare
   // `x = fn;` statement there is a SyntaxError ("Invalid left-hand side in
   // assignment"), so wrap the reassignment in parens and call it instead.
   out = out.replace(/navigator\.serviceWorker\.register\s*\(/g, '(navigator.serviceWorker.register=function(){return Promise.reject(new Error("Service workers are not available in Veyra proxy mode."))})(');
-  for (const re of patterns) {
-    out = out.replace(re, (m, prefix, quote, spec) => {
-      const u = resolveResource(spec, base);
-      return u ? `${prefix}${quote}${makeResourceUrl(u, base, sid)}${quote}` : m;
-    });
-  }
   out = out.replace(/(["'`])(https?:\/\/[^"'`\s]+)\1/g, (m, quote, value) => {
     const u = resolveResource(value, base);
     try {
