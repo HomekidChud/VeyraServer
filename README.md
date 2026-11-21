@@ -12,7 +12,9 @@ Tests: `node tests/handoff.test.js`.
 
 ## Keep-alive
 
-Render's free tier spins the service down after 15 minutes without traffic, and its wake-up interstitial is unframeable — Veyra tabs then show `ERR_BLOCKED_BY_RESPONSE`. `.github/workflows/keepalive.yml` pings `/health` every 10 minutes to prevent spin-down, and the frontend warms the API (`ensureApiAwake`) before any iframe navigation as a fallback. If the error still appears, check the Render dashboard for a **suspended** service (out of free instance hours) — that is a billing state, not an idle one.
+Render can spin down idle services on its free tier. The keep-alive workflow schedules `/health` pings, but a ping is not a substitute for client recovery. The Browser probes `/api/health` when a recoverable connection error interrupts search or session creation, waits for a successful JSON response, then retries. A host-branded HTML page does not establish readiness. If the service is suspended, check its status in the Render dashboard.
+
+The API health routes return JSON and are not the Browser UI. Top-level visits to `/search?q=...` (or `/browse?q=...`) on the API host redirect to the configured `VEYRA_FRONTEND_URL`; search fetches stay on `/api/search/*`. When configuring `FRONTEND_ORIGIN` explicitly, include the web app origin and `https://localhost` for the bundled Android app.
 
 ## Acquisition defaults
 

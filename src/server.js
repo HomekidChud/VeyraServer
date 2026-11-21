@@ -5100,8 +5100,8 @@ const vpnErrStatus = code => ({ VPN_DISABLED: 503, VPN_NOT_CONFIGURED: 404, VPN_
 
 
 
-app.get('/health', (req, res) => res.json({ ok: true, uptime: Math.round(process.uptime()), plan: VEYRA_CONFIG.plan.label, time: new Date().toISOString() }));
-app.get('/api/health', (req, res) => res.json({ ok: true, uptime: Math.round(process.uptime()), plan: VEYRA_CONFIG.plan.label, time: new Date().toISOString() }));
+app.get(['/health', '/api/health'], (req, res) => res.set("Cache-Control", "no-store")
+  .json({ ok: true, uptime: Math.round(process.uptime()), plan: VEYRA_CONFIG.plan.label, time: new Date().toISOString() }));
 
 let vpnProfileHydration, vpnProfileRefreshAt = 0;
 function loadConfiguredVpnProfiles() {
@@ -8275,8 +8275,23 @@ app.use(async (req, res, next) => {
       { requestId: req.veyraRequestId, upstreamCode: e.upstreamCode || networkErrorCode(e) || null });
   }
 });
-
-
+// User-facing search links on the API hostname are not API endpoints.
+// Try proxy recovery first so an upstream site's own /search stays in its tab.
+app.get(["/search", "/browse"], (req, res, next) => {
+  const destination = String(req.get("Sec-Fetch-Dest") || "").toLowerCase();
+  if ((destination && destination !== "document") || !documentNavigation(req)) return next();
+  if (Object.hasOwn(req.query, "__veyra_url") || Object.hasOwn(req.query, "__veyra_sid") || proxiedPageFromReferer(req)) return next();
+  const q = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 600) : "";
+  if (/^\/browse\/?$/i.test(req.path) && !q) return next();
+  let target;
+  try { target = new URL(CFG.frontendUrl); } catch { return next(); }
+  if (!/^https?:$/.test(target.protocol) || target.origin === requestOrigin(req)) return next();
+  target.searchParams.set("veyra_route", "search");
+  if (q) target.searchParams.set("q", q);
+  if (["web", "index", ...SEARCH_VERTICALS].includes(req.query.type)) target.searchParams.set("type", req.query.type);
+  if (req.query.incognito === "1") target.searchParams.set("incognito", "1");
+  return res.set({ "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" }).redirect(302, target.href);
+});
 
 app.use((req, res, next) => {
   if (res.headersSent) return next();
