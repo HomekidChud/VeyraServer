@@ -4,6 +4,8 @@ const { normalizeSearchText, unicodeWords, braveLanguage } = require("./search-l
 const { india, indiaLanguage, indiaAffinity, inrPrice, isIndianProductUrl } = require("./search-region");
 
 const cheerio = require("cheerio");
+const WEB_FEED_STEP = 10;
+const WEB_FEED_INDEX_OFFSET = 100;
 
 function cleanText(s, max = 400) { return String(s || "").replace(/\s+/g, " ").trim().slice(0, max); }
 function safeHttpUrl(raw) {
@@ -210,15 +212,16 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       const r = await fetchText(u.href, { accept: "application/json", signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Google Custom Search API request failed"), { status: r.status, retryAfterMs: r.retryAfterMs });
       const json = JSON.parse(r.text); return { results: parseGoogleApi(json, shopping), total: json.searchInformation?.totalResults ?? null, more: !!json.queries?.nextPage?.length, stride: 10 };
     } },
-    brave: { available: () => !!braveKey, async run(q, { offset, lang, region, signal }) {
-      const u = new URL("https://api.search.brave.com/res/v1/web/search"); u.searchParams.set("q", q); u.searchParams.set("count", "20"); if (offset) u.searchParams.set("offset", String(Math.min(9, Math.floor(offset / 20)))); if (lang) u.searchParams.set("search_lang", lang);
+    brave: { available: () => !!braveKey, async run(q, { offset, lang, region, signal, feed }) {
+      const count = feed ? WEB_FEED_STEP : 20;
+      const u = new URL("https://api.search.brave.com/res/v1/web/search"); u.searchParams.set("q", q); u.searchParams.set("count", String(count)); if (offset) u.searchParams.set("offset", String(Math.min(9, Math.floor(offset / count)))); if (lang) u.searchParams.set("search_lang", lang);
       if (region) u.searchParams.set("country", region);
       const r = await fetchText(u.href, { accept: "application/json", headers: { "X-Subscription-Token": braveKey }, signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Brave Search API request failed"), { status: r.status, retryAfterMs: r.retryAfterMs }); const json = JSON.parse(r.text); return { results: parseBraveApi(json), total: null, more: !!json?.query?.more_results_available };
     } },
-    bing: { available: () => true, async run(q, { offset, lang, region, signal, limit }) {
+    bing: { available: () => true, async run(q, { offset, lang, region, signal, limit, feed }) {
       const u = new URL(bingKey ? "https://api.bing.microsoft.com/v7.0/search" : "https://www.bing.com/search"); u.searchParams.set("q", q);
       if (region) u.searchParams.set("cc", region);
-      const requestedLimit = Math.max(1, Math.min(100, Number(limit) || 30));
+      const requestedLimit = feed ? WEB_FEED_STEP : Math.max(1, Math.min(100, Number(limit) || 30));
       if (bingKey) { u.searchParams.set("count", String(requestedLimit)); u.searchParams.set("offset", String(offset || 0)); if (lang) u.searchParams.set("setLang", lang); }
       else {
         if (lang) u.searchParams.set("setlang", lang);
@@ -318,7 +321,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       return { name, results: [], ms, error: info.code, classification: info.classification };
     } finally { clearTimeout(timer); if (abortListener) controller.signal.removeEventListener("abort", abortListener); params.signal?.removeEventListener("abort", abortUpstream); }
   }
-  async function search(query, { offset = 0, engine = "", lang = "", signal, limit = 20, noCache = false, region = "", shopping = false } = {}) {
+  async function search(query, { offset = 0, engine = "", lang = "", signal, limit = 20, noCache = false, region = "", shopping = false, feed = false } = {}) {
     const requestStartedAt = Date.now(); let firstResultAt = null;
     const requestedLimit = Math.max(1, Math.min(50, Number(limit) || 20));
     const q = cleanText(query, 600); if (!q) return { provider: "none", results: [], attempts: [], responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: null };
@@ -328,7 +331,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
     shopping = Boolean(region && shopping);
     const regionalLanguage = region ? indiaLanguage(scope.text || q, lang) : "";
     const requested = [...new Set(engine && Object.hasOwn(providers, engine) ? [engine] : order.filter(name => Object.hasOwn(providers, name)))];
-    const key = JSON.stringify([requested, offset, region, shopping, requestedLimit, regionalLanguage || lang, q.toLowerCase()]);
+    const key = JSON.stringify([requested, offset, region, shopping, feed, requestedLimit, regionalLanguage || lang, q.toLowerCase()]);
     const hit = noCache ? null : cache.get(key);
     if (hit && Date.now() - hit.time < cacheTtlMs) return { ...hit.value, cached: true, responseTimeMs: Date.now() - requestStartedAt };
     const attempts = []; let eligible = [];
@@ -344,6 +347,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
         eligible.sort((a, b) => providerUtility(b) - providerUtility(a) || originalOrder.get(a) - originalOrder.get(b));
       }
     }
+    if (feed && offset) eligible = eligible.filter(name => ["google", "brave", "bing"].includes(name));
     const requestController = new AbortController();
     let callerCancelled = false, deadlineExpired = false, earlyCancelled = false;
     const observedResultKeys = new Set();
@@ -359,7 +363,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       while (cursor < eligible.length && !requestController.signal.aborted) {
         const index = cursor++, name = eligible[index];
         const providerLang = regionalLanguage ? (name === "brave" ? braveLanguage(regionalLanguage) : regionalLanguage.split("-")[0]) : lang;
-        const item = await runProvider(name, q, { offset, limit: requestedLimit, lang: providerLang, region, shopping, filterRows: scopedRows,
+        const item = await runProvider(name, q, { offset, limit: requestedLimit, lang: providerLang, region, shopping, feed, filterRows: scopedRows,
           signal: requestController.signal, isCancelled: () => callerCancelled, isDeadlineExpired: () => deadlineExpired,
           isEarlyCancel: () => earlyCancelled, onResults: at => { if (firstResultAt == null) firstResultAt = at; } });
         settled[index] = item;
@@ -385,12 +389,18 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
     }
     // Rank the merged provider results by token relevance to the query so the
     // most on-topic pages surface first instead of raw provider arrival order.
-    const results = rankResultsByRelevance(scope.active ? scope.text : q, [...merged.values()], region).slice(0, requestedLimit);
+    const ranked = rankResultsByRelevance(scope.active ? scope.text : q, [...merged.values()], region);
+    const results = (feed && scope.text && unicodeWords(scope.text).length ? ranked.filter(row => row.relevance > 0) : ranked).slice(0, requestedLimit);
     const source = successful.find(x => x.results.length)?.name || "none";
     const value = { provider: source, results, ranking: { method: "token-relevance" }, total: successful.reduce((n, x) => n + (x.total || x.results.length), 0) || null, more: successful.some(x => x.more), attempts, googleConfigured: configured("google"), braveConfigured: configured("brave"), bingConfigured: configured("bing"), providersUsed: successful.filter(x => x.results.length).map(x => x.name), cancelled: callerCancelled, earlyCancelled, deadlineExceeded: deadlineExpired, responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: firstResultAt == null ? null : firstResultAt - requestStartedAt, diagnostics: { providerCount: eligible.length, parallelism: Math.min(parallelism, eligible.length), overallDeadlineMs: requestBudgetMs, earlyCancelWindowMs, earlyResultThreshold, providers: Object.fromEntries(Object.keys(providers).map(name => [name, healthSummary(name)])), google: healthSummary("google") } };
     if (scope.active) {
       value.total = null;
       value.siteFilter = { include: scope.include, exclude: scope.exclude };
+    }
+    if (feed) {
+      value.more = results.length > 0 && value.more && offset + WEB_FEED_STEP < WEB_FEED_INDEX_OFFSET;
+      value.nextOffset = value.more ? offset + WEB_FEED_STEP : null;
+    } else if (scope.active) {
       const nextOffset = offset + Math.min(requestedLimit, ...successful.filter(item => item.more).map(item => item.stride));
       value.more = value.more && nextOffset < 60;
       if (value.more) value.nextOffset = nextOffset;
@@ -402,4 +412,4 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
   return { search, googleConfigured: () => configured("google"), order, providers: Object.keys(providers), diagnostics: () => ({ adaptiveOrdering: true, maxProviders, parallelism, overallDeadlineMs, providers: Object.fromEntries(Object.keys(providers).map(name => [name, healthSummary(name)])) }) };
 }
 
-module.exports = { createWebSearch, parseDuckDuckGoHtml, parseBingHtml, parseMojeekHtml, parseEcosiaHtml, parseStartpageHtml, parseYahooHtml, parseGoogleApi, parseBraveApi, parseBingApi, unwrapBing, unwrapDuckDuckGo, classifyGoogleResponse, canonicalKey, rankResultsByRelevance, scoreResultRelevance, diceSimilarity };
+module.exports = { createWebSearch, WEB_FEED_STEP, WEB_FEED_INDEX_OFFSET, parseDuckDuckGoHtml, parseBingHtml, parseMojeekHtml, parseEcosiaHtml, parseStartpageHtml, parseYahooHtml, parseGoogleApi, parseBraveApi, parseBingApi, unwrapBing, unwrapDuckDuckGo, classifyGoogleResponse, canonicalKey, rankResultsByRelevance, scoreResultRelevance, diceSimilarity };

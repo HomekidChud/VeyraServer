@@ -69,6 +69,33 @@ test("Web passes India market hints, prefers equally relevant Indian results and
   assert.equal(calls.length, 8);
 });
 
+test("Web feed uses provider-specific offsets without repeating first-page-only adapters", async () => {
+  const calls = [];
+  const service = createWebSearch({ env: {
+    WEB_SEARCH_ORDER: "brave,google,bing,duckduckgo",
+    BRAVE_SEARCH_API_KEY: "fixture", GOOGLE_SEARCH_API_KEY: "fixture", GOOGLE_SEARCH_CX: "fixture", BING_SEARCH_API_KEY: "fixture"
+  }, fetchText: async raw => {
+    const url = new URL(raw);
+    calls.push(url);
+    if (url.hostname === "api.search.brave.com") return response({ query: { more_results_available: true }, web: { results: [
+      { url: "https://example.in/railway", title: "Indian railway" },
+      { url: "https://example.in/other", title: "Apple orchard" }
+    ] } });
+    if (url.hostname === "www.googleapis.com") return response({ items: [] });
+    if (url.hostname === "api.bing.microsoft.com") return response({ webPages: { value: [] } });
+    assert.fail(`Non-paginated provider called: ${url.hostname}`);
+  } });
+  const result = await service.search("railway", { region: "IN", offset: 20, feed: true });
+  assert.deepEqual(result.results.map(row => row.title), ["Indian railway"]);
+  assert.equal(result.nextOffset, 30);
+  const params = Object.fromEntries(calls.map(url => [url.hostname, url.searchParams]));
+  assert.equal(params["api.search.brave.com"].get("count"), "10");
+  assert.equal(params["api.search.brave.com"].get("offset"), "2");
+  assert.equal(params["www.googleapis.com"].get("start"), "21");
+  assert.equal(params["api.bing.microsoft.com"].get("offset"), "20");
+  assert.equal((await service.search("railway", { offset: 90, feed: true })).nextOffset, null);
+});
+
 test("India applies to image mix, video and news requests without inventing research market filters", async () => {
   const calls = [];
   const service = createVerticalSearch({ env: { BRAVE_SEARCH_API_KEY: "fixture", VEYRA_YOUTUBE_SEARCH: "1", YOUTUBE_DATA_API_KEY: "fixture" }, indexedImages: () => [], fetchText: async raw => {

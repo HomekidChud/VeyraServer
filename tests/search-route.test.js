@@ -193,7 +193,8 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     assert.equal(categoryAnswer.vertical, "videos");
     assert.equal((await getSummary({ query: "site:nasa.gov category fixture", vertical: "images" })).vertical, "images");
     assert.equal((await fetch(`${base}/api/search/vertical?type=images&page=7&provider=image-mix&q=category`)).status, 200);
-    assert.equal((await fetch(`${base}/api/search/vertical?type=images&page=8&provider=image-mix&q=category`)).status, 400);
+    assert.equal((await fetch(`${base}/api/search/vertical?type=images&page=9&provider=image-mix&q=category`)).status, 200);
+    assert.equal((await fetch(`${base}/api/search/vertical?type=images&page=10&provider=image-mix&q=category`)).status, 400);
 
     assert.match(answer.observationId, /^obs_[A-Za-z0-9_-]{20,40}$/);
     assert.equal(answer.qualityLearning.calibrated, false, "the learned quality estimate must not be presented as calibrated confidence");
@@ -246,6 +247,46 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     assert.equal(unavailable.code, "YOUTUBE_EMBED_DISABLED");
     assert.equal(unavailable.playbackVerified, false);
     assert.equal(Object.hasOwn(unavailable, "stack"), false);
+
+    const feedTerm = "paginatest";
+    const localA = "https://feed-fixture.example/indexed-a", localB = "https://feed-fixture.example/indexed-b";
+    for (const link of [localA, localB, "https://outside.example/indexed"]) {
+      assert(indexDocument(link, article.replaceAll("fixture", feedTerm)));
+    }
+    const offsets = [];
+    const crawlsBeforeFeed = crawlCalls;
+    app.locals.veyraWebSearch = { async search(query, options) {
+      assert.equal(query, `site:feed-fixture.example ${feedTerm}`);
+      assert.equal(options.feed, true);
+      assert.equal(options.region, "IN");
+      offsets.push(options.offset);
+      const more = options.offset === 0;
+      return { provider: "fixture", nextOffset: more ? 10 : null, more, results: [
+        { url: `https://feed-fixture.example/provider-${options.offset}`, title: feedTerm },
+        { url: "https://outside.example/", title: feedTerm }
+      ] };
+    } };
+    const feedUrl = `${base}/api/search/web?${new URLSearchParams({ q: `site:feed-fixture.example ${feedTerm}`, feed: "1", region: "IN", limit: "1" })}`;
+    const getFeed = async (offset, { privateFeed = false } = {}) => {
+      const response = await fetch(`${feedUrl}&offset=${offset}${privateFeed ? "&private=1" : ""}`, { headers: { authorization } });
+      assert.equal(response.status, 200);
+      if (privateFeed) assert.equal(response.headers.get("cache-control"), "no-store");
+      return response.json();
+    };
+    assert.equal((await fetch(`${feedUrl}&offset=7`)).status, 400);
+    const providerStart = await getFeed(0, { privateFeed: true });
+    assert.equal(providerStart.nextOffset, 10);
+    const providerEnd = await getFeed(providerStart.nextOffset);
+    assert.equal(providerEnd.results.length, 1);
+    assert.equal(providerEnd.nextOffset, 100);
+    const indexStart = await getFeed(providerEnd.nextOffset);
+    assert.equal(indexStart.provider, "veyra-index");
+    assert.equal(indexStart.nextOffset, 101);
+    const indexEnd = await getFeed(indexStart.nextOffset);
+    assert.equal(indexEnd.nextOffset, null);
+    assert.deepEqual([indexStart.results[0].url, indexEnd.results[0].url].sort(), [localA, localB]);
+    assert.deepEqual(offsets, [0, 10], "index pages must not call providers");
+    assert.equal(crawlCalls, crawlsBeforeFeed, "private initial requests and authenticated continuations must not trigger new crawls");
     console.log("Search, answer and YouTube Express routes passed controlled local integration tests");
   } finally {
     delete app.locals.veyraWebSearch;

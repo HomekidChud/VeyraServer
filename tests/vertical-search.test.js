@@ -7,11 +7,12 @@ const checkpoint = require("../src/services/vertical-ranker-weights.json");
 const { trainModel, evaluate } = require("../scripts/train-vertical-ranker");
 const fixture = require("./fixtures/vertical-ranking");
 
-function mock(routes, { env = {}, results = [], indexedImages } = {}) {
+function mock(routes, { env = {}, results = [], indexedImages, indexedVideos } = {}) {
   const calls = [];
   const service = createVerticalSearch({
     env,
     indexedImages,
+    indexedVideos,
     async fetchText(rawUrl, options) {
       const url = new URL(rawUrl);
       calls.push({ url, options });
@@ -67,10 +68,13 @@ test("deduplicates and paginates images from both providers and the local crawle
       return { results: Array.from({ length: 48 }, (_, i) => ({ title: `Planet Brave ${i}`, url: `${nasa}/${i}`, properties: { url: asset(i) } })) };
     },
     "commons.wikimedia.org": url => {
-      assert.equal(url.searchParams.get("gsrlimit"), "48");
-      return { query: { pages: Array.from({ length: 48 }, (_, i) => ({ index: i, title: `File:Planet Commons ${i}.jpg`,
-        imageinfo: [{ mime: "image/jpeg", url: asset(i + 47), descriptionurl: `https://commons.wikimedia.org/wiki/Fixture_${i}`, thumburl: `https://thumb.wikimedia.org/${i}.jpg` }]
-      })) } };
+      const size = Number(url.searchParams.get("gsrlimit")), offset = Number(url.searchParams.get("gsroffset"));
+      assert.equal(size, offset ? 12 : 48);
+      return { ...(!offset ? { continue: { gsroffset: 48 } } : {}), query: { pages: Array.from({ length: size }, (_, index) => {
+        const i = index + offset;
+        return { index, title: `File:Planet Commons ${i}.jpg`,
+          imageinfo: [{ mime: "image/jpeg", url: asset(i + (offset ? 100 : 47)), descriptionurl: `https://commons.wikimedia.org/wiki/Fixture_${i}`, thumburl: `https://thumb.wikimedia.org/${i}.jpg` }] };
+      }) } };
     }
   }, { env: { BRAVE_SEARCH_API_KEY: "fixture" }, indexedImages: () => [
     { url: asset(99), imageUrl: asset(99), title: "Planet archive photo", sourcePageUrl: nasa, thumbnail: asset(99) },
@@ -80,21 +84,41 @@ test("deduplicates and paginates images from both providers and the local crawle
   let page = await service.search("images", "Planet", { noCache: false });
   assert.equal(page.provider, "image-mix");
   let pages = 0;
-  while (++pages <= 8) {
+  while (++pages <= 11) {
     rows.push(...page.results);
     if (page.nextPage == null) break;
-    page = await service.search("images", "Planet", { page: page.nextPage, provider: page.provider, noCache: false });
+    page = await service.search("images", "Planet", { page: page.nextPage, provider: page.nextProvider || page.provider, noCache: false });
   }
-  assert.equal(pages, 8);
-  assert.equal(page.nextPage, null, "the mixed feed has a bounded page count");
-  assert.equal(rows.length, 96);
-  assert.equal(new Set(rows.map(row => row.imageUrl)).size, 96);
+  assert.equal(pages, 10);
+  assert.equal(page.nextPage, null, "the feed stops when Commons has no continuation");
+  assert.equal(rows.length, 109);
+  assert.equal(new Set(rows.map(row => row.imageUrl)).size, 109);
   assert.deepEqual(new Set(rows.map(row => row.provider)), new Set(["brave", "wikimedia", "veyra-crawler"]));
-  assert.equal(service.calls.length, 2, "both sources are queried once for cached pagination");
+  assert.equal(service.calls.length, 3, "cached hybrid pages reuse their feeds, then Commons continues at offset 48");
+  assert.equal(service.calls.at(-1).url.searchParams.get("gsroffset"), "48");
   assert.equal(rows.find(row => row.imageUrl === asset(99)).sourcePageUrl, nasa);
   assert.equal(rows.find(row => row.imageUrl === asset(99)).thumbnail, asset(99));
   const scoped = await service.search("images", "site:nasa.gov Planet");
   assert.ok(scoped.results.every(row => new URL(row.sourcePageUrl || row.url).hostname.endsWith("nasa.gov")));
+});
+
+test("Videos can continue from a provider into existing crawl-index watch pages", async () => {
+  const service = mock({ "sepiasearch.org": { total: 1, data: [{
+    url: "https://video.example/w/abc123", name: "Jaipur walk", nsfw: false, privacy: { id: 1 }
+  }] } }, { indexedVideos: (_q, offset, limit, region) => {
+    assert.equal(offset, 0);
+    assert.equal(region, "IN");
+    const rows = [{ url: "https://www.youtube.com/watch?v=abcdefghijk", title: "Jaipur fort walk" },
+      { url: "https://video.example/unknown", title: "Unverified watch page" }];
+    return { total: 2, results: rows.slice(0, limit) };
+  } });
+  const first = await service.search("videos", "Jaipur", { region: "IN" });
+  assert.equal(first.provider, "peertube");
+  assert.equal(first.nextProvider, "veyra-crawler");
+  const next = await service.search("videos", "Jaipur", { region: "IN", provider: first.nextProvider, page: first.nextPage });
+  assert.equal(next.provider, "veyra-crawler");
+  assert.deepEqual(next.results.map(row => row.url), ["https://www.youtube.com/watch?v=abcdefghijk"]);
+  assert.equal(next.nextPage, null);
 });
 
 test("agency previews use exact hosts and publisher renditions collapse without changing the URLs", async () => {

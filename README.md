@@ -57,6 +57,8 @@ In India mode, Shopping discovers product links from Indian merchants rather tha
 
 The old `/api/search/deep` route returns `410 Gone`; the Crossref Research category and opt-in summaries are separate and remain available.
 
+Web clients can send `feed=1` and follow `nextOffset` to page through supported external providers and then matching crawler-index documents. Images mixes provider and approved crawler results before continuing through Wikimedia when it has more. Videos can continue into indexed YouTube and Vimeo watch pages. Feeds stop when sources run out or reach their provider limits. Private searches read the existing index but do not start crawling. Signed-in search discovery uses the existing crawler budget and robots rules; loading another batch does not start a new Web crawl.
+
 The cooperative crawler uses XML sitemap structure to distinguish indexes from pages, including extensionless nested sitemap URLs. It follows published [localized sitemap alternates](https://support.google.com/webmasters/answer/189077?hl=en) and HTML `hreflang` links only within the existing crawl scope, subject to robots, challenge and size limits. New pages use Unicode normalization and [word segmentation](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/Segmenter) where spaces alone are insufficient. Existing index records remain readable; updated tokenization applies when pages are reindexed.
 
 ## Google search

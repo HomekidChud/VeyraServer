@@ -15,11 +15,11 @@ const { pageActionsRuntime } = require("./browser/page-actions-runtime");
 const { VpnManager } = require("./network/vpn");
 const { createShield } = require("./network/shield");
 const { upstreamHeaderCapOptions } = require("./network/header-cap");
-const { createWebSearch } = require("./services/websearch");
+const { createWebSearch, WEB_FEED_STEP, WEB_FEED_INDEX_OFFSET, canonicalKey } = require("./services/websearch");
 const { languageTag, normalizeSearchText, unicodeWords } = require("./services/search-language");
 const { walkSitemap, hasRel } = require("./services/crawl-sitemap");
 const { india, indiaAffinity } = require("./services/search-region");
-const { createVerticalSearch, TYPES: SEARCH_VERTICALS, LAST_IMAGE_PAGE, safeUrl: verticalResultUrl } = require("./services/vertical-search");
+const { createVerticalSearch, TYPES: SEARCH_VERTICALS, lastVerticalPage, indexedWatchPage, safeUrl: verticalResultUrl } = require("./services/vertical-search");
 const { publicImageUrl, imageIdentity } = require("./services/crawl-page-data");
 const { parseSiteScope, allowsSiteUrl } = require("./services/search-site-scope");
 const { installBrandRoutes, isReservedOriginPath, brandNotFoundHtml } = require("./services/brand");
@@ -1638,6 +1638,7 @@ const webSearch = createWebSearch({
 const verticalSearch = createVerticalSearch({
   webSearch: (query, opts) => (app.locals.veyraWebSearch || webSearch).search(query, opts),
   indexedImages: localImageSearch,
+  indexedVideos: localVideoSearch,
   fetchText: async (url, opts) => {
     const r = await fetchBuffer(url, {
       method: opts.method, body: opts.body, headers: opts.headers, accept: opts.accept || "application/json",
@@ -3670,6 +3671,7 @@ function localSearch(query, offset, limit, options = {}) {
   for (const url of candidateUrls) {
     const doc = searchIndex.get(url); if (!doc) continue;
     if (options.onlyWithImages && !doc.searchImages?.length) continue;
+    if (options.onlyWatchPages && !indexedWatchPage(doc.url)) continue;
     if (!allowsSiteUrl(parsed.siteScope, doc.url)) continue;
     if (parsed.filters.intitle && !searchFieldHas(doc, "title", parsed.filters.intitle)) continue;
     if (parsed.filters.inurl && !searchFieldHas(doc, "url", parsed.filters.inurl)) continue;
@@ -3721,10 +3723,13 @@ function isReferenceImageSource(url) {
   return ["nasa.gov", "noaa.gov", "usgs.gov", "si.edu", "nhm.ac.uk", "esa.int"]
     .some(domain => host === domain || host.endsWith(`.${domain}`));
 }
-function localImageSearch(query) {
+function localVideoSearch(query, offset, limit, region) {
+  return localSearch(query, offset, limit, { region, onlyWatchPages: true, requireTerms: true });
+}
+function localImageSearch(query, region) {
   const parsed = parseSearchQuery(query);
   if (!parsed.terms.length || parsed.siteScope.invalid) return [];
-  const { results } = localSearch(query, 0, 40, { onlyWithImages: true });
+  const { results } = localSearch(query, 0, 40, { region, onlyWithImages: true });
   const feeds = results.filter(page => isReferenceImageSource(page.url)).map(page => {
     const candidates = [];
     for (const item of searchIndex.get(page.url)?.searchImages || []) {
@@ -6354,15 +6359,30 @@ app.get('/api/search/web', async (req, res) => {
     const validEngine = new Set(["google", "brave", "bing", "duckduckgo", ""]);
     const selected = validEngine.has(engine) ? engine : "";
     const offset = Math.max(0, Math.floor(Number(req.query.offset || 0)) || 0);
+    const feed = req.query.feed === "1";
     const lang = String(req.query.lang || "en").slice(0, 35);
     const limit = Math.min(CFG.maxSearchResults, Math.max(1, Math.floor(Number(req.query.limit || 20)) || 20));
     const started = Date.now();
     const scope = parseSiteScope(input);
     if (scope.invalid) return res.json({ ok: true, results: [], provider: "none", siteFilter: { invalid: true }, more: false, source: "web", responseTimeMs: Date.now() - started });
-    const result = await (app.locals.veyraWebSearch || webSearch).search(q, { offset, limit, engine: selected, lang, region: req.query.region, signal: request.signal, noCache: isPrivate || !CFG.globalCacheEnabled });
+    const fromIndex = indexOffset => {
+      const local = localSearch(q, indexOffset, limit, { region: req.query.region, requireTerms: !scope.active });
+      const next = indexOffset + local.results.length;
+      const more = local.results.length > 0 && next < local.total;
+      return { ...local, provider: "veyra-index", results: local.results.map(row => ({ ...row, canonicalUrl: canonicalKey(row.url) || row.url })),
+        nextOffset: more ? WEB_FEED_INDEX_OFFSET + next : null, more };
+    };
+    const reply = result => res.json({ ok: true, ...result, ...(scope.active ? { total: null, siteFilter: { include: scope.include, exclude: scope.exclude } } : {}), source: "web", responseTimeMs: Date.now() - started });
+    if (feed && (!Number.isSafeInteger(offset) || offset > WEB_FEED_INDEX_OFFSET + CFG.maxIndexDocs || (offset < WEB_FEED_INDEX_OFFSET && offset % WEB_FEED_STEP))) return respondError(res, 400, "Invalid search feed offset.", "INVALID_SEARCH_OFFSET");
+    if (feed && offset >= WEB_FEED_INDEX_OFFSET) return reply(fromIndex(offset - WEB_FEED_INDEX_OFFSET));
+    const result = await (app.locals.veyraWebSearch || webSearch).search(q, { offset, limit, engine: selected, lang, region: req.query.region, signal: request.signal, noCache: isPrivate || !CFG.globalCacheEnabled, feed });
     const results = (result.results || []).filter(row => row && allowsSiteUrl(scope, row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl)));
-    if (!isPrivate) queueNeuralIndexFindings(q, results);
-    res.json({ ok: true, ...result, ...(scope.active ? { total: null, siteFilter: { include: scope.include, exclude: scope.exclude } } : {}), results, source: "web", responseTimeMs: Date.now() - started });
+    if (!isPrivate && (!feed || !offset)) queueNeuralIndexFindings(q, results);
+    if (feed && !results.length) return reply(fromIndex(0));
+    if (feed && !result.nextOffset && (localSearch(q, 0, 1, { region: req.query.region, requireTerms: !scope.active }).total > 0)) {
+      return reply({ ...result, results, nextOffset: WEB_FEED_INDEX_OFFSET, more: true });
+    }
+    reply({ ...result, results });
   } catch (e) {
     respondError(res, 502, "Veyra web search is temporarily unavailable.", "SEARCH_WEB_ERROR");
   } finally { request.dispose(); }
@@ -6373,7 +6393,7 @@ app.get("/api/search/vertical", async (req, res) => {
   const q = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 600) : "";
   const page = Number(req.query.page ?? 0);
   const provider = typeof req.query.provider === "string" ? req.query.provider : "";
-  const lastPage = type === "images" && provider === "image-mix" ? LAST_IMAGE_PAGE : 3;
+  const lastPage = lastVerticalPage(type, provider);
   if ((type !== "all" && !SEARCH_VERTICALS.includes(type)) || !Number.isInteger(page) || page < 0 || page > lastPage || (page > 0 && !provider) || !/^[a-z-]{0,24}$/.test(provider) || (type === "all" && (page || provider))) {
     return respondError(res, 400, "Invalid search category or page.", "INVALID_SEARCH_CATEGORY");
   }
@@ -6429,12 +6449,12 @@ function queueNeuralIndexFindings(query, sources = []) {
   const crawler = app.locals.veyraNeuralRobotPool || neuralRobotPool;
   if (!CFG.indexAiFindings || typeof crawler?.startCrawl !== "function") return;
   const stop = new Set("a an and are as at be but by for from how in is it of on or the to was were what when where which who why with does do did can could should would".split(" "));
-  const queryTokens = [...new Set(String(query || "").toLowerCase().match(/[a-z0-9]{2,}/g) || [])].filter(token => !stop.has(token));
+  const queryTokens = unicodeWords(parseSiteScope(query).text).filter(token => !stop.has(token));
   if (!queryTokens.length) return;
   const external = (Array.isArray(sources) ? sources : []).filter(source => source && source.extractionStatus !== "local-index" && !["veyra-index", "local-index"].includes(String(source.provider || source.source || "").toLowerCase()));
   const ranked = rankSearchCandidates(query, external, 20);
   const relevant = ranked.filter(source => {
-    const words = new Set(`${source.title || ""} ${source.snippet || source.description || ""} ${source.url || ""}`.toLowerCase().match(/[a-z0-9]{2,}/g) || []);
+    const words = new Set(unicodeWords(`${source.title || ""} ${source.snippet || source.description || ""} ${source.url || ""}`));
     return queryTokens.some(token => words.has(token));
   });
   const seeds = [...new Set(relevant.map(source => normalizeUrl(source.url || source.canonicalUrl)).filter(Boolean))].slice(0, 6);

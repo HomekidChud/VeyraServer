@@ -7,10 +7,17 @@ const { rankVertical, rankerVersion } = require("./vertical-ranker");
 const { imageIdentity } = require("./crawl-page-data");
 const { braveLanguage } = require("./search-language");
 const { india, indiaLanguage, indiaAffinity, inrPrice, isIndianProductUrl } = require("./search-region");
+const { WEB_FEED_STEP, scoreResultRelevance } = require("./websearch");
 
 const TYPES = Object.freeze(["images", "videos", "news", "shopping", "research", "discussions"]);
 const PAGE_SIZE = 12;
-const LAST_IMAGE_PAGE = 7;
+const LAST_IMAGE_PAGE = 9;
+function lastVerticalPage(type, provider) {
+  if (provider === "image-mix") return LAST_IMAGE_PAGE;
+  if (provider === "brave" || provider === "web-discovery") return 9;
+  if (type === "images" && provider === "wikimedia") return 49;
+  return ["peertube", "veyra-crawler", "google-news-rss", "ebay", "crossref", "hacker-news"].includes(provider) ? 19 : 3;
+}
 const ENDPOINT = "https://api.search.brave.com/res/v1";
 const TIMEOUT = 4400;
 const THUMB_HOSTS = new Set(["imgs.search.brave.com", "upload.wikimedia.org", "thumb.wikimedia.org", "i.ebayimg.com", "i.ytimg.com",
@@ -55,6 +62,15 @@ function testLink(type, value, region) {
   if (type === "shopping") return (matchingHost(u.hostname, ["amazon.com", "amazon.co.uk"]) && /\/(?:dp|gp\/product)\/[A-Z0-9]{10}(?:\/|$)/i.test(u.pathname)) || (matchingHost(u.hostname, ["ebay.com", "ebay.co.uk"]) && /^\/itm\/(?:[^/]+\/)?\d+\/?$/.test(u.pathname)) || (matchingHost(u.hostname, ["etsy.com"]) && /\/listing\/\d+(?:\/|$)/.test(u.pathname));
   return true;
 }
+function indexedWatchPage(value) {
+  return testLink("videos", value) && /^https:/.test(value);
+}
+function watchThumbnail(value) {
+  const u = new URL(value);
+  if (!matchingHost(u.hostname, ["youtube.com"])) return "";
+  const videoId = u.searchParams.get("v") || /^\/shorts\/([\w-]{11})/.exec(u.pathname)?.[1];
+  return videoId ? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg` : "";
+}
 function row(type, provider, item) {
   const url = safeUrl(item.url), title = plain(item.title);
   if (!url || !title) return null;
@@ -84,7 +100,7 @@ function waitForToken(promise, signal) {
   });
 }
 
-function createVerticalSearch({ fetchText, webSearch, indexedImages, env = process.env, providerTimeoutMs = TIMEOUT }) {
+function createVerticalSearch({ fetchText, webSearch, indexedImages, indexedVideos, env = process.env, providerTimeoutMs = TIMEOUT }) {
   const cache = new Map(), cooldown = new Map();
   let ebayToken, ebayTokenPromise;
   const braveKey = String(env.BRAVE_SEARCH_API_KEY || "").trim();
@@ -136,13 +152,14 @@ function createVerticalSearch({ fetchText, webSearch, indexedImages, env = proce
     }
     signal?.throwIfAborted();
     const feeds = settled.flatMap(item => item.status === "fulfilled" ? [item.value.results.slice(0, 48)] : []);
+    const commonsMore = settled.some(item => item.status === "fulfilled" && item.value.provider === "wikimedia" && item.value.more);
     let local = [];
-    try { local = indexedImages(fullQuery).slice(0, 24).map(item => row(type, "veyra-crawler", item)); } catch {}
+    try { local = indexedImages(fullQuery, region).slice(0, 24).map(item => row(type, "veyra-crawler", item)); } catch {}
     if (local.some(Boolean)) feeds.push(local);
     if (!feeds.length) throw new Error("No image providers available");
     const results = [];
     for (let i = 0; i < 48; i++) for (const feed of feeds) if (feed[i]) results.push(feed[i]);
-    return { provider: "image-mix", results, whole: true };
+    return { provider: "image-mix", results, whole: true, commonsMore };
   }
   async function newsFeed(type, q, { lang, region, signal }) {
     lang = lang.split("-")[0];
@@ -151,7 +168,7 @@ function createVerticalSearch({ fetchText, webSearch, indexedImages, env = proce
     const xml = await get(queryUrl("https://news.google.com/rss/search", { q, hl: `${lang}-${region}`, gl: region, ceid: `${region}:${lang}` }), signal, { raw: true, accept: "application/rss+xml,application/xml" });
     const $ = cheerio.load(xml, { xml: true });
     if (!$("rss > channel").length) throw new Error("Invalid RSS feed");
-    const results = $("channel > item").slice(0, PAGE_SIZE * 4).toArray().map(node => {
+    const results = $("channel > item").slice(0, 96).toArray().map(node => {
       const item = $(node);
       return row(type, "google-news-rss", { url: item.children("link").text(), title: item.children("title").text(), source: item.children("source").text(), publishedAt: item.children("pubDate").text() });
     });
@@ -236,18 +253,21 @@ function createVerticalSearch({ fetchText, webSearch, indexedImages, env = proce
     // No site operators here: the existing web engine treats multiple sites
     // as an intersection, not a disjunction. Enforce concrete URLs below.
     const shopping = type === "shopping" && india(region);
-    const packed = await webSearch(`${q} ${type === "videos" ? "YouTube video" : shopping ? "buy online India" : "buy online"}`, { offset: page * PAGE_SIZE, limit: PAGE_SIZE, lang, region, shopping, signal, noCache });
+    const packed = await webSearch(`${q} ${type === "videos" ? "YouTube video" : shopping ? "buy online India" : "buy online"}`, { offset: page * WEB_FEED_STEP, limit: PAGE_SIZE, lang, region, shopping, signal, noCache, feed: true });
     if (packed.attempts?.length && packed.attempts.every(attempt => attempt.error || attempt.skipped)) throw new Error("No provider reached");
-    const results = (packed.results || []).filter(item => testLink(type, item.url, region)).map(item => {
-      let poster = "";
-      if (type === "videos") {
-        const u = new URL(item.url);
-        const videoId = u.searchParams.get("v") || /^\/shorts\/([\w-]{11})/.exec(u.pathname)?.[1];
-        if (matchingHost(u.hostname, ["youtube.com"]) && videoId) poster = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
-      }
+    const results = (packed.results || []).filter(item => testLink(type, item.url, region) &&
+      scoreResultRelevance(q, { ...item, snippet: item.snippet || item.description }).coverage > 0).map(item => {
+      const poster = type === "videos" ? watchThumbnail(item.url) : "";
       return row(type, "web-discovery", { url: item.url, title: item.title, source: shopping ? "" : item.source, snippet: shopping ? "" : item.snippet || item.description, thumbnail: poster, price: shopping ? inrPrice(item.price) : null });
     });
     return { provider: "web-discovery", results, more: !!packed.more };
+  }
+  function crawlerVideoFeed(type, _q, { page, region, fullQuery }) {
+    const batch = Math.max(1, page);
+    const data = indexedVideos(fullQuery, (batch - 1) * PAGE_SIZE, PAGE_SIZE, region);
+    return { provider: "veyra-crawler", results: data.results.filter(item => indexedWatchPage(item.url)).map(item =>
+      row(type, "veyra-crawler", { ...item, source: "", thumbnail: watchThumbnail(item.url) })),
+    more: batch * PAGE_SIZE < data.total, nextPage: batch + 1 };
   }
   function adapters(type, page, preview, provider, region) {
     const list = [];
@@ -259,6 +279,7 @@ function createVerticalSearch({ fetchText, webSearch, indexedImages, env = proce
     if (type === "news") list.push(["google-news-rss", newsFeed]);
     if (type === "shopping" && !india(region) && env.EBAY_CLIENT_ID && env.EBAY_CLIENT_SECRET) list.push(["ebay", ebay]);
     if (type === "videos" || type === "shopping") list.push(["web-discovery", webCategory]);
+    if (type === "videos" && !preview && typeof indexedVideos === "function") list.push(["veyra-crawler", crawlerVideoFeed]);
     if (type === "research") list.push(["crossref", crossref]);
     if (type === "discussions") list.push(["hacker-news", discussions]);
     return list;
@@ -280,7 +301,7 @@ function createVerticalSearch({ fetchText, webSearch, indexedImages, env = proce
       if ((cooldown.get(breaker) || 0) > Date.now()) { attempts.push("unavailable"); continue; }
       const singleFeed = name === "image-mix" || name === "google-news-rss" || (name === "brave" && type === "images");
       const key = JSON.stringify([name, type, q, language, region, singleFeed ? 0 : page]);
-      const saved = noCache ? null : cache.get(key);
+      const saved = noCache || name === "veyra-crawler" ? null : cache.get(key);
       try {
         const providerQuery = name === "brave" ? q : (scope.text || q).slice(0, 400);
         const packed = saved?.until > Date.now() ? saved.packed : await run(type, providerQuery, { page, lang: language, region, signal, noCache, fullQuery: q });
@@ -295,11 +316,21 @@ function createVerticalSearch({ fetchText, webSearch, indexedImages, env = proce
         const results = packed.whole ? ranked.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE) : ranked;
         const hasNext = packed.whole ? ranked.length > (page + 1) * PAGE_SIZE : packed.more;
         if (!results.length && !provider && name !== "image-mix") { attempts.push("empty"); continue; }
-        if (!noCache && results.length && !(saved?.until > Date.now())) {
+        if (!noCache && name !== "veyra-crawler" && results.length && !(saved?.until > Date.now())) {
           cache.set(key, { packed, until: Date.now() + 45_000 });
           if (cache.size > 100) cache.delete(cache.keys().next().value);
         }
-        return { ...empty(results.length ? "ok" : "empty"), results, provider: packed.provider, nextPage: hasNext && page < (name === "image-mix" ? LAST_IMAGE_PAGE : 3) ? page + 1 : null, observedAt: new Date().toISOString() };
+        let nextPage = hasNext && page < lastVerticalPage(type, name) ? packed.nextPage ?? page + 1 : null;
+        let nextProvider;
+        if (nextPage === null && packed.commonsMore) {
+          nextPage = 4; nextProvider = "wikimedia"; // First mix already fetched 48 Commons entries.
+        }
+        if (nextPage === null && type === "videos" && !preview && name !== "veyra-crawler" &&
+            typeof indexedVideos === "function" && indexedVideos(q, 0, 1, region).total) {
+          nextPage = 1; nextProvider = "veyra-crawler";
+        }
+        return { ...empty(results.length ? "ok" : "empty"), results, provider: packed.provider, nextPage,
+          ...(nextProvider ? { nextProvider } : {}), observedAt: new Date().toISOString() };
       } catch (error) {
         if (signal?.aborted) return empty("cancelled");
         if ([401, 403, 429].includes(error.status)) cooldown.set(breaker, Date.now() + 30_000);
@@ -311,4 +342,4 @@ function createVerticalSearch({ fetchText, webSearch, indexedImages, env = proce
   return { search };
 }
 
-module.exports = { createVerticalSearch, TYPES, PAGE_SIZE, LAST_IMAGE_PAGE, safeUrl };
+module.exports = { createVerticalSearch, TYPES, PAGE_SIZE, LAST_IMAGE_PAGE, lastVerticalPage, indexedWatchPage, safeUrl };
