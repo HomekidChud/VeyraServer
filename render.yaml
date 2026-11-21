@@ -58,7 +58,8 @@ services:
       - key: PLATFORM_EARLY_ACCESS_URL
         sync: false
       - key: FRONTEND_ORIGIN
-        value: https://homekidchud.github.io
+        # GitHub Pages (all desktop/mobile browsers) and the packaged Android WebView.
+        value: "https://homekidchud.github.io,https://localhost"
       - key: NODE_VERSION
         value: "20"
       # Chromium is an explicit opt-in; normal acquisition is direct HTTP/search-first.
