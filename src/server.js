@@ -20,6 +20,7 @@ const { languageTag, normalizeSearchText, unicodeWords } = require("./services/s
 const { walkSitemap, hasRel } = require("./services/crawl-sitemap");
 const { india, indiaAffinity, isIndianProductUrl } = require("./services/search-region");
 const { createVerticalSearch, TYPES: SEARCH_VERTICALS, lastVerticalPage, indexedWatchPage, safeUrl: verticalResultUrl } = require("./services/vertical-search");
+const { merchantProductUrl, PRODUCT_BYTES } = require("./services/india-storefronts");
 const { publicImageUrl, imageIdentity } = require("./services/crawl-page-data");
 const { parseSiteScope, allowsSiteUrl } = require("./services/search-site-scope");
 const { installBrandRoutes, isReservedOriginPath, brandNotFoundHtml } = require("./services/brand");
@@ -1635,8 +1636,39 @@ const webSearch = createWebSearch({
   env: process.env,
   log: (level, source, message) => serverLog(level, source, message)
 });
+const merchantRobotsCache = new Map();
+const merchantUserAgent = `VeyraSearch/${VEYRA_VERSION} (+https://github.com/HomekidChud/VeyraServer)`;
+async function fetchIndiaCatalog(url, { signal, kind }) {
+  const u = new URL(url);
+  if (kind === "catalog" ? u.pathname !== "/search/suggest.json" || !merchantProductUrl("/products/placeholder", u.hostname) || u.origin !== `https://${u.hostname}`
+    : merchantProductUrl(url) !== url) throw new Error("Unrecognized storefront URL");
+  const deadline = AbortSignal.timeout(kind === "catalog" ? 3600 : 2200);
+  const requestSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
+  requestSignal.throwIfAborted();
+  let policy = merchantRobotsCache.get(u.origin);
+  if (!policy || policy.expiresAt <= Date.now()) {
+    const r = await fetchBuffer(`${u.origin}/robots.txt`, {
+      timeout: 1250, signal: requestSignal, limit: 512 * 1024, maxRedirects: 0,
+      accept: "text/plain,*/*;q=0.1", retries: 0, userAgent: merchantUserAgent
+    });
+    const text = r.body.toString("utf8");
+    if ((!r.ok && r.status !== 404 && r.status !== 410) || r.truncated || r.tooLarge ||
+        (r.ok && detectChallenge(text, r.contentType, r.status, { server: r.serverHeader, "cf-mitigated": r.cfMitigated }))) throw new Error("Storefront crawl policy unavailable");
+    policy = { group: r.ok ? robotsMatchGroup(parseRobots(text), merchantUserAgent) : null, expiresAt: Date.now() + 60 * 60_000 };
+    merchantRobotsCache.set(u.origin, policy);
+  }
+  if (!robotsAllowed(url, policy) || policy.group?.crawlDelayMs) throw new Error("Storefront requests not permitted at search speed");
+  requestSignal.throwIfAborted();
+  const r = await fetchBuffer(url, { timeout: kind === "catalog" ? 2250 : 1450, signal: requestSignal, retries: 0,
+    limit: kind === "catalog" ? 512 * 1024 : PRODUCT_BYTES, maxRedirects: 0, preserveQuery: true,
+    accept: kind === "catalog" ? "application/json" : "text/html", userAgent: merchantUserAgent });
+  requestSignal.throwIfAborted();
+  if (!r.ok || (kind === "catalog" && r.truncated)) throw new Error("Storefront request failed");
+  return r.body.toString("utf8");
+}
 const verticalSearch = createVerticalSearch({
   webSearch: (query, opts) => (app.locals.veyraWebSearch || webSearch).search(query, opts),
+  fetchIndiaCatalog,
   indexedImages: localImageSearch,
   indexedVideos: localVideoSearch,
   indexedProducts: (q, offset, limit, region) => localSearch(q, offset, limit, { region, topical: true, requireTerms: true, onlyIndianProducts: true }),
@@ -2114,8 +2146,8 @@ function parseRobots(text) {
   }
   return groups;
 }
-function robotsMatchGroup(groups) {
-  const agent = CFG.userAgent.toLowerCase().split(/[\s/]/, 1)[0];
+function robotsMatchGroup(groups, userAgent = CFG.userAgent) {
+  const agent = userAgent.toLowerCase().split(/[\s/]/, 1)[0];
   const ranked = groups.map(group => ({ group, specificity: group.agents.reduce((max, token) =>
     token !== "*" && agent.includes(token) ? Math.max(max, token.length) : max, 0) }));
   const best = ranked.reduce((max, item) => Math.max(max, item.specificity), 0);
@@ -6423,7 +6455,7 @@ app.get("/api/search/vertical", async (req, res) => {
   try {
     const signal = AbortSignal.any([request.signal, AbortSignal.timeout(type === "all" ? 12000 : 9000)]);
     const service = app.locals.veyraVerticalSearch || verticalSearch;
-    const options = { page, provider, lang: req.query.lang, region: req.query.region, signal, noCache: req.veyraPrivateTraffic || !CFG.globalCacheEnabled, preview: type === "all" };
+    const options = { page, provider, lang: req.query.lang, region: req.query.region, signal, noCache: req.veyraPrivateTraffic || !CFG.globalCacheEnabled, preview: type === "all", privateSearch: req.query.private === "1" && req.query.incognito === "1" };
     if (type !== "all") return res.json({ ok: true, ...await service.search(type, q, options) });
     let cursor = 0;
     const sections = Array(SEARCH_VERTICALS.length);
@@ -6543,7 +6575,19 @@ app.post('/api/search/answer', async (req, res) => {
       results = [...distinctSources.values()];
       retrievalDiagnostics = { vertical, provider: section.provider, candidates: results.length };
       if (!results.length) return res.json({ hasAnswer: false, reason: "No source pages are available in this category to support a summary.", vertical });
-    } else if (!Array.isArray(results) || !results.length) {
+    } else if (Array.isArray(results) && results.length) {
+      // Client results are URL hints only. Read the server's indexed copy or
+      // the source page itself rather than citing client-supplied prose.
+      const trusted = new Map();
+      for (const row of results.slice(0, 12)) {
+        const url = verticalResultUrl(row?.url);
+        if (!url || !inScope({ url }) || trusted.has(url)) continue;
+        const indexed = searchIndex.get(normalizeUrl(url));
+        trusted.set(url, indexed ? { url: indexed.url, title: indexed.title, contentText: indexed.text,
+          provider: "veyra-index", retrievedAt: indexed.indexedAt } : { url });
+      }
+      results = [...trusted.values()];
+    } else {
       const normalizedQuery = String(query).slice(0, CFG.maxSearchQueryChars);
       const localSearchStartedAt = Date.now();
       const local = localSearch(query, 0, Math.min(4, CFG.maxSearchResults), { includeText: true, maxTextChars: 30000 });
@@ -6553,7 +6597,7 @@ app.post('/api/search/answer', async (req, res) => {
       try { discovered = await acquisitionManager.searchFirst(normalizedQuery, async (q, opts) => {
         const result = await (app.locals.veyraWebSearch || webSearch).search(q, opts);
         return scope.active ? { ...result, results: (result.results || []).filter(inScope) } : result;
-      }, { limit: CFG.maxSearchResults, fetchLimit: Math.min(8, CFG.maxSearchResults), signal: request.signal }); }
+      }, { limit: CFG.maxSearchResults, fetchLimit: Math.min(8, CFG.maxSearchResults), signal: request.signal, deadlineMs: 8000 }); }
       catch { serverLog("warn", "SEARCH", "Search-to-answer external discovery failed; continuing with local-index candidates."); }
       const externalDiscoveries = (discovered.candidates || []).filter(inScope);
       queueNeuralIndexFindings(normalizedQuery, externalDiscoveries);

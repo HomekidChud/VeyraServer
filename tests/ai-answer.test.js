@@ -226,7 +226,7 @@ assert.ok(qualityEvaluation.after.logLoss < qualityEvaluation.before.logLoss, "o
   const sparseResult = await sparseEngine.synthesizeWithLLM("Roblox", { type: "explore" }, sparseEvidence);
   assert.ok(sparseResult, "short grounded summaries should be accepted when evidence consists of search snippets");
   assert.match(sparseRequest.messages[0].content, /1-3 sentences and 10-80 words/i, "sparse evidence should not be forced into a long overview");
-  assert.match(sparseRequest.messages[0].content, /at least 2 independent sources/i, "sparse summaries should still use independent evidence");
+  assert.match(sparseRequest.messages[0].content, /Prefer independent sources.*do not force extra citations/i, "a well-supported answer need not add a weaker citation just to reach a quota");
   assert.deepEqual(sparseResult.sourceIds, ["S1", "S2", "S3"], "citations can supply source IDs when a compatible model omits optional JSON fields");
   assert.deepEqual(sparseResult.keyPoints, []);
   assert.equal(sparseEngine.verifyAnswer(sparseResult.answer, sparseEvidence).unsupported, 0, "the accepted short summary must still pass the factual grounding verifier");
@@ -234,6 +234,27 @@ assert.ok(qualityEvaluation.after.logLoss < qualityEvaluation.before.logLoss, "o
   assert.equal(sparseEngine.verifyAnswer(crossSourceClaim, sparseEvidence).unsupported, 0, "a paraphrased claim supported collectively by its cited sources should not be rejected just because no single source repeats the full sentence");
   const unsupportedClaim = "Roblox guarantees weekly income for every player [S1][S2][S3].";
   assert.equal(sparseEngine.verifyAnswer(unsupportedClaim, sparseEvidence).unsupported, 1, "multi-source aggregation must still reject claims with insufficient evidence overlap");
+  const precise = [{ id: "S1", matched: ["The charger uses a USB-C port with a 65W power delivery limit."], verificationSentences: ["The charger uses a USB-C port with a 65W power delivery limit."] }];
+  assert.equal(sparseEngine.verifyAnswer("This USB-C charger delivers up to 100W of power. [S1]", precise, { strict: true }).unsupported, 1);
+  assert.equal(sparseEngine.verifyAnswer("This USB-C charger supplies up to 65W. [S1]", precise, { strict: true }).supported, 1);
+  const hindi = "डोसा चावल और उड़द दाल के घोल से बनाया जाता है।";
+  const hindiEvidence = engine.buildEvidence("डोसा कैसे बनता है", { type: "howto" }, [
+    { url: "https://recipes.example/dosa", title: "डोसा", text: hindi },
+    { url: "https://unrelated.example/", title: "Weather", text: "A readable but completely unrelated weather report from the national observatory." }
+  ], []);
+  assert.equal(hindiEvidence.length, 1);
+  assert.equal(engine.verifyAnswer(`${hindi} [S1]`, hindiEvidence, { strict: true }).supported, 1);
+  const recovering = new AIAnswerEngine({ allowExtractiveFallback: false });
+  recovering.fetchContents = async () => sparseEvidence.map(row => ({ ...row, text: row.documentText, sentences: row.verificationSentences }));
+  recovering.synthesizeWithLLM = async () => ({
+    answer: `${sparseSummary} Roblox provides a guaranteed weekly income of $100. [S99]`,
+    caveats: ["Also guarantees employment."], sourceIds: ["S1", "S2", "S3", "S99"]
+  });
+  const recovered = await recovering.answer("Roblox");
+  assert.equal(recovered.hasAnswer, true);
+  assert.equal(recovered.grounding.unsupportedClaims, 0);
+  assert.equal(recovered.grounding.removedClaims, 1);
+  assert.doesNotMatch(JSON.stringify(recovered), /weekly income|employment|S99/);
   clearAIEnv();
   process.env.GROQ_API_KEY = "offline-groq-unauthorized-key";
   global.fetch = async url => String(url) === "https://api.groq.com/openai/v1/models"

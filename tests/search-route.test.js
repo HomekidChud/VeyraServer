@@ -134,6 +134,27 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     })).json();
     assert.equal(scopedAnswer.hasAnswer, true);
     assert.deepEqual(scopedAnswer.sources.map(row => row.url), [url]);
+    const engineOverride = app.locals.veyraAnswerEngine;
+    app.locals.veyraAnswerEngine = {
+      async answer(_query, results) {
+        assert.equal(results.length, 2);
+        assert.equal(results[0].url, url);
+        assert.equal(results[0].provider, "veyra-index");
+        assert.match(results[0].contentText, /Veyra/);
+        assert.deepEqual(results[1], { url: "https://external.example/page" });
+        assert.doesNotMatch(JSON.stringify(results), /UNTRUSTED/);
+        return { hasAnswer: false, reason: "Controlled provenance fixture" };
+      }
+    };
+    const hints = await (await fetch(`${base}/api/search/answer`, {
+      method: "POST", headers: { "content-type": "application/json", authorization },
+      body: JSON.stringify({ query: "Veyra fixture", results: [
+        { url, title: "UNTRUSTED", contentText: "UNTRUSTED" },
+        { url: "https://external.example/page", title: "UNTRUSTED", snippet: "UNTRUSTED", contentText: "UNTRUSTED" }
+      ] })
+    })).json();
+    assert.equal(hints.reason, "Controlled provenance fixture");
+    app.locals.veyraAnswerEngine = engineOverride;
 
     let verticalCalls = 0, activeVerticalCalls = 0, peakVerticalCalls = 0;
     app.locals.veyraVerticalSearch = {
