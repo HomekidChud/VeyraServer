@@ -1,6 +1,6 @@
 "use strict";
 const assert = require("assert");
-const { NeuralRobot } = require("../src/services/neural-robots");
+const { NeuralRobot, NeuralRobotPool } = require("../src/services/neural-robots");
 const { NeuralCrawlerModel, NUM_FEATURES } = require("../src/services/neural-crawler");
 
 const robot = new NeuralRobot(0, { neuralModel: null });
@@ -43,5 +43,49 @@ assert.equal(model.report().optimizer.name, "AdamW");
   assert.equal(await safeRobot.checkRobots("https://crawler-fixture.example/private/page"), false, "plain-text robots.txt must be parsed instead of silently treated as unavailable");
   const page = await safeRobot.fetchRaw("https://crawler-fixture.example/public/page");
   assert.match(page.html, /Safe fixture page content/);
+
+  const origin = "https://crawler-fixture.example";
+  const requested = [];
+  const ignoredMeta = '<meta name="irrelevant" content="fixture">'.repeat(201);
+  const pages = {
+    "/": '<a href="/a">First</a><a href="/b">Second</a><a href="/private">Blocked</a>',
+    "/a": `<meta property="og:image" content="/cover.jpg?utm_source=fixture">
+      <script type="application/ld+json">{"@type":"Article","articleBody":"Structured fixture text about planetary science.","image":"/structured.jpg"}</script>
+      <main><p>This is the visible, public planetary science fixture.</p><figure><picture><source srcset="/small.jpg 320w, /large.jpg 1280w">
+      <img src="/placeholder.gif" alt="Wide planet view"></picture></figure><img data-src="/lazy.jpg" alt="Lazy-loaded photo">
+      <img src="/cover.jpg" alt="Planet cover"><img src="/pixel.png"><img src="/unsafe.jpg?token=fixture"></main>
+      <a href="/shared">Deep link</a>`,
+    "/b": `<meta property="og:image" content="/b.jpg">${ignoredMeta}<meta name="ROBOTS" content="noimageindex"><a href="/shared?utm_tag=fixture">Deep duplicate</a>`,
+    "/shared": '<a href="/do-not-follow">Unfollowed</a>',
+    "/restricted": '<meta name="robots" content="noindex"><p>Not searchable</p>'
+  };
+  const fetchPage = async url => {
+    const path = new URL(url).pathname;
+    requested.push(path);
+    if (path === "/") await new Promise(resolve => setImmediate(resolve));
+    const body = path === "/robots.txt" ? "User-agent: *\nDisallow: /private" : pages[path] || "";
+    return { status: 200, finalUrl: url, body: Buffer.from(body), contentType: path === "/robots.txt" ? "text/plain" : "text/html",
+      headers: new Headers(path === "/shared" ? { "x-robots-tag": "nofollow" } : {}) };
+  };
+  const branching = new NeuralRobot(2, { fetchPage, maxDepth: 2, concurrency: 3 });
+  const crawl = await branching.startCrawl(origin, "planetary science", { maxPages: 5 });
+  assert.deepEqual(crawl.pages.map(row => new URL(row.url).pathname).sort(), ["/", "/a", "/b", "/shared"]);
+  assert.equal(requested.filter(path => path === "/shared").length, 1);
+  assert.ok(!requested.includes("/private") && !requested.includes("/do-not-follow"));
+  const gallery = crawl.pages.find(row => row.url === `${origin}/a`);
+  assert.match(gallery.text, /Structured fixture text/);
+  assert.deepEqual(gallery.images.map(image => [image.url, image.title]), [
+    [`${origin}/cover.jpg`, "Planet cover"], [`${origin}/structured.jpg`, ""], [`${origin}/large.jpg`, "Wide planet view"], [`${origin}/lazy.jpg`, "Lazy-loaded photo"]
+  ]);
+  assert.equal(crawl.stats.imagesFound, 4);
+  assert.deepEqual(crawl.pages.find(row => row.url === `${origin}/b`).images, []);
+  assert.equal((await branching.startCrawl(origin, "", { maxDepth: 0 })).pages.length, 1);
+  assert.equal((await branching.startCrawl(`${origin}/restricted`)).pages.length, 0);
+
+  const pool = new NeuralRobotPool({ maxWorkers: 1, fetchPage });
+  const seeds = [`${origin}/a`, `${origin}/b`, `${origin}/shared`];
+  const pending = pool.startCrawl(seeds, "", { maxDepth: 0, maxPages: 1 });
+  assert.deepEqual(await pool.startCrawl(seeds, ""), [], "a second call cannot take a reserved worker");
+  assert.deepEqual((await pending).map(row => [row.seed, row.status, row.result.pages.length]), seeds.map(seed => [seed, "fulfilled", 1]));
   console.log("Neural crawler regression tests passed, including fail-closed safe fetching and robots.txt policy");
 })().catch(error => { console.error(error); process.exitCode = 1; });

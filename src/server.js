@@ -9,12 +9,14 @@ const fsp = fs.promises;
 const path = require("path");
 const os = require("os");
 const { BrowserEngine } = require("./browser/browser-engine");
+const { blockPlaybackPopup } = require("./browser/popup-follow");
 const { pageActionsRuntime } = require("./browser/page-actions-runtime");
 const { VpnManager } = require("./network/vpn");
 const { createShield } = require("./network/shield");
 const { upstreamHeaderCapOptions } = require("./network/header-cap");
 const { createWebSearch } = require("./services/websearch");
-const { createVerticalSearch, TYPES: SEARCH_VERTICALS, safeUrl: verticalResultUrl } = require("./services/vertical-search");
+const { createVerticalSearch, TYPES: SEARCH_VERTICALS, LAST_IMAGE_PAGE, safeUrl: verticalResultUrl } = require("./services/vertical-search");
+const { publicImageUrl } = require("./services/crawl-page-data");
 const { parseSiteScope, allowsSiteUrl } = require("./services/search-site-scope");
 const { installBrandRoutes, isReservedOriginPath, brandNotFoundHtml } = require("./services/brand");
 const VEYRA_VERSION = require("../package.json").version;
@@ -1597,6 +1599,7 @@ const webSearch = createWebSearch({
 });
 const verticalSearch = createVerticalSearch({
   webSearch: (query, opts) => (app.locals.veyraWebSearch || webSearch).search(query, opts),
+  indexedImages: localImageSearch,
   fetchText: async (url, opts) => {
     const r = await fetchBuffer(url, {
       method: opts.method, body: opts.body, headers: opts.headers, accept: opts.accept || "application/json",
@@ -2966,20 +2969,22 @@ function injectRuntime(html, original, sid = "") {
   function emitGetForm(form,submitter,source){if(rootProxiedFrame())return false;const target=submitTarget(form,submitter);if(!target)return false;const method=String(form.method||'get').toUpperCase();if(method!=='GET')return false;const fd=new FormData(form,submitter||undefined);const u=new URL(target);for(const [k,v] of fd.entries())if(typeof v==='string')u.searchParams.append(k,v);emit(source||'form.submit',u.href);return true}
   try{const nativeFormSubmit=HTMLFormElement.prototype.submit;HTMLFormElement.prototype.submit=function(){try{if(rootProxiedFrame())return nativeFormSubmit.call(this);if(emitGetForm(this,null,'form.submit'))return;const target=submitTarget(this,null);const method=String(this.method||'get').toUpperCase();if(target&&method==='POST'){const fd=new FormData(this);const entries=[];for(const [k,v] of fd.entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});return;}}catch{}return nativeFormSubmit.call(this)}}catch{}
   try{const nativeRequestSubmit=HTMLFormElement.prototype.requestSubmit;if(nativeRequestSubmit)HTMLFormElement.prototype.requestSubmit=function(submitter){try{if(rootProxiedFrame())return nativeRequestSubmit.call(this,submitter);if(emitGetForm(this,submitter,'form.requestSubmit'))return;const target=submitTarget(this,submitter);const method=String(this.method||'get').toUpperCase();if(target&&method==='POST'){const entries=[];for(const [k,v] of new FormData(this,submitter).entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});return;}}catch{}return nativeRequestSubmit.call(this,submitter)}}catch{}
+  ${blockPlaybackPopup.toString()}
   try{const nativeOpen=window.open;window.open=function(url,target,features){
     const raw=String(url??'').trim();
     const blank=blankPopupUrl(raw);
     const u=blank?null:canonicalizeMaybeProxy(raw);
+    const tgt=String(target||'').toLowerCase();
     // A navigation button that opens its destination over the current page —
     // window.open(url,'_self'), and '_top'/'_parent' from the root frame —
     // must never become a new tab: it is in-place navigation.
-    const tgt=String(target||'').toLowerCase();
     if(tgt==='_self'||((tgt==='_top'||tgt==='_parent')&&rootProxiedFrame())){
       if(!u)return null;
       if(!rootProxiedFrame()){emit('location.assign',u);return null}
       try{location.assign(proxy('view',u))}catch(e){}
       return null;
     }
+    if(u&&blockPlaybackPopup(virtualUrl,u))return null;
     if(!appEmbedded){
       // A frame does not get native popups before the embed handshake.
       if(window.parent!==window)return null;
@@ -2994,6 +2999,7 @@ function injectRuntime(html, original, sid = "") {
       const rawNext=String(next??'').trim();
       const destination=blankPopupUrl(rawNext)?null:canonicalizeMaybeProxy(rawNext);
       if(shim.closed||!destination)return;
+      if(blockPlaybackPopup(virtualUrl,destination)){shim.close();return}
       href=destination;
       clearTimeout(timer);
       if(opened)topPost({type:'veyra:popup-navigate',popupId:popupId,url:destination,sessionId:SESSION_ID});
@@ -3168,6 +3174,7 @@ ${pageActionsRuntime()}
     const u=blankPopupUrl(raw)||raw==='#'?null:canonicalizeMaybeProxy(raw);
     // A static href="#" may already have been rewritten as a proxy URL.
     if(!u||(u.endsWith('#')&&u.slice(0,-1)===virtualUrl.split('#')[0]))return;
+    if(tgt!=='_top'&&tgt!=='_parent'&&blockPlaybackPopup(virtualUrl,u,true))return;
     if(tgt!=='_top'&&tgt!=='_parent'&&(!ev.isTrusted||!claimPopupGesture()))return;
     topPost({type:'veyra:open',url:u,target:tgt,sessionId:SESSION_ID});
   }
@@ -3474,6 +3481,7 @@ function indexDocument(url, text, precomputedMeta = null) {
       host: meta.host,
       path: meta.path,
       wordCount: meta.wordCount,
+      searchImages: meta.searchImages || [],
       indexedAt: now(),
       termFreq: meta.termFreq
     };
@@ -3488,19 +3496,21 @@ function indexDocument(url, text, precomputedMeta = null) {
 }
 function indexNeuralPage(page, query = "") {
   const url = normalizeUrl(page?.url);
-  if (!url || !page?.text || page.text.length < 80) return null;
+  if (!url || page.indexable === false) return null;
+  const searchImages = isReferenceImageSource(url) && Array.isArray(page.images) ? page.images.slice(0, 20) : [];
+  if ((!page.text || page.text.length < 80) && !searchImages.length) return null;
   const title = String(page.title || hostOf(url)).replace(/\s+/g, " ").trim().slice(0, 300);
   const headings = Array.isArray(page.headings) ? page.headings.join(" | ").replace(/\s+/g, " ").trim().slice(0, 1200) : "";
   const description = String(page.metadata?.description || page.metadata?.["og:description"] || "").replace(/\s+/g, " ").trim().slice(0, 600);
-  const text = String(page.text)
+  const text = String(page.text || "")
     .replace(/\b(?:jump to content|main menu|move to sidebar|hide navigation|search search|appearance|donate|contribute|help learn to edit|community portal|recent changes|upload file|special pages|add to word list|audio player|play pronunciation|cookie settings)\b/gi, " ")
     .replace(/\s+/g, " ").trim().slice(0, CFG.maxIndexTextChars);
   const termFreq = new Map();
-  for (const term of tokenizeSearch(`${title} ${headings} ${description} ${text} ${url}`)) termFreq.set(term, (termFreq.get(term) || 0) + 1);
+  for (const term of tokenizeSearch(`${title} ${headings} ${description} ${text} ${url} ${searchImages.map(image => image.title).join(" ")}`)) termFreq.set(term, (termFreq.get(term) || 0) + 1);
   const doc = indexDocument(url, text, {
     title, description, headings, snippet: description || text.slice(0, 600), text,
     favicon: "", canonical: url, lang: page.language || "", host: hostOf(url), path: pathOf(url),
-    wordCount: Math.max(1, tokenizeSearch(text).length), termFreq
+    wordCount: Math.max(1, tokenizeSearch(text).length), termFreq, searchImages
   });
   if (doc) {
     doc.indexedBy = "neural-crawler";
@@ -3541,6 +3551,7 @@ function localSearch(query, offset, limit, options = {}) {
   }
   for (const url of candidateUrls) {
     const doc = searchIndex.get(url); if (!doc) continue;
+    if (options.onlyWithImages && !doc.searchImages?.length) continue;
     if (!allowsSiteUrl(parsed.siteScope, doc.url)) continue;
     if (parsed.filters.intitle && !searchFieldHas(doc, "title", parsed.filters.intitle)) continue;
     if (parsed.filters.inurl && !String(doc.url).toLocaleLowerCase().includes(parsed.filters.inurl)) continue;
@@ -3582,6 +3593,34 @@ function localSearch(query, offset, limit, options = {}) {
     };
   });
   return { total, results, indexSize: N, terms: parsed.terms, filters: parsed.filters };
+}
+// Do not turn the public Images tab into an unfiltered index of arbitrary
+// third-party imagery. Crawl metadata for other sites is not surfaced here.
+function isReferenceImageSource(url) {
+  let host;
+  try { const u = new URL(url); if (u.protocol !== "https:" || u.port) return false; host = u.hostname; } catch { return false; }
+  return ["nasa.gov", "noaa.gov", "usgs.gov", "si.edu", "nhm.ac.uk", "esa.int"]
+    .some(domain => host === domain || host.endsWith(`.${domain}`));
+}
+function localImageSearch(query) {
+  const parsed = parseSearchQuery(query);
+  if (!parsed.terms.length || parsed.siteScope.invalid) return [];
+  const { results } = localSearch(query, 0, 40, { onlyWithImages: true });
+  const images = [], seen = new Set();
+  for (const page of results) {
+    if (!isReferenceImageSource(page.url)) continue;
+    for (const item of searchIndex.get(page.url)?.searchImages || []) {
+      const url = publicImageUrl(item.url, page.url);
+      if (!url || !isReferenceImageSource(url) || seen.has(url)) continue;
+      const title = item.title || page.title;
+      const words = new Set(tokenizeSearch(`${title} ${page.title} ${page.snippet}`));
+      if (!parsed.terms.some(term => words.has(term))) continue;
+      images.push({ url, imageUrl: url, sourcePageUrl: page.url, source: hostOf(page.url), thumbnail: url, title, snippet: page.title });
+      seen.add(url);
+      if (images.length === 24) return images;
+    }
+  }
+  return images;
 }
 function localSearchSuggestions(query, limit = 8) {
   const prefix = String(query || "").trim().toLocaleLowerCase().split(/\s+/).pop() || "";
@@ -6172,7 +6211,8 @@ app.get("/api/search/vertical", async (req, res) => {
   const q = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 600) : "";
   const page = Number(req.query.page ?? 0);
   const provider = typeof req.query.provider === "string" ? req.query.provider : "";
-  if ((type !== "all" && !SEARCH_VERTICALS.includes(type)) || !Number.isInteger(page) || page < 0 || page > 3 || (page > 0 && !provider) || !/^[a-z-]{0,24}$/.test(provider) || (type === "all" && (page || provider))) {
+  const lastPage = type === "images" && provider === "image-mix" ? LAST_IMAGE_PAGE : 3;
+  if ((type !== "all" && !SEARCH_VERTICALS.includes(type)) || !Number.isInteger(page) || page < 0 || page > lastPage || (page > 0 && !provider) || !/^[a-z-]{0,24}$/.test(provider) || (type === "all" && (page || provider))) {
     return respondError(res, 400, "Invalid search category or page.", "INVALID_SEARCH_CATEGORY");
   }
   const request = requestAbortSignal(req, res);
@@ -6289,8 +6329,14 @@ app.post('/api/search/answer', async (req, res) => {
       });
       // Use server-discovered source links only. A product price, image,
       // video description, or research listing is not verified page evidence.
-      results = section.results.filter(row => row && verticalResultUrl(row.url) && inScope(row))
-        .slice(0, 6).map(row => ({ url: row.url, provider: row.provider }));
+      const distinctSources = new Map();
+      for (const row of section.results) {
+        const url = verticalResultUrl(row?.sourcePageUrl || row?.url);
+        if (!url || !inScope({ url }) || distinctSources.has(url)) continue;
+        distinctSources.set(url, { url, provider: row.provider });
+        if (distinctSources.size === 6) break;
+      }
+      results = [...distinctSources.values()];
       retrievalDiagnostics = { vertical, provider: section.provider, candidates: results.length };
       if (!results.length) return res.json({ hasAnswer: false, reason: "No source pages are available in this category to support a summary.", vertical });
     } else if (!Array.isArray(results) || !results.length) {
@@ -7862,7 +7908,7 @@ app.post("/api/robots/crawl", async (req, res) => {
     const seeds = req.body.seeds || (req.body.seed ? [req.body.seed] : []);
     if (!seeds.length) return res.status(400).json({ error: "No seed URLs provided" });
     const query = req.body.query || "";
-    const opts = { maxDepth: req.body.maxDepth || 3, maxPages: req.body.maxPages || 50 };
+    const opts = { maxDepth: Number(req.body.maxDepth ?? 3), maxPages: Number(req.body.maxPages ?? 50) };
     const result = await neuralRobotPool.startCrawl(seeds, query, opts);
     res.json({ ok: true, results: result });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -7873,7 +7919,8 @@ app.post("/api/neural/index", async (req, res) => {
     if (!Array.isArray(seeds) || !seeds.length) return res.status(400).json({ ok: false, error: "No seed URLs provided" });
     const query = String(req.body?.query || "").slice(0, CFG.maxSearchQueryChars);
     const maxPages = Math.min(CFG.indexAiMaxPages, Math.max(1, Number(req.body?.maxPages) || CFG.indexAiMaxPages));
-    const maxDepth = Math.min(CFG.indexAiMaxDepth, Math.max(0, Number(req.body?.maxDepth) || CFG.indexAiMaxDepth));
+    const requestedDepth = req.body?.maxDepth == null ? CFG.indexAiMaxDepth : Number(req.body.maxDepth);
+    const maxDepth = Number.isInteger(requestedDepth) ? Math.min(CFG.indexAiMaxDepth, Math.max(0, requestedDepth)) : CFG.indexAiMaxDepth;
     const normalized = [...new Set(seeds.map(seed => normalizeUrl(seed)).filter(Boolean))].slice(0, 8);
     if (!normalized.length) return res.status(400).json({ ok: false, error: "No public HTTP(S) seed URLs provided" });
     const result = await neuralRobotPool.startCrawl(normalized, query, { maxPages: Math.ceil(maxPages / normalized.length), maxDepth });

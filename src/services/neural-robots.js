@@ -23,6 +23,7 @@
 
 const { URL } = require("url");
 const { responseTrainingPolicy } = require("./neural-training-data");
+const { readCrawlPageData } = require("./crawl-page-data");
 
 
 let cheerio = null;
@@ -35,9 +36,11 @@ class NeuralRobot {
   constructor(id, opts = {}) {
     this.id = id;
     this.status = "idle";      
+    this.running = false;
     this.currentUrl = null;
     this.visited = new Set();
     this.queue = [];
+    this.queued = new Set();
     this.depth = 0;
     this.maxDepth = opts.maxDepth || 3;
     this.maxPages = opts.maxPages || 50;
@@ -50,6 +53,7 @@ class NeuralRobot {
     this.stats = {
       pagesCrawled: 0,
       linksFound: 0,
+      imagesFound: 0,
       errors: 0,
       startTime: 0,
       bytesFetched: 0,
@@ -114,26 +118,34 @@ class NeuralRobot {
     }
 
     const $ = cheerio.load(html);
+    const data = readCrawlPageData($, baseUrl);
     const title = $("title").text().trim() || $("h1").first().text().trim() || "";
     const links = [];
     $("a[href]").each((i, el) => {
-      if (i >= this.maxLinksPerPage) return false;
+      if (links.length >= this.maxLinksPerPage || i >= 1000) return false;
       const href = $(el).attr("href");
       if (!href || href.startsWith("#") || href.startsWith("javascript:") || href.startsWith("mailto:")) return;
-      try { links.push(new URL(href, baseUrl).href); } catch {}
+      const url = this.canonicalUrl(href, baseUrl);
+      if (url && !links.includes(url)) links.push(url);
     });
 
     
     const metadata = {};
-    $('meta[name], meta[property]').each((i, el) => {
+    $('meta[name], meta[property]').slice(0, 100).each((i, el) => {
       const name = $(el).attr("name") || $(el).attr("property");
       const content = $(el).attr("content");
-      if (name && content) metadata[name] = content;
+      if (name && content && name.length <= 100 && !Object.hasOwn(Object.prototype, name) && name !== "prototype") metadata[name] = content.slice(0, 1500);
     });
 
     
     $("script, style, noscript, svg, template, nav, header, footer, aside, form, [role='navigation'], [aria-hidden='true'], [class*='cookie'], [id*='cookie'], [class*='advert'], [id*='advert'], [class*='social'], [class*='share']").remove();
-    const text = String($("main, article").first().text() || $("body").text()).replace(/\s+/g, " ").trim().slice(0, 5000);
+    // Preserve word boundaries between markup and add structured article data
+    // when the readable body does not already contain it.
+    const main = $("main, article").first(), content = main.length ? main : $("body");
+    content.find("br,h1,h2,h3,h4,p,li,dt,dd,blockquote,figcaption,tr,div,section").before(" ");
+    const body = content.text().replace(/\s+/g, " ").trim();
+    const extra = data.structured && !body.includes(data.structured) ? data.structured : "";
+    const text = [body.slice(0, extra ? 12000 : 18000), extra].filter(Boolean).join(" ").slice(0, 18000);
 
     
     const headings = [];
@@ -143,18 +155,13 @@ class NeuralRobot {
 
     const canonical = $("link[rel='canonical']").attr("href") || "";
     const language = $("html").attr("lang") || "";
-    const jsonLd = [];
-    $("script[type='application/ld+json']").each((i, el) => {
-      if (i >= 4) return false;
-      try { jsonLd.push(JSON.parse($(el).text())); } catch {}
-    });
     const passages = [];
     $("main,article,section,p,li").each((i, el) => {
       if (i >= 80) return false;
       const value = $(el).text().replace(/\s+/g, " ").trim();
       if (value.length >= 45) passages.push(value.slice(0, 500));
     });
-    return { title, links, text, metadata, headings, canonical, language, jsonLd, passages };
+    return { title, links, text, metadata, headings, canonical, language, passages, ...data };
   }
 
   /**
@@ -196,7 +203,7 @@ class NeuralRobot {
   canonicalUrl(raw, base = "") {
     try {
       const u = new URL(raw, base || undefined);
-      if (!/^https?:$/.test(u.protocol)) return "";
+      if (!/^https?:$/.test(u.protocol) || u.username || u.password) return "";
       u.hash = ""; u.hostname = u.hostname.toLowerCase();
       for (const key of [...u.searchParams.keys()]) if (/^(utm_|gclid|fbclid|mc_|ref|source|session|click)/i.test(key)) u.searchParams.delete(key);
       if ((u.protocol === "https:" && u.port === "443") || (u.protocol === "http:" && u.port === "80")) u.port = "";
@@ -212,9 +219,9 @@ class NeuralRobot {
     if (!this.respectRobots) return true;
     const u = new URL(url);
     const robotsUrl = `${u.protocol}//${u.host}/robots.txt`;
-    if (this.robotsCache.has(u.host)) {
-      const rules = this.robotsCache.get(u.host);
-      return rules.isAllowed(u.pathname);
+    if (this.robotsCache.has(u.origin)) {
+      const rules = this.robotsCache.get(u.origin);
+      return rules.isAllowed(u.pathname + u.search);
     }
     try {
       const res = await this.fetchRaw(robotsUrl, { timeoutMs: 5000 });
@@ -222,11 +229,11 @@ class NeuralRobot {
       if (res.statusCode === 200 && res.url === robotsUrl && !res.redirected && /^text\/plain(?:\s*;|$)/i.test(res.contentType)) {
         rules.verifiedTrainingOrigin = u.origin;
       }
-      this.robotsCache.set(u.host, rules);
-      return rules.isAllowed(u.pathname);
+      this.robotsCache.set(u.origin, rules);
+      return rules.isAllowed(u.pathname + u.search);
     } catch {
       
-      this.robotsCache.set(u.host, { isAllowed: () => true });
+      this.robotsCache.set(u.origin, { isAllowed: () => true });
       return true;
     }
   }
@@ -266,11 +273,15 @@ class NeuralRobot {
       return null;
     }
     const crawlOrigin = this.onCrawlObservation && this.respectRobots ? new URL(url) : null;
-    const robotsVerified = !!crawlOrigin && this.robotsCache.get(crawlOrigin.host)?.verifiedTrainingOrigin === crawlOrigin.origin;
+    const robotsVerified = !!crawlOrigin && this.robotsCache.get(crawlOrigin.origin)?.verifiedTrainingOrigin === crawlOrigin.origin;
 
     try {
       const res = await this.fetchRaw(url);
       const parsed = this.parseHtml(res.html, res.url || url);
+      const policy = responseTrainingPolicy(res.headers);
+      const directives = [policy.robots, ...(parsed.directives || [])].join(" ");
+      const canIndex = !/\b(?:noindex|none)\b/i.test(directives) && !/\b(?:private|no-store)\b/i.test(policy.cacheControl || "") && !policy.setCookie && !policy.challenge;
+      const images = canIndex && !/\bnoimageindex\b/i.test(directives) ? parsed.images || [] : [];
       if (robotsVerified && !res.cached && !res.redirected) this.observeCrawl({
         requestedUrl: url, fetchedUrl: res.url, status: res.statusCode, depth, page: parsed, robotsVerified, ...responseTrainingPolicy(res.headers)
       });
@@ -279,25 +290,30 @@ class NeuralRobot {
 
       this.stats.pagesCrawled++;
       this.stats.linksFound += parsed.links.length;
+      this.stats.imagesFound = (this.stats.imagesFound || 0) + images.length;
       this.stats.bytesFetched += res.bytes;
       this.stats.avgLatencyMs = (this.stats.avgLatencyMs * (this.stats.pagesCrawled - 1) + latency) / this.stats.pagesCrawled;
 
+      const finalUrl = this.canonicalUrl(res.url || url), canonical = this.canonicalUrl(parsed.canonical, finalUrl);
+      const pageUrl = canonical && new URL(canonical).origin === new URL(finalUrl).origin ? canonical : finalUrl;
       const page = {
-        url: this.canonicalUrl(parsed.canonical || res.url || url), title: parsed.title, text: parsed.text, links: parsed.links.map(link => this.canonicalUrl(link, res.url || url)).filter(Boolean),
-        metadata: parsed.metadata, headings: parsed.headings, passages: parsed.passages || [], language: parsed.language || "", jsonLd: parsed.jsonLd || [],
+        url: pageUrl, title: parsed.title, text: parsed.text, links: parsed.links.map(link => this.canonicalUrl(link, finalUrl)).filter(Boolean),
+        metadata: parsed.metadata, headings: parsed.headings, passages: parsed.passages || [], language: parsed.language || "", images, indexable: canIndex,
         score, query, queryRelevance: this.textRelevance(`${parsed.title} ${parsed.text} ${(parsed.headings || []).join(" ")}`, query), depth, latency, bytes: res.bytes,
         timestamp: Date.now(),
       };
 
-      this.onPageFound(page);
-      page.links.forEach(link => this.onLinkFound(link, page.url, score));
+      if (canIndex) this.onPageFound(page);
+      const follow = !/\b(?:nofollow|none)\b/i.test(directives);
+      if (follow) page.links.forEach(link => this.onLinkFound(link, page.url, score));
 
       
       for (const link of page.links) {
-        if (!this.visited.has(link) && depth < this.maxDepth) {
+        if (follow && !this.queued.has(link) && !this.visited.has(link) && depth < this.maxDepth && this.queue.length < this.maxPages * 8) {
           const lexical = this.textRelevance(link, query);
           const neural = this.neuralModel?.scoreUrl ? this.neuralModel.scoreUrl(link, { type: "html", internal: new URL(link).hostname === new URL(page.url).hostname }) : score;
           const priority = neural + lexical * 2;
+          this.queued.add(link);
           this.queue.push({ url: link, depth: depth + 1, priority });
         }
       }
@@ -321,35 +337,40 @@ class NeuralRobot {
    * Start a crawl from a seed URL.
    */
   async startCrawl(seedUrl, query = "", opts = {}) {
+    if (this.running) throw new Error("Crawler worker is busy");
+    this.running = true;
     this.visited.clear();
     this.queue = [{ url: this.canonicalUrl(seedUrl), depth: 0, priority: 1 }];
-    this.stats = { pagesCrawled: 0, linksFound: 0, errors: 0, startTime: Date.now(), bytesFetched: 0, avgLatencyMs: 0, compressedResponses: 0, duplicateUrls: 0, skippedNonHtml: 0 };
-    this.maxDepth = opts.maxDepth || this.maxDepth;
-    this.maxPages = opts.maxPages || this.maxPages;
+    this.queued = new Set(this.queue.map(item => item.url));
+    this.stats = { pagesCrawled: 0, linksFound: 0, imagesFound: 0, errors: 0, startTime: Date.now(), bytesFetched: 0, avgLatencyMs: 0, compressedResponses: 0, duplicateUrls: 0, skippedNonHtml: 0 };
+    const setting = (value, fallback, min, max) => Number.isInteger(value) ? Math.min(max, Math.max(min, value)) : fallback;
+    const configured = [this.maxDepth, this.maxPages];
+    this.maxDepth = setting(opts.maxDepth, configured[0], 0, 5);
+    this.maxPages = setting(opts.maxPages, configured[1], 1, 100);
 
     const results = [], active = new Set();
     let started = 0;
     this.status = "crawling";
-    const pump = async () => {
-      while (this.queue.length && started < this.maxPages && this.status !== "paused") {
-        const item = this.queue.shift();
-        if (!item?.url || this.visited.has(item.url)) { this.stats.duplicateUrls++; continue; }
-        this.visited.add(item.url);
-        started++;
-        const task = this.crawlPage(item.url, query, item.depth).then(page => { if (page) results.push(page); }).finally(() => active.delete(task));
-        active.add(task);
-        if (active.size >= this.concurrency) await Promise.race(active);
+    try {
+      while ((this.queue.length || active.size) && started < this.maxPages && this.status !== "paused") {
+        while (this.queue.length && active.size < this.concurrency && started < this.maxPages) {
+          const item = this.queue.shift();
+          if (!item?.url || this.visited.has(item.url)) { this.stats.duplicateUrls++; continue; }
+          this.visited.add(item.url);
+          started++;
+          const task = this.crawlPage(item.url, query, item.depth).then(page => { if (page?.indexable) results.push(page); }).finally(() => active.delete(task));
+          active.add(task);
+        }
+        if (active.size) await Promise.race(active);
       }
       await Promise.all(active);
-    };
-    await pump();
-    this.status = "idle";
-
-    return {
-      pages: results,
-      stats: this.report(),
-      query,
-    };
+    } finally {
+      [this.maxDepth, this.maxPages] = configured;
+      this.running = false;
+      this.status = "idle";
+      this.currentUrl = null;
+    }
+    return { pages: results, stats: this.report(), query };
   }
 
   /**
@@ -374,6 +395,7 @@ class NeuralRobot {
       currentUrl: this.currentUrl,
       pagesCrawled: this.stats.pagesCrawled,
       linksFound: this.stats.linksFound,
+      imagesFound: this.stats.imagesFound || 0,
       errors: this.stats.errors,
       bytesFetched: this.stats.bytesFetched,
       avgLatencyMs: Math.round(this.stats.avgLatencyMs),
@@ -389,7 +411,8 @@ class NeuralRobot {
   reset() {
     this.visited.clear();
     this.queue = [];
-    this.stats = { pagesCrawled: 0, linksFound: 0, errors: 0, startTime: 0, bytesFetched: 0, avgLatencyMs: 0, compressedResponses: 0, duplicateUrls: 0, skippedNonHtml: 0 };
+    this.queued.clear();
+    this.stats = { pagesCrawled: 0, linksFound: 0, imagesFound: 0, errors: 0, startTime: 0, bytesFetched: 0, avgLatencyMs: 0, compressedResponses: 0, duplicateUrls: 0, skippedNonHtml: 0 };
     this.status = "idle";
     this.currentUrl = null;
   }
@@ -436,21 +459,23 @@ class NeuralRobotPool {
    * Start a parallel crawl from multiple seed URLs.
    */
   async startCrawl(seeds, query, opts = {}) {
-    const seedList = Array.isArray(seeds) ? seeds : [seeds];
-    const activeWorkers = this.workers.filter(w => w.status === "idle");
-    const promises = [];
-
-    for (let i = 0; i < seedList.length && i < activeWorkers.length; i++) {
-      promises.push(activeWorkers[i].startCrawl(seedList[i], query, opts));
-    }
-
-    const results = await Promise.allSettled(promises);
-    return results.map((r, i) => ({
-      seed: seedList[i],
-      status: r.status,
-      result: r.status === "fulfilled" ? r.value : null,
-      error: r.status === "rejected" ? r.reason?.message : null,
+    const seedList = [...new Set((Array.isArray(seeds) ? seeds : [seeds])
+      .map(seed => this.workers[0]?.canonicalUrl(seed)).filter(Boolean))].slice(0, 8);
+    const activeWorkers = this.workers.filter(w => !w.reserved && !w.running && w.status === "idle").slice(0, seedList.length);
+    if (!activeWorkers.length) return [];
+    let cursor = 0;
+    const results = Array(seedList.length);
+    for (const worker of activeWorkers) worker.reserved = true;
+    await Promise.all(activeWorkers.map(async worker => {
+      try {
+        while (cursor < seedList.length) {
+          const index = cursor++, seed = seedList[index];
+          try { results[index] = { seed, status: "fulfilled", result: await worker.startCrawl(seed, query, opts), error: null }; }
+          catch (error) { results[index] = { seed, status: "rejected", result: null, error: error?.message || String(error) }; }
+        }
+      } finally { worker.reserved = false; }
     }));
+    return results;
   }
 
   /**
@@ -466,11 +491,12 @@ class NeuralRobotPool {
   report() {
     return {
       totalWorkers: this.workers.length,
-      active: this.workers.filter(w => w.status === "crawling").length,
-      idle: this.workers.filter(w => w.status === "idle").length,
+      active: this.workers.filter(w => w.running).length,
+      idle: this.workers.filter(w => !w.running && w.status === "idle").length,
       error: this.workers.filter(w => w.status === "error").length,
       totalPagesCrawled: this.workers.reduce((sum, w) => sum + w.stats.pagesCrawled, 0),
       totalLinksFound: this.workers.reduce((sum, w) => sum + w.stats.linksFound, 0),
+      totalImagesFound: this.workers.reduce((sum, w) => sum + (w.stats.imagesFound || 0), 0),
       totalErrors: this.workers.reduce((sum, w) => sum + w.stats.errors, 0),
       totalBytesFetched: this.workers.reduce((sum, w) => sum + w.stats.bytesFetched, 0),
       workers: this.workers.map(w => w.report()),

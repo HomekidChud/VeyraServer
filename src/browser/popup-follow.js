@@ -32,6 +32,8 @@ function httpUrl(page) {
 // script sends it to an actual page. Keep showing the opener until then.
 function followPopupWhenReady(session, opener, popup, timeoutMs = 120000) {
   if (!isOpen(popup)) return;
+  const source = opener.url();
+  const close = () => { void popup.close().catch(() => {}); };
   let timer;
   function cleanup() {
     clearTimeout(timer);
@@ -42,10 +44,14 @@ function followPopupWhenReady(session, opener, popup, timeoutMs = 120000) {
     const url = httpUrl(popup);
     if (!url) return false;
     cleanup();
+    if (blockPlaybackPopup(source, url)) { close(); return true; }
     if (session.page === opener && isOpen(opener) && isOpen(popup)) {
       pendingPopups.delete(popup);
       followPopup(session, popup);
       session.canonicalUrl = url;
+      if (blockPlaybackPopup(source, "about:blank")) popup.on("framenavigated", frame => {
+        if (frame === popup.mainFrame() && blockPlaybackPopup(source, frame.url())) close();
+      });
     } else if (isOpen(popup)) void popup.close().catch(() => {});
     return true;
   }
@@ -61,6 +67,24 @@ function followPopupWhenReady(session, opener, popup, timeoutMs = 120000) {
   popup.on("close", cleanup);
   timer = setTimeout(() => { cleanup(); if (isOpen(popup)) void popup.close().catch(() => {}); }, timeoutMs);
   timer.unref?.();
+}
+
+// This function is also serialized into the Fast Proxy runtime. Keep it
+// self-contained so the streamed and in-frame paths make the same decision.
+function blockPlaybackPopup(source, destination, explicitLink = false) {
+  const site = /^(?:[a-z0-9-]+\.)*xhamster\.com$/i;
+  const watch = /^\/videos\/([^/]+)\/?$/i;
+  let opener, from;
+  try { opener = new URL(source); from = site.test(opener.hostname) && watch.exec(opener.pathname); } catch {}
+  if (!from) return false;
+  try {
+    const next = new URL(destination, opener);
+    if (!/^https?:$/.test(next.protocol) || !site.test(next.hostname)) return !explicitLink;
+    const to = watch.exec(next.pathname);
+    if (!to) return false;
+    const videoId = slug => /(?:^|[-_])(x[hx][a-z0-9]+)$/i.exec(slug)?.[1]?.toLowerCase();
+    return from[1] === to[1] || (!!videoId(from[1]) && videoId(from[1]) === videoId(to[1]));
+  } catch { return !explicitLink; }
 }
 
 // Make `popup` the active page for the session; the previous active page is
@@ -103,4 +127,4 @@ function restoreAfterClose(session, page) {
   return next;
 }
 
-module.exports = { followPopup, followPopupWhenReady, restoreAfterClose };
+module.exports = { followPopup, followPopupWhenReady, restoreAfterClose, blockPlaybackPopup };

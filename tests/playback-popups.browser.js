@@ -14,6 +14,8 @@ process.env.VEYRA_CHROMIUM_ENABLED = "false";
 delete process.env.PUBLIC_API_ORIGIN;
 const { app } = require(process.env.POPUP_TEST_SERVER || "../src/server");
 const site = "https://example.com";
+const watchSite = "https://www.xhamster.com";
+const watchPath = "/videos/test-player-xhA123";
 const player = `<!doctype html><html><head><title>Playback fixture</title></head><body>
  <h1>Playback fixture with a locally generated clip</h1>
  <video muted playsinline preload="auto" src="/clip.webm"></video>
@@ -44,6 +46,24 @@ const player = `<!doctype html><html><head><title>Playback fixture</title></head
  });
  document.getElementById('same').onclick = () => window.open('/details', '_self');
  </script></body></html>`;
+const watchPlayer = `<!doctype html><title>Watch fixture</title>
+ <video muted playsinline preload="auto" src="/clip.webm"></video>
+ <button id="play">Play</button><output id="result"></output>
+ <a id="duplicate" href="/videos/changed-title-xhA123?utm_source=fixture" target="_blank">Same video</a>
+ <a id="other" href="/videos/another-clip-xhB456" target="_blank">Other video</a>
+ <a id="external" href="${site}/details" target="_blank">External details</a>
+ <script>
+ document.getElementById('play').onclick = () => {
+   window.open('${watchPath}?utm_source=fixture#player', '_blank');
+   window.open('https://ads.example/redirect', '_blank');
+   const pending = window.open('', 'delayed');
+   setTimeout(() => {
+     if (pending) pending.location.replace('/videos/changed-title-xhA123');
+     document.getElementById('result').textContent = 'playback popup attempts finished';
+   }, 120);
+   document.querySelector('video').play();
+ };
+ </script>`;
 const signIn = `<h1>Sign-in window fixture</h1><button id="finish" disabled>Finish</button><script>
  window.addEventListener('message', e => {
    if (e.origin === 'https://example.com' && e.data === 'reply') document.getElementById('finish').disabled = false;
@@ -57,7 +77,7 @@ async function run() {
     "color=blue:size=64x64:rate=10", "-t", "3", "-c:v", "libvpx", "-f", "webm", "pipe:1"]);
   app.locals.veyraProxyFetchBuffer = async (target, opts) => {
     const u = new URL(target);
-    assert.equal(u.origin, site, "fixture never fetches an external host");
+    assert.ok([site, watchSite].includes(u.origin), "fixture never fetches an unrelated host");
     assert.equal(u.searchParams.has("veyra_popup"), false, "popup routing metadata is not passed to the site");
     if (u.pathname === "/clip.webm") {
       const range = /bytes=(\d+)-(\d*)/.exec(opts.requestHeaders?.range || "");
@@ -69,8 +89,10 @@ async function run() {
       }
       return { status: 200, finalUrl: target, contentType: "video/webm", body: clip };
     }
-    const html = u.pathname === "/player" ? player : `<!doctype html><html><head><title>Fixture</title></head><body>${
-      u.pathname === "/signin" ? signIn : u.pathname === "/details" ? "<h1>Details fixture</h1>" : ""
+    assert.notEqual(u.pathname, "/videos/changed-title-xhA123", "duplicate video popup must not request the document");
+    const html = u.pathname === "/player" ? player : u.pathname === watchPath ? watchPlayer : `<!doctype html><html><head><title>Fixture</title></head><body>${
+      u.pathname === "/signin" ? signIn : u.pathname === "/details" ? "<h1>Details fixture</h1>" :
+        u.pathname === "/videos/another-clip-xhB456" ? "<h1>Other fixture video</h1>" : ""
     }</body></html>`;
     return { status: 200, finalUrl: target, contentType: "text/html", body: Buffer.from(html), cacheControl: "no-store" };
   };
@@ -144,6 +166,27 @@ async function run() {
     assert.equal(await count(), 2);
     assert.equal(nativePopups.length, 0);
     console.log("Playback, blank links, delayed sign-in relay, in-place navigation and genuine new-tab links passed.");
+    const watchUrl = new URL(url);
+    watchUrl.searchParams.set("url", watchSite + watchPath);
+    await page.goto(watchUrl.href);
+    await opener.locator("#play").click();
+    await opener.getByText("playback popup attempts finished").waitFor();
+    await opener.locator("video").evaluate(v => new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("watch fixture video never played")), 3000);
+      const playing = () => { if (v.currentTime > 0) { clearTimeout(timeout); v.removeEventListener("timeupdate", playing); resolve(); } };
+      v.addEventListener("timeupdate", playing);
+      playing();
+    }));
+    await opener.locator("#duplicate").click();
+    assert.equal(await count(), 1);
+    assert.equal(await active(), before.active);
+    assert.equal(nativePopups.length, 0);
+    await opener.locator("#other").click();
+    await page.frameLocator("#frame-t2").getByRole("heading", { name: "Other fixture video" }).waitFor();
+    await page.goto(watchUrl.href);
+    await opener.locator("#external").click();
+    await page.frameLocator("#frame-t2").getByRole("heading", { name: "Details fixture" }).waitFor();
+    console.log("Watch playback stayed in place while tracked, staged and explicit duplicates were blocked; independent links worked.");
   } finally {
     await browser?.close();
     apiServer.closeAllConnections();

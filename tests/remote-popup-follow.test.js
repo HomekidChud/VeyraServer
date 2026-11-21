@@ -131,7 +131,7 @@ assert.equal(sessionLike.page, fakePlaywrightPage, "closing the popup must resto
 function placeholder(initial = "about:blank") {
   let current = initial;
   let closed = false;
-  const frame = {};
+  const frame = { url: () => current };
   return Object.assign(new EventEmitter(), {
     url: () => current, mainFrame: () => frame, isClosed: () => closed,
     async close() { closed = true; this.emit("close"); },
@@ -174,3 +174,27 @@ abandoned.once("close", () => {
 });
 // Keep the test process alive for the helper's unref'ed expiry timer.
 setTimeout(() => assert.equal(abandoned.isClosed(), true, "a blank page must expire"), 10);
+
+const watch = fakePage("https://xhamster.com/videos/sample-xhA123");
+const watchSession = fakeSession(watch);
+const sameVideo = placeholder("https://www.xhamster.com/videos/different-slug-xha123?utm_source=ad");
+followPopupWhenReady(watchSession, watch, sameVideo);
+assert.equal(sameVideo.isClosed(), true);
+assert.equal(watchSession.page, watch);
+
+const staged = placeholder();
+followPopupWhenReady(watchSession, watch, staged);
+staged.navigate("https://example.com/ad");
+assert.equal(staged.isClosed(), true);
+assert.equal(watchSession.page, watch);
+
+const independent = placeholder("https://xhamster.com/videos/sample-xhB456");
+watchSession.pages.add(independent);
+independent.once("close", () => restoreAfterClose(watchSession, independent));
+followPopupWhenReady(watchSession, watch, independent);
+assert.equal(watchSession.page, independent);
+independent.navigate(watch.url(), true);
+assert.equal(independent.isClosed(), false);
+independent.navigate(watch.url());
+assert.equal(independent.isClosed(), true);
+assert.equal(watchSession.page, watch);

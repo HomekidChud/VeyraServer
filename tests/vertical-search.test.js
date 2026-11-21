@@ -7,10 +7,11 @@ const checkpoint = require("../src/services/vertical-ranker-weights.json");
 const { trainModel, evaluate } = require("../scripts/train-vertical-ranker");
 const fixture = require("./fixtures/vertical-ranking");
 
-function mock(routes, { env = {}, results = [] } = {}) {
+function mock(routes, { env = {}, results = [], indexedImages } = {}) {
   const calls = [];
   const service = createVerticalSearch({
     env,
+    indexedImages,
     async fetchText(rawUrl, options) {
       const url = new URL(rawUrl);
       calls.push({ url, options });
@@ -55,6 +56,45 @@ test("image fallback validates artwork, license, provenance, cache and scoped pa
   assert.equal(service.calls.at(-1).url.searchParams.get("gsrsearch"), "Welsh lake");
   await service.search("images", "site: Welsh lake");
   assert.equal(service.calls.length, 5);
+});
+
+test("deduplicates and paginates images from both providers and the local crawler", async () => {
+  const asset = i => `https://images-assets.nasa.gov/photo-${i}.jpg`;
+  const nasa = "https://www.nasa.gov/gallery";
+  const service = mock({
+    "api.search.brave.com": url => {
+      assert.equal(url.searchParams.get("safesearch"), "strict");
+      return { results: Array.from({ length: 48 }, (_, i) => ({ title: `Planet Brave ${i}`, url: `${nasa}/${i}`, properties: { url: asset(i) } })) };
+    },
+    "commons.wikimedia.org": url => {
+      assert.equal(url.searchParams.get("gsrlimit"), "48");
+      return { query: { pages: Array.from({ length: 48 }, (_, i) => ({ index: i, title: `File:Planet Commons ${i}.jpg`,
+        imageinfo: [{ mime: "image/jpeg", url: asset(i + 47), descriptionurl: `https://commons.wikimedia.org/wiki/Fixture_${i}`, thumburl: `https://thumb.wikimedia.org/${i}.jpg` }]
+      })) } };
+    }
+  }, { env: { BRAVE_SEARCH_API_KEY: "fixture" }, indexedImages: () => [
+    { url: asset(99), imageUrl: asset(99), title: "Planet archive photo", sourcePageUrl: nasa, thumbnail: asset(99) },
+    { url: asset(100), imageUrl: asset(100), title: "Planet archive closeup", sourcePageUrl: nasa, thumbnail: asset(100) }
+  ] });
+  const rows = [];
+  let page = await service.search("images", "Planet", { noCache: false });
+  assert.equal(page.provider, "image-mix");
+  let pages = 0;
+  while (++pages <= 8) {
+    rows.push(...page.results);
+    if (page.nextPage == null) break;
+    page = await service.search("images", "Planet", { page: page.nextPage, provider: page.provider, noCache: false });
+  }
+  assert.equal(pages, 8);
+  assert.equal(page.nextPage, null, "the mixed feed has a bounded page count");
+  assert.equal(rows.length, 96);
+  assert.equal(new Set(rows.map(row => row.imageUrl)).size, 96);
+  assert.deepEqual(new Set(rows.map(row => row.provider)), new Set(["brave", "wikimedia", "veyra-crawler"]));
+  assert.equal(service.calls.length, 2, "both sources are queried once for cached pagination");
+  assert.equal(rows.find(row => row.imageUrl === asset(99)).sourcePageUrl, nasa);
+  assert.equal(rows.find(row => row.imageUrl === asset(99)).thumbnail, asset(99));
+  const scoped = await service.search("images", "site:nasa.gov Planet");
+  assert.ok(scoped.results.every(row => new URL(row.sourcePageUrl || row.url).hostname.endsWith("nasa.gov")));
 });
 
 test("a stalled provider body times out and leaves time for a fallback", async () => {
