@@ -4,6 +4,7 @@ const cheerio = require("cheerio");
 const { isIP } = require("node:net");
 const { parseSiteScope, allowsSiteUrl } = require("./search-site-scope");
 const { rankVertical, rankerVersion } = require("./vertical-ranker");
+const { imageIdentity } = require("./crawl-page-data");
 
 const TYPES = Object.freeze(["images", "videos", "news", "shopping", "research", "discussions"]);
 const PAGE_SIZE = 12;
@@ -11,7 +12,7 @@ const LAST_IMAGE_PAGE = 7;
 const ENDPOINT = "https://api.search.brave.com/res/v1";
 const TIMEOUT = 4400;
 const THUMB_HOSTS = new Set(["imgs.search.brave.com", "upload.wikimedia.org", "thumb.wikimedia.org", "i.ebayimg.com", "i.ytimg.com",
-  "images-assets.nasa.gov", "science.nasa.gov", "www.esa.int"]);
+  "images-assets.nasa.gov", "science.nasa.gov", "assets.science.nasa.gov", "www.esa.int", "media.esa.int"]);
 
 function safeUrl(value) {
   try {
@@ -23,8 +24,13 @@ function safeUrl(value) {
   } catch { return ""; }
 }
 function thumbnail(value) {
-  const url = safeUrl(value);
-  return url && url.startsWith("https:") && THUMB_HOSTS.has(new URL(url).hostname) ? url : "";
+  const valueUrl = safeUrl(value);
+  if (!valueUrl || !valueUrl.startsWith("https:")) return "";
+  const url = new URL(valueUrl);
+  if (!THUMB_HOSTS.has(url.hostname)) return "";
+  if (url.hostname === "assets.science.nasa.gov" && url.pathname.startsWith("/dynamicimage/") &&
+      ["w", "h"].some(key => Number(url.searchParams.get(key)) > 2048)) return "";
+  return valueUrl;
 }
 function plain(value, max = 300) {
   if (typeof value !== "string") return "";
@@ -275,7 +281,7 @@ function createVerticalSearch({ fetchText, webSearch, indexedImages, env = proce
         const seen = new Set();
         const known = packed.results.filter(item => {
           if (!item || !allowsSiteUrl(scope, item.sourcePageUrl || item.url)) return false;
-          const key = type === "images" ? item.imageUrl || item.thumbnail || item.url : item.url;
+          const key = type === "images" ? imageIdentity(item.imageUrl || item.thumbnail || item.url) : item.url;
           return !seen.has(key) && seen.add(key);
         });
         const ranked = rankVertical(scope.text || q, known);

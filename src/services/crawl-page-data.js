@@ -22,21 +22,45 @@ function publicImageUrl(value, base) {
   } catch { return ""; }
 }
 
+// A publisher may advertise the same image as social artwork and in several
+// responsive sizes. Only collapse variants whose publisher IDs are known.
+function imageIdentity(value) {
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.username || url.password || url.port) return value;
+    if (url.hostname === "media.esa.int") {
+      const id = /^\/(?:legacy\/web\/images|global\/public)\/.+\/(\d+)\/image-thumb__\1__(?:social_share|fit_large|fill_small|fill_square)\//.exec(url.pathname);
+      if (id) return `${url.origin}/image/${id[1]}`;
+    }
+    if (url.hostname === "assets.science.nasa.gov") {
+      const asset = /^\/(?:content\/dam|dynamicimage\/assets)(\/science\/(?:[^/:]+\/)*[^/:]+\.(?:jpe?g|webp|png))(?:\/jcr:content\/renditions\/cq5dam\.web\.\d+\.\d+\.(?:jpe?g|webp|png))?$/i.exec(url.pathname);
+      // JSON-LD can carry HTML-escaped separators even though its URLs are JSON strings.
+      const params = new URLSearchParams(url.search.replace(/&amp;(?=(?:w|h|fit)=)/g, "&"));
+      const resizeOnly = [...params].every(([name, val]) => name === "fit" ? val === "clip" :
+        (name === "w" || name === "h") && /^\d+$/.test(val));
+      if (asset && resizeOnly) return `${url.origin}${asset[1]}`;
+    }
+  } catch {}
+  return value;
+}
+
 function readCrawlPageData($, base) {
   const images = new Map(), structured = [], jsonLd = [], directives = [];
   let imageBytes = 0;
-  function image(raw, label, width, height) {
+  function image(raw, label, width, height, primary = false) {
     const url = publicImageUrl(raw, base);
     if (!url || (+width > 0 && +width < 48) || (+height > 0 && +height < 48)) return false;
     const title = cleanText(label, 200);
-    if (images.has(url)) {
-      const existing = images.get(url);
+    const identity = imageIdentity(url);
+    if (images.has(identity)) {
+      const existing = images.get(identity);
       if (!existing.title && title) existing.title = title;
+      if (primary) existing.primary = true;
       return true;
     }
     if (images.size >= 20 || imageBytes + url.length > 8000) return false;
     imageBytes += url.length;
-    images.set(url, { url, title });
+    images.set(identity, { url, title, ...(primary ? { primary: true } : {}) });
     return true;
   }
   $('meta[name="robots" i], meta[name="veyraneuralbot" i], meta[name="veyrascan" i]').each((_, element) => {
@@ -50,7 +74,7 @@ function readCrawlPageData($, base) {
     const value = node.attr("content");
     if (/^(?:og:image(?::(?:url|secure_url))?|twitter:image(?::src)?)$/.test(name)) {
       const alt = name.startsWith("og:") ? 'meta[property="og:image:alt"]' : 'meta[name="twitter:image:alt"]';
-      image(value, $(alt).first().attr("content"));
+      image(value, $(alt).first().attr("content"), undefined, undefined, true);
     }
   });
   $('link[rel~="image_src"]').slice(0, 10).each((_, node) => image($(node).attr("href")));
@@ -107,4 +131,4 @@ function readCrawlPageData($, base) {
   return { images: [...images.values()], structured: [...new Set(structured)].join(" ").slice(0, 6000), jsonLd, directives };
 }
 
-module.exports = { readCrawlPageData, publicImageUrl };
+module.exports = { readCrawlPageData, publicImageUrl, imageIdentity };

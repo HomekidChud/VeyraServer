@@ -16,7 +16,7 @@ const { createShield } = require("./network/shield");
 const { upstreamHeaderCapOptions } = require("./network/header-cap");
 const { createWebSearch } = require("./services/websearch");
 const { createVerticalSearch, TYPES: SEARCH_VERTICALS, LAST_IMAGE_PAGE, safeUrl: verticalResultUrl } = require("./services/vertical-search");
-const { publicImageUrl } = require("./services/crawl-page-data");
+const { publicImageUrl, imageIdentity } = require("./services/crawl-page-data");
 const { parseSiteScope, allowsSiteUrl } = require("./services/search-site-scope");
 const { installBrandRoutes, isReservedOriginPath, brandNotFoundHtml } = require("./services/brand");
 const VEYRA_VERSION = require("../package.json").version;
@@ -3606,19 +3606,29 @@ function localImageSearch(query) {
   const parsed = parseSearchQuery(query);
   if (!parsed.terms.length || parsed.siteScope.invalid) return [];
   const { results } = localSearch(query, 0, 40, { onlyWithImages: true });
-  const images = [], seen = new Set();
-  for (const page of results) {
-    if (!isReferenceImageSource(page.url)) continue;
+  const feeds = results.filter(page => isReferenceImageSource(page.url)).map(page => {
+    const candidates = [];
     for (const item of searchIndex.get(page.url)?.searchImages || []) {
       const url = publicImageUrl(item.url, page.url);
-      if (!url || !isReferenceImageSource(url) || seen.has(url)) continue;
+      if (!url || !isReferenceImageSource(url)) continue;
       const title = item.title || page.title;
-      const words = new Set(tokenizeSearch(`${title} ${page.title} ${page.snippet}`));
+      let path = new URL(url).pathname;
+      try { path = decodeURIComponent(path); } catch {}
+      const words = new Set(tokenizeSearch(`${item.title || (item.primary ? page.title : "")} ${path.replace(/[-_]/g, " ")}`));
       if (!parsed.terms.some(term => words.has(term))) continue;
-      images.push({ url, imageUrl: url, sourcePageUrl: page.url, source: hostOf(page.url), thumbnail: url, title, snippet: page.title });
-      seen.add(url);
-      if (images.length === 24) return images;
+      candidates.push({ url, imageUrl: url, sourcePageUrl: page.url, source: hostOf(page.url), thumbnail: url, title, snippet: page.title });
     }
+    return candidates;
+  });
+  // A single long article must not use up every slot before other publishers.
+  const images = [], seen = new Set();
+  for (let i = 0; i < 20; i++) for (const feed of feeds) {
+    if (!feed[i]) continue;
+    const id = imageIdentity(feed[i].imageUrl);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    images.push(feed[i]);
+    if (images.length === 24) return images;
   }
   return images;
 }

@@ -97,6 +97,31 @@ test("deduplicates and paginates images from both providers and the local crawle
   assert.ok(scoped.results.every(row => new URL(row.sourcePageUrl || row.url).hostname.endsWith("nasa.gov")));
 });
 
+test("agency previews use exact hosts and publisher renditions collapse without changing the URLs", async () => {
+  const sourcePageUrl = "https://science.nasa.gov/gallery";
+  const nasa = "https://assets.science.nasa.gov";
+  const esa = "https://media.esa.int/legacy/web/images/2022/gallery/259791/image-thumb__259791";
+  const nasaPreview = `${nasa}/content/dam/science/webb/planet.png/jcr:content/renditions/cq5dam.web.1280.1280.png`;
+  const esaPreview = `${esa}__social_share/planet.jpg`;
+  const oversized = `${nasa}/dynamicimage/assets/science/webb/other.png?w=8423&h=14589&fit=clip`;
+  const lookalike = nasaPreview.replace(".gov", ".gov.example.com");
+  const lookalikeEsa = esaPreview.replace("esa.int", "esa.int.example.com");
+  const service = mock({ "commons.wikimedia.org": {} }, { indexedImages: () => [
+    nasaPreview, `${nasa}/dynamicimage/assets/science/webb/planet.png?w=720&h=1280&fit=clip`,
+    esaPreview, `${esa}__fit_large/planet.webp`, oversized, lookalike, lookalikeEsa,
+  ].map(url => ({ url, imageUrl: url, title: "Planet", sourcePageUrl, thumbnail: url })) });
+  const { results } = await service.search("images", "Planet");
+  assert.equal(results.length, 5);
+  for (const url of [nasaPreview, esaPreview]) {
+    const row = results.find(item => item.url === url);
+    assert.equal(row?.thumbnail, url);
+    assert.equal(row?.sourcePageUrl, sourcePageUrl);
+  }
+  for (const url of [oversized, lookalike, lookalikeEsa]) {
+    assert.equal(results.find(item => item.url === url)?.thumbnail, "");
+  }
+});
+
 test("a stalled provider body times out and leaves time for a fallback", async () => {
   const service = createVerticalSearch({
     env: { BRAVE_SEARCH_API_KEY: "fixture" },

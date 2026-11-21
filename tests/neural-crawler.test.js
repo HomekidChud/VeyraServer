@@ -2,6 +2,7 @@
 const assert = require("assert");
 const { NeuralRobot, NeuralRobotPool } = require("../src/services/neural-robots");
 const { NeuralCrawlerModel, NUM_FEATURES } = require("../src/services/neural-crawler");
+const { imageIdentity } = require("../src/services/crawl-page-data");
 
 const robot = new NeuralRobot(0, { neuralModel: null });
 const relevant = robot.scorePage({ title: "Photosynthesis process", text: "Photosynthesis converts light, water and carbon dioxide into chemical energy.", metadata: {"og:title":"Photosynthesis"}, links: [] }, "photosynthesis", 1);
@@ -15,6 +16,30 @@ assert.equal(parsed.title, 'Photosynthesis');
 assert.equal(parsed.links[0], 'https://example.com/biology');
 assert.match(parsed.text, /Plants use light/);
 assert.doesNotMatch(parsed.text, /Navigation menu|Add to word list|Cookie settings/);
+
+const nasa = "https://assets.science.nasa.gov";
+const esa = "https://media.esa.int/legacy/web/images/esa_multimedia/images/2022/12/gallery";
+const nasaOg = `${nasa}/content/dam/science/missions/webb/nebula.png/jcr:content/renditions/cq5dam.web.1280.1280.png`;
+const nasaDynamic = `${nasa}/dynamicimage/assets/science/missions/webb/nebula.png?w=8423&h=14589&fit=clip`;
+const compass = `${nasa}/content/dam/science/missions/webb/nebula.png/jcr:content/renditions/Compass%20and%20Scale%20Image.png`;
+const esaOg = `${esa}/259791/image-thumb__259791__social_share/nebula.jpg`;
+const esaLarge = `${esa}/259791/image-thumb__259791__fit_large/nebula.webp`;
+assert.equal(imageIdentity(nasaOg), imageIdentity(nasaDynamic));
+assert.equal(imageIdentity(nasaOg), imageIdentity(nasaDynamic.replaceAll("&", "&amp;")));
+assert.equal(imageIdentity(esaOg), imageIdentity(esaLarge));
+assert.notEqual(imageIdentity(esaOg), imageIdentity(esaLarge.replaceAll("259791", "259792")));
+for (const url of [compass, `${nasaDynamic}&transform=other`, esaLarge.replace("/259791/", "/259792/"),
+  esaOg.replace("media.esa.int", "media.esa.int.example.org"), nasaOg.replace(".gov", ".gov.example.org")]) {
+  assert.equal(imageIdentity(url), url, "unrelated images and lookalike hosts keep their original key");
+}
+const galleryPage = robot.parseHtml(`<meta property="og:image" content="${nasaOg}"><meta property="og:image" content="${esaOg}">
+  <script type="application/ld+json">${JSON.stringify({ "@type": "ImageObject", contentUrl: nasaDynamic.replaceAll("&", "&amp;") })}</script>
+  <main><img src="${nasaDynamic.replaceAll("&", "&amp;")}" alt="Nebula"><img src="${compass}" alt="Compass">
+  <img src="${esaLarge}" alt="ESA nebula"></main>`, "https://science.nasa.gov/fixture");
+assert.deepEqual(galleryPage.images, [
+  { url: nasaOg, title: "Nebula", primary: true }, { url: esaOg, title: "ESA nebula", primary: true },
+  { url: compass, title: "Compass" },
+]);
 
 const model = new NeuralCrawlerModel({ learningRate: 0.01, weightDecay: 0.001 });
 const trainingUrl = "https://developer.mozilla.org/en-US/docs/Web/JavaScript";
