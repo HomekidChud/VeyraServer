@@ -69,9 +69,10 @@ test("sparse Commons results can switch to relevant, credited Openverse photos",
       { mime: "image/jpeg", descriptionurl: "https://commons.wikimedia.org/wiki/File:Different.jpg", thumburl: "https://thumb.wikimedia.org/other.jpg" }
     ] }] } },
     "api.openverse.org": url => {
-      assert.equal(url.searchParams.get("mature"), "false");
+      assert.equal(url.searchParams.has("mature"), false, "Openverse rejects the legacy parameter alongside the sensitivity switch");
       assert.equal(url.searchParams.get("unstable__include_sensitive_results"), "false");
-      return { page_count: 2, results: [photo, { ...photo, mature: true }, { ...photo, title: "Someone at a press conference", url: "https://live.staticflickr.com/other.jpg" }] };
+      return { page_count: 2, results: [photo, { ...photo, mature: true }, { ...photo, unstable__sensitivity: ["fixture"], url: "https://live.staticflickr.com/sensitive.jpg" },
+        { ...photo, title: "Someone at a press conference", url: "https://live.staticflickr.com/other.jpg" }] };
     }
   }, { indexedImages: () => [] });
   const d = await service.search("images", "desk cable management");

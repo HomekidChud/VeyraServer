@@ -169,12 +169,15 @@ function createVerticalSearch({ fetchText, webSearch, indexedImages, indexedVide
     return { provider: "image-mix", results, whole: true, commonsMore };
   }
   async function openverse(type, q, { page, signal }) {
+    // Openverse treats its legacy mature parameter and the sensitivity
+    // parameter as mutually exclusive. Validate the returned rows as well.
     const json = await get(queryUrl("https://api.openverse.org/v1/images/", { q, page: page + 1, page_size: PAGE_SIZE,
-      filter_dead: true, mature: false, unstable__include_sensitive_results: false }), signal);
+      filter_dead: true, unstable__include_sensitive_results: false }), signal);
     if (!Array.isArray(json.results)) throw new Error("Invalid Openverse response");
     const results = json.results.slice(0, PAGE_SIZE).flatMap(item => {
       const url = safeUrl(item.foreign_landing_url), imageUrl = safeUrl(item.url);
-      if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(item.id || "") || item.mature !== false || !url || !imageUrl) return [];
+      if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(item.id || "") || item.mature !== false ||
+          (Array.isArray(item.unstable__sensitivity) && item.unstable__sensitivity.length) || !url || !imageUrl) return [];
       const license = /^(?:by(?:-nc)?(?:-sa|-nd)?|cc0|pdm)$/i.test(item.license || "") ?
         [item.license === "pdm" ? "Public Domain Mark" : item.license === "cc0" ? "CC0" : `CC ${item.license.toUpperCase()}`, item.license_version].filter(Boolean).join(" ") : "";
       if (!license) return [];
