@@ -15,7 +15,8 @@
 //     closes, falling back to any still-open page;
 //   - a closed non-active page changes nothing.
 const assert = require("node:assert/strict");
-const { followPopup, restoreAfterClose } = require("../src/browser/popup-follow");
+const { EventEmitter } = require("node:events");
+const { followPopup, followPopupWhenReady, restoreAfterClose } = require("../src/browser/popup-follow");
 
 function fakePage(url, closed = false) {
   return {
@@ -87,7 +88,7 @@ const fs = require("fs");
 for (const engine of ["src/browser/browser-engine.js", "src/browser/optimized-browser-engine.js"]) {
   const src = fs.readFileSync(require.resolve("../" + engine.replace("src/", "src/")), "utf8");
   assert.match(src, /require\('\.\/popup-follow'\)/, `${engine} must require popup-follow`);
-  assert.match(src, /followPopup\(session, popup\)/, `${engine} must follow opened popups`);
+  assert.match(src, /followPopupWhenReady\(session, page, popup\)/, `${engine} must wait for a popup to navigate`);
   assert.match(src, /restoreAfterClose\(session, page\)/, `${engine} must restore after a page closes`);
 }
 
@@ -111,6 +112,7 @@ const popupPage = {
   isClosed: () => false,
   bringToFront: () => Promise.resolve(),
   on: (n, h) => { (events[n] ||= []).push(h); },
+  off: () => {},
   once: () => {},
 };
 sessionLike.pages.add(popupPage);
@@ -126,8 +128,73 @@ const popupCloseHandlers = events.close.slice(closeBeforePopup);
 assert.ok(popupCloseHandlers.length > 0, "the popup must have its own close handler");
 for (const h of popupCloseHandlers) h(popupPage);
 assert.equal(sessionLike.page, fakePlaywrightPage, "closing the popup must restore the opener");
-// A background page closing while another page is active must not hijack
-// the active page: restoreAfterClose only switches when the closing page
-// was the active one (already covered by case 3 above).
+function placeholder(initial = "about:blank") {
+  let current = initial;
+  let closed = false;
+  const frame = { url: () => current };
+  return Object.assign(new EventEmitter(), {
+    url: () => current, mainFrame: () => frame, isClosed: () => closed,
+    async close() { closed = true; this.emit("close"); },
+    navigate(url, child = false) {
+      if (!child) current = url;
+      this.emit("framenavigated", child ? {} : frame);
+    },
+  });
+}
+const blank = placeholder();
+const s4 = fakeSession(opener);
+s4.canonicalUrl = opener.url();
+s4.pages.add(blank);
+followPopupWhenReady(s4, opener, blank);
+assert.equal(s4.page, opener, "an about:blank popup must not replace a playing page");
+assert.equal(s4.canonicalUrl, opener.url());
+blank.navigate("https://login.example.com", true);
+assert.equal(s4.page, opener, "only the popup's main frame can promote it");
+blank.navigate("https://login.example.com/");
+assert.equal(s4.page, blank, "an OAuth popup becomes visible after its delayed navigation");
+assert.equal(s4.canonicalUrl, "https://login.example.com/");
+assert.equal(restoreAfterClose(s4, blank), opener);
+assert.equal(s4.canonicalUrl, opener.url());
 
-console.log("remote popup-follow regression tests passed");
+const stale = placeholder();
+const otherWindow = fakePage("https://example.com/active");
+s4.pages.add(stale);
+s4.pages.add(otherWindow);
+followPopupWhenReady(s4, opener, stale);
+followPopup(s4, otherWindow);
+stale.navigate("https://example.com/late");
+assert.equal(s4.page, otherWindow, "a delayed popup must not steal focus from a different active window");
+assert.equal(stale.isClosed(), true);
+
+const abandoned = placeholder();
+followPopupWhenReady(s4, otherWindow, abandoned, 1);
+abandoned.once("close", () => {
+  assert.equal(s4.page, otherWindow);
+  console.log("remote popup-follow regression tests passed");
+});
+// Keep the test process alive for the helper's unref'ed expiry timer.
+setTimeout(() => assert.equal(abandoned.isClosed(), true, "a blank page must expire"), 10);
+
+const watch = fakePage("https://xhamster.com/videos/sample-xhA123");
+const watchSession = fakeSession(watch);
+const sameVideo = placeholder("https://www.xhamster.com/videos/different-slug-xha123?utm_source=ad");
+followPopupWhenReady(watchSession, watch, sameVideo);
+assert.equal(sameVideo.isClosed(), true);
+assert.equal(watchSession.page, watch);
+
+const staged = placeholder();
+followPopupWhenReady(watchSession, watch, staged);
+staged.navigate("https://example.com/ad");
+assert.equal(staged.isClosed(), true);
+assert.equal(watchSession.page, watch);
+
+const independent = placeholder("https://xhamster.com/videos/sample-xhB456");
+watchSession.pages.add(independent);
+independent.once("close", () => restoreAfterClose(watchSession, independent));
+followPopupWhenReady(watchSession, watch, independent);
+assert.equal(watchSession.page, independent);
+independent.navigate(watch.url(), true);
+assert.equal(independent.isClosed(), false);
+independent.navigate(watch.url());
+assert.equal(independent.isClosed(), true);
+assert.equal(watchSession.page, watch);

@@ -284,8 +284,6 @@ class AcquisitionManager {
           try {
             this.stats.requests += 1;
             const response = await this.fetchImpl(url, { dispatcher: this.dispatcher, redirect: "manual", signal: controller.signal, headers: { "User-Agent": this.userAgent, Accept: opts.accept || "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.1", "Accept-Encoding": "gzip, deflate, br", ...(opts.headers || {}) } });
-            clearTimeout(timer);
-            if (opts.signal) opts.signal.removeEventListener("abort", onAbort);
             this.stats.completedRequests += 1;
             if (response.status >= 200 && response.status < 300 || response.status === 304) this.stats.successfulHttpResponses += 1;
             if (response.status >= 300 && response.status < 400 && response.headers.get("location")) {
@@ -321,6 +319,9 @@ class AcquisitionManager {
             if (attempt >= (opts.retries ?? this.maxRetries) || error.noRetry || error.code === "SSRF_BLOCKED" || error.code === "CONTENT_TYPE_UNSUPPORTED") break;
             this.stats.retries += 1;
             await sleep(150 * 2 ** attempt + Math.random() * 100, opts.signal);
+          } finally {
+            clearTimeout(timer);
+            if (opts.signal) opts.signal.removeEventListener("abort", onAbort);
           }
         }
         if (lastError) { this._error(lastError, url); throw lastError; }

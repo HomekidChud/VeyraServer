@@ -1,5 +1,5 @@
 const crypto = require('crypto');
-const { followPopup, restoreAfterClose } = require('./popup-follow');
+const { followPopupWhenReady, restoreAfterClose } = require('./popup-follow');
 const fs = require('fs');
 
 function id(prefix = 'b') { return `${prefix}_${crypto.randomBytes(12).toString('base64url')}`; }
@@ -428,7 +428,7 @@ class BrowserEngine {
       void req.allHeaders?.().then(h => { row.requestHeaders = sanitizeRequestWarmHeaders(h); }).catch(() => {});
     });
     page.on('framenavigated', frame => {
-      if (frame === page.mainFrame()) {
+      if (page === session.page && frame === page.mainFrame()) {
         session.canonicalUrl = safeUrl(frame.url()) || session.canonicalUrl;
         session.lastUsed = Date.now();
       }
@@ -454,7 +454,7 @@ class BrowserEngine {
       // The streamed surface and all input target session.page: follow the
       // popup so a window the site actually needs (OAuth, launcher, auth) is
       // visible and clickable instead of opening invisibly in the background.
-      followPopup(session, popup);
+      followPopupWhenReady(session, page, popup);
       this.pushConsole(session, 'info', `Popup opened: ${sanitizeUrl(popup.url()) || 'new page'}`);
     });
     page.on('close', () => {

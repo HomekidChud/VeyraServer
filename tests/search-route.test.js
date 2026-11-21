@@ -141,6 +141,10 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
         }
         if (type === "news") throw Error("provider unreachable");
         if (type === "research") return { type, status: "empty", results: [] };
+        if (type === "images" && !options.preview) return { type, status: "ok", provider: "image-mix", results: [
+          { url: "https://images-assets.nasa.gov/first.jpg", sourcePageUrl: "https://www.nasa.gov/gallery", provider: "veyra-crawler", title: "Fixture" },
+          { url: "https://images-assets.nasa.gov/second.jpg", sourcePageUrl: "https://www.nasa.gov/gallery", provider: "veyra-crawler", title: "Second fixture" }
+        ] };
         const candidate = { url: "https://public.example/vertical-result", provider: "fixture", title: "Provider title is not evidence", snippet: "Provider snippet is not evidence" };
         return { type, status: "ok", provider: "fixture", results: Array(4).fill(candidate) };
       }
@@ -165,17 +169,24 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     assert.equal((await getSummary({ query: "site:outside.example category fixture", vertical: "images" })).hasAnswer, false);
     app.locals.veyraAnswerEngine = {
       async answer(query, results, options) {
-        assert.equal(query, "category fixture");
         assert.equal(options.requirePageEvidence, true);
-        assert.equal(options.vertical, "videos");
-        assert.ok(results.length > 0);
-        assert.ok(results.every(row => row.url === "https://public.example/vertical-result" && !row.contentText && !row.snippet && !row.title));
+        if (options.vertical === "images") {
+          assert.equal(query, "category fixture");
+          assert.deepEqual(results, [{ url: "https://www.nasa.gov/gallery", provider: "veyra-crawler" }]);
+        } else {
+          assert.equal(query, "category fixture");
+          assert.equal(options.vertical, "videos");
+          assert.deepEqual(results, [{ url: "https://public.example/vertical-result", provider: "fixture" }]);
+        }
         return { hasAnswer: false, reason: "No readable source evidence found" };
       }
     };
     const categoryAnswer = await getSummary({ query: "category fixture", vertical: "videos", results: [{ url: "https://evil.example/", contentText: "Untrusted text" }] });
     assert.equal(categoryAnswer.hasAnswer, false);
     assert.equal(categoryAnswer.vertical, "videos");
+    assert.equal((await getSummary({ query: "site:nasa.gov category fixture", vertical: "images" })).vertical, "images");
+    assert.equal((await fetch(`${base}/api/search/vertical?type=images&page=7&provider=image-mix&q=category`)).status, 200);
+    assert.equal((await fetch(`${base}/api/search/vertical?type=images&page=8&provider=image-mix&q=category`)).status, 400);
 
     assert.match(answer.observationId, /^obs_[A-Za-z0-9_-]{20,40}$/);
     assert.equal(answer.qualityLearning.calibrated, false, "the learned quality estimate must not be presented as calibrated confidence");

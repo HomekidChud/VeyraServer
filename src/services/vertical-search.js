@@ -4,12 +4,15 @@ const cheerio = require("cheerio");
 const { isIP } = require("node:net");
 const { parseSiteScope, allowsSiteUrl } = require("./search-site-scope");
 const { rankVertical, rankerVersion } = require("./vertical-ranker");
+const { imageIdentity } = require("./crawl-page-data");
 
 const TYPES = Object.freeze(["images", "videos", "news", "shopping", "research", "discussions"]);
 const PAGE_SIZE = 12;
+const LAST_IMAGE_PAGE = 7;
 const ENDPOINT = "https://api.search.brave.com/res/v1";
 const TIMEOUT = 4400;
-const THUMB_HOSTS = new Set(["imgs.search.brave.com", "upload.wikimedia.org", "thumb.wikimedia.org", "i.ebayimg.com", "i.ytimg.com"]);
+const THUMB_HOSTS = new Set(["imgs.search.brave.com", "upload.wikimedia.org", "thumb.wikimedia.org", "i.ebayimg.com", "i.ytimg.com",
+  "images-assets.nasa.gov", "science.nasa.gov", "assets.science.nasa.gov", "www.esa.int", "media.esa.int"]);
 
 function safeUrl(value) {
   try {
@@ -21,8 +24,13 @@ function safeUrl(value) {
   } catch { return ""; }
 }
 function thumbnail(value) {
-  const url = safeUrl(value);
-  return url && url.startsWith("https:") && THUMB_HOSTS.has(new URL(url).hostname) ? url : "";
+  const valueUrl = safeUrl(value);
+  if (!valueUrl || !valueUrl.startsWith("https:")) return "";
+  const url = new URL(valueUrl);
+  if (!THUMB_HOSTS.has(url.hostname)) return "";
+  if (url.hostname === "assets.science.nasa.gov" && url.pathname.startsWith("/dynamicimage/") &&
+      ["w", "h"].some(key => Number(url.searchParams.get(key)) > 2048)) return "";
+  return valueUrl;
 }
 function plain(value, max = 300) {
   if (typeof value !== "string") return "";
@@ -52,6 +60,7 @@ function row(type, provider, item) {
   return {
     type, provider, url, title, source: plain(item.source, 120) || new URL(url).hostname.replace(/^www\./, ""),
     snippet: plain(item.snippet, 500), thumbnail: thumbnail(item.thumbnail),
+    ...(type === "images" ? { imageUrl: safeUrl(item.imageUrl) || "", sourcePageUrl: safeUrl(item.sourcePageUrl) || "" } : {}),
     publishedAt: isoDate(item.publishedAt), duration: plain(item.duration, 32), license: plain(item.license, 48),
     condition: plain(item.condition, 60), price
   };
@@ -72,7 +81,7 @@ function waitForToken(promise, signal) {
   });
 }
 
-function createVerticalSearch({ fetchText, webSearch, env = process.env, providerTimeoutMs = TIMEOUT }) {
+function createVerticalSearch({ fetchText, webSearch, indexedImages, env = process.env, providerTimeoutMs = TIMEOUT }) {
   const cache = new Map(), cooldown = new Map();
   let ebayToken, ebayTokenPromise;
   const braveKey = String(env.BRAVE_SEARCH_API_KEY || "").trim();
@@ -95,23 +104,42 @@ function createVerticalSearch({ fetchText, webSearch, env = process.env, provide
     const results = json.results.map(item => row(type, "brave", {
       ...item, source: item.source || item.video?.creator || item.meta_url?.hostname,
       thumbnail: item.thumbnail?.src, snippet: item.description, duration: item.video?.duration,
+      imageUrl: item.properties?.url,
       publishedAt: item.page_age || item.video?.published
     }));
     return { provider: "brave", results, whole: type === "images", more: type !== "images" && (json.query?.more_results_available ?? results.length === PAGE_SIZE) };
   }
-  async function commons(type, q, { page, signal }) {
+  async function commons(type, q, { page, signal, count = PAGE_SIZE }) {
     const json = await get(queryUrl("https://commons.wikimedia.org/w/api.php", {
       action: "query", format: "json", formatversion: 2, generator: "search", gsrnamespace: 6, gsrsearch: q,
-      gsrlimit: PAGE_SIZE, gsroffset: page * PAGE_SIZE, prop: "imageinfo", iiprop: "url|mime|extmetadata",
+      gsrlimit: count, gsroffset: page * count, prop: "imageinfo", iiprop: "url|mime|extmetadata",
       iiextmetadatafilter: "LicenseShortName", iiurlwidth: 480
     }), signal);
     if (json.error) throw new Error("Invalid Commons response");
-    const results = (json.query?.pages || []).sort((a, b) => (a.index || 0) - (b.index || 0)).map(item => {
+    const results = (json.query?.pages || []).slice(0, count).sort((a, b) => (a.index || 0) - (b.index || 0)).map(item => {
       const image = item.imageinfo?.[0];
       if (!image?.mime?.startsWith("image/") || !thumbnail(image.thumburl)) return null;
-      return row(type, "wikimedia", { title: item.title.replace(/^File:/, "").replace(/\.[\w]{2,5}$/, ""), url: image.descriptionurl, thumbnail: image.thumburl, source: "Wikimedia Commons", license: image.extmetadata?.LicenseShortName?.value });
+      return row(type, "wikimedia", { title: String(item.title || "").replace(/^File:/, "").replace(/\.[\w]{2,5}$/, ""), url: image.descriptionurl, imageUrl: image.url, thumbnail: image.thumburl, source: "Wikimedia Commons", license: image.extmetadata?.LicenseShortName?.value });
     });
-    return { provider: "wikimedia", results, more: json.continue?.gsroffset === (page + 1) * PAGE_SIZE };
+    return { provider: "wikimedia", results, more: json.continue?.gsroffset === (page + 1) * count };
+  }
+  async function imageMix(type, q, { signal, lang, fullQuery }) {
+    const lanes = [["wikimedia", () => commons(type, q, { page: 0, signal, count: 48 })]];
+    if (braveKey) lanes.unshift(["brave", () => brave(type, fullQuery, { page: 0, signal, lang })]);
+    const active = lanes.filter(([name]) => (cooldown.get(`${name}:images`) || 0) <= Date.now());
+    const settled = await Promise.allSettled(active.map(([, run]) => run()));
+    for (let i = 0; i < settled.length; i++) {
+      if ([401, 403, 429].includes(settled[i].reason?.status)) cooldown.set(`${active[i][0]}:images`, Date.now() + 30_000);
+    }
+    signal?.throwIfAborted();
+    const feeds = settled.flatMap(item => item.status === "fulfilled" ? [item.value.results.slice(0, 48)] : []);
+    let local = [];
+    try { local = indexedImages(fullQuery).slice(0, 24).map(item => row(type, "veyra-crawler", item)); } catch {}
+    if (local.some(Boolean)) feeds.push(local);
+    if (!feeds.length) throw new Error("No image providers available");
+    const results = [];
+    for (let i = 0; i < 48; i++) for (const feed of feeds) if (feed[i]) results.push(feed[i]);
+    return { provider: "image-mix", results, whole: true };
   }
   async function newsFeed(type, q, { lang, signal }) {
     const region = lang === "en" ? "GB" : ({ fr: "FR", de: "DE", es: "ES", it: "IT", pt: "BR", nl: "NL", ja: "JP" })[lang] || "GB";
@@ -215,8 +243,9 @@ function createVerticalSearch({ fetchText, webSearch, env = process.env, provide
     });
     return { provider: "web-discovery", results, more: !!packed.more };
   }
-  function adapters(type, page, preview) {
+  function adapters(type, page, preview, provider) {
     const list = [];
+    if (type === "images" && !preview && typeof indexedImages === "function" && (!provider || provider === "image-mix")) return [["image-mix", imageMix]];
     if (braveKey && ["images", "videos", "news"].includes(type)) list.push(["brave", brave]);
     if (type === "images") list.push(["wikimedia", commons]);
     if (type === "videos" && !page && !preview && env.YOUTUBE_DATA_API_KEY && env.VEYRA_YOUTUBE_SEARCH === "1") list.push(["youtube", youtube]);
@@ -237,29 +266,33 @@ function createVerticalSearch({ fetchText, webSearch, env = process.env, provide
     if (scope.invalid) return empty("invalid-scope");
     if (!q || (scope.active && !scope.text)) return empty("empty");
     const attempts = [];
-    for (const [name, run] of adapters(type, page, preview)) {
+    for (const [name, run] of adapters(type, page, preview, provider)) {
       if (signal?.aborted) return empty("cancelled");
       if (provider && provider !== name) continue;
       const breaker = `${name}:${name === "brave" ? type : ""}`;
       if ((cooldown.get(breaker) || 0) > Date.now()) { attempts.push("unavailable"); continue; }
-      const singleFeed = name === "google-news-rss" || (name === "brave" && type === "images");
+      const singleFeed = name === "image-mix" || name === "google-news-rss" || (name === "brave" && type === "images");
       const key = JSON.stringify([name, type, q, language, singleFeed ? 0 : page]);
       const saved = noCache ? null : cache.get(key);
       try {
         const providerQuery = name === "brave" ? q : (scope.text || q).slice(0, 400);
-        const packed = saved?.until > Date.now() ? saved.packed : await run(type, providerQuery, { page, lang: language, signal, noCache });
+        const packed = saved?.until > Date.now() ? saved.packed : await run(type, providerQuery, { page, lang: language, signal, noCache, fullQuery: q });
         if (signal?.aborted) return empty("cancelled");
         const seen = new Set();
-        const known = packed.results.filter(item => item && allowsSiteUrl(scope, item.url) && !seen.has(item.url) && seen.add(item.url));
+        const known = packed.results.filter(item => {
+          if (!item || !allowsSiteUrl(scope, item.sourcePageUrl || item.url)) return false;
+          const key = type === "images" ? imageIdentity(item.imageUrl || item.thumbnail || item.url) : item.url;
+          return !seen.has(key) && seen.add(key);
+        });
         const ranked = rankVertical(scope.text || q, known);
         const results = packed.whole ? ranked.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE) : ranked;
         const hasNext = packed.whole ? ranked.length > (page + 1) * PAGE_SIZE : packed.more;
-        if (!results.length && !provider) { attempts.push("empty"); continue; }
+        if (!results.length && !provider && name !== "image-mix") { attempts.push("empty"); continue; }
         if (!noCache && results.length && !(saved?.until > Date.now())) {
           cache.set(key, { packed, until: Date.now() + 45_000 });
           if (cache.size > 100) cache.delete(cache.keys().next().value);
         }
-        return { ...empty(results.length ? "ok" : "empty"), results, provider: packed.provider, nextPage: hasNext && page < 3 ? page + 1 : null, observedAt: new Date().toISOString() };
+        return { ...empty(results.length ? "ok" : "empty"), results, provider: packed.provider, nextPage: hasNext && page < (name === "image-mix" ? LAST_IMAGE_PAGE : 3) ? page + 1 : null, observedAt: new Date().toISOString() };
       } catch (error) {
         if (signal?.aborted) return empty("cancelled");
         if ([401, 403, 429].includes(error.status)) cooldown.set(breaker, Date.now() + 30_000);
@@ -271,4 +304,4 @@ function createVerticalSearch({ fetchText, webSearch, env = process.env, provide
   return { search };
 }
 
-module.exports = { createVerticalSearch, TYPES, PAGE_SIZE, safeUrl };
+module.exports = { createVerticalSearch, TYPES, PAGE_SIZE, LAST_IMAGE_PAGE, safeUrl };

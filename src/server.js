@@ -9,12 +9,14 @@ const fsp = fs.promises;
 const path = require("path");
 const os = require("os");
 const { BrowserEngine } = require("./browser/browser-engine");
+const { blockPlaybackPopup } = require("./browser/popup-follow");
 const { pageActionsRuntime } = require("./browser/page-actions-runtime");
 const { VpnManager } = require("./network/vpn");
 const { createShield } = require("./network/shield");
 const { upstreamHeaderCapOptions } = require("./network/header-cap");
 const { createWebSearch } = require("./services/websearch");
-const { createVerticalSearch, TYPES: SEARCH_VERTICALS, safeUrl: verticalResultUrl } = require("./services/vertical-search");
+const { createVerticalSearch, TYPES: SEARCH_VERTICALS, LAST_IMAGE_PAGE, safeUrl: verticalResultUrl } = require("./services/vertical-search");
+const { publicImageUrl, imageIdentity } = require("./services/crawl-page-data");
 const { parseSiteScope, allowsSiteUrl } = require("./services/search-site-scope");
 const { installBrandRoutes, isReservedOriginPath, brandNotFoundHtml } = require("./services/brand");
 const VEYRA_VERSION = require("../package.json").version;
@@ -1122,8 +1124,9 @@ function escapedPathFor(target) {
 }
 function markEscapedNavigation(req, res, url, sid) {
   const sep = url.search ? "&" : "?";
+  const popup = req.query?.veyra_popup === "1" ? "&veyra_popup=1" : "";
   const loc = requestOrigin(req) + url.pathname + url.search
-    + `${sep}__veyra_url=${encodeURIComponent(url.href)}&__veyra_sid=${encodeURIComponent(sid)}` + url.hash;
+    + `${sep}__veyra_url=${encodeURIComponent(url.href)}&__veyra_sid=${encodeURIComponent(sid)}${popup}` + url.hash;
   res.setHeader("location", loc);
   res.setHeader("cache-control", "no-store");
   res.setHeader("x-veyra-escaped-path", "1");
@@ -1596,6 +1599,7 @@ const webSearch = createWebSearch({
 });
 const verticalSearch = createVerticalSearch({
   webSearch: (query, opts) => (app.locals.veyraWebSearch || webSearch).search(query, opts),
+  indexedImages: localImageSearch,
   fetchText: async (url, opts) => {
     const r = await fetchBuffer(url, {
       method: opts.method, body: opts.body, headers: opts.headers, accept: opts.accept || "application/json",
@@ -2382,6 +2386,7 @@ function injectRuntime(html, original, sid = "") {
   const SESSION_ID=${JSON.stringify(sid)};
   const API_ORIGIN=${JSON.stringify(process.env.PUBLIC_API_ORIGIN || "")};
   const ESCAPED_DOCUMENT=location.pathname!=='/api/view';
+  const POPUP_FRAME=window.parent!==window&&/[?&]veyra_popup=1(?:&|$)/.test(String(location.search||''));
   let virtualUrl=CANONICAL;
   // The browser does not send its fragment with the document request.
   try{if(location.hash){const u=new URL(virtualUrl);u.hash=location.hash;virtualUrl=u.href}}catch{}
@@ -2455,7 +2460,7 @@ function injectRuntime(html, original, sid = "") {
   function toVirtual(raw){if(/^[?#]/.test(raw))return cleanVeyraParams(new URL(raw,virtualUrl));const u=new URL(raw,location.href);return cleanVeyraParams(fixDerivedHost(ownOrigin(u.origin)?fixOwn(u):u))}
   function resolve(v){try{const raw=unwrap(realUrl(v));return (raw===''?new URL(virtualUrl):toVirtual(raw)).href}catch{return String(v||'')}}
   function shouldProxy(v){try{const u=new URL(unwrap(v));return /^https?:$/.test(u.protocol)}catch{return false}}
-  function proxy(kind,u){const prefix=API_ORIGIN || location.origin;const base=prefix+(kind==='view'?'/api/view?url=':'/api/resource?url=')+encodeURIComponent(u);const from=encodeURIComponent(new URL(virtualUrl).href);return kind==='view'?base+'&sid='+encodeURIComponent(SESSION_ID):base+'&from='+from+'&sid='+encodeURIComponent(SESSION_ID)}
+  function proxy(kind,u){const prefix=API_ORIGIN || location.origin;const base=prefix+(kind==='view'?'/api/view?url=':'/api/resource?url=')+encodeURIComponent(u);const from=encodeURIComponent(new URL(virtualUrl).href);return kind==='view'?base+'&sid='+encodeURIComponent(SESSION_ID)+(POPUP_FRAME?'&veyra_popup=1':''):base+'&from='+from+'&sid='+encodeURIComponent(SESSION_ID)}
   function topPost(msg){try{window.top.postMessage(msg,'*')}catch{}}
   function emit(source,url,extra){if(!url)return;topPost({type:'veyra:navigate',url,source,sessionId:SESSION_ID,...extra})}
   let netSeq=0;
@@ -2469,7 +2474,7 @@ function injectRuntime(html, original, sid = "") {
   function escapedHistoryUrl(next){
     const u=new URL(next);
     if(/^[/]api[/]/.test(u.pathname))return proxy('view',next);
-    const markers=SESSION_ID?(u.search?'&':'?')+'__veyra_url='+encodeURIComponent(u.href)+'&__veyra_sid='+encodeURIComponent(SESSION_ID):'';
+    const markers=SESSION_ID?(u.search?'&':'?')+'__veyra_url='+encodeURIComponent(u.href)+'&__veyra_sid='+encodeURIComponent(SESSION_ID)+(POPUP_FRAME?'&veyra_popup=1':''):'';
     return location.origin+u.pathname+u.search+markers+u.hash;
   }
   function keepEscapedContext(next){
@@ -2491,7 +2496,7 @@ function injectRuntime(html, original, sid = "") {
   // an embed ping; once acked, popups route through the app as new Veyra
   // tabs and element inspection works on the main frame too.
   var appEmbedded=false;
-  try{addEventListener('message',function(ev){try{if(ev.data&&ev.data.type==='veyra:embed-ack')appEmbedded=true}catch{}});topPost({type:'veyra:embed-ping',sessionId:SESSION_ID})}catch{}
+  try{addEventListener('message',function(ev){try{if(ev.source===window.top&&ev.data&&ev.data.type==='veyra:embed-ack')appEmbedded=true}catch{}});topPost({type:'veyra:embed-ping',sessionId:SESSION_ID})}catch{}
   // ----- Popup relay: OAuth popups open as proxied Veyra tabs -----
   // A site's window.open() (Google/Microsoft/Apple sign-in, "continue with
   // …" OAuth popups) must not escape to a raw browser tab, and the popup
@@ -2503,7 +2508,22 @@ function injectRuntime(html, original, sid = "") {
   // origin, so the site's own origin checks keep passing. Everything runs
   // in this session's cookie jar — no cross-session cookies anywhere.
   var POPUP_SEQ=0;
-  var POPUP_HANDLES={};
+  var POPUP_DOCUMENT=Math.random().toString(36).slice(2);
+  var POPUP_HANDLES=Object.create(null);
+  // The relay is not subject to the browser's native popup blocker. Spend
+  // one trusted activation on a popup, and only during its input dispatch.
+  let popupGesture=null;
+  function rememberPopupGesture(ev){
+    if(!ev.isTrusted||navigator.userActivation?.isActive===false)return;
+    popupGesture={event:ev,used:false};
+  }
+  window.addEventListener('click',rememberPopupGesture,true);
+  window.addEventListener('auxclick',rememberPopupGesture,true);
+  function claimPopupGesture(){
+    if(!popupGesture||popupGesture.used||popupGesture.event.eventPhase===0)return false;
+    popupGesture.used=true;return true;
+  }
+  function blankPopupUrl(raw){return !raw||/^about:blank(?:[?#].*)?$/i.test(raw)}
   function popupReplyShim(dir,popupId){
     return {closed:false,focus:function(){},length:0,opener:null,
       postMessage:function(data,origin){
@@ -2540,14 +2560,14 @@ function injectRuntime(html, original, sid = "") {
         return;
       }
       if(d.type==='veyra:relay-message'){popupDispatchRelay(d);return}
-      if(d.type==='veyra:popup-closed'&&d.popupId&&POPUP_HANDLES[d.popupId]){try{POPUP_HANDLES[d.popupId].closed=true}catch(e){}return}
+      if(d.type==='veyra:popup-closed'&&d.popupId&&POPUP_HANDLES[d.popupId]){try{POPUP_HANDLES[d.popupId].closed=true;delete POPUP_HANDLES[d.popupId]}catch(e){}return}
     }catch(e){}
   })}catch(e){}
   // The app marks a popup tab's frame URL with veyra_popup=1 so the shim
   // installs synchronously at injection time — before any site script can
   // touch window.opener (no round-trip race on the first load).
   try{
-    if(/[?&]veyra_popup=1(?:&|$)/.test(String(window.location.search||''))){
+    if(POPUP_FRAME){
       try{if(!window.opener)window.opener=popupReplyShim('to-opener','')}catch(e){}
       try{window.close=function(){topPost({type:'veyra:popup-self-close',sessionId:SESSION_ID})}}catch(e){}
     }
@@ -2949,33 +2969,61 @@ function injectRuntime(html, original, sid = "") {
   function emitGetForm(form,submitter,source){if(rootProxiedFrame())return false;const target=submitTarget(form,submitter);if(!target)return false;const method=String(form.method||'get').toUpperCase();if(method!=='GET')return false;const fd=new FormData(form,submitter||undefined);const u=new URL(target);for(const [k,v] of fd.entries())if(typeof v==='string')u.searchParams.append(k,v);emit(source||'form.submit',u.href);return true}
   try{const nativeFormSubmit=HTMLFormElement.prototype.submit;HTMLFormElement.prototype.submit=function(){try{if(rootProxiedFrame())return nativeFormSubmit.call(this);if(emitGetForm(this,null,'form.submit'))return;const target=submitTarget(this,null);const method=String(this.method||'get').toUpperCase();if(target&&method==='POST'){const fd=new FormData(this);const entries=[];for(const [k,v] of fd.entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});return;}}catch{}return nativeFormSubmit.call(this)}}catch{}
   try{const nativeRequestSubmit=HTMLFormElement.prototype.requestSubmit;if(nativeRequestSubmit)HTMLFormElement.prototype.requestSubmit=function(submitter){try{if(rootProxiedFrame())return nativeRequestSubmit.call(this,submitter);if(emitGetForm(this,submitter,'form.requestSubmit'))return;const target=submitTarget(this,submitter);const method=String(this.method||'get').toUpperCase();if(target&&method==='POST'){const entries=[];for(const [k,v] of new FormData(this,submitter).entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});return;}}catch{}return nativeRequestSubmit.call(this,submitter)}}catch{}
-  try{const nativeOpen=window.open;window.open=function(url,target,features){const u=canonicalizeMaybeProxy(url);if(u){
+  ${blockPlaybackPopup.toString()}
+  try{const nativeOpen=window.open;window.open=function(url,target,features){
+    const raw=String(url??'').trim();
+    const blank=blankPopupUrl(raw);
+    const u=blank?null:canonicalizeMaybeProxy(raw);
+    const tgt=String(target||'').toLowerCase();
     // A navigation button that opens its destination over the current page —
     // window.open(url,'_self'), and '_top'/'_parent' from the root frame —
     // must never become a new tab: it is in-place navigation.
-    const tgt=String(target||'').toLowerCase();
     if(tgt==='_self'||((tgt==='_top'||tgt==='_parent')&&rootProxiedFrame())){
+      if(!u)return null;
       if(!rootProxiedFrame()){emit('location.assign',u);return null}
       try{location.assign(proxy('view',u))}catch(e){}
       return null;
     }
-    if(!rootProxiedFrame()||appEmbedded){
-      // OAuth/sign-in popups (and every other popup) open as proxied Veyra
-      // tabs. The returned handle is a shim with real opener semantics:
-      // .closed tracks the tab, .close() closes it, .postMessage() relays
-      // through the app, and assigning .location navigates the popup tab —
-      // so popup-based sign-in flows (GIS, MSAL, appleid, …) complete
-      // inside the fast proxy instead of escaping to a raw browser tab.
-      const popupId='vp'+(++POPUP_SEQ);
-      topPost({type:'veyra:popup-open',url:u,name:String(target||''),popupId:popupId,sessionId:SESSION_ID,virtualUrl:virtualUrl});
-      const shim=popupReplyShim('to-popup',popupId);
-      try{shim.name=String(target||'')}catch(e){}
-      try{Object.defineProperty(shim,'location',{set:function(loc){const lu=canonicalizeMaybeProxy(loc);if(lu)topPost({type:'veyra:popup-navigate',popupId:popupId,url:lu,sessionId:SESSION_ID})},get:function(){return {href:virtualUrl,replace:function(loc){const lu=canonicalizeMaybeProxy(loc);if(lu)topPost({type:'veyra:popup-navigate',popupId:popupId,url:lu,sessionId:SESSION_ID})},assign:function(loc){const lu=canonicalizeMaybeProxy(loc);if(lu)topPost({type:'veyra:popup-navigate',popupId:popupId,url:lu,sessionId:SESSION_ID})}}},configurable:true})}catch(e){}
-      shim.close=function(){topPost({type:'veyra:popup-close',popupId:popupId,sessionId:SESSION_ID})};
-      POPUP_HANDLES[popupId]=shim;
-      return shim;
+    if(u&&blockPlaybackPopup(virtualUrl,u))return null;
+    if(!appEmbedded){
+      // A frame does not get native popups before the embed handshake.
+      if(window.parent!==window)return null;
+      return nativeOpen.call(window,u?proxy('view',u):url,target,features);
     }
-    return nativeOpen.call(window,proxy('view',u),target,features)}if(appEmbedded)return null;return nativeOpen.call(window,url,target,features)}}catch{}
+    if((!u&&!blank)||!claimPopupGesture())return null;
+    const popupId='vp'+POPUP_DOCUMENT+'-'+(++POPUP_SEQ);
+    const shim=popupReplyShim('to-popup',popupId);
+    let opened=false,href='about:blank',timer;
+    shim.name=String(target||'');
+    function navigatePopup(next){
+      const rawNext=String(next??'').trim();
+      const destination=blankPopupUrl(rawNext)?null:canonicalizeMaybeProxy(rawNext);
+      if(shim.closed||!destination)return;
+      if(blockPlaybackPopup(virtualUrl,destination)){shim.close();return}
+      href=destination;
+      clearTimeout(timer);
+      if(opened)topPost({type:'veyra:popup-navigate',popupId:popupId,url:destination,sessionId:SESSION_ID});
+      else{
+        opened=true;
+        topPost({type:'veyra:popup-open',url:destination,name:shim.name,popupId:popupId,sessionId:SESSION_ID,virtualUrl:virtualUrl});
+      }
+    }
+    const popupLocation={get href(){return href},set href(next){navigatePopup(next)},replace:navigatePopup,assign:navigatePopup,toString:function(){return href}};
+    Object.defineProperty(shim,'location',{get:function(){return popupLocation},set:navigatePopup});
+    shim.close=function(){
+      if(shim.closed)return;
+      shim.closed=true;
+      clearTimeout(timer);
+      delete POPUP_HANDLES[popupId];
+      if(opened)topPost({type:'veyra:popup-close',popupId:popupId,sessionId:SESSION_ID});
+    };
+    POPUP_HANDLES[popupId]=shim;
+    // A blank OAuth window is a placeholder, not a visible tab. The page
+    // can assign its real destination asynchronously on the same handle.
+    if(u)navigatePopup(u);
+    else timer=setTimeout(shim.close,120000);
+    return shim;
+  }}catch{}
   function fmtArg(x,d){d=d||0;if(typeof x==='string')return x;if(x instanceof Error)return (x.name||'Error')+': '+x.message+(x.stack?'\\n'+String(x.stack).split('\\n').slice(1,6).join('\\n'):'');if(typeof Node!=='undefined'&&x instanceof Node)return x.nodeType===1?'<'+x.tagName.toLowerCase()+(x.id?'#'+x.id:'')+(x.className&&typeof x.className==='string'?'.'+x.className.trim().split(/\\s+/).slice(0,3).join('.'):'')+'>':x.nodeName;if(typeof x==='function')return 'ƒ '+(x.name||'anonymous')+'()';try{const seen=new WeakSet();return JSON.stringify(x,(k,v)=>{if(typeof v==='object'&&v){if(seen.has(v))return '[Circular]';seen.add(v)}if(typeof v==='function')return 'ƒ';if(typeof v==='bigint')return String(v)+'n';return v})||String(x)}catch{return String(x)}}
   let consoleBudget=400,consoleWindow=Date.now();
   try{['log','info','debug','warn','error','trace','dir','table','assert','group','groupCollapsed','groupEnd','count','timeEnd'].forEach(level=>{if(typeof console[level]!=='function')return;const native=console[level].bind(console);console[level]=(...args)=>{native(...args);if(level==='assert'){if(args[0])return;args=['Assertion failed:',...args.slice(1)]}const now=Date.now();if(now-consoleWindow>2000){consoleWindow=now;consoleBudget=400}if(--consoleBudget<0)return;let stack='';if(level==='trace'||level==='error'){try{stack=String(new Error().stack||'').split('\\n').slice(2,9).join('\\n')}catch{}}let msg='';try{msg=args.map(x=>fmtArg(x)).join(' ')}catch{}topPost({type:'veyra:page-console',level:level==='assert'?'error':level,sessionId:SESSION_ID,message:msg.slice(0,20000),stack,time:now,pageUrl:virtualUrl})}})}catch{}
@@ -3086,14 +3134,14 @@ ${pageActionsRuntime()}
         const p=ev.composedPath();
         for(let i=0;i<p.length;i++){
           const n=p[i];
-          if(n&&n.tagName==='A'&&n.getAttribute&&n.getAttribute('href')!=null)return n;
+          if(n&&(n.tagName==='A'||n.tagName==='AREA')&&n.getAttribute('href')!=null)return n;
         }
       }
     }catch{}
     try{
       let t=ev.target;
       while(t&&t!==document){
-        if(t.tagName==='A'&&t.getAttribute&&t.getAttribute('href')!=null)return t;
+        if((t.tagName==='A'||t.tagName==='AREA')&&t.getAttribute('href')!=null)return t;
         t=t.parentElement;
       }
     }catch{}
@@ -3104,25 +3152,34 @@ ${pageActionsRuntime()}
     // ev.target is retargeted to the shadow host and closest() never finds
     // it — resolve through the composed path instead.
     const a=anchorFromEvent(ev);if(!a)return;
-    const raw=a.getAttribute('href')||'';
-    // In the app-embedded root frame, pure-hash links keep their native
-    // scroll-to-anchor behaviour instead of a full proxy reload.
-    if(rootProxiedFrame()&&raw.charAt(0)==='#')return;
-    const u=canonicalizeMaybeProxy(raw);if(!u)return;
-    // _blank, named windows, _parent and _top must never escape into a raw
-    // browser tab or replace the app: route them through the app, which
-    // opens them as a new Veyra tab — or, for _top/_parent, navigates the
-    // tab in place (a target=_top link is the page replacing the whole
-    // view, not a request for a second tab).
     const tgt=String(a.getAttribute('target')||'').toLowerCase();
-    if(tgt&&tgt!=='_self'){ev.preventDefault();ev.stopPropagation();topPost({type:'veyra:open',url:u,target:tgt,sessionId:SESSION_ID});return}
+    if(tgt&&tgt!=='_self')return;
     // In the app-embedded root frame, same-frame links navigate the iframe
     // natively to their rewritten href; only nested proxied frames need the
     // document-navigation message (their parent is another proxied page).
     if(rootProxiedFrame())return;
+    const u=canonicalizeMaybeProxy(a.getAttribute('href'));if(!u)return;
     ev.preventDefault();ev.stopPropagation();
     emit('document-navigation',u);
   },true);
+  function relayTargetLink(ev){
+    if(!appEmbedded||ev.defaultPrevented)return;
+    if(ev.type==='auxclick'&&ev.button!==1)return;
+    const a=anchorFromEvent(ev);if(!a||a.hasAttribute('download'))return;
+    const tgt=String(a.getAttribute('target')||'').toLowerCase();
+    if(!tgt||tgt==='_self')return;
+    // Run after the page's link handler so it can cancel the navigation.
+    ev.preventDefault();
+    const raw=(a.getAttribute('href')||'').trim();
+    const u=blankPopupUrl(raw)||raw==='#'?null:canonicalizeMaybeProxy(raw);
+    // A static href="#" may already have been rewritten as a proxy URL.
+    if(!u||(u.endsWith('#')&&u.slice(0,-1)===virtualUrl.split('#')[0]))return;
+    if(tgt!=='_top'&&tgt!=='_parent'&&blockPlaybackPopup(virtualUrl,u,true))return;
+    if(tgt!=='_top'&&tgt!=='_parent'&&(!ev.isTrusted||!claimPopupGesture()))return;
+    topPost({type:'veyra:open',url:u,target:tgt,sessionId:SESSION_ID});
+  }
+  document.addEventListener('click',relayTargetLink);
+  document.addEventListener('auxclick',relayTargetLink);
   document.addEventListener('submit',function(ev){
     if(rootProxiedFrame())return;
     const form=ev.target;if(!form)return;const method=String(form.method||'get').toUpperCase();
@@ -3424,6 +3481,7 @@ function indexDocument(url, text, precomputedMeta = null) {
       host: meta.host,
       path: meta.path,
       wordCount: meta.wordCount,
+      searchImages: meta.searchImages || [],
       indexedAt: now(),
       termFreq: meta.termFreq
     };
@@ -3438,19 +3496,21 @@ function indexDocument(url, text, precomputedMeta = null) {
 }
 function indexNeuralPage(page, query = "") {
   const url = normalizeUrl(page?.url);
-  if (!url || !page?.text || page.text.length < 80) return null;
+  if (!url || page.indexable === false) return null;
+  const searchImages = isReferenceImageSource(url) && Array.isArray(page.images) ? page.images.slice(0, 20) : [];
+  if ((!page.text || page.text.length < 80) && !searchImages.length) return null;
   const title = String(page.title || hostOf(url)).replace(/\s+/g, " ").trim().slice(0, 300);
   const headings = Array.isArray(page.headings) ? page.headings.join(" | ").replace(/\s+/g, " ").trim().slice(0, 1200) : "";
   const description = String(page.metadata?.description || page.metadata?.["og:description"] || "").replace(/\s+/g, " ").trim().slice(0, 600);
-  const text = String(page.text)
+  const text = String(page.text || "")
     .replace(/\b(?:jump to content|main menu|move to sidebar|hide navigation|search search|appearance|donate|contribute|help learn to edit|community portal|recent changes|upload file|special pages|add to word list|audio player|play pronunciation|cookie settings)\b/gi, " ")
     .replace(/\s+/g, " ").trim().slice(0, CFG.maxIndexTextChars);
   const termFreq = new Map();
-  for (const term of tokenizeSearch(`${title} ${headings} ${description} ${text} ${url}`)) termFreq.set(term, (termFreq.get(term) || 0) + 1);
+  for (const term of tokenizeSearch(`${title} ${headings} ${description} ${text} ${url} ${searchImages.map(image => image.title).join(" ")}`)) termFreq.set(term, (termFreq.get(term) || 0) + 1);
   const doc = indexDocument(url, text, {
     title, description, headings, snippet: description || text.slice(0, 600), text,
     favicon: "", canonical: url, lang: page.language || "", host: hostOf(url), path: pathOf(url),
-    wordCount: Math.max(1, tokenizeSearch(text).length), termFreq
+    wordCount: Math.max(1, tokenizeSearch(text).length), termFreq, searchImages
   });
   if (doc) {
     doc.indexedBy = "neural-crawler";
@@ -3491,6 +3551,7 @@ function localSearch(query, offset, limit, options = {}) {
   }
   for (const url of candidateUrls) {
     const doc = searchIndex.get(url); if (!doc) continue;
+    if (options.onlyWithImages && !doc.searchImages?.length) continue;
     if (!allowsSiteUrl(parsed.siteScope, doc.url)) continue;
     if (parsed.filters.intitle && !searchFieldHas(doc, "title", parsed.filters.intitle)) continue;
     if (parsed.filters.inurl && !String(doc.url).toLocaleLowerCase().includes(parsed.filters.inurl)) continue;
@@ -3532,6 +3593,44 @@ function localSearch(query, offset, limit, options = {}) {
     };
   });
   return { total, results, indexSize: N, terms: parsed.terms, filters: parsed.filters };
+}
+// Do not turn the public Images tab into an unfiltered index of arbitrary
+// third-party imagery. Crawl metadata for other sites is not surfaced here.
+function isReferenceImageSource(url) {
+  let host;
+  try { const u = new URL(url); if (u.protocol !== "https:" || u.port) return false; host = u.hostname; } catch { return false; }
+  return ["nasa.gov", "noaa.gov", "usgs.gov", "si.edu", "nhm.ac.uk", "esa.int"]
+    .some(domain => host === domain || host.endsWith(`.${domain}`));
+}
+function localImageSearch(query) {
+  const parsed = parseSearchQuery(query);
+  if (!parsed.terms.length || parsed.siteScope.invalid) return [];
+  const { results } = localSearch(query, 0, 40, { onlyWithImages: true });
+  const feeds = results.filter(page => isReferenceImageSource(page.url)).map(page => {
+    const candidates = [];
+    for (const item of searchIndex.get(page.url)?.searchImages || []) {
+      const url = publicImageUrl(item.url, page.url);
+      if (!url || !isReferenceImageSource(url)) continue;
+      const title = item.title || page.title;
+      let path = new URL(url).pathname;
+      try { path = decodeURIComponent(path); } catch {}
+      const words = new Set(tokenizeSearch(`${item.title || (item.primary ? page.title : "")} ${path.replace(/[-_]/g, " ")}`));
+      if (!parsed.terms.some(term => words.has(term))) continue;
+      candidates.push({ url, imageUrl: url, sourcePageUrl: page.url, source: hostOf(page.url), thumbnail: url, title, snippet: page.title });
+    }
+    return candidates;
+  });
+  // A single long article must not use up every slot before other publishers.
+  const images = [], seen = new Set();
+  for (let i = 0; i < 20; i++) for (const feed of feeds) {
+    if (!feed[i]) continue;
+    const id = imageIdentity(feed[i].imageUrl);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    images.push(feed[i]);
+    if (images.length === 24) return images;
+  }
+  return images;
 }
 function localSearchSuggestions(query, limit = 8) {
   const prefix = String(query || "").trim().toLocaleLowerCase().split(/\s+/).pop() || "";
@@ -6122,7 +6221,8 @@ app.get("/api/search/vertical", async (req, res) => {
   const q = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 600) : "";
   const page = Number(req.query.page ?? 0);
   const provider = typeof req.query.provider === "string" ? req.query.provider : "";
-  if ((type !== "all" && !SEARCH_VERTICALS.includes(type)) || !Number.isInteger(page) || page < 0 || page > 3 || (page > 0 && !provider) || !/^[a-z-]{0,24}$/.test(provider) || (type === "all" && (page || provider))) {
+  const lastPage = type === "images" && provider === "image-mix" ? LAST_IMAGE_PAGE : 3;
+  if ((type !== "all" && !SEARCH_VERTICALS.includes(type)) || !Number.isInteger(page) || page < 0 || page > lastPage || (page > 0 && !provider) || !/^[a-z-]{0,24}$/.test(provider) || (type === "all" && (page || provider))) {
     return respondError(res, 400, "Invalid search category or page.", "INVALID_SEARCH_CATEGORY");
   }
   const request = requestAbortSignal(req, res);
@@ -6239,8 +6339,14 @@ app.post('/api/search/answer', async (req, res) => {
       });
       // Use server-discovered source links only. A product price, image,
       // video description, or research listing is not verified page evidence.
-      results = section.results.filter(row => row && verticalResultUrl(row.url) && inScope(row))
-        .slice(0, 6).map(row => ({ url: row.url, provider: row.provider }));
+      const distinctSources = new Map();
+      for (const row of section.results) {
+        const url = verticalResultUrl(row?.sourcePageUrl || row?.url);
+        if (!url || !inScope({ url }) || distinctSources.has(url)) continue;
+        distinctSources.set(url, { url, provider: row.provider });
+        if (distinctSources.size === 6) break;
+      }
+      results = [...distinctSources.values()];
       retrievalDiagnostics = { vertical, provider: section.provider, candidates: results.length };
       if (!results.length) return res.json({ hasAnswer: false, reason: "No source pages are available in this category to support a summary.", vertical });
     } else if (!Array.isArray(results) || !results.length) {
@@ -6828,7 +6934,7 @@ async function streamOversizeResponse(req, res, result, ctx) {
 
 
 
-const PROXY_OWN_PARAMS = new Set(["url", "target", "u", "sid", "from", "download"]);
+const PROXY_OWN_PARAMS = new Set(["url", "target", "u", "sid", "from", "download", "veyra_popup"]);
 function mergeStrayProxyParams(req, canonical) {
   if (!canonical || !req.originalUrl) return canonical;
   let extra;
@@ -7812,7 +7918,7 @@ app.post("/api/robots/crawl", async (req, res) => {
     const seeds = req.body.seeds || (req.body.seed ? [req.body.seed] : []);
     if (!seeds.length) return res.status(400).json({ error: "No seed URLs provided" });
     const query = req.body.query || "";
-    const opts = { maxDepth: req.body.maxDepth || 3, maxPages: req.body.maxPages || 50 };
+    const opts = { maxDepth: Number(req.body.maxDepth ?? 3), maxPages: Number(req.body.maxPages ?? 50) };
     const result = await neuralRobotPool.startCrawl(seeds, query, opts);
     res.json({ ok: true, results: result });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -7823,7 +7929,8 @@ app.post("/api/neural/index", async (req, res) => {
     if (!Array.isArray(seeds) || !seeds.length) return res.status(400).json({ ok: false, error: "No seed URLs provided" });
     const query = String(req.body?.query || "").slice(0, CFG.maxSearchQueryChars);
     const maxPages = Math.min(CFG.indexAiMaxPages, Math.max(1, Number(req.body?.maxPages) || CFG.indexAiMaxPages));
-    const maxDepth = Math.min(CFG.indexAiMaxDepth, Math.max(0, Number(req.body?.maxDepth) || CFG.indexAiMaxDepth));
+    const requestedDepth = req.body?.maxDepth == null ? CFG.indexAiMaxDepth : Number(req.body.maxDepth);
+    const maxDepth = Number.isInteger(requestedDepth) ? Math.min(CFG.indexAiMaxDepth, Math.max(0, requestedDepth)) : CFG.indexAiMaxDepth;
     const normalized = [...new Set(seeds.map(seed => normalizeUrl(seed)).filter(Boolean))].slice(0, 8);
     if (!normalized.length) return res.status(400).json({ ok: false, error: "No public HTTP(S) seed URLs provided" });
     const result = await neuralRobotPool.startCrawl(normalized, query, { maxPages: Math.ceil(maxPages / normalized.length), maxDepth });
@@ -8100,7 +8207,8 @@ function resolveEscapedTarget(escaped, pageUrl) {
   try {
     const parsed = new URL(escaped, "http://veyra.escaped.invalid");
     if (parsed.search) {
-      const strip = new Set([...parsed.searchParams.keys()].filter(k => /^__veyra/i.test(k)
+      const popupRoute = parsed.searchParams.has("__veyra_url") && parsed.searchParams.has("__veyra_sid");
+      const strip = new Set([...parsed.searchParams.keys()].filter(k => /^__veyra/i.test(k) || (popupRoute && k === "veyra_popup")
         || ((k === "sid" || k === "from") && liveSessionId(parsed.searchParams.get(k)))));
       if (strip.size) {
         parsed.search = parsed.search.slice(1).split("&").filter(value => {

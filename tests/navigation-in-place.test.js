@@ -43,9 +43,13 @@ const body = runtime.replace(/^\s*\(function\(\)\{/, "").replace(/\}\)\(\);\s*$/
 let assigned = [];
 const noop = () => {};
 let msgHandlers = [];
+const clickHandlers = [];
 let openedTabs = [];
 const stubWindow = {
-  addEventListener: (type, h) => { if (type === "message") msgHandlers.push(h); },
+  addEventListener: (type, h) => {
+    if (type === "message") msgHandlers.push(h);
+    if (type === "click") clickHandlers.push(h);
+  },
   postMessage: (m) => { openedTabs.push(m); },
   open: () => null,
   parent: null,
@@ -61,7 +65,12 @@ const api = fn(stubWindow, stubDoc(), stubLocation(), stubHistory(), { userAgent
   globalThis.History || Object, FakeLocation, globalThis.Element || Object, globalThis.Node || Object, globalThis.CSSStyleSheet || Object, globalThis.MutationObserver || Object, WeakSet, () => 0, () => 0, clearTimeout, clearInterval);
 // The app answers the runtime's embed ping: this frame is app-embedded, so
 // popups/new windows route through the app instead of the native window.open.
-for (const h of msgHandlers) { try { h({ data: { type: "veyra:embed-ack" } }); } catch {} }
+for (const h of msgHandlers) { try { h({ source: stubWindow, data: { type: "veyra:embed-ack" } }); } catch {} }
+function click(isTrusted) {
+  const event = { isTrusted, eventPhase: 2 };
+  clickHandlers.forEach(h => h(event));
+  return event;
+}
 
 function stubDoc() { return { addEventListener: noop, cookie: "", body: null, documentElement: null, querySelector: () => null }; }
 function stubHistory() { return { pushState: noop, replaceState: noop, state: null }; }
@@ -86,6 +95,13 @@ assert.equal(openedTabs.length, 0, "window.open(url,'_top') from the root frame 
 // window.open(url) with no target opens a new proxied Veyra tab and
 // returns the popup relay shim (real opener semantics for OAuth flows).
 openedTabs = []; assigned = [];
+assert.equal(api.open("https://example.com/games"), null, "scripts need a real click for a new tab");
+click(false);
+assert.equal(api.open("https://example.com/games"), null, "a synthetic click does not grant a popup");
+const dispatched = click(true);
+dispatched.eventPhase = 0;
+assert.equal(api.open("https://example.com/games"), null, "a timer after the click dispatch does not inherit its popup");
+click(true);
 ret = api.open("https://example.com/games");
 assert.ok(ret && typeof ret.postMessage === "function" && ret.closed === false,
   "window.open must return the popup relay shim, not null");
@@ -93,9 +109,11 @@ assert.equal(openedTabs.length, 1, "window.open(url) without a target still hand
 assert.equal(openedTabs[0].type, "veyra:popup-open");
 assert.equal(openedTabs[0].target, undefined, "the popup-open message carries no target (the popup IS the tab)");
 assert.equal(typeof openedTabs[0].popupId, "string", "the popup-open message carries the popup id");
+assert.equal(api.open("https://example.com/duplicate"), null, "an interaction cannot open a second tab");
 
 // The app must be able to tell in-place targets from new-tab targets.
 openedTabs = [];
+click(true);
 ret = api.open("https://example.com/games", "_blank");
 assert.equal(openedTabs[0].name, "_blank", "explicit _blank passes its window name through");
 // The shim's postMessage relays through the app (veyra:popup-message).
@@ -106,5 +124,37 @@ assert.equal(openedTabs[openedTabs.length - 1].data.hello, 1);
 // The shim's close() asks the app to close the popup tab.
 ret.close();
 assert.equal(openedTabs[openedTabs.length - 1].type, "veyra:popup-close", "the shim close() must ask the app to close the tab");
+
+for (const [blank, setLocation] of [
+  [undefined, (h, url) => { h.location = url; }],
+  ["about:blank", (h, url) => { h.location.href = url; }],
+  [" ", (h, url) => h.location.replace(url)],
+  ["", (h, url) => h.location.assign(url)]
+]) {
+  click(true);
+  openedTabs = [];
+  const handle = api.open(blank, "signin");
+  assert.equal(handle.location.href, "about:blank");
+  assert.equal(handle.closed, false);
+  assert.equal(openedTabs.length, 0, "a blank window must not open a tab");
+  setLocation(handle, "about:blank");
+  assert.equal(openedTabs.length, 0);
+  setLocation(handle, "https://example.com/signin");
+  assert.equal(openedTabs[0]?.type, "veyra:popup-open");
+  assert.equal(handle.location.href, "https://example.com/signin");
+  setLocation(handle, "https://example.com/next");
+  assert.equal(openedTabs[1]?.type, "veyra:popup-navigate");
+  assert.equal(openedTabs[1]?.popupId, openedTabs[0]?.popupId);
+  handle.close();
+  assert.equal(handle.closed, true);
+  assert.equal(openedTabs[2]?.type, "veyra:popup-close");
+}
+click(true);
+openedTabs = [];
+const cancelled = api.open();
+cancelled.close();
+cancelled.location.href = "https://example.com/never";
+assert.equal(cancelled.closed, true);
+assert.equal(openedTabs.length, 0, "closing the placeholder prevents a late tab");
 
 console.log("navigation-in-place regression tests passed");

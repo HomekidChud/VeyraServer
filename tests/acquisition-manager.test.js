@@ -196,6 +196,20 @@ const { MongoStore } = require("../src/core/mongo-store");
   await assert.rejects(pending, error => error.code === "OPERATION_CANCELLED");
   assert.equal(cancellable.report().inflight, 0);
 
+  const bodyDeadline = new AcquisitionManager({ assertPublicUrl: async () => {}, fetchImpl: async (_url, opts) =>
+    new Response(new ReadableStream({ start(controller) {
+      controller.enqueue(new TextEncoder().encode("first chunk"));
+      const fallback = setTimeout(() => controller.close(), 800);
+      opts.signal.addEventListener("abort", () => {
+        clearTimeout(fallback);
+        controller.error(Object.assign(new Error("aborted during response body"), { name: "AbortError" }));
+      }, { once: true });
+    } }), { headers: { "content-type": "text/plain" } })
+  });
+  await assert.rejects(() => bodyDeadline.fetch("https://example.com/slow-body", { skipRobots: true, timeoutMs: 260, retries: 0 }),
+    error => error.code === "FETCH_TIMEOUT", "headers do not stop the timeout clock");
+  assert.equal(bodyDeadline.report().inflight, 0);
+
   const robotsBlocked = new AcquisitionManager({ assertPublicUrl: async () => {}, fetchImpl: async url => new Response(url.endsWith("robots.txt") ? "User-agent: *\nDisallow: /blocked" : "should not fetch", { headers: { "content-type": "text/plain" } }) });
   await assert.rejects(() => robotsBlocked.fetch("https://example.com/blocked/page"), error => error.code === "ROBOTS_DISALLOWED");
 
