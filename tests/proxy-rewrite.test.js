@@ -1,5 +1,37 @@
 const assert = require('assert');
 const { rewriteHtml, rewriteJsText, cacheSafeUrl, cacheSafeResponse } = require('../src/server');
+const { parse: parseImports } = require('es-module-lexer');
+
+// Compact ESM chunks must retain their original upstream module base even
+// when loaded at /api/resource?url=... through another module's import().
+{
+  const literal = 'const note = \'import "./not-a-module.js"\'';
+  const js = [
+    'import"./side-effect.js";import{a}from"./dep.js";export*from"../parent.js";',
+    'export {a as b} from "./named.js";',
+    'const load=()=>import(`./lazy.js`);const data=()=>import("./data.json",{with:{type:"json"}});',
+    'import mapping from "import-map-key";const runtime=()=>import(`./${mapping}.js`);',
+    'const quoted=()=>import("./name\'s.js");',
+    literal,
+  ].join('\n');
+  const base = 'https://example.com/packs/app.js';
+  const out = rewriteJsText(js, base, 'module-session');
+  assert.ok(out.includes(literal), 'module-like text in a string is not rewritten');
+  assert.ok(out.includes('import(`./${mapping}.js`)'), 'computed import is unchanged');
+  assert.ok(out.includes('import mapping from "import-map-key"'), 'bare import-map key survives');
+  assert.ok(out.includes(',{with:{type:"json"}})'), 'dynamic import options survive');
+  const proxied = parseImports(out)[0].filter(item => item.specifier?.startsWith('/api/resource?'));
+  const targets = proxied.map(item => {
+    const params = new URL(item.specifier, base).searchParams;
+    assert.equal(params.get('from'), 'https://example.com/');
+    assert.equal(params.get('sid'), 'module-session');
+    return params.get('url');
+  });
+  assert.deepEqual(targets, ['./side-effect.js', './dep.js', '../parent.js', './named.js',
+    './lazy.js', './data.json', "./name's.js"].map(p => new URL(p, base).href));
+  const sibling = rewriteJsText('import{a}from"./dep.js"', 'https://example.com/packs/other.js', 'module-session');
+  assert.equal(parseImports(sibling)[0][0].specifier, proxied[1].specifier, 'sibling modules share one dependency instance');
+}
 
 // Bare-origin string literals must stay verbatim in rewritten JS: apps parse
 // them with new URL(...) and compare hostnames (browser.lol's app-origin
