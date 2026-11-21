@@ -3075,7 +3075,12 @@ ${pageActionsRuntime()}
   const SC_SHIFT=['i','j','c','v','delete','t','n','b','o','m','r','p','k','tab','pageup','pagedown'];
   const SC_MOD=['t','w','n','l','r','f','p','j','h','d','k','e','u','g','s',',','pageup','pagedown','=','+','-','0','1','2','3','4','5','6','7','8','9','tab'];
   const SC_ALT=['arrowleft','arrowright','home','d','t','w'];
-  document.addEventListener('keydown',function(ev){try{if(!rootProxiedFrame())return;const k=String(ev.key||'').toLowerCase();const mod=ev.ctrlKey||ev.metaKey;
+  function browserlingOwnsKeyboard(ev){
+    if(!ev.target?.closest?.('.view-screen[tabindex]'))return false;
+    const u=new URL(virtualUrl);
+    return (u.hostname==='www.browserling.com'||u.hostname==='browserling.com')&&u.pathname.startsWith('/browse/');
+  }
+  document.addEventListener('keydown',function(ev){try{if(!rootProxiedFrame()||browserlingOwnsKeyboard(ev))return;const k=String(ev.key||'').toLowerCase();const mod=ev.ctrlKey||ev.metaKey;
     let fwd=false;
     if(k==='f12'||k==='f5'||k==='f6')fwd=true;
     else if(mod&&ev.shiftKey&&SC_SHIFT.includes(k))fwd=true;
