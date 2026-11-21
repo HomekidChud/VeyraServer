@@ -13,6 +13,17 @@ const { rewriteHtml, rewriteJsText, cacheSafeUrl, cacheSafeResponse } = require(
   assert.doesNotMatch(out, /"\/api\/resource\?url=https%3A%2F%2Fbrowser\.lol%2F&/);
   assert.match(out, /"\/api\/resource\?url=https%3A%2F%2Fbrowser\.lol%2Fimg%2Fx\.png/);
 }
+
+// Browserling's runtime joins stylesheet filenames to an absolute base.
+// The directory must stay intact until the computed link href is set.
+{
+  const site = 'https://www.browserling.com';
+  const base = `${site}/css/new-browse-page/`;
+  const js = `const styles="${base}"; link.href=styles+"menu.css"; fetch("${base}fixed.css");`;
+  const out = rewriteJsText(js, `${site}/js/new-browse-page/bundle.js`, 'css-test');
+  assert.ok(out.includes(`const styles="${base}"; link.href=styles+"menu.css"`));
+  assert.ok(out.includes(`fetch("/api/resource?url=${encodeURIComponent(`${base}fixed.css`)}&`));
+}
 // srcFix's script flag is a real parameter now (it used to be a free variable
 // that threw ReferenceError and silently disabled the whole script-form
 // logic): same-origin script URLs keep their path, other origins get proxied.
