@@ -1,7 +1,13 @@
 "use strict";
 const { parseSiteScope, allowsSiteUrl } = require("./search-site-scope");
+const { normalizeSearchText, unicodeWords, braveLanguage } = require("./search-language");
 
 const cheerio = require("cheerio");
+const WIKI_EDITIONS = new Set("ar bg bn ca cs cy da de el en es et eu fa fi fr gl gu he hi hr hu hy id is it ja ka km kn ko lo lt lv ml mr ms my ne nl no pa pl pt ro ru sa sk sl sr sv sw ta te th tr uk ur vi zh".split(" "));
+function wikiEdition(lang, scope) {
+  const candidates = [lang.split("-")[0], "en", ...scope.include.map(host => /^([a-z]+)\.wikipedia\.org$/.exec(host)?.[1])];
+  return candidates.find(candidate => WIKI_EDITIONS.has(candidate) && allowsSiteUrl(scope, `https://${candidate}.wikipedia.org`));
+}
 
 function cleanText(s, max = 400) { return String(s || "").replace(/\s+/g, " ").trim().slice(0, max); }
 function safeHttpUrl(raw) {
@@ -81,7 +87,8 @@ function parseYahooHtml(html) {
   return out;
 }
 function rankTokens(text) {
-  return String(text || "").toLowerCase().replace(/[^a-z0-9\s-]+/g, " ").split(/\s+/).filter(Boolean).map(word => {
+  return unicodeWords(text).map(word => {
+    if (!/^[a-z]+$/.test(word)) return word;
     if (word.length > 4 && word.endsWith("ies")) return `${word.slice(0, -3)}y`;
     if (word.length > 3 && word.endsWith("s") && !/(?:ss|us|is|ous|ics)$/.test(word)) return word.slice(0, -1);
     return word;
@@ -102,7 +109,7 @@ function diceSimilarity(a, b) {
 }
 const RANK_STOP = new Set("a an and are as at be but by for from how in is it of on or the to was were what when where which who why with does do did can could should would com www http https".split(" "));
 function scoreResultRelevance(query, row) {
-  const queryTokens = [...new Set(rankTokens(query))].filter(token => token.length > 1 && !RANK_STOP.has(token));
+  const queryTokens = [...new Set(rankTokens(query))].filter(token => !RANK_STOP.has(token)).slice(0, 40);
   const titleTokens = new Set(rankTokens(row.title));
   const urlTokens = new Set(rankTokens(row.displayUrl || row.url));
   const snippetTokens = new Set(rankTokens(row.snippet));
@@ -124,8 +131,8 @@ function scoreResultRelevance(query, row) {
   }
   const coverage = matched.length / queryTokens.length;
   score *= 0.4 + 0.6 * coverage;
-  const phrase = query.trim().toLowerCase();
-  if (phrase.length > 3 && (`${row.title} ${row.snippet}`).toLowerCase().includes(phrase)) score += 4;
+  const phrase = normalizeSearchText(query.trim());
+  if (phrase.length > 3 && normalizeSearchText(`${row.title} ${row.snippet}`).includes(phrase)) score += 4;
   score += Math.min(3, (row.providers?.length || 1) - 1) * 1.5;
   return { score: Math.round(score * 1000) / 1000, coverage: Math.round(coverage * 1000) / 1000, matchedTokens: matched };
 }
@@ -143,7 +150,7 @@ function rankResultsByRelevance(query, rows) {
   return scored.map(item => ({ ...item.row, relevance: item.coverage, relevanceScore: item.score }));
 }
 function canonicalKey(url) {
-  try { const u = new URL(url); if (u.username || u.password) return ""; u.hash = ""; for (const k of [...u.searchParams.keys()]) if (/^utm_/i.test(k) || /^(fbclid|gclid|mc_cid|mc_eid)$/i.test(k)) u.searchParams.delete(k); u.hostname = u.hostname.toLowerCase(); return u.pathname === "/" && !u.search ? u.origin : u.href; }
+  try { const u = new URL(url); if (!/^https?:$/.test(u.protocol) || u.username || u.password) return ""; u.hash = ""; for (const k of [...u.searchParams.keys()]) if (/^utm_/i.test(k) || /^(fbclid|gclid|mc_cid|mc_eid)$/i.test(k)) u.searchParams.delete(k); u.hostname = u.hostname.toLowerCase(); return u.pathname === "/" && !u.search ? u.origin : u.href; }
   catch { return ""; }
 }
 function dedupe(rows) { const seen = new Set(); return rows.filter(r => { const key = canonicalKey(r.url); if (!key || seen.has(key)) return false; seen.add(key); r.canonicalUrl = key; return true; }); }
@@ -190,7 +197,31 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
   const cacheTtlMs = Math.max(0, Math.min(600000, Number(env.WEB_SEARCH_CACHE_TTL_MS) || 30000));
   const cache = new Map(); const MAX_CACHE = 200; const cooldowns = new Map();
   const health = Object.create(null);
+  let wikipediaActive = false;
   const providers = {
+    wikipedia: { available: () => env.WEB_SEARCH_DEEP_WIKIPEDIA !== "0", async run(_query, { offset, wiki, scope, signal }) {
+      const origin = `https://${wiki}.wikipedia.org`;
+      const url = new URL("/w/api.php", origin);
+      url.search = new URLSearchParams({ action: "query", list: "search", format: "json", formatversion: "2",
+        srsearch: scope.text, srnamespace: "0", srlimit: "10", sroffset: String(offset), srprop: "snippet", maxlag: "5" });
+      wikipediaActive = true;
+      try {
+        const response = await fetchText(url.href, { signal, accept: "application/json", timeoutMs: Math.min(timeoutMs, 5000),
+          userAgent: "VeyraSearch/8.21 (+https://github.com/HomekidChud/VeyraServer)", maxRedirects: 0 });
+        if (!response.ok) throw Object.assign(new Error("Wikipedia search unavailable"), { status: response.status, retryAfterMs: response.retryAfterMs });
+        const data = JSON.parse(response.text);
+        if (data.error) throw Object.assign(new Error("Wikipedia search unavailable"), { status: data.error.code === "maxlag" ? 503 : 400, retryAfterMs: response.retryAfterMs });
+        if (!Array.isArray(data.query?.search)) throw new Error("Invalid Wikipedia search response");
+        const results = data.query.search.slice(0, 10).flatMap(item => {
+          if (typeof item.title !== "string" || !item.title || item.title.length > 300) return [];
+          const url = `${origin}/wiki/${encodeURIComponent(item.title.replaceAll(" ", "_"))}`;
+          const snippet = cheerio.load(String(item.snippet || "").slice(0, 2000)).text();
+          const result = row(url, item.title, snippet, "wikipedia");
+          return result ? [{ ...result, lang: wiki }] : [];
+        });
+        return { results, more: data.continue?.sroffset === offset + 10, total: null };
+      } finally { wikipediaActive = false; }
+    } },
     google: { available: () => !!(googleKey && googleCx), async run(q, { offset, lang, signal }) {
       const u = new URL("https://www.googleapis.com/customsearch/v1"); u.searchParams.set("key", googleKey); u.searchParams.set("cx", googleCx); u.searchParams.set("q", q); u.searchParams.set("num", "10"); if (offset) u.searchParams.set("start", String(Math.min(91, offset + 1))); if (lang) u.searchParams.set("hl", lang);
       const r = await fetchText(u.href, { accept: "application/json", signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Google Custom Search API request failed"), { status: r.status, retryAfterMs: r.retryAfterMs });
@@ -302,17 +333,25 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       return { name, results: [], ms, error: info.code, classification: info.classification };
     } finally { clearTimeout(timer); if (abortListener) controller.signal.removeEventListener("abort", abortListener); params.signal?.removeEventListener("abort", abortUpstream); }
   }
-  async function search(query, { offset = 0, engine = "", lang = "", signal, limit = 20, noCache = false } = {}) {
+  async function search(query, { offset = 0, engine = "", lang = "", signal, limit = 20, noCache = false, researchPage = null, budgetMs = 12000 } = {}) {
     const requestStartedAt = Date.now(); let firstResultAt = null;
+    const research = Number.isSafeInteger(researchPage) && researchPage >= 0 && researchPage < 10;
+    // Page only adapters with explicit continuation or a stable offset. Other
+    // adapters may still contribute to the first batch.
+    const pageable = new Set(["brave", "bing", "google", "wikipedia"]);
     const requestedLimit = Math.max(1, Math.min(50, Number(limit) || 20));
     const q = cleanText(query, 600); if (!q) return { provider: "none", results: [], attempts: [], responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: null };
     const scope = parseSiteScope(q);
     if (scope.invalid) return { provider: "none", results: [], attempts: [], more: false, siteFilter: { invalid: true }, responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: null };
-    const requested = engine && providers[engine] ? [engine] : order.filter(name => providers[name]);
-    const key = `${requested.join(",")}|${offset}|${requestedLimit}|${lang}|${q.toLowerCase()}`; const hit = noCache ? null : cache.get(key);
+    const wiki = research && scope.text && wikiEdition(lang, scope);
+    const requested = [...new Set(engine && Object.hasOwn(providers, engine) ? [engine] :
+      [...(wiki ? ["wikipedia"] : []), ...order.filter(name => name !== "wikipedia" && Object.hasOwn(providers, name))])];
+    const key = `${requested.join(",")}|${offset}|${researchPage}|${requestedLimit}|${lang}|${q.toLowerCase()}`; const hit = noCache ? null : cache.get(key);
     if (hit && Date.now() - hit.time < cacheTtlMs) return { ...hit.value, cached: true, responseTimeMs: Date.now() - requestStartedAt };
     const attempts = []; let eligible = [];
     for (const name of requested) {
+      if (name === "wikipedia" && !wiki) continue;
+      if (research && researchPage > 0 && !pageable.has(name)) continue;
       if (!configured(name)) { attempts.push({ provider: name, skipped: "not-configured" }); continue; }
       if ((cooldowns.get(name) || 0) > Date.now()) { attempts.push({ provider: name, skipped: "cooldown" }); continue; }
       eligible.push(name);
@@ -328,12 +367,32 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
     let callerCancelled = false, deadlineExpired = false, earlyCancelled = false;
     const observedResultKeys = new Set();
     const scopedRows = rows => scope.active ? rows.filter(result => allowsSiteUrl(scope, result.url)) : rows;
-    const deadlineAt = Date.now() + overallDeadlineMs;
+    const requestBudgetMs = research ? Math.max(1, Math.min(overallDeadlineMs, 12000, budgetMs)) : overallDeadlineMs;
+    const deadlineAt = Date.now() + requestBudgetMs;
     const abortForCaller = () => { callerCancelled = true; requestController.abort(); };
     if (signal?.aborted) abortForCaller(); else signal?.addEventListener("abort", abortForCaller, { once: true });
-    const deadlineTimer = setTimeout(() => { deadlineExpired = true; requestController.abort(); }, overallDeadlineMs);
+    const deadlineTimer = setTimeout(() => { deadlineExpired = true; requestController.abort(); }, requestBudgetMs);
     const settled = new Array(eligible.length); let cursor = 0;
-    async function worker() { while (cursor < eligible.length && !requestController.signal.aborted) { const index = cursor++; const item = await runProvider(eligible[index], q, { offset, limit: requestedLimit, lang, filterRows: scopedRows, signal: requestController.signal, isCancelled: () => callerCancelled, isDeadlineExpired: () => deadlineExpired, isEarlyCancel: () => earlyCancelled, onResults: at => { if (firstResultAt == null) firstResultAt = at; } }); settled[index] = item; for (const result of item.results) { const key = canonicalKey(result.url); if (key) observedResultKeys.add(key); } if (!callerCancelled && !deadlineExpired && !earlyCancelled && observedResultKeys.size >= earlyResultThreshold && deadlineAt - Date.now() <= earlyCancelWindowMs) { earlyCancelled = true; requestController.abort(); } } }
+    async function worker() {
+      while (cursor < eligible.length && !requestController.signal.aborted) {
+        const index = cursor++, name = eligible[index];
+        if (name === "wikipedia" && wikipediaActive) {
+          attempts.push({ provider: name, skipped: "busy" });
+          continue;
+        }
+        const providerOffset = research ? researchPage * (name === "brave" ? 20 : 10) : offset;
+        const providerLang = research && name === "brave" ? braveLanguage(lang) : lang;
+        const item = await runProvider(name, q, { offset: providerOffset, limit: requestedLimit, lang: providerLang, filterRows: scopedRows, wiki, scope,
+          signal: requestController.signal, isCancelled: () => callerCancelled, isDeadlineExpired: () => deadlineExpired,
+          isEarlyCancel: () => earlyCancelled, onResults: at => { if (firstResultAt == null) firstResultAt = at; } });
+        settled[index] = item;
+        if (research) continue;
+        for (const result of item.results) { const key = canonicalKey(result.url); if (key) observedResultKeys.add(key); }
+        if (!callerCancelled && !deadlineExpired && !earlyCancelled && observedResultKeys.size >= earlyResultThreshold && deadlineAt - Date.now() <= earlyCancelWindowMs) {
+          earlyCancelled = true; requestController.abort();
+        }
+      }
+    }
     try { await Promise.all(Array.from({ length: Math.min(parallelism, eligible.length) }, worker)); }
     finally { clearTimeout(deadlineTimer); signal?.removeEventListener("abort", abortForCaller); }
     const successful = settled.filter(Boolean);
@@ -346,15 +405,18 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
     }
     // Rank the merged provider results by token relevance to the query so the
     // most on-topic pages surface first instead of raw provider arrival order.
-    const results = rankResultsByRelevance(scope.active ? scope.text : q, [...merged.values()]).slice(0, requestedLimit);
+    const ranked = rankResultsByRelevance(scope.active ? scope.text : q, [...merged.values()]);
+    const results = research ? ranked.slice(0, maxProviders * 20) : ranked.slice(0, requestedLimit);
     const source = successful.find(x => x.results.length)?.name || "none";
-    const value = { provider: source, results, ranking: { method: "token-relevance" }, total: successful.reduce((n, x) => n + (x.total || x.results.length), 0) || null, more: successful.some(x => x.more), attempts, googleConfigured: configured("google"), braveConfigured: configured("brave"), bingConfigured: configured("bing"), providersUsed: successful.filter(x => x.results.length).map(x => x.name), cancelled: callerCancelled, earlyCancelled, deadlineExceeded: deadlineExpired, responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: firstResultAt == null ? null : firstResultAt - requestStartedAt, diagnostics: { providerCount: eligible.length, parallelism: Math.min(parallelism, eligible.length), overallDeadlineMs, earlyCancelWindowMs, earlyResultThreshold, providers: Object.fromEntries(Object.keys(providers).map(name => [name, healthSummary(name)])), google: healthSummary("google") } };
+    const value = { provider: source, results, ranking: { method: "token-relevance" }, total: successful.reduce((n, x) => n + (x.total || x.results.length), 0) || null, more: successful.some(x => x.more), attempts, googleConfigured: configured("google"), braveConfigured: configured("brave"), bingConfigured: configured("bing"), providersUsed: successful.filter(x => x.results.length).map(x => x.name), cancelled: callerCancelled, earlyCancelled, deadlineExceeded: deadlineExpired, responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: firstResultAt == null ? null : firstResultAt - requestStartedAt, diagnostics: { providerCount: eligible.length, parallelism: Math.min(parallelism, eligible.length), overallDeadlineMs: requestBudgetMs, earlyCancelWindowMs, earlyResultThreshold, providers: Object.fromEntries(Object.keys(providers).map(name => [name, healthSummary(name)])), google: healthSummary("google") } };
     if (scope.active) {
       value.total = null;
       value.siteFilter = { include: scope.include, exclude: scope.exclude };
-      const nextOffset = offset + Math.min(requestedLimit, ...successful.filter(item => item.more).map(item => item.stride));
-      value.more = value.more && nextOffset < 60;
-      if (value.more) value.nextOffset = nextOffset;
+      if (!research) {
+        const nextOffset = offset + Math.min(requestedLimit, ...successful.filter(item => item.more).map(item => item.stride));
+        value.more = value.more && nextOffset < 60;
+        if (value.more) value.nextOffset = nextOffset;
+      }
       if (!results.length) value.timeToFirstResultMs = null;
     }
     if (!noCache && !callerCancelled && results.length && cacheTtlMs) { cache.set(key, { time: Date.now(), value }); while (cache.size > MAX_CACHE) cache.delete(cache.keys().next().value); }

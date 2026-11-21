@@ -16,6 +16,9 @@ const { VpnManager } = require("./network/vpn");
 const { createShield } = require("./network/shield");
 const { upstreamHeaderCapOptions } = require("./network/header-cap");
 const { createWebSearch } = require("./services/websearch");
+const { languageTag, normalizeSearchText, unicodeWords, queryLanguage } = require("./services/search-language");
+const { walkSitemap, hasRel } = require("./services/crawl-sitemap");
+const { RESEARCH_BATCHES, researchBatch } = require("./services/research-search");
 const { createVerticalSearch, TYPES: SEARCH_VERTICALS, LAST_IMAGE_PAGE, safeUrl: verticalResultUrl } = require("./services/vertical-search");
 const { publicImageUrl, imageIdentity } = require("./services/crawl-page-data");
 const { parseSiteScope, allowsSiteUrl } = require("./services/search-site-scope");
@@ -1625,9 +1628,9 @@ const webSearch = createWebSearch({
   fetchText: async (url, opts = {}) => {
     const r = await fetchBuffer(url, {
       headers: opts.headers || {}, accept: opts.accept || "application/json", timeout: opts.timeoutMs || 12000,
-      signal: opts.signal, retries: 0, limit: 2 * 1024 * 1024
+      signal: opts.signal, retries: 0, limit: 2 * 1024 * 1024, maxRedirects: opts.maxRedirects, userAgent: opts.userAgent
     });
-    return { ok: r.ok, status: r.status, text: r.body.toString("utf8"), finalUrl: r.finalUrl, retryAfterMs: r.retryAfterMs };
+    return { ok: r.ok && !r.truncated, status: r.status, text: r.body.toString("utf8"), finalUrl: r.finalUrl, retryAfterMs: r.retryAfterMs };
   },
   env: process.env,
   log: (level, source, message) => serverLog(level, source, message)
@@ -2071,6 +2074,7 @@ function crawlPriority(url, kind, reason = "discovered") {
   const r = String(reason || "").toLowerCase();
   if (r === "root") score += 1000;
   if (r === "sitemap") score += 250;
+  if (r === "locale-alternate") score += 160;
   if (r === "canonical") score += 180;
   if (r === "navigation") score += 100;
   if (r === "browser-network" || r === "dynamic") score += 140;
@@ -2219,36 +2223,39 @@ async function loadRobots(job) {
   for (const sitemap of job.robots.sitemaps) if (crawlOriginAllowed(job, sitemap)) job.sitemaps.add(sitemap);
 }
 async function loadSitemaps(job) {
-  const pending = [...new Set([
-    ...job.sitemaps,
-    normalizeUrl("/sitemap.xml", job.root),
-    normalizeUrl("/sitemap_index.xml", job.root)
-  ].filter(Boolean))];
-  const seen = new Set();
-  const pendingSet = new Set(pending);
-  let files = 0, urls = 0;
+  const pending = [], pendingSet = new Set(), pageUrls = new Set();
+  const queueSitemap = url => {
+    if (!url || !crawlOriginAllowed(job, url) || pendingSet.has(url) || pendingSet.size >= CFG.maxSitemapFiles) return;
+    pendingSet.add(url);
+    pending.push(url);
+  };
+  for (const url of [...job.sitemaps, normalizeUrl("/sitemap.xml", job.root), normalizeUrl("/sitemap_index.xml", job.root)]) queueSitemap(url);
+  let files = 0;
   async function processSitemap(sm) {
-    if (seen.has(sm) || files >= CFG.maxSitemapFiles || urls >= CFG.maxSitemapUrls || job.stopRequested || !crawlOriginAllowed(job, sm)) return;
-    seen.add(sm); files += 1;
+    if (pageUrls.size >= CFG.maxSitemapUrls || job.stopRequested) return;
+    files += 1;
     try {
       await assertCrawlAllowed(job, sm, sm);
       const r = await fetchCached(sm, { timeout: CFG.sitemapTimeoutMs, limit: 8 * 1024 * 1024, accept: "application/xml,text/xml,text/plain,*/*;q=0.1",
-        signal: job.controller.signal, beforeRedirect: url => assertCrawlAllowed(job, url, sm) });
-      if (r.status >= 400 || r.tooLarge) throw new Error(`HTTP ${r.status}`);
+        retries: 0, signal: job.controller.signal, beforeRedirect: url => assertCrawlAllowed(job, url, sm) });
+      if (!r.ok || r.tooLarge || r.truncated) throw new Error(`HTTP ${r.status} or unreadable sitemap`);
       const xml = r.body.toString("utf8");
-      for (const match of xml.matchAll(/<loc>\s*([^<]+?)\s*<\/loc>/gi)) {
-        const u = normalizeUrl(match[1], sm); if (!u) continue;
-        if (/\.xml(?:$|\?)/i.test(u) && /sitemap/i.test(u)) { if (!seen.has(u) && !pendingSet.has(u) && pending.length < 250) { pending.push(u); pendingSet.add(u); } continue; }
-        if (crawlOriginAllowed(job, u)) { addLink(job, u, "html", sm, "sitemap"); urls += 1; }
-        if (urls >= CFG.maxSitemapUrls) break;
-      }
+      const source = r.finalUrl || sm;
+      walkSitemap(xml, (raw, kind) => {
+        const url = normalizeUrl(raw, source);
+        if (!url || !crawlOriginAllowed(job, url) || job.stopRequested) return;
+        if (kind === "sitemap-index") return queueSitemap(url);
+        if (pageUrls.size >= CFG.maxSitemapUrls || pageUrls.has(url)) return;
+        pageUrls.add(url);
+        addLink(job, url, "html", source, kind);
+      }, Math.max(CFG.maxSitemapFiles, Math.min(100_000, CFG.maxSitemapUrls * 2)));
     } catch (e) { if (!job.controller.signal.aborted && e.code !== "CRAWL_POLICY") jobLog(job, "debug", `Sitemap failed: ${sm} — ${e.message}`); }
   }
-  while (pending.length && files < CFG.maxSitemapFiles && urls < CFG.maxSitemapUrls && !job.stopRequested) {
+  while (pending.length && pageUrls.size < CFG.maxSitemapUrls && !job.stopRequested) {
     const batch = pending.splice(0, CFG.sitemapConcurrency);
     await Promise.allSettled(batch.map(processSitemap));
   }
-  if (files) jobLog(job, "info", `Sitemap pass: ${files} file(s), ${urls} URL(s) discovered.`);
+  if (files) jobLog(job, "info", `Sitemap pass: ${files} file(s), ${pageUrls.size} URL(s) discovered.`);
 }
 
 
@@ -3492,9 +3499,7 @@ const SEARCH_STOP_WORDS = new Set([
   "a","an","and","are","as","at","be","by","for","from","has","have","how","in","is","it","of","on","or","that","the","this","to","was","what","when","where","which","who","why","with","you","your"
 ]);
 function tokenizeSearch(value) {
-  const raw = String(value || "").toLocaleLowerCase();
-  const tokens = raw.normalize("NFKC").match(/[\p{L}\p{N}][\p{L}\p{N}'_-]{1,63}/gu) || [];
-  return tokens.map(x => x.replace(/^['_-]+|['_-]+$/g, "")).filter(x => x && (x.length > 1 || /\d/.test(x)) && !SEARCH_STOP_WORDS.has(x));
+  return unicodeWords(value).filter(x => !SEARCH_STOP_WORDS.has(x));
 }
 function parseSearchQuery(query) {
   const input = String(query || "").trim();
@@ -3502,13 +3507,13 @@ function parseSearchQuery(query) {
   const siteScope = parseSiteScope(input);
   const source = siteScope.text.slice(0, CFG.maxSearchQueryChars);
   const phrases = [];
-  const stripped = source.replace(/"([^\"]{1,160})"/g, (_, phrase) => { phrases.push(phrase.trim().toLocaleLowerCase()); return " "; });
+  const stripped = source.replace(/"([^\"]{1,160})"/g, (_, phrase) => { phrases.push(normalizeSearchText(phrase.trim())); return " "; });
   const filters = { site: siteScope.include.at(-1) || "", intitle: "", inurl: "" };
   const negative = [];
   const positiveRaw = [];
   for (const part of stripped.split(/\s+/).filter(Boolean)) {
-    if (/^intitle:[^\s]+$/i.test(part)) filters.intitle = part.slice(8).toLocaleLowerCase();
-    else if (/^inurl:[^\s]+$/i.test(part)) filters.inurl = part.slice(6).toLocaleLowerCase();
+    if (/^intitle:[^\s]+$/i.test(part)) filters.intitle = normalizeSearchText(part.slice(8));
+    else if (/^inurl:[^\s]+$/i.test(part)) filters.inurl = normalizeSearchText(part.slice(6));
     else if (/^-[^\s-]+$/.test(part)) negative.push(...tokenizeSearch(part.slice(1)));
     else positiveRaw.push(part);
   }
@@ -3519,7 +3524,7 @@ function parseSearchQuery(query) {
   const normalizedPhrases = [...new Set(phrases)].filter(Boolean).slice(0, 8);
   return { raw, terms, negativeTerms, phrases: normalizedPhrases, filters, siteScope };
 }
-function searchFieldHas(doc, field, term) { return String(doc[field] || "").toLocaleLowerCase().includes(term); }
+function searchFieldHas(doc, field, term) { return normalizeSearchText(doc[field]).includes(term); }
 function removeIndexedDocument(doc) {
   if (!doc?.termFreq) return;
   for (const term of doc.termFreq.keys()) {
@@ -3539,14 +3544,17 @@ function extractPageMeta(text, url) {
   const title = String($("title").first().text() || $("h1").first().text() || "").replace(/\s+/g, " ").trim().slice(0, 300) || hostOf(url);
   const description = String($("meta[name='description'],meta[property='og:description']").first().attr("content") || "").replace(/\s+/g, " ").trim().slice(0, 600);
   const headings = String($("h1,h2,h3").map((_, el) => $(el).text()).get().join(" | ") || "").replace(/\s+/g, " ").trim().slice(0, 1200);
-  const bodyText = String($("main,article").first().text() || $("body").text() || "").replace(/\s+/g, " ").trim();
+  // Preserve word boundaries between adjacent HTML blocks (notably headings
+  // followed by paragraphs), without splitting inline formatting.
+  $("h1,h2,h3,h4,h5,h6,p,li,br,dt,dd,td,th,div,section").after(" ");
+  const bodyText = String($("main,article").first().text() || $("body").text() || "").replace(/\s+/g, " ").trim().slice(0, CFG.maxIndexTextChars);
   const textContent = (description ? `${description} ` : "") + bodyText;
   const snippet = description || bodyText.slice(0, 600) || title;
   let favicon = "";
   const rawIcon = $("link[rel~='icon'],link[rel='shortcut icon']").first().attr("href");
   if (rawIcon) favicon = resolveResource(rawIcon, url) || "";
   const canonical = resolveNavigation($("link[rel='canonical']").attr("href"), url);
-  const lang = String($("html").attr("lang") || "").slice(0, 32);
+  const lang = languageTag($("html").attr("lang") || $("html").attr("xml:lang"));
   const allText = `${title} ${headings} ${textContent} ${url}`;
   const termFreq = new Map();
   for (const term of tokenizeSearch(allText)) termFreq.set(term, (termFreq.get(term) || 0) + 1);
@@ -3645,7 +3653,7 @@ function makeSearchSnippet(doc, parsed) {
 function localSearch(query, offset, limit, options = {}) {
   const parsed = parseSearchQuery(query);
   const N = searchIndex.size;
-  if (!N) return { total: 0, results: [], indexSize: 0, terms: parsed.terms, filters: parsed.filters };
+  if (!N || (options.requireTerms && !parsed.terms.length)) return { total: 0, results: [], indexSize: N, terms: parsed.terms, filters: parsed.filters };
   const candidateScores = new Map();
   const k1 = 1.35, b = 0.75;
   let avgLen = 0;
@@ -3664,7 +3672,7 @@ function localSearch(query, offset, limit, options = {}) {
     if (options.onlyWithImages && !doc.searchImages?.length) continue;
     if (!allowsSiteUrl(parsed.siteScope, doc.url)) continue;
     if (parsed.filters.intitle && !searchFieldHas(doc, "title", parsed.filters.intitle)) continue;
-    if (parsed.filters.inurl && !String(doc.url).toLocaleLowerCase().includes(parsed.filters.inurl)) continue;
+    if (parsed.filters.inurl && !searchFieldHas(doc, "url", parsed.filters.inurl)) continue;
     if (parsed.negativeTerms.some(term => doc.termFreq.has(term) || searchFieldHas(doc, "url", term))) continue;
     let score = 0;
     for (const term of parsed.terms) {
@@ -3680,7 +3688,7 @@ function localSearch(query, offset, limit, options = {}) {
       if (searchFieldHas(doc, "description", term)) score += 0.9 * idf;
     }
     for (const phrase of parsed.phrases) {
-      const phraseText = `${doc.title} ${doc.headings} ${doc.text} ${doc.description}`.toLocaleLowerCase();
+      const phraseText = normalizeSearchText(`${doc.title} ${doc.headings} ${doc.text} ${doc.description}`);
       if (phraseText.includes(phrase)) score += 7;
     }
     if (!parsed.terms.length && (doc.title || doc.description)) score += 0.05;
@@ -3993,7 +4001,8 @@ function discoverHtml(job, text, base, depth = 0) {
     const rel = String($(el).attr("rel") || "").toLowerCase();
     const as = String($(el).attr("as") || "").toLowerCase();
     let hint = rel.includes("stylesheet") ? "css" : as === "script" ? "js" : as === "style" ? "css" : as === "image" ? "image" : as === "font" ? "font" : /video|audio/.test(as) ? "media" : rel.includes("manifest") ? "manifest" : (rel.includes("canonical") || rel.includes("alternate") || rel.includes("amphtml")) ? "html" : typeFor($(el).attr("href"));
-    const reason = rel.includes("preload") ? "preload" : rel.includes("modulepreload") ? "modulepreload" : rel.includes("canonical") ? "canonical" : "link";
+    const reason = hasRel(rel, "alternate") && languageTag($(el).attr("hreflang")) ? "locale-alternate"
+      : rel.includes("preload") ? "preload" : rel.includes("modulepreload") ? "modulepreload" : rel.includes("canonical") ? "canonical" : "link";
     addLink(job, $(el).attr("href"), hint, effectiveBase, reason);
   });
   $("script[src]").each((_, el) => addLink(job, $(el).attr("src"), "js", effectiveBase, "script"));
@@ -4293,7 +4302,11 @@ async function processItem(job, item) {
     if (job.counts.bytesScanned > CFG.maxScanBytes) { job.stopRequested = true; job.stopReason = "scan-byte-limit"; return; }
     const lower = r.contentType.toLowerCase();
     const finalUrl = r.finalUrl || item.url;
-    if (finalUrl && sameRedirectHost(finalUrl, item.url)) { try { job.crawlOrigins.add(new URL(finalUrl).origin); } catch {} }
+    // A permitted CDN asset can have its own origin. It must not make that
+    // origin eligible for pages (including later sitemap alternates).
+    if (item.type === "html" && finalUrl && sameRedirectHost(finalUrl, item.url)) {
+      try { job.crawlOrigins.add(new URL(finalUrl).origin); } catch {}
+    }
     if (r.linkHeader) discoverLinkHeader(job, r.linkHeader, finalUrl);
     const challenge = detectChallenge(r.body.toString("utf8"), r.contentType, r.status, { server: r.serverHeader, "cf-mitigated": r.cfMitigated });
     if (challenge) {
@@ -4314,6 +4327,7 @@ async function processItem(job, item) {
     }
     let type = item.type;
     if (lower.includes("text/html") || lower.includes("application/xhtml+xml")) type = "html";
+    if (type === "html" && !crawlOriginAllowed(job, finalUrl)) return;
     else if (lower.includes("text/css")) type = "css";
     else if (lower.includes("javascript") || lower.includes("ecmascript")) type = "js";
     else if (/json|xml|text\/plain|graphql/.test(lower)) type = "data";
@@ -6322,6 +6336,37 @@ function requestAbortSignal(req, res) {
   res.once("close", abort);
   return { signal: controller.signal, dispose() { req.removeListener("aborted", abort); res.removeListener("close", abort); } };
 }
+let activeDeepSearches = 0;
+app.get("/api/search/deep", async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  req.veyraPrivateTraffic = true;
+  const query = typeof req.query.q === "string" ? req.query.q.trim() : "";
+  const rawPage = req.query.page ?? "0";
+  const page = /^\d{1,2}$/.test(typeof rawPage === "string" ? rawPage : "") ? Number(rawPage) : -1;
+  if (!query || query.length > 600 || page < 0 || page >= RESEARCH_BATCHES) {
+    return respondError(res, 400, "Provide a search query and a valid results page.", "INVALID_DEEP_SEARCH");
+  }
+  const scope = parseSiteScope(query);
+  if (scope.invalid) return res.json({ ok: true, provider: "veyra-deep", results: [], nextPage: null, siteFilter: { invalid: true } });
+  if (activeDeepSearches >= 3) {
+    res.set("Retry-After", "2");
+    return respondError(res, 429, "Deep Search is busy. Try again in a moment.", "DEEP_SEARCH_BUSY");
+  }
+  const preferred = languageTag(req.query.lang);
+  const lang = queryLanguage(scope.text, preferred === "x-default" ? "" : preferred);
+  const request = requestAbortSignal(req, res);
+  const started = Date.now();
+  activeDeepSearches++;
+  try {
+    const service = app.locals.veyraWebSearch || webSearch;
+    const result = await researchBatch({ query, scope, page, lang, signal: request.signal,
+      localSearch, webSearch: service.search.bind(service) });
+    if (!request.signal.aborted) res.json({ ok: true, ...result, responseTimeMs: Date.now() - started });
+  } catch {
+    if (!request.signal.aborted) respondError(res, 502, "Deep Search is temporarily unavailable.", "DEEP_SEARCH_UNAVAILABLE");
+  } finally { activeDeepSearches--; request.dispose(); }
+});
+
 app.get('/api/search/web', async (req, res) => {
   const request = requestAbortSignal(req, res);
   const isPrivate = req.query.private === "1" || !authStore.userFromRequest(req);
