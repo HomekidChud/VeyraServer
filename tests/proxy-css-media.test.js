@@ -6,7 +6,7 @@ const { test } = require("node:test");
 process.env.GATE_ENABLED = "false";
 process.env.PROXY_PASSTHROUGH_BINARY = "true";
 process.env.VEYRA_CHROMIUM_ENABLED = "false";
-const { app, fetchBuffer, rewriteCssText, makeResourceUrl } = require("../src/server");
+const { app, fetchBuffer, rewriteCssText, rewriteHtml, makeResourceUrl } = require("../src/server");
 const origin = "https://93.184.216.34";
 const sid = "cssmediafixturetest12345";
 
@@ -25,10 +25,26 @@ test("CSS imports and assets are rewritten once, preserving conditional imports"
   assert.doesNotMatch(output, /%2Fapi%2Fresource/);
 });
 
+test("initial video and nested source URLs are routed without changing signed queries or blob URLs", () => {
+  const cheerio = require("cheerio");
+  const base = `${origin}/embed/fixture`;
+  const media = "https://1.1.1.1/clip.webm?b=2&a=x%2By&a=3";
+  const html = `<video id="direct" src="${media}"></video>
+    <video><source src="../second.webm"></video>
+    <video id="blob" src="blob:https://93.184.216.34/fixture"></video>
+    <video id="empty" src=""></video>`;
+  const $ = cheerio.load(rewriteHtml(html, base, sid));
+  assert.equal($("#direct").attr("src"), makeResourceUrl(media, base, sid));
+  assert.equal($("source").attr("src"), makeResourceUrl(`${origin}/second.webm`, base, sid));
+  assert.equal($("#blob").attr("src"), "blob:https://93.184.216.34/fixture");
+  assert.equal($("#empty").attr("src"), "");
+});
+
 test("Fast Proxy rewrites complete HLS playlists but passes byte ranges through unchanged", async () => {
   const server = app.listen(0, "127.0.0.1");
   await once(server, "listening");
   const urlFor = path => `http://127.0.0.1:${server.address().port}${makeResourceUrl(origin + path, "", sid)}`;
+  const signedSegment = "/live/chunks/one.mp4?sig=x%2By%2Fz&order=2&order=1&utm_custom=keep";
   const playlist = [
     "#EXTM3U",
     '#EXT-X-MEDIA:TYPE=AUDIO,NAME="Main, stereo",URI="alt/audio.m3u8"',
@@ -52,6 +68,7 @@ test("Fast Proxy rewrites complete HLS playlists but passes byte ranges through 
       return new Response(playlist, { headers: { "content-type": path.endsWith(".audio") ? "audio/x-mpegurl" : "application/mpegurl; charset=utf-8" } });
     }
     assert.equal(path, "/live/chunks/one.mp4");
+    assert.equal(target, origin + signedSegment, "the fetch transport must preserve the signed query exactly");
     assert.equal(request.headers.get("Range"), "bytes=2-5");
     return new Response(Buffer.from([2, 3, 4, 5]), { status: 206, headers: {
       "content-type": "video/mp4", "content-range": "bytes 2-5/8", "content-length": "4", "accept-ranges": "bytes"
@@ -72,7 +89,7 @@ test("Fast Proxy rewrites complete HLS playlists but passes byte ranges through 
       assert.ok(result.includes('# Private comment,URI="keep.mp4"'));
       assert.ok(result.split(/\r?\n/).includes(expected("/live/chunks/one.mp4")));
     }
-    const segment = await fetch(urlFor("/live/chunks/one.mp4"), { headers: { range: "bytes=2-5" } });
+    const segment = await fetch(urlFor(signedSegment), { headers: { range: "bytes=2-5" } });
     assert.equal(segment.status, 206);
     assert.equal(segment.headers.get("content-range"), "bytes 2-5/8");
     assert.equal(segment.headers.get("accept-ranges"), "bytes");

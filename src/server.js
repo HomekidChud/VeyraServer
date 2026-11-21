@@ -1020,12 +1020,12 @@ function queryStringValue(value) {
   if (Array.isArray(value)) return value.map(x => String(x || "").trim()).find(Boolean) || "";
   return String(value || "").trim();
 }
-function firstValidUrl(values, base) {
+function firstValidUrl(values, base, options) {
   const list = Array.isArray(values) ? values : [values];
   for (const value of list) {
     const candidate = queryStringValue(value);
     if (!candidate) continue;
-    const normalized = normalizeUrl(candidate, base);
+    const normalized = normalizeUrl(candidate, base, options);
     if (normalized) return normalized;
   }
   return null;
@@ -1043,15 +1043,19 @@ function unwrapProxyTarget(value, base) {
         return "";
       }
     } catch {}
-    try {
-      const decoded = decodeURIComponent(raw);
-      if (decoded !== raw && /^https?:\/\//i.test(decoded)) { raw = decoded; continue; }
-    } catch {}
+    // Decode an encoded URL wrapper, never the escapes inside a URL that's
+    // already unwrapped. A second decode can change signed paths and queries.
+    if (!/^(?:[a-z][a-z\d+.-]*:|\/)/i.test(raw)) {
+      try {
+        const decoded = decodeURIComponent(raw);
+        if (decoded !== raw && /^https?:\/\//i.test(decoded)) { raw = decoded; continue; }
+      } catch {}
+    }
     break;
   }
   return raw;
 }
-function normalizeUrl(value, base) {
+function normalizeUrl(value, base, { preserveQuery = false } = {}) {
   try {
     const raw = unwrapProxyTarget(value, base);
     if (!raw) return null;
@@ -1059,6 +1063,7 @@ function normalizeUrl(value, base) {
     if (!['http:', 'https:'].includes(u.protocol)) return null;
     if (u.username || u.password) return null;
     canonicalizeGeoFsHost(u);
+    if (preserveQuery) { u.hash = ""; return u.href; }
     return normalizedSearch(u.href);
   } catch { return null; }
 }
@@ -1424,7 +1429,7 @@ async function readBodyLimited(response, limit, keepStream = false, bodyTimeoutM
   return { body: Buffer.concat(chunks), bytes: total, truncated, tooLarge: truncated };
 }
 async function fetchBuffer(url, opts = {}) {
-  let current = normalizeUrl(url);
+  let current = normalizeUrl(url, undefined, opts);
   if (!current) throw new Error("Invalid HTTP(S) URL.");
   const maxRedirects = opts.maxRedirects ?? CFG.maxRedirects;
   const limit = opts.limit ?? CFG.maxTextBytesPerResource;
@@ -1847,7 +1852,7 @@ async function validateCacheEntry(entry, key, url) {
 }
 async function fetchCached(url, opts = {}) {
   const method = String(opts.method || "GET").toUpperCase();
-  const normalized = normalizeUrl(url);
+  const normalized = normalizeUrl(url, undefined, opts);
   const referrerKey = String(opts.referrer || "");
   const sid = String(opts.sessionId || "");
   
@@ -2251,14 +2256,11 @@ function rewriteJsText(text, base, sid = "") {
     try {
       if (!u) return m;
       const target = new URL(u), source = new URL(base);
-      // Bare-origin literals ("https://site.com", "https://site.com/") are
-      // origin identifiers, not resource fetches: apps parse them with
-      // new URL(...) and compare hostnames (browser.lol's app-origin
-      // constant gates Google One Tap), and the relative proxy form makes
-      // that parse throw. Concatenating paths onto the query-string proxy
-      // URL would corrupt it anyway, and real fetches of the constant are
-      // proxied by the runtime fetch/XHR wrappers — leave it verbatim.
-      if (!target.pathname.replace(/\/+$/, "") && !target.search && !target.hash) return m;
+      // Origin and directory literals can be URL bases, not resource
+      // requests. Browserling appends a stylesheet filename to its CSS
+      // directory at runtime; pre-rewriting the base appends the filename
+      // to the proxy's query instead. Let the runtime proxy the final URL.
+      if (target.pathname.endsWith("/") && !target.search && !target.hash) return m;
       // GeoFS keeps terrain, imagery, weather, and multiplayer APIs on
       // separate geo-fs.com subdomains. Image/Cesium loaders do not pass
       // through fetch/XHR, so keep these URLs same-origin in the bundle.
@@ -3309,7 +3311,9 @@ function rewriteHtml(html, base, sid = "") {
     $(el).removeAttr("crossorigin");
     if ($(el).attr("integrity")) $(el).removeAttr("integrity");
   });
-  for (const tag of ["img", "source", "audio", "input", "embed"]) {
+  // Rewrite a parser-loaded <video src> just like <source src>. The runtime
+  // cannot reliably catch loads the browser starts while parsing the document.
+  for (const tag of ["img", "source", "audio", "video", "input", "embed"]) {
     $(`${tag}[src]`).each((_, el) => { const u = resolveResource($(el).attr("src"), effectiveBase); if (u) $(el).attr("src", makeResourceUrl(u, effectiveBase, sid)); });
   }
   // Several large sites (including GeoFS) defer script loading through
@@ -6981,7 +6985,10 @@ async function proxyRequest(req, res, mode) {
   req.veyraPrivateTraffic = !canCacheSession(sessionManager.peek(sid));
   res.setHeader("Cache-Control", "no-store");
   if (sessionManager.checkLimit(sid)) return sendSessionExpired(req, res, mode, sid);
-  const canonical = mergeStrayProxyParams(req, firstValidUrl([req.query.url, req.query.target, req.query.u], req.get('Origin') || undefined)) || proxyRefererCanonical(req);
+  // Resource URLs are transport addresses, not crawler deduplication keys.
+  // Keep their encoded query and order (e.g. signed media playlist URLs).
+  const preserveQuery = mode === "resource";
+  const canonical = mergeStrayProxyParams(req, firstValidUrl([req.query.url, req.query.target, req.query.u], req.get('Origin') || undefined, { preserveQuery })) || proxyRefererCanonical(req);
   const download = String(req.query.download || "") === "1";
   if (!canonical) return respondError(res, 400, "Missing or invalid public HTTP(S) URL.", "INVALID_URL");
   await assertPublicUrl(canonical);
@@ -7109,7 +7116,7 @@ async function proxyRequest(req, res, mode) {
     const hasAuthorization = !!req.get("Authorization");
     const result = await browserScheduler.request(null, () => {
       if (record.abort.signal.aborted || sessionManager.checkLimit(sid)) throw Object.assign(new Error("Session deleted."), { code: "SESSION_EXPIRED" });
-      return fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, requestId: req.veyraRequestId, userAgent: effectiveUserAgent || undefined, limit: requestLimit, retries, limitForContentType, noCache: download || method !== "GET" || mediaRequest || hasAuthorization || isNextRsc, timeout: mediaRequest ? CFG.mediaRequestTimeoutMs : CFG.requestTimeoutMs, bodyTimeoutMs: mediaRequest ? CFG.mediaBodyTimeoutMs : CFG.bodyTimeoutMs, streamOversize: mode === "resource", passthroughBinary: mode === "resource" && !download && CFG.proxyPassthroughBinary });
+      return fetchCached(canonical, { method, headers, body, referrer, preserveQuery, sessionId: sid, requestId: req.veyraRequestId, userAgent: effectiveUserAgent || undefined, limit: requestLimit, retries, limitForContentType, noCache: download || method !== "GET" || mediaRequest || hasAuthorization || isNextRsc, timeout: mediaRequest ? CFG.mediaRequestTimeoutMs : CFG.requestTimeoutMs, bodyTimeoutMs: mediaRequest ? CFG.mediaBodyTimeoutMs : CFG.bodyTimeoutMs, streamOversize: mode === "resource", passthroughBinary: mode === "resource" && !download && CFG.proxyPassthroughBinary });
     }, { priority: browserPriority + (mediaRequest ? 30 : 0), host: hostOf(canonical), signal: record.abort.signal });
   
   
