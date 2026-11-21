@@ -37,7 +37,7 @@ assert.ok(runtime, "the runtime script must be injected");
 // 1: window.open returns a shim handle and announces the popup.
 assert.match(runtime, /type:'veyra:popup-open'/, "window.open must post veyra:popup-open");
 assert.match(runtime, /POPUP_HANDLES\[popupId\]=shim/, "the shim must be registered so .closed can flip later");
-assert.match(runtime, /shim\.close=function\(\)\{topPost\(\{type:'veyra:popup-close'/, "the shim's close() must post veyra:popup-close");
+assert.match(runtime, /if\(opened\)topPost\(\{type:'veyra:popup-close'/, "the shim's close() notifies the app if it opened a visible tab");
 assert.match(runtime, /Object\.defineProperty\(shim,'location'/, "the shim must support w.location = url navigation");
 assert.ok(!/topPost\(\{type:'veyra:open',url:u,target:tgt\|\|'_blank'/.test(runtime), "window.open must no longer post the plain veyra:open (anchors keep it)");
 
@@ -56,7 +56,7 @@ assert.match(runtime, /else if\(d\.from==='popup'\)src=popupReplyShim\('to-popup
 assert.match(runtime, /Object\.defineProperty\(ev,'source',\{value:src,configurable:true\}\)/, "the relayed event's source must be shadowed with the reply shim");
 
 // 5: popup-closed flips the handle.
-assert.match(runtime, /if\(d\.type==='veyra:popup-closed'&&d\.popupId&&POPUP_HANDLES\[d\.popupId\]\)\{try\{POPUP_HANDLES\[d\.popupId\]\.closed=true\}/, "veyra:popup-closed must set handle.closed = true");
+assert.match(runtime, /if\(d\.type==='veyra:popup-closed'&&d\.popupId&&POPUP_HANDLES\[d\.popupId\]\)\{try\{POPUP_HANDLES\[d\.popupId\]\.closed=true;/, "veyra:popup-closed must set handle.closed = true");
 
 // 6: sign-in interception unchanged (in-proxy sign-in).
 assert.match(runtime, /type:'veyra:signin'/, "sign-in clicks must still post veyra:signin");

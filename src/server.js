@@ -1122,8 +1122,9 @@ function escapedPathFor(target) {
 }
 function markEscapedNavigation(req, res, url, sid) {
   const sep = url.search ? "&" : "?";
+  const popup = req.query?.veyra_popup === "1" ? "&veyra_popup=1" : "";
   const loc = requestOrigin(req) + url.pathname + url.search
-    + `${sep}__veyra_url=${encodeURIComponent(url.href)}&__veyra_sid=${encodeURIComponent(sid)}` + url.hash;
+    + `${sep}__veyra_url=${encodeURIComponent(url.href)}&__veyra_sid=${encodeURIComponent(sid)}${popup}` + url.hash;
   res.setHeader("location", loc);
   res.setHeader("cache-control", "no-store");
   res.setHeader("x-veyra-escaped-path", "1");
@@ -2382,6 +2383,7 @@ function injectRuntime(html, original, sid = "") {
   const SESSION_ID=${JSON.stringify(sid)};
   const API_ORIGIN=${JSON.stringify(process.env.PUBLIC_API_ORIGIN || "")};
   const ESCAPED_DOCUMENT=location.pathname!=='/api/view';
+  const POPUP_FRAME=window.parent!==window&&/[?&]veyra_popup=1(?:&|$)/.test(String(location.search||''));
   let virtualUrl=CANONICAL;
   // The browser does not send its fragment with the document request.
   try{if(location.hash){const u=new URL(virtualUrl);u.hash=location.hash;virtualUrl=u.href}}catch{}
@@ -2455,7 +2457,7 @@ function injectRuntime(html, original, sid = "") {
   function toVirtual(raw){if(/^[?#]/.test(raw))return cleanVeyraParams(new URL(raw,virtualUrl));const u=new URL(raw,location.href);return cleanVeyraParams(fixDerivedHost(ownOrigin(u.origin)?fixOwn(u):u))}
   function resolve(v){try{const raw=unwrap(realUrl(v));return (raw===''?new URL(virtualUrl):toVirtual(raw)).href}catch{return String(v||'')}}
   function shouldProxy(v){try{const u=new URL(unwrap(v));return /^https?:$/.test(u.protocol)}catch{return false}}
-  function proxy(kind,u){const prefix=API_ORIGIN || location.origin;const base=prefix+(kind==='view'?'/api/view?url=':'/api/resource?url=')+encodeURIComponent(u);const from=encodeURIComponent(new URL(virtualUrl).href);return kind==='view'?base+'&sid='+encodeURIComponent(SESSION_ID):base+'&from='+from+'&sid='+encodeURIComponent(SESSION_ID)}
+  function proxy(kind,u){const prefix=API_ORIGIN || location.origin;const base=prefix+(kind==='view'?'/api/view?url=':'/api/resource?url=')+encodeURIComponent(u);const from=encodeURIComponent(new URL(virtualUrl).href);return kind==='view'?base+'&sid='+encodeURIComponent(SESSION_ID)+(POPUP_FRAME?'&veyra_popup=1':''):base+'&from='+from+'&sid='+encodeURIComponent(SESSION_ID)}
   function topPost(msg){try{window.top.postMessage(msg,'*')}catch{}}
   function emit(source,url,extra){if(!url)return;topPost({type:'veyra:navigate',url,source,sessionId:SESSION_ID,...extra})}
   let netSeq=0;
@@ -2469,7 +2471,7 @@ function injectRuntime(html, original, sid = "") {
   function escapedHistoryUrl(next){
     const u=new URL(next);
     if(/^[/]api[/]/.test(u.pathname))return proxy('view',next);
-    const markers=SESSION_ID?(u.search?'&':'?')+'__veyra_url='+encodeURIComponent(u.href)+'&__veyra_sid='+encodeURIComponent(SESSION_ID):'';
+    const markers=SESSION_ID?(u.search?'&':'?')+'__veyra_url='+encodeURIComponent(u.href)+'&__veyra_sid='+encodeURIComponent(SESSION_ID)+(POPUP_FRAME?'&veyra_popup=1':''):'';
     return location.origin+u.pathname+u.search+markers+u.hash;
   }
   function keepEscapedContext(next){
@@ -2491,7 +2493,7 @@ function injectRuntime(html, original, sid = "") {
   // an embed ping; once acked, popups route through the app as new Veyra
   // tabs and element inspection works on the main frame too.
   var appEmbedded=false;
-  try{addEventListener('message',function(ev){try{if(ev.data&&ev.data.type==='veyra:embed-ack')appEmbedded=true}catch{}});topPost({type:'veyra:embed-ping',sessionId:SESSION_ID})}catch{}
+  try{addEventListener('message',function(ev){try{if(ev.source===window.top&&ev.data&&ev.data.type==='veyra:embed-ack')appEmbedded=true}catch{}});topPost({type:'veyra:embed-ping',sessionId:SESSION_ID})}catch{}
   // ----- Popup relay: OAuth popups open as proxied Veyra tabs -----
   // A site's window.open() (Google/Microsoft/Apple sign-in, "continue with
   // …" OAuth popups) must not escape to a raw browser tab, and the popup
@@ -2503,7 +2505,22 @@ function injectRuntime(html, original, sid = "") {
   // origin, so the site's own origin checks keep passing. Everything runs
   // in this session's cookie jar — no cross-session cookies anywhere.
   var POPUP_SEQ=0;
-  var POPUP_HANDLES={};
+  var POPUP_DOCUMENT=Math.random().toString(36).slice(2);
+  var POPUP_HANDLES=Object.create(null);
+  // The relay is not subject to the browser's native popup blocker. Spend
+  // one trusted activation on a popup, and only during its input dispatch.
+  let popupGesture=null;
+  function rememberPopupGesture(ev){
+    if(!ev.isTrusted||navigator.userActivation?.isActive===false)return;
+    popupGesture={event:ev,used:false};
+  }
+  window.addEventListener('click',rememberPopupGesture,true);
+  window.addEventListener('auxclick',rememberPopupGesture,true);
+  function claimPopupGesture(){
+    if(!popupGesture||popupGesture.used||popupGesture.event.eventPhase===0)return false;
+    popupGesture.used=true;return true;
+  }
+  function blankPopupUrl(raw){return !raw||/^about:blank(?:[?#].*)?$/i.test(raw)}
   function popupReplyShim(dir,popupId){
     return {closed:false,focus:function(){},length:0,opener:null,
       postMessage:function(data,origin){
@@ -2540,14 +2557,14 @@ function injectRuntime(html, original, sid = "") {
         return;
       }
       if(d.type==='veyra:relay-message'){popupDispatchRelay(d);return}
-      if(d.type==='veyra:popup-closed'&&d.popupId&&POPUP_HANDLES[d.popupId]){try{POPUP_HANDLES[d.popupId].closed=true}catch(e){}return}
+      if(d.type==='veyra:popup-closed'&&d.popupId&&POPUP_HANDLES[d.popupId]){try{POPUP_HANDLES[d.popupId].closed=true;delete POPUP_HANDLES[d.popupId]}catch(e){}return}
     }catch(e){}
   })}catch(e){}
   // The app marks a popup tab's frame URL with veyra_popup=1 so the shim
   // installs synchronously at injection time — before any site script can
   // touch window.opener (no round-trip race on the first load).
   try{
-    if(/[?&]veyra_popup=1(?:&|$)/.test(String(window.location.search||''))){
+    if(POPUP_FRAME){
       try{if(!window.opener)window.opener=popupReplyShim('to-opener','')}catch(e){}
       try{window.close=function(){topPost({type:'veyra:popup-self-close',sessionId:SESSION_ID})}}catch(e){}
     }
@@ -2949,33 +2966,58 @@ function injectRuntime(html, original, sid = "") {
   function emitGetForm(form,submitter,source){if(rootProxiedFrame())return false;const target=submitTarget(form,submitter);if(!target)return false;const method=String(form.method||'get').toUpperCase();if(method!=='GET')return false;const fd=new FormData(form,submitter||undefined);const u=new URL(target);for(const [k,v] of fd.entries())if(typeof v==='string')u.searchParams.append(k,v);emit(source||'form.submit',u.href);return true}
   try{const nativeFormSubmit=HTMLFormElement.prototype.submit;HTMLFormElement.prototype.submit=function(){try{if(rootProxiedFrame())return nativeFormSubmit.call(this);if(emitGetForm(this,null,'form.submit'))return;const target=submitTarget(this,null);const method=String(this.method||'get').toUpperCase();if(target&&method==='POST'){const fd=new FormData(this);const entries=[];for(const [k,v] of fd.entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});return;}}catch{}return nativeFormSubmit.call(this)}}catch{}
   try{const nativeRequestSubmit=HTMLFormElement.prototype.requestSubmit;if(nativeRequestSubmit)HTMLFormElement.prototype.requestSubmit=function(submitter){try{if(rootProxiedFrame())return nativeRequestSubmit.call(this,submitter);if(emitGetForm(this,submitter,'form.requestSubmit'))return;const target=submitTarget(this,submitter);const method=String(this.method||'get').toUpperCase();if(target&&method==='POST'){const entries=[];for(const [k,v] of new FormData(this,submitter).entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});return;}}catch{}return nativeRequestSubmit.call(this,submitter)}}catch{}
-  try{const nativeOpen=window.open;window.open=function(url,target,features){const u=canonicalizeMaybeProxy(url);if(u){
+  try{const nativeOpen=window.open;window.open=function(url,target,features){
+    const raw=String(url??'').trim();
+    const blank=blankPopupUrl(raw);
+    const u=blank?null:canonicalizeMaybeProxy(raw);
     // A navigation button that opens its destination over the current page —
     // window.open(url,'_self'), and '_top'/'_parent' from the root frame —
     // must never become a new tab: it is in-place navigation.
     const tgt=String(target||'').toLowerCase();
     if(tgt==='_self'||((tgt==='_top'||tgt==='_parent')&&rootProxiedFrame())){
+      if(!u)return null;
       if(!rootProxiedFrame()){emit('location.assign',u);return null}
       try{location.assign(proxy('view',u))}catch(e){}
       return null;
     }
-    if(!rootProxiedFrame()||appEmbedded){
-      // OAuth/sign-in popups (and every other popup) open as proxied Veyra
-      // tabs. The returned handle is a shim with real opener semantics:
-      // .closed tracks the tab, .close() closes it, .postMessage() relays
-      // through the app, and assigning .location navigates the popup tab —
-      // so popup-based sign-in flows (GIS, MSAL, appleid, …) complete
-      // inside the fast proxy instead of escaping to a raw browser tab.
-      const popupId='vp'+(++POPUP_SEQ);
-      topPost({type:'veyra:popup-open',url:u,name:String(target||''),popupId:popupId,sessionId:SESSION_ID,virtualUrl:virtualUrl});
-      const shim=popupReplyShim('to-popup',popupId);
-      try{shim.name=String(target||'')}catch(e){}
-      try{Object.defineProperty(shim,'location',{set:function(loc){const lu=canonicalizeMaybeProxy(loc);if(lu)topPost({type:'veyra:popup-navigate',popupId:popupId,url:lu,sessionId:SESSION_ID})},get:function(){return {href:virtualUrl,replace:function(loc){const lu=canonicalizeMaybeProxy(loc);if(lu)topPost({type:'veyra:popup-navigate',popupId:popupId,url:lu,sessionId:SESSION_ID})},assign:function(loc){const lu=canonicalizeMaybeProxy(loc);if(lu)topPost({type:'veyra:popup-navigate',popupId:popupId,url:lu,sessionId:SESSION_ID})}}},configurable:true})}catch(e){}
-      shim.close=function(){topPost({type:'veyra:popup-close',popupId:popupId,sessionId:SESSION_ID})};
-      POPUP_HANDLES[popupId]=shim;
-      return shim;
+    if(!appEmbedded){
+      // A frame does not get native popups before the embed handshake.
+      if(window.parent!==window)return null;
+      return nativeOpen.call(window,u?proxy('view',u):url,target,features);
     }
-    return nativeOpen.call(window,proxy('view',u),target,features)}if(appEmbedded)return null;return nativeOpen.call(window,url,target,features)}}catch{}
+    if((!u&&!blank)||!claimPopupGesture())return null;
+    const popupId='vp'+POPUP_DOCUMENT+'-'+(++POPUP_SEQ);
+    const shim=popupReplyShim('to-popup',popupId);
+    let opened=false,href='about:blank',timer;
+    shim.name=String(target||'');
+    function navigatePopup(next){
+      const rawNext=String(next??'').trim();
+      const destination=blankPopupUrl(rawNext)?null:canonicalizeMaybeProxy(rawNext);
+      if(shim.closed||!destination)return;
+      href=destination;
+      clearTimeout(timer);
+      if(opened)topPost({type:'veyra:popup-navigate',popupId:popupId,url:destination,sessionId:SESSION_ID});
+      else{
+        opened=true;
+        topPost({type:'veyra:popup-open',url:destination,name:shim.name,popupId:popupId,sessionId:SESSION_ID,virtualUrl:virtualUrl});
+      }
+    }
+    const popupLocation={get href(){return href},set href(next){navigatePopup(next)},replace:navigatePopup,assign:navigatePopup,toString:function(){return href}};
+    Object.defineProperty(shim,'location',{get:function(){return popupLocation},set:navigatePopup});
+    shim.close=function(){
+      if(shim.closed)return;
+      shim.closed=true;
+      clearTimeout(timer);
+      delete POPUP_HANDLES[popupId];
+      if(opened)topPost({type:'veyra:popup-close',popupId:popupId,sessionId:SESSION_ID});
+    };
+    POPUP_HANDLES[popupId]=shim;
+    // A blank OAuth window is a placeholder, not a visible tab. The page
+    // can assign its real destination asynchronously on the same handle.
+    if(u)navigatePopup(u);
+    else timer=setTimeout(shim.close,120000);
+    return shim;
+  }}catch{}
   function fmtArg(x,d){d=d||0;if(typeof x==='string')return x;if(x instanceof Error)return (x.name||'Error')+': '+x.message+(x.stack?'\\n'+String(x.stack).split('\\n').slice(1,6).join('\\n'):'');if(typeof Node!=='undefined'&&x instanceof Node)return x.nodeType===1?'<'+x.tagName.toLowerCase()+(x.id?'#'+x.id:'')+(x.className&&typeof x.className==='string'?'.'+x.className.trim().split(/\\s+/).slice(0,3).join('.'):'')+'>':x.nodeName;if(typeof x==='function')return 'ƒ '+(x.name||'anonymous')+'()';try{const seen=new WeakSet();return JSON.stringify(x,(k,v)=>{if(typeof v==='object'&&v){if(seen.has(v))return '[Circular]';seen.add(v)}if(typeof v==='function')return 'ƒ';if(typeof v==='bigint')return String(v)+'n';return v})||String(x)}catch{return String(x)}}
   let consoleBudget=400,consoleWindow=Date.now();
   try{['log','info','debug','warn','error','trace','dir','table','assert','group','groupCollapsed','groupEnd','count','timeEnd'].forEach(level=>{if(typeof console[level]!=='function')return;const native=console[level].bind(console);console[level]=(...args)=>{native(...args);if(level==='assert'){if(args[0])return;args=['Assertion failed:',...args.slice(1)]}const now=Date.now();if(now-consoleWindow>2000){consoleWindow=now;consoleBudget=400}if(--consoleBudget<0)return;let stack='';if(level==='trace'||level==='error'){try{stack=String(new Error().stack||'').split('\\n').slice(2,9).join('\\n')}catch{}}let msg='';try{msg=args.map(x=>fmtArg(x)).join(' ')}catch{}topPost({type:'veyra:page-console',level:level==='assert'?'error':level,sessionId:SESSION_ID,message:msg.slice(0,20000),stack,time:now,pageUrl:virtualUrl})}})}catch{}
@@ -3086,14 +3128,14 @@ ${pageActionsRuntime()}
         const p=ev.composedPath();
         for(let i=0;i<p.length;i++){
           const n=p[i];
-          if(n&&n.tagName==='A'&&n.getAttribute&&n.getAttribute('href')!=null)return n;
+          if(n&&(n.tagName==='A'||n.tagName==='AREA')&&n.getAttribute('href')!=null)return n;
         }
       }
     }catch{}
     try{
       let t=ev.target;
       while(t&&t!==document){
-        if(t.tagName==='A'&&t.getAttribute&&t.getAttribute('href')!=null)return t;
+        if((t.tagName==='A'||t.tagName==='AREA')&&t.getAttribute('href')!=null)return t;
         t=t.parentElement;
       }
     }catch{}
@@ -3104,25 +3146,33 @@ ${pageActionsRuntime()}
     // ev.target is retargeted to the shadow host and closest() never finds
     // it — resolve through the composed path instead.
     const a=anchorFromEvent(ev);if(!a)return;
-    const raw=a.getAttribute('href')||'';
-    // In the app-embedded root frame, pure-hash links keep their native
-    // scroll-to-anchor behaviour instead of a full proxy reload.
-    if(rootProxiedFrame()&&raw.charAt(0)==='#')return;
-    const u=canonicalizeMaybeProxy(raw);if(!u)return;
-    // _blank, named windows, _parent and _top must never escape into a raw
-    // browser tab or replace the app: route them through the app, which
-    // opens them as a new Veyra tab — or, for _top/_parent, navigates the
-    // tab in place (a target=_top link is the page replacing the whole
-    // view, not a request for a second tab).
     const tgt=String(a.getAttribute('target')||'').toLowerCase();
-    if(tgt&&tgt!=='_self'){ev.preventDefault();ev.stopPropagation();topPost({type:'veyra:open',url:u,target:tgt,sessionId:SESSION_ID});return}
+    if(tgt&&tgt!=='_self')return;
     // In the app-embedded root frame, same-frame links navigate the iframe
     // natively to their rewritten href; only nested proxied frames need the
     // document-navigation message (their parent is another proxied page).
     if(rootProxiedFrame())return;
+    const u=canonicalizeMaybeProxy(a.getAttribute('href'));if(!u)return;
     ev.preventDefault();ev.stopPropagation();
     emit('document-navigation',u);
   },true);
+  function relayTargetLink(ev){
+    if(!appEmbedded||ev.defaultPrevented)return;
+    if(ev.type==='auxclick'&&ev.button!==1)return;
+    const a=anchorFromEvent(ev);if(!a||a.hasAttribute('download'))return;
+    const tgt=String(a.getAttribute('target')||'').toLowerCase();
+    if(!tgt||tgt==='_self')return;
+    // Run after the page's link handler so it can cancel the navigation.
+    ev.preventDefault();
+    const raw=(a.getAttribute('href')||'').trim();
+    const u=blankPopupUrl(raw)||raw==='#'?null:canonicalizeMaybeProxy(raw);
+    // A static href="#" may already have been rewritten as a proxy URL.
+    if(!u||(u.endsWith('#')&&u.slice(0,-1)===virtualUrl.split('#')[0]))return;
+    if(tgt!=='_top'&&tgt!=='_parent'&&(!ev.isTrusted||!claimPopupGesture()))return;
+    topPost({type:'veyra:open',url:u,target:tgt,sessionId:SESSION_ID});
+  }
+  document.addEventListener('click',relayTargetLink);
+  document.addEventListener('auxclick',relayTargetLink);
   document.addEventListener('submit',function(ev){
     if(rootProxiedFrame())return;
     const form=ev.target;if(!form)return;const method=String(form.method||'get').toUpperCase();
@@ -6828,7 +6878,7 @@ async function streamOversizeResponse(req, res, result, ctx) {
 
 
 
-const PROXY_OWN_PARAMS = new Set(["url", "target", "u", "sid", "from", "download"]);
+const PROXY_OWN_PARAMS = new Set(["url", "target", "u", "sid", "from", "download", "veyra_popup"]);
 function mergeStrayProxyParams(req, canonical) {
   if (!canonical || !req.originalUrl) return canonical;
   let extra;
@@ -8100,7 +8150,8 @@ function resolveEscapedTarget(escaped, pageUrl) {
   try {
     const parsed = new URL(escaped, "http://veyra.escaped.invalid");
     if (parsed.search) {
-      const strip = new Set([...parsed.searchParams.keys()].filter(k => /^__veyra/i.test(k)
+      const popupRoute = parsed.searchParams.has("__veyra_url") && parsed.searchParams.has("__veyra_sid");
+      const strip = new Set([...parsed.searchParams.keys()].filter(k => /^__veyra/i.test(k) || (popupRoute && k === "veyra_popup")
         || ((k === "sid" || k === "from") && liveSessionId(parsed.searchParams.get(k)))));
       if (strip.size) {
         parsed.search = parsed.search.slice(1).split("&").filter(value => {
