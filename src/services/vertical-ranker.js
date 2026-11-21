@@ -14,8 +14,8 @@ function features(query, row, index) {
 function score(query, row, index, weights = model.weights) {
   return features(query, row, index).reduce((sum, value, i) => sum + value * weights[i], 0);
 }
-function rankVertical(query, rows) {
-  return rows.map((row, index) => ({ row, index, score: score(query, row, index) }))
+function rankVertical(query, rows, regionalBoost = () => 0) {
+  return rows.map((row, index) => ({ row, index, score: score(query, row, index) + regionalBoost(row) }))
     .sort((a, b) => b.score - a.score || a.index - b.index).map(item => item.row);
 }
 module.exports = { features, score, rankVertical, rankerVersion: model.version };
