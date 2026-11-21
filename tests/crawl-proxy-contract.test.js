@@ -17,7 +17,7 @@ Object.assign(process.env, {
   SEARCH_PROVIDER: "local", MAX_ACTIVE_JOBS: "1", CRAWLER_ROBOTS: "64",
   VEYRA_USER_AGENT: "VeyraBrowseCrawler/1.0"
 });
-const { app, jobs, createJob, scheduleCrawl, fetchBuffer, robotsAllowed } = require("../src/server");
+const { app, jobs, createJob, scheduleCrawl, fetchBuffer, robotsAllowed, localSearch } = require("../src/server");
 
 const fixture = "https://93.184.216.34"; // Literal public IP; every network response is stubbed.
 const cdn = "https://assets.veyra-fixture.test";
@@ -48,7 +48,8 @@ test("proxy and crawler HTTP contracts", { timeout: 30000 }, async () => {
   const robots = [
     "User-agent: *", "Disallow: /public",
     "User-agent: Veyra", "Disallow: /hidden-a", "Disallow: /private$", "Disallow: /blocked/",
-    "User-agent: Veyra", "Disallow: /hidden-b", "Disallow: /sitemap_index.xml", "Disallow: /encoded~", "Allow: /blocked/ok.js"
+    "User-agent: Veyra", "Disallow: /hidden-b", "Disallow: /sitemap_index.xml", "Disallow: /encoded~", "Allow: /blocked/ok.js",
+    "Sitemap: " + fixture + "/maps"
   ].join("\n");
   app.locals.veyraProxyFetchBuffer = async (url, options) => {
     const u = new URL(url), p = u.pathname;
@@ -61,9 +62,24 @@ test("proxy and crawler HTTP contracts", { timeout: 30000 }, async () => {
       await wait(160, null, { signal: options.signal });
       return reply(url, `<urlset><url><loc>${fixture}/late</loc></url></urlset>`, "application/xml");
     }
+    if (p === "/maps") return reply(url, `<sm:sitemapindex xmlns:sm="http://www.sitemaps.org/schemas/sitemap/0.9">
+      <sm:sitemap><sm:loc>${fixture}/mapped-locales</sm:loc></sm:sitemap>
+      <sm:sitemap><sm:loc>${cdn}/external-sitemap</sm:loc></sm:sitemap>
+    </sm:sitemapindex>`, "application/xml");
+    if (p === "/mapped-locales") return reply(url, `<urlset xmlns:alt="http://www.w3.org/1999/xhtml" xmlns:video="urn:fixture:video">
+      <url><loc>${fixture}/ja</loc><video:video><video:loc>${fixture}/not-a-sitemap-page</video:loc></video:video>
+        <alt:link rel="alternate" hreflang="th" href="${fixture}/th"/>
+        <alt:link rel="alternate" hreflang="th" href="${fixture}/th"/>
+        <alt:link rel="alternate" hreflang="ar" href="${fixture}/blocked/locale"/>
+        <alt:link rel="alternate" hreflang="fr" href="${cdn}/external-locale"/>
+      </url></urlset>`, "application/xml");
     if (p === "/root") return reply(url, html(anchors([...pages, "/private", "/private-guide", "/hidden-a", "/hidden-b", "/encoded~", "/public", "/missing"])
       + `<script src="/blocked/never.js"></script><script src="/blocked/ok.js"></script>
-        <script src="${cdn}/blocked.js"></script><script src="${cdn}/ok.js"></script>`), "text/html");
+        <script src="${cdn}/blocked.js"></script><script src="${cdn}/ok.js"></script>
+        <link rel="alternate" hreflang="hi" href="/hi">`), "text/html");
+    if (p === "/ja") return reply(url, `<html lang="ja"><title>学習</title><main><h1>日本語</h1><p>勉強します</p></main></html>`, "text/html");
+    if (p === "/th") return reply(url, `<html lang="th"><title>ค้นหา</title><main><p>ภาษาไทย</p></main></html>`, "text/html");
+    if (p === "/hi") return reply(url, `<html lang="hi"><title>परिचय</title><main><p>हिन्दी भाषा</p></main></html>`, "text/html");
     if (p === "/slow") { await wait(10000, null, { signal: options.signal }); }
     if (p === "/api/limited") return reply(url, '{"rate":"limited"}', "application/json", 429, { retryAfter: dateRetry });
     if (p === "/api/example") return reply(url, '{"fixture":true}', "application/json", 200, options.method === "OPTIONS" ? { allow: "GET, HEAD, OPTIONS" } : {});
@@ -133,6 +149,14 @@ test("proxy and crawler HTTP contracts", { timeout: 30000 }, async () => {
     const { resources } = await (await http(`/api/crawl/${job.id}/resources`)).json();
     assert.deepEqual(resources.map(row => row.id), resources.map((_, index) => index));
     assert.ok(resources.some(row => row.url === `${fixture}/late`), "late sitemap work is waited on");
+    for (const [path, word, lang] of [["/ja", "日本語", "ja"], ["/th", "ภาษาไทย", "th"], ["/hi", "हिन्दी", "hi"]]) {
+      assert.ok(resources.some(row => row.url === `${fixture}${path}`), `discovered ${path}`);
+      assert.equal(entries.filter(([origin, requested]) => origin === fixture && requested === path).length, 1, `no duplicate requests for ${path}`);
+      assert.ok(localSearch(word, 0, 10).results.some(row => row.url === `${fixture}${path}` && row.lang === lang), `indexed ${word}`);
+    }
+    for (const path of ["/not-a-sitemap-page", "/external-sitemap", "/external-locale", "/blocked/locale"]) {
+      assert.ok(!entries.some(([, requested]) => requested === path), `skipped ${path}`);
+    }
     assert.ok(resources.some(row => row.url === `${fixture}/private-guide`), "the end anchor isn't a prefix");
     assert.ok(resources.some(row => row.url === `${fixture}/public`), "an unrelated wildcard group isn't applied");
     assert.ok(resources.some(row => row.url === `${fixture}/blocked/ok.js`), "longer allow rule wins");

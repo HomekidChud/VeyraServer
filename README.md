@@ -49,6 +49,14 @@ For supported model endpoints, where to create provider keys, and how to configu
 
 For rollout, deploy this backend first; smoke-test `/health`, `/api/search/web`, one request per category, and the signed-in category answer in staging before deploying the browser client. No database migration is required.
 
+## Deep Search and multilingual discovery
+
+`GET /api/search/deep?q=…&lang=…&page=0` is an opt-in, paginated search endpoint, separate from the Crossref Research category and the generated answer endpoint. It retrieves up to 20 matching local index pages per batch and merges configured web-provider results with their source names. For supported language editions it also queries the official [Wikipedia search API](https://www.mediawiki.org/wiki/API:Search); set `WEB_SEARCH_DEEP_WIKIPEDIA=0` to disable that adapter.
+
+Use `nextPage` to continue; `null` ends the current sequence. There are at most 10 batches, three simultaneous Deep Search requests per server, and a 12-second web provider budget per batch. The first batch can make one short follow-up query to a successful provider if a plain-language request such as “Please find …” returns very few results. The JSON response reports `partial` and `limitReached` rather than a guessed total. Results are deduplicated by canonical URL and `site:` and `-site:` are enforced on each batch. Because batches read live search providers and the local index, their contents can change between requests; the browser also deduplicates across batches. The route does not open result pages, start crawler jobs or cache queries.
+
+The cooperative crawler uses XML sitemap structure to distinguish indexes from pages, including extensionless nested sitemap URLs. It follows published [localized sitemap alternates](https://support.google.com/webmasters/answer/189077?hl=en) and HTML `hreflang` links only within the existing crawl scope, subject to robots, challenge and size limits. New pages use Unicode normalization and [word segmentation](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Intl/Segmenter) where spaces alone are insufficient. Existing index records remain readable; updated tokenization applies when pages are reindexed.
+
 ## Google search
 
 Google's public HTML search often challenges cloud datacenter IPs. Veyra does not bypass that challenge or rotate IPs to evade it. The preferred solution is the official Google Programmable Search JSON API: set `GOOGLE_SEARCH_API_KEY` and `GOOGLE_SEARCH_CX` as secret Render environment variables. No residential IP is needed for that API path. If those variables are absent, an explicit `engine=google` request reports `not-configured` instead of silently returning another provider's results; ordinary search may still use the configured Bing, Brave, or other permitted provider.

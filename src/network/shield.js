@@ -77,6 +77,7 @@ function createShield(env = process.env, { log = () => {}, lean = false } = {}) 
     // stop on an existing session id) are steady stream traffic, not
     // session-spawning abuse — they belong in the generous "stream" bucket.
     if (/^\/api\/browser\/session\/[^/]+(?:\/[a-z-]+)?$/.test(p)) return "stream";
+    if (/^\/api\/search\/deep\/?$/i.test(p)) return "heavy";
     if ((p === "/api/session" && m === "POST") || (p === "/api/browser/session" && m === "POST") || /^\/api\/browser\/(?:open|start)/.test(p) || (p === "/api/open" && m === "POST") || /^\/api\/crawl(?:\/|$)/.test(p) && m === "POST") return "heavy";
     if (/^\/api\/(?:view|resource|form-get|download)/.test(p)) return "proxy";
     if (p.startsWith("/api/")) return "api";
