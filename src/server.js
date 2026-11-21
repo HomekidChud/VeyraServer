@@ -6375,7 +6375,8 @@ app.get('/api/search/web', async (req, res) => {
     const reply = result => res.json({ ok: true, ...result, ...(scope.active ? { total: null, siteFilter: { include: scope.include, exclude: scope.exclude } } : {}), source: "web", responseTimeMs: Date.now() - started });
     if (feed && (!Number.isSafeInteger(offset) || offset > WEB_FEED_INDEX_OFFSET + CFG.maxIndexDocs || (offset < WEB_FEED_INDEX_OFFSET && offset % WEB_FEED_STEP))) return respondError(res, 400, "Invalid search feed offset.", "INVALID_SEARCH_OFFSET");
     if (feed && offset >= WEB_FEED_INDEX_OFFSET) return reply(fromIndex(offset - WEB_FEED_INDEX_OFFSET));
-    const result = await (app.locals.veyraWebSearch || webSearch).search(q, { offset, limit, engine: selected, lang, region: req.query.region, signal: request.signal, noCache: isPrivate || !CFG.globalCacheEnabled, feed });
+    const result = await (app.locals.veyraWebSearch || webSearch).search(q, { offset, limit, engine: selected, lang, region: req.query.region,
+      signal: request.signal, noCache: isPrivate || !CFG.globalCacheEnabled, feed, reference: true });
     const results = (result.results || []).filter(row => row && allowsSiteUrl(scope, row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl)));
     if (!isPrivate && (!feed || !offset)) queueNeuralIndexFindings(q, results);
     if (feed && !results.length) return reply(fromIndex(0));

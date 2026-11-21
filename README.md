@@ -38,7 +38,7 @@ For supported model endpoints, where to create provider keys, and how to configu
 
 ### Search categories and summaries
 
-`GET /api/search/vertical?q=...&type=images|videos|news|shopping|research|discussions` returns attributed results. `type=all` remains available for older clients and returns up to three preview cards per category; the current Web view does not request those previews. Continue a category using its `nextPage` and `provider`; the mixed Images feed supports up to eight pages, while other adapters support up to four. Empty results and unavailable providers are separate states. Guest and private requests bypass the shared result cache. Searches are still sent to the upstream providers used for the selected category.
+`GET /api/search/vertical?q=...&type=images|videos|news|shopping|research|discussions` returns attributed results. `type=all` remains available for older clients and returns up to three preview cards per category; the current Web view does not request those previews. Continue a category using `nextPage` and `nextProvider` (or `provider` when `nextProvider` is absent). Pagination stops when the provider or configured safety limit is exhausted. Empty results and unavailable providers are separate states. Guest and private requests bypass the shared result cache. Searches are still sent to the upstream providers used for the selected category.
 
 - **Images:** The dedicated feed blends Wikimedia Commons, Brave when configured and supported, and matching images on indexed public reference pages. It deduplicates by image URL and lists a source page for crawler discoveries. The neural crawler picks up responsive and lazy-loaded images, structured article data, Open Graph images, and captions without fetching the image files as crawl work. The public index only surfaces crawler images from vetted reference domains, and inline thumbnails use a narrower origin allowlist.
 - **Video and news:** `BRAVE_SEARCH_API_KEY` enables Brave where the API plan supports the category. Other adapters include PeerTube via Sepia Search and Google News RSS. The optional YouTube Data API fallback is enabled with `VEYRA_YOUTUBE_SEARCH=1` and `YOUTUBE_DATA_API_KEY` and is skipped for mixed previews.
@@ -50,6 +50,8 @@ For supported model endpoints, where to create provider keys, and how to configu
 For rollout, deploy this backend first; smoke-test `/health`, `/api/search/web`, one request per category, and the signed-in category answer in staging before deploying the browser client. No database migration is required.
 
 ## India search and multilingual discovery
+
+The default `GET /api/search/web?feed=1` search can include paginated Wikipedia article links alongside the other providers. It uses the MediaWiki search API in the detected supported language, respects `site:` scope, and leaves explicit engine selections and category discovery unchanged.
 
 Send `region=IN` to `/api/search/web`, `/api/search/vertical` or `/api/search` to request India-first results. Supported providers receive their India market parameter, with an India relevance boost for local and global result feeds. Crossref, Wikimedia Commons, PeerTube and Hacker News remain global. Requests without the region parameter retain the previous behavior; cached results are separated by region.
 

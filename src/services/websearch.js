@@ -6,6 +6,8 @@ const { india, indiaLanguage, indiaAffinity, inrPrice, isIndianProductUrl } = re
 const cheerio = require("cheerio");
 const WEB_FEED_STEP = 10;
 const WEB_FEED_INDEX_OFFSET = 100;
+const REFERENCE_LANGS = new Set("as bn en gu hi kn ml mr ne or pa sa ta te ur".split(" "));
+const referenceHost = lang => `${REFERENCE_LANGS.has(lang) ? lang : "en"}.wikipedia.org`;
 
 function cleanText(s, max = 400) { return String(s || "").replace(/\s+/g, " ").trim().slice(0, max); }
 function safeHttpUrl(raw) {
@@ -206,6 +208,25 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
   const cache = new Map(); const MAX_CACHE = 200; const cooldowns = new Map();
   const health = Object.create(null);
   const providers = {
+    wikipedia: { available: () => true, async run(q, { offset, lang, signal }) {
+      const u = new URL(`https://${referenceHost(lang)}/w/api.php`);
+      u.search = new URLSearchParams({ action: "query", list: "search", format: "json", formatversion: "2",
+        srsearch: q, srnamespace: "0", srprop: "snippet", srinfo: "totalhits",
+        srlimit: String(WEB_FEED_STEP), sroffset: String(offset) }).toString();
+      const response = await fetchText(u.href, { accept: "application/json", signal, timeoutMs: Math.min(3200, timeoutMs),
+        userAgent: "VeyraSearch/1.0 (+https://github.com/HomekidChud/VeyraServer)" });
+      if (!response.ok) throw Object.assign(new Error("Wikipedia Search request failed"), { status: response.status, retryAfterMs: response.retryAfterMs });
+      const payload = JSON.parse(response.text);
+      if (payload.error) throw new Error("Wikipedia Search API error");
+      const results = (Array.isArray(payload.query?.search) ? payload.query.search : []).slice(0, WEB_FEED_STEP).flatMap(item => {
+        if (item?.ns !== 0 || typeof item.title !== "string" || !item.title.trim()) return [];
+        const url = `${u.origin}/wiki/${encodeURIComponent(item.title.replaceAll(" ", "_"))}`;
+        const snippet = cheerio.load(String(item.snippet || "").slice(0, 2400), null, false).text();
+        const result = row(url, item.title, snippet, "wikipedia");
+        return result ? [result] : [];
+      });
+      return { results, total: payload.query?.searchinfo?.totalhits, more: payload.continue?.sroffset === offset + WEB_FEED_STEP };
+    } },
     google: { available: () => !!(googleKey && googleCx), async run(q, { offset, lang, region, shopping, signal }) {
       const u = new URL("https://www.googleapis.com/customsearch/v1"); u.searchParams.set("key", googleKey); u.searchParams.set("cx", googleCx); u.searchParams.set("q", q); u.searchParams.set("num", "10"); if (offset) u.searchParams.set("start", String(Math.min(91, offset + 1))); if (lang) u.searchParams.set("hl", lang);
       if (region) u.searchParams.set("gl", region.toLowerCase());
@@ -321,7 +342,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       return { name, results: [], ms, error: info.code, classification: info.classification };
     } finally { clearTimeout(timer); if (abortListener) controller.signal.removeEventListener("abort", abortListener); params.signal?.removeEventListener("abort", abortUpstream); }
   }
-  async function search(query, { offset = 0, engine = "", lang = "", signal, limit = 20, noCache = false, region = "", shopping = false, feed = false } = {}) {
+  async function search(query, { offset = 0, engine = "", lang = "", signal, limit = 20, noCache = false, region = "", shopping = false, feed = false, reference = false } = {}) {
     const requestStartedAt = Date.now(); let firstResultAt = null;
     const requestedLimit = Math.max(1, Math.min(50, Number(limit) || 20));
     const q = cleanText(query, 600); if (!q) return { provider: "none", results: [], attempts: [], responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: null };
@@ -330,8 +351,12 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
     region = india(region) ? "IN" : "";
     shopping = Boolean(region && shopping);
     const regionalLanguage = region ? indiaLanguage(scope.text || q, lang) : "";
-    const requested = [...new Set(engine && Object.hasOwn(providers, engine) ? [engine] : order.filter(name => Object.hasOwn(providers, name)))];
-    const key = JSON.stringify([requested, offset, region, shopping, feed, requestedLimit, regionalLanguage || lang, q.toLowerCase()]);
+    const referenceLang = (regionalLanguage || lang).toLowerCase().split("-")[0];
+    const includeReference = feed && reference && !engine && !shopping && scope.text &&
+      allowsSiteUrl(scope, `https://${referenceHost(referenceLang)}/`);
+    const requested = [...new Set(engine && Object.hasOwn(providers, engine) && engine !== "wikipedia" ? [engine]
+      : order.filter(name => name !== "wikipedia" && Object.hasOwn(providers, name)))];
+    const key = JSON.stringify([requested, offset, region, shopping, feed, !!includeReference, requestedLimit, regionalLanguage || lang, q.toLowerCase()]);
     const hit = noCache ? null : cache.get(key);
     if (hit && Date.now() - hit.time < cacheTtlMs) return { ...hit.value, cached: true, responseTimeMs: Date.now() - requestStartedAt };
     const attempts = []; let eligible = [];
@@ -348,6 +373,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       }
     }
     if (feed && offset) eligible = eligible.filter(name => ["google", "brave", "bing"].includes(name));
+    if (includeReference && !(cooldowns.get("wikipedia") > Date.now())) eligible.unshift("wikipedia");
     const requestController = new AbortController();
     let callerCancelled = false, deadlineExpired = false, earlyCancelled = false;
     const observedResultKeys = new Set();
@@ -363,7 +389,8 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       while (cursor < eligible.length && !requestController.signal.aborted) {
         const index = cursor++, name = eligible[index];
         const providerLang = regionalLanguage ? (name === "brave" ? braveLanguage(regionalLanguage) : regionalLanguage.split("-")[0]) : lang;
-        const item = await runProvider(name, q, { offset, limit: requestedLimit, lang: providerLang, region, shopping, feed, filterRows: scopedRows,
+        const item = await runProvider(name, name === "wikipedia" ? scope.text : q, { offset, limit: requestedLimit,
+          lang: name === "wikipedia" ? referenceLang : providerLang, region, shopping, feed, filterRows: scopedRows,
           signal: requestController.signal, isCancelled: () => callerCancelled, isDeadlineExpired: () => deadlineExpired,
           isEarlyCancel: () => earlyCancelled, onResults: at => { if (firstResultAt == null) firstResultAt = at; } });
         settled[index] = item;
@@ -391,7 +418,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
     // most on-topic pages surface first instead of raw provider arrival order.
     const ranked = rankResultsByRelevance(scope.active ? scope.text : q, [...merged.values()], region);
     const results = (feed && scope.text && unicodeWords(scope.text).length ? ranked.filter(row => row.relevance > 0) : ranked).slice(0, requestedLimit);
-    const source = successful.find(x => x.results.length)?.name || "none";
+    const source = (feed ? results[0]?.source : successful.find(x => x.results.length)?.name) || "none";
     const value = { provider: source, results, ranking: { method: "token-relevance" }, total: successful.reduce((n, x) => n + (x.total || x.results.length), 0) || null, more: successful.some(x => x.more), attempts, googleConfigured: configured("google"), braveConfigured: configured("brave"), bingConfigured: configured("bing"), providersUsed: successful.filter(x => x.results.length).map(x => x.name), cancelled: callerCancelled, earlyCancelled, deadlineExceeded: deadlineExpired, responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: firstResultAt == null ? null : firstResultAt - requestStartedAt, diagnostics: { providerCount: eligible.length, parallelism: Math.min(parallelism, eligible.length), overallDeadlineMs: requestBudgetMs, earlyCancelWindowMs, earlyResultThreshold, providers: Object.fromEntries(Object.keys(providers).map(name => [name, healthSummary(name)])), google: healthSummary("google") } };
     if (scope.active) {
       value.total = null;
