@@ -88,7 +88,59 @@ test("the requested subject, not generic action words, controls video results", 
     { name: "Fix leaking car seals", url: "https://video.example/w/car-seals", nsfw: false, privacy: { id: 1 } },
     { name: "Repair a leaking tap", url: "https://video.example/w/plumbing", nsfw: false, privacy: { id: 1 } }
   ] } });
-  assert.deepEqual((await service.search("videos", "fix a leaking tap")).results.map(r => r.title), ["Repair a leaking tap"]);
+  assert.deepEqual((await service.search("videos", "fix a leaking tap", { provider: "peertube" })).results.map(r => r.title), ["Repair a leaking tap"]);
+});
+
+test("verified videos surface direct, scoped watch links without a paid provider", async () => {
+  const service = mock({ "sepiasearch.org": { total: 0, data: [] } });
+  for (const [q, count] of [["how to fix a leaking tap", 3], ["dripping faucet", 3], ["how to make crispy dosa", 4], ["डोसा", 4]]) {
+    const page = await service.search("videos", q);
+    assert.equal(page.provider, "verified-videos");
+    assert.equal(page.results.length, count);
+    assert.ok(page.results.every(r => /^https:\/\/www\.youtube\.com\/watch\?v=[\w-]{11}$/.test(r.url) && r.source && r.thumbnail));
+  }
+  assert.equal(service.calls.length, 0);
+  assert.equal((await service.search("videos", "site:youtube.com instant crispy dosa")).results.length, 2);
+  assert.equal((await service.search("videos", "-site:youtube.com dosa")).results.length, 0);
+  assert.equal((await service.search("videos", "dosa rap song")).results.length, 0);
+});
+
+test("India catalog accepts in-stock direct product listings and verifies INR without trusting search prices", async () => {
+  const calls = [];
+  const good = { title: "Adapto 65B", type: "Adaptor", url: "/products/adapto-65b?_pos=1", available: true, price: "1299.00",
+    body: "<h2>65W Power Adapter</h2><p>Includes a Type-C PD port for laptops.</p>" };
+  const service = createVerticalSearch({
+    env: {}, fetchText: async () => { throw new Error("unused"); },
+    webSearch: async () => ({ results: [] }),
+    async fetchIndiaCatalog(rawUrl, { kind }) {
+      const url = new URL(rawUrl);
+      calls.push([kind, url]);
+      assert.equal(url.hostname, "www.portronics.com", "site scope limits which merchant receives the query");
+      if (kind === "product") return '<meta itemprop="priceCurrency" content="INR"><meta itemprop="price" content="1299">';
+      assert.equal(url.searchParams.get("q"), "USB-C 65W charger");
+      return JSON.stringify({ resources: { results: { products: [
+        good, { ...good, url: "/products/no-stock", available: false }, { ...good, url: "https://outside.example/products/forged" },
+        { ...good, title: "Konnect Dash Max", url: "/products/konnect-dash-max", type: "Cable" },
+        { ...good, title: "67W USB-C Charger", url: "/products/ch-67" },
+        { ...good, title: "Car Power", type: "Car Charger", url: "/products/car-power" },
+        { ...good, title: "Adapto 65M", url: "/products/adapto-65m", price: "1249.00" }
+      ] } } });
+    }
+  });
+  const query = "site:portronics.com USB-C 65W charger";
+  const page = await service.search("shopping", query, { region: "IN" });
+  assert.equal(page.provider, "india-storefronts");
+  const listings = new Map(page.results.map(r => [r.url, r.price]));
+  assert.deepEqual(listings.get("https://www.portronics.com/products/adapto-65b"), { value: "1299.00", currency: "INR" });
+  assert.equal(listings.get("https://www.portronics.com/products/adapto-65m"), null);
+  assert.equal(listings.size, 2);
+  assert.equal(page.nextPage, null);
+  const preview = await service.search("shopping", query, { region: "IN", preview: true });
+  assert.ok(preview.results.length && preview.results.every(row => row.price === null));
+  assert.equal(calls.length, 4);
+  await service.search("shopping", query, { region: "IN", privateSearch: true });
+  await service.search("shopping", query, {});
+  assert.equal(calls.length, 4, "incognito and non-India searches do not call storefronts");
 });
 
 test("News breaks topical ties in favor of recent coverage and collapses duplicate headlines", async () => {

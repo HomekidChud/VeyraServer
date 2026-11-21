@@ -9,6 +9,8 @@ const { braveLanguage } = require("./search-language");
 const { india, indiaLanguage, indiaAffinity, inrPrice, isIndianProductUrl } = require("./search-region");
 const { WEB_FEED_STEP, isTopicalResult } = require("./websearch");
 const { unicodeWords } = require("./search-language");
+const { videoMatches } = require("./verified-videos");
+const { createIndiaCatalog } = require("./india-storefronts");
 
 const TYPES = Object.freeze(["images", "videos", "news", "shopping", "research", "discussions"]);
 const PAGE_SIZE = 12;
@@ -64,7 +66,7 @@ function testLink(type, value, region) {
   const url = safeUrl(value);
   if (!url) return false;
   const u = new URL(url);
-  if (type === "videos") return (matchingHost(u.hostname, ["youtube.com"]) && ((u.pathname === "/watch" && /^[\w-]{11}$/.test(u.searchParams.get("v") || "")) || /^\/shorts\/[\w-]{11}\/?$/.test(u.pathname))) || (matchingHost(u.hostname, ["vimeo.com"]) && /\/\d+\/?$/.test(u.pathname));
+  if (type === "videos") return !!youtubeWatch(u) || (matchingHost(u.hostname, ["vimeo.com"]) && /\/\d+\/?$/.test(u.pathname));
   if (type === "shopping" && india(region)) return isIndianProductUrl(url);
   if (type === "shopping") return (matchingHost(u.hostname, ["amazon.com", "amazon.co.uk"]) && /\/(?:dp|gp\/product)\/[A-Z0-9]{10}(?:\/|$)/i.test(u.pathname)) || (matchingHost(u.hostname, ["ebay.com", "ebay.co.uk"]) && /^\/itm\/(?:[^/]+\/)?\d+\/?$/.test(u.pathname)) || (matchingHost(u.hostname, ["etsy.com"]) && /\/listing\/\d+(?:\/|$)/.test(u.pathname));
   return true;
@@ -72,10 +74,15 @@ function testLink(type, value, region) {
 function indexedWatchPage(value) {
   return testLink("videos", value) && /^https:/.test(value);
 }
+function youtubeWatch(u) {
+  const id = u.hostname === "youtu.be" ? /^\/([\w-]{11})\/?$/.exec(u.pathname)?.[1]
+    : !["youtube.com", "www.youtube.com", "m.youtube.com"].includes(u.hostname) ? ""
+    : u.pathname === "/watch" ? u.searchParams.get("v") : /^\/shorts\/([\w-]{11})\/?$/.exec(u.pathname)?.[1];
+  return /^[\w-]{11}$/.test(id || "") ? id : "";
+}
 function watchThumbnail(value) {
   const u = new URL(value);
-  if (!matchingHost(u.hostname, ["youtube.com"])) return "";
-  const videoId = u.searchParams.get("v") || /^\/shorts\/([\w-]{11})/.exec(u.pathname)?.[1];
+  const videoId = youtubeWatch(u);
   return videoId ? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg` : "";
 }
 function row(type, provider, item) {
@@ -107,8 +114,9 @@ function waitForToken(promise, signal) {
   });
 }
 
-function createVerticalSearch({ fetchText, webSearch, indexedImages, indexedVideos, indexedProducts, env = process.env, providerTimeoutMs = TIMEOUT }) {
+function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexedImages, indexedVideos, indexedProducts, env = process.env, providerTimeoutMs = TIMEOUT }) {
   const cache = new Map(), cooldown = new Map();
+  const indiaCatalog = fetchIndiaCatalog && createIndiaCatalog({ fetchCatalog: fetchIndiaCatalog, allowsSiteUrl, limit: PAGE_SIZE });
   let ebayToken, ebayTokenPromise;
   const braveKey = String(env.BRAVE_SEARCH_API_KEY || "").trim();
   const market = /^[A-Z]{2}$/.test(String(env.VEYRA_EBAY_MARKET || "")) ? env.VEYRA_EBAY_MARKET : "GB";
@@ -229,6 +237,13 @@ function createVerticalSearch({ fetchText, webSearch, indexedImages, indexedVide
     }));
     return { provider: "youtube", results, more: false };
   }
+  function verifiedVideos(type, q, { page }) {
+    return { provider: "verified-videos", results: page ? [] : videoMatches(q).map(item => row(type, "verified-videos", item)), more: false };
+  }
+  async function storefronts(type, q, opts) {
+    const result = await indiaCatalog(q, opts);
+    return { ...result, provider: "india-storefronts", results: result.results.map(item => row(type, "india-storefronts", item)) };
+  }
   async function peertube(type, q, { page, signal }) {
     const json = await get(queryUrl("https://sepiasearch.org/api/v1/search/videos", {
       search: q, start: page * PAGE_SIZE, count: PAGE_SIZE, nsfw: "false", sort: "-match"
@@ -304,8 +319,10 @@ function createVerticalSearch({ fetchText, webSearch, indexedImages, indexedVide
     return { provider: "veyra-crawler", results: data.results.filter(item => testLink(type, item.url, region))
       .map(item => row(type, "veyra-crawler", { title: item.title, url: item.url })), more: (page + 1) * PAGE_SIZE < data.total };
   }
-  function adapters(type, page, preview, provider, region) {
+  function adapters(type, page, preview, provider, region, privateSearch) {
     const list = [];
+    if (type === "videos" && !page) list.push(["verified-videos", verifiedVideos]);
+    if (type === "shopping" && india(region) && indiaCatalog && !privateSearch) list.push(["india-storefronts", storefronts]);
     if (type === "images" && !preview && typeof indexedImages === "function" && (!provider || provider === "image-mix")) list.push(["image-mix", imageMix]);
     else {
       if (braveKey && ["images", "videos", "news"].includes(type)) list.push(["brave", brave]);
@@ -323,7 +340,7 @@ function createVerticalSearch({ fetchText, webSearch, indexedImages, indexedVide
     if (type === "discussions") list.push(["hacker-news", discussions]);
     return list;
   }
-  async function search(type, rawQuery, { page = 0, lang = "en", region = "", signal, noCache = true, provider = "", preview = false } = {}) {
+  async function search(type, rawQuery, { page = 0, lang = "en", region = "", signal, noCache = true, provider = "", preview = false, privateSearch = false } = {}) {
     if (!TYPES.includes(type)) throw new Error("Unknown vertical");
     const started = Date.now(), scope = parseSiteScope(rawQuery), q = String(rawQuery).trim().slice(0, 400);
     region = india(region) ? "IN" : "";
@@ -340,25 +357,26 @@ function createVerticalSearch({ fetchText, webSearch, indexedImages, indexedVide
       const age = (started - Date.parse(item.publishedAt)) / 86400000;
       return type === "news" && age >= 0 ? 1.8 / (1 + age / 30) : 0;
     };
-    for (const [name, run] of adapters(type, page, preview, provider, region)) {
+    for (const [name, run] of adapters(type, page, preview, provider, region, privateSearch)) {
       if (signal?.aborted) return sparseImages || empty("cancelled");
       if (provider && provider !== name) continue;
       if (name === "openverse" && scope.include.length) continue;
       const breaker = `${name}:${name === "brave" ? type : ""}`;
       if ((cooldown.get(breaker) || 0) > Date.now()) { attempts.push("unavailable"); continue; }
       const singleFeed = name === "image-mix" || name === "google-news-rss" || (name === "brave" && type === "images");
-      const key = JSON.stringify([name, type, q, language, region, singleFeed ? 0 : page]);
+      const key = JSON.stringify([name, type, q, language, region, singleFeed ? 0 : page, name === "india-storefronts" && preview]);
       const saved = noCache || name === "veyra-crawler" ? null : cache.get(key);
       try {
         const providerQuery = name === "brave" ? q : (scope.text || q).slice(0, 400);
-        const packed = saved?.until > Date.now() ? saved.packed : await run(type, providerQuery, { page, lang: language, region, signal, noCache, fullQuery: q });
+        const packed = saved?.until > Date.now() ? saved.packed : await run(type, providerQuery, { page, lang: language, region, signal, noCache, fullQuery: q, scope, preview });
         if (signal?.aborted) return sparseImages || empty("cancelled");
         const seen = new Set();
         const known = packed.results.filter(item => {
           if (!item || !allowsSiteUrl(scope, item.sourcePageUrl || item.url)) return false;
-          const topicalMedia = type === "videos" || (type === "images" && unicodeWords(topic).length > 1 && !/[^\u0000-\u007f]/.test(topic));
+          const topicalMedia = (type === "videos" && name !== "verified-videos") || (type === "images" && unicodeWords(topic).length > 1 && !/[^\u0000-\u007f]/.test(topic));
           if (topicalMedia && !isTopicalResult(mediaTopic, item, { requireTitle: true })) return false;
           const key = type === "images" ? imageIdentity(item.imageUrl || item.thumbnail || item.url)
+            : type === "videos" ? youtubeWatch(new URL(item.url)) || item.url
             : type === "news" ? unicodeWords(item.title).join(" ") || item.url : item.url;
           return !seen.has(key) && seen.add(key);
         });
