@@ -288,6 +288,10 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     assert.deepEqual([indexStart.results[0].url, indexEnd.results[0].url].sort(), [localA, localB]);
     assert.deepEqual(offsets, [0, 10], "index pages must not call providers");
     assert.equal(crawlCalls, crawlsBeforeFeed, "private initial requests and authenticated continuations must not trigger new crawls");
+    assert(indexDocument("https://one-word.example/landing", article.replaceAll("fixture", "cobalt")));
+    assert(indexDocument("https://relevant.example/cobalt", article.replaceAll("fixture", "cobalt quarry")));
+    const topical = await (await fetch(`${base}/api/search?q=cobalt+quarry&region=IN`)).json();
+    assert.deepEqual(topical.results.map(row => row.url), ["https://relevant.example/cobalt"]);
     console.log("Search, answer and YouTube Express routes passed controlled local integration tests");
   } finally {
     delete app.locals.veyraWebSearch;

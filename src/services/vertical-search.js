@@ -7,7 +7,8 @@ const { rankVertical, rankerVersion } = require("./vertical-ranker");
 const { imageIdentity } = require("./crawl-page-data");
 const { braveLanguage } = require("./search-language");
 const { india, indiaLanguage, indiaAffinity, inrPrice, isIndianProductUrl } = require("./search-region");
-const { WEB_FEED_STEP, scoreResultRelevance } = require("./websearch");
+const { WEB_FEED_STEP, isTopicalResult } = require("./websearch");
+const { unicodeWords } = require("./search-language");
 
 const TYPES = Object.freeze(["images", "videos", "news", "shopping", "research", "discussions"]);
 const PAGE_SIZE = 12;
@@ -16,10 +17,15 @@ function lastVerticalPage(type, provider) {
   if (provider === "image-mix") return LAST_IMAGE_PAGE;
   if (provider === "brave" || provider === "web-discovery") return 9;
   if (type === "images" && provider === "wikimedia") return 49;
-  return ["peertube", "veyra-crawler", "google-news-rss", "ebay", "crossref", "hacker-news"].includes(provider) ? 19 : 3;
+  return ["openverse", "peertube", "veyra-crawler", "google-news-rss", "ebay", "crossref", "hacker-news"].includes(provider) ? 19 : 3;
 }
 const ENDPOINT = "https://api.search.brave.com/res/v1";
 const TIMEOUT = 4400;
+const VIDEO_INTENT = new Set("fix repair make install tutorial guide review recipe video watch".split(" "));
+function videoTopic(query) {
+  const subject = unicodeWords(query).filter(word => !VIDEO_INTENT.has(word));
+  return subject.length ? subject.join(" ") : query;
+}
 const THUMB_HOSTS = new Set(["imgs.search.brave.com", "upload.wikimedia.org", "thumb.wikimedia.org", "i.ebayimg.com", "i.ytimg.com",
   "images-assets.nasa.gov", "science.nasa.gov", "assets.science.nasa.gov", "www.esa.int", "media.esa.int"]);
 
@@ -36,6 +42,7 @@ function thumbnail(value) {
   const valueUrl = safeUrl(value);
   if (!valueUrl || !valueUrl.startsWith("https:")) return "";
   const url = new URL(valueUrl);
+  if (url.hostname === "api.openverse.org") return /^\/v1\/images\/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\/thumb\/$/i.test(url.pathname) && !url.search ? valueUrl : "";
   if (!THUMB_HOSTS.has(url.hostname)) return "";
   if (url.hostname === "assets.science.nasa.gov" && url.pathname.startsWith("/dynamicimage/") &&
       ["w", "h"].some(key => Number(url.searchParams.get(key)) > 2048)) return "";
@@ -100,7 +107,7 @@ function waitForToken(promise, signal) {
   });
 }
 
-function createVerticalSearch({ fetchText, webSearch, indexedImages, indexedVideos, env = process.env, providerTimeoutMs = TIMEOUT }) {
+function createVerticalSearch({ fetchText, webSearch, indexedImages, indexedVideos, indexedProducts, env = process.env, providerTimeoutMs = TIMEOUT }) {
   const cache = new Map(), cooldown = new Map();
   let ebayToken, ebayTokenPromise;
   const braveKey = String(env.BRAVE_SEARCH_API_KEY || "").trim();
@@ -113,7 +120,7 @@ function createVerticalSearch({ fetchText, webSearch, indexedImages, indexedVide
     // active during the body read as well, so a stalled feed can't block fallback.
     const response = await fetchText(url, { signal: requestSignal, timeoutMs: providerTimeoutMs, ...options });
     requestSignal.throwIfAborted();
-    if (!response.ok) throw Object.assign(new Error("Provider request failed"), { status: response.status });
+    if (!response.ok) throw Object.assign(new Error("Provider request failed"), { status: response.status, retryAfterMs: response.retryAfterMs });
     return options.raw ? response.text : JSON.parse(response.text);
   }
   async function brave(type, q, { page, lang, region, signal }) {
@@ -161,6 +168,25 @@ function createVerticalSearch({ fetchText, webSearch, indexedImages, indexedVide
     for (let i = 0; i < 48; i++) for (const feed of feeds) if (feed[i]) results.push(feed[i]);
     return { provider: "image-mix", results, whole: true, commonsMore };
   }
+  async function openverse(type, q, { page, signal }) {
+    // Openverse treats its legacy mature parameter and the sensitivity
+    // parameter as mutually exclusive. Validate the returned rows as well.
+    const json = await get(queryUrl("https://api.openverse.org/v1/images/", { q, page: page + 1, page_size: PAGE_SIZE,
+      filter_dead: true, unstable__include_sensitive_results: false }), signal);
+    if (!Array.isArray(json.results)) throw new Error("Invalid Openverse response");
+    const results = json.results.slice(0, PAGE_SIZE).flatMap(item => {
+      const url = safeUrl(item.foreign_landing_url), imageUrl = safeUrl(item.url);
+      if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(item.id || "") || item.mature !== false ||
+          (Array.isArray(item.unstable__sensitivity) && item.unstable__sensitivity.length) || !url || !imageUrl) return [];
+      const license = /^(?:by(?:-nc)?(?:-sa|-nd)?|cc0|pdm)$/i.test(item.license || "") ?
+        [item.license === "pdm" ? "Public Domain Mark" : item.license === "cc0" ? "CC0" : `CC ${item.license.toUpperCase()}`, item.license_version].filter(Boolean).join(" ") : "";
+      if (!license) return [];
+      return [row(type, "openverse", { url, sourcePageUrl: url, imageUrl, license, title: item.title || "Untitled image",
+        thumbnail: `https://api.openverse.org/v1/images/${item.id}/thumb/`, source: [item.creator, "Openverse"].filter(Boolean).join(" · "),
+        snippet: (Array.isArray(item.tags) ? item.tags : []).slice(0, 24).map(tag => tag.name).filter(Boolean).join(" ") })];
+    });
+    return { provider: "openverse", results, more: Number(json.page_count) > page + 1 };
+  }
   async function newsFeed(type, q, { lang, region, signal }) {
     lang = lang.split("-")[0];
     if (region === "IN") lang = lang === "hi" ? "hi" : "en";
@@ -170,7 +196,8 @@ function createVerticalSearch({ fetchText, webSearch, indexedImages, indexedVide
     if (!$("rss > channel").length) throw new Error("Invalid RSS feed");
     const results = $("channel > item").slice(0, 96).toArray().map(node => {
       const item = $(node);
-      return row(type, "google-news-rss", { url: item.children("link").text(), title: item.children("title").text(), source: item.children("source").text(), publishedAt: item.children("pubDate").text() });
+      const source = item.children("source").text(), title = item.children("title").text();
+      return row(type, "google-news-rss", { url: item.children("link").text(), title: source && title.endsWith(` - ${source}`) ? title.slice(0, -source.length - 3) : title, source, publishedAt: item.children("pubDate").text() });
     });
     return { provider: "google-news-rss", results, whole: true };
   }
@@ -250,13 +277,16 @@ function createVerticalSearch({ fetchText, webSearch, indexedImages, indexedVide
     return { provider: "ebay", results, more: !!json.next };
   }
   async function webCategory(type, q, { page, signal, lang, region, noCache }) {
-    // No site operators here: the existing web engine treats multiple sites
-    // as an intersection, not a disjunction. Enforce concrete URLs below.
+    // The discovery hint goes to upstreams, but never counts as a match.
     const shopping = type === "shopping" && india(region);
-    const packed = await webSearch(`${q} ${type === "videos" ? "YouTube video" : shopping ? "buy online India" : "buy online"}`, { offset: page * WEB_FEED_STEP, limit: PAGE_SIZE, lang, region, shopping, signal, noCache, feed: true });
+    const topic = type === "videos" ? videoTopic(q) : q;
+    const deadline = AbortSignal.timeout(providerTimeoutMs);
+    const packed = await webSearch(`${q} ${type === "videos" ? "YouTube video" : shopping ? "buy online India" : "buy online"}`, {
+      offset: page * WEB_FEED_STEP, limit: PAGE_SIZE * 2, lang, region, shopping, topic,
+      signal: signal ? AbortSignal.any([signal, deadline]) : deadline, noCache, feed: true });
     if (packed.attempts?.length && packed.attempts.every(attempt => attempt.error || attempt.skipped)) throw new Error("No provider reached");
     const results = (packed.results || []).filter(item => testLink(type, item.url, region) &&
-      scoreResultRelevance(q, { ...item, snippet: item.snippet || item.description }).coverage > 0).map(item => {
+      isTopicalResult(topic, { ...item, snippet: item.snippet || item.description }, { requireTitle: true })).map(item => {
       const poster = type === "videos" ? watchThumbnail(item.url) : "";
       return row(type, "web-discovery", { url: item.url, title: item.title, source: shopping ? "" : item.source, snippet: shopping ? "" : item.snippet || item.description, thumbnail: poster, price: shopping ? inrPrice(item.price) : null });
     });
@@ -269,17 +299,26 @@ function createVerticalSearch({ fetchText, webSearch, indexedImages, indexedVide
       row(type, "veyra-crawler", { ...item, source: "", thumbnail: watchThumbnail(item.url) })),
     more: batch * PAGE_SIZE < data.total, nextPage: batch + 1 };
   }
+  function crawlerProductFeed(type, _q, { page, region, fullQuery }) {
+    const data = indexedProducts(fullQuery, page * PAGE_SIZE, PAGE_SIZE, region);
+    return { provider: "veyra-crawler", results: data.results.filter(item => testLink(type, item.url, region))
+      .map(item => row(type, "veyra-crawler", { title: item.title, url: item.url })), more: (page + 1) * PAGE_SIZE < data.total };
+  }
   function adapters(type, page, preview, provider, region) {
     const list = [];
-    if (type === "images" && !preview && typeof indexedImages === "function" && (!provider || provider === "image-mix")) return [["image-mix", imageMix]];
-    if (braveKey && ["images", "videos", "news"].includes(type)) list.push(["brave", brave]);
-    if (type === "images") list.push(["wikimedia", commons]);
+    if (type === "images" && !preview && typeof indexedImages === "function" && (!provider || provider === "image-mix")) list.push(["image-mix", imageMix]);
+    else {
+      if (braveKey && ["images", "videos", "news"].includes(type)) list.push(["brave", brave]);
+      if (type === "images") list.push(["wikimedia", commons]);
+    }
+    if (type === "images" && !preview) list.push(["openverse", openverse]);
     if (type === "videos" && !page && !preview && env.YOUTUBE_DATA_API_KEY && env.VEYRA_YOUTUBE_SEARCH === "1") list.push(["youtube", youtube]);
     if (type === "videos") list.push(["peertube", peertube]);
     if (type === "news") list.push(["google-news-rss", newsFeed]);
     if (type === "shopping" && !india(region) && env.EBAY_CLIENT_ID && env.EBAY_CLIENT_SECRET) list.push(["ebay", ebay]);
-    if (type === "videos" || type === "shopping") list.push(["web-discovery", webCategory]);
     if (type === "videos" && !preview && typeof indexedVideos === "function") list.push(["veyra-crawler", crawlerVideoFeed]);
+    if (type === "shopping" && !preview && india(region) && typeof indexedProducts === "function") list.push(["veyra-crawler", crawlerProductFeed]);
+    if (type === "videos" || type === "shopping") list.push(["web-discovery", webCategory]);
     if (type === "research") list.push(["crossref", crossref]);
     if (type === "discussions") list.push(["hacker-news", discussions]);
     return list;
@@ -294,9 +333,17 @@ function createVerticalSearch({ fetchText, webSearch, indexedImages, indexedVide
     if (scope.invalid) return empty("invalid-scope");
     if (!q || (scope.active && !scope.text)) return empty("empty");
     const attempts = [];
+    let sparseImages;
+    const topic = scope.text || q;
+    const mediaTopic = type === "videos" ? videoTopic(topic) : topic;
+    const ageScore = item => {
+      const age = (started - Date.parse(item.publishedAt)) / 86400000;
+      return type === "news" && age >= 0 ? 1.8 / (1 + age / 30) : 0;
+    };
     for (const [name, run] of adapters(type, page, preview, provider, region)) {
-      if (signal?.aborted) return empty("cancelled");
+      if (signal?.aborted) return sparseImages || empty("cancelled");
       if (provider && provider !== name) continue;
+      if (name === "openverse" && scope.include.length) continue;
       const breaker = `${name}:${name === "brave" ? type : ""}`;
       if ((cooldown.get(breaker) || 0) > Date.now()) { attempts.push("unavailable"); continue; }
       const singleFeed = name === "image-mix" || name === "google-news-rss" || (name === "brave" && type === "images");
@@ -305,17 +352,20 @@ function createVerticalSearch({ fetchText, webSearch, indexedImages, indexedVide
       try {
         const providerQuery = name === "brave" ? q : (scope.text || q).slice(0, 400);
         const packed = saved?.until > Date.now() ? saved.packed : await run(type, providerQuery, { page, lang: language, region, signal, noCache, fullQuery: q });
-        if (signal?.aborted) return empty("cancelled");
+        if (signal?.aborted) return sparseImages || empty("cancelled");
         const seen = new Set();
         const known = packed.results.filter(item => {
           if (!item || !allowsSiteUrl(scope, item.sourcePageUrl || item.url)) return false;
-          const key = type === "images" ? imageIdentity(item.imageUrl || item.thumbnail || item.url) : item.url;
+          const topicalMedia = type === "videos" || (type === "images" && unicodeWords(topic).length > 1 && !/[^\u0000-\u007f]/.test(topic));
+          if (topicalMedia && !isTopicalResult(mediaTopic, item, { requireTitle: true })) return false;
+          const key = type === "images" ? imageIdentity(item.imageUrl || item.thumbnail || item.url)
+            : type === "news" ? unicodeWords(item.title).join(" ") || item.url : item.url;
           return !seen.has(key) && seen.add(key);
         });
-        const ranked = rankVertical(scope.text || q, known, region ? item => indiaAffinity(item) * 0.35 : undefined);
+        const ranked = rankVertical(topic, known, item => (region ? indiaAffinity(item) * 0.35 : 0) + ageScore(item));
         const results = packed.whole ? ranked.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE) : ranked;
         const hasNext = packed.whole ? ranked.length > (page + 1) * PAGE_SIZE : packed.more;
-        if (!results.length && !provider && name !== "image-mix") { attempts.push("empty"); continue; }
+        if (!results.length && !provider) { attempts.push("empty"); continue; }
         if (!noCache && name !== "veyra-crawler" && results.length && !(saved?.until > Date.now())) {
           cache.set(key, { packed, until: Date.now() + 45_000 });
           if (cache.size > 100) cache.delete(cache.keys().next().value);
@@ -329,15 +379,20 @@ function createVerticalSearch({ fetchText, webSearch, indexedImages, indexedVide
             typeof indexedVideos === "function" && indexedVideos(q, 0, 1, region).total) {
           nextPage = 1; nextProvider = "veyra-crawler";
         }
-        return { ...empty(results.length ? "ok" : "empty"), results, provider: packed.provider, nextPage,
+        const section = { ...empty(results.length ? "ok" : "empty"), results, provider: packed.provider, nextPage,
           ...(nextProvider ? { nextProvider } : {}), observedAt: new Date().toISOString() };
+        if (name === "image-mix" && !provider && !preview && results.length < 6 && !scope.include.length) { sparseImages = section; continue; }
+        if (name === "openverse" && sparseImages && results.length < sparseImages.results.length) return sparseImages;
+        return section;
       } catch (error) {
-        if (signal?.aborted) return empty("cancelled");
-        if ([401, 403, 429].includes(error.status)) cooldown.set(breaker, Date.now() + 30_000);
+        if (signal?.aborted) return sparseImages || empty("cancelled");
+        if ([401, 403, 429].includes(error.status) || error.retryAfterMs > 0) {
+          cooldown.set(breaker, Date.now() + Math.max(name === "openverse" ? 60_000 : 30_000, error.retryAfterMs || 0));
+        }
         attempts.push("unavailable");
       }
     }
-    return empty(attempts.includes("empty") ? "empty" : "unavailable");
+    return sparseImages || empty(attempts.includes("empty") ? "empty" : "unavailable");
   }
   return { search };
 }

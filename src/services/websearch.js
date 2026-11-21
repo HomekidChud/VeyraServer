@@ -1,6 +1,6 @@
 "use strict";
 const { parseSiteScope, allowsSiteUrl } = require("./search-site-scope");
-const { normalizeSearchText, unicodeWords, braveLanguage } = require("./search-language");
+const { unicodeWords, braveLanguage } = require("./search-language");
 const { india, indiaLanguage, indiaAffinity, inrPrice, isIndianProductUrl } = require("./search-region");
 
 const cheerio = require("cheerio");
@@ -97,7 +97,7 @@ function parseYahooHtml(html) {
   return out;
 }
 function rankTokens(text) {
-  return unicodeWords(text).map(word => {
+  return unicodeWords(String(text || "").replace(/[_-]/g, " ")).map(word => {
     if (!/^[a-z]+$/.test(word)) return word;
     if (word.length > 4 && word.endsWith("ies")) return `${word.slice(0, -3)}y`;
     if (word.length > 3 && word.endsWith("s") && !/(?:ss|us|is|ous|ics)$/.test(word)) return word.slice(0, -1);
@@ -118,10 +118,29 @@ function diceSimilarity(a, b) {
   return (2 * shared) / (left.size + right.size);
 }
 const RANK_STOP = new Set("a an and are as at be but by for from how in is it of on or the to was were what when where which who why with does do did can could should would com www http https".split(" "));
+const relevanceTerms = query => [...new Set(rankTokens(query))].filter(token => !RANK_STOP.has(token)).slice(0, 40);
+const minimumMatches = count => Math.ceil(count * 2 / 3);
+function isTopicalResult(query, result, { requireTitle = false } = {}) {
+  const terms = relevanceTerms(query);
+  if (!terms.length) return true;
+  const title = new Set(rankTokens(result.title));
+  let path = "";
+  try { const u = new URL(result.url); path = `${u.hostname} ${decodeURIComponent(u.pathname)}`; } catch {}
+  const subject = new Set([...title, ...rankTokens(path)]);
+  const all = new Set([...subject, ...rankTokens(result.snippet)]);
+  const matched = term => all.has(term) || (
+    /^[a-z]{4,}$/.test(term) && [term.replace(/e$/, "") + "ing", term + "ed", term + "d"].some(word => all.has(word))
+  );
+  return terms.filter(matched).length >= minimumMatches(terms.length) &&
+    terms.every(term => !/[0-9]/.test(term) || all.has(term)) &&
+    (!requireTitle || terms.some(term => subject.has(term)));
+}
 function scoreResultRelevance(query, row) {
-  const queryTokens = [...new Set(rankTokens(query))].filter(token => !RANK_STOP.has(token)).slice(0, 40);
+  const queryTokens = relevanceTerms(query);
   const titleTokens = new Set(rankTokens(row.title));
-  const urlTokens = new Set(rankTokens(row.displayUrl || row.url));
+  let displayPath = row.displayUrl || row.url || "";
+  try { displayPath = decodeURIComponent(displayPath); } catch {}
+  const urlTokens = new Set(rankTokens(displayPath));
   const snippetTokens = new Set(rankTokens(row.snippet));
   const allTokens = [...new Set([...titleTokens, ...urlTokens, ...snippetTokens])];
   if (!queryTokens.length) return { score: 0, coverage: 0, matchedTokens: [] };
@@ -134,15 +153,18 @@ function scoreResultRelevance(query, row) {
     else if (snippetTokens.has(token)) hit = 1;
     if (!hit) {
       // Character-level fuzzy match so typos and word variants still rank (e.g. "gmaes" ~ "games").
-      const fuzzy = allTokens.find(candidate => candidate.length > 3 && (candidate.startsWith(token) || token.startsWith(candidate) || diceSimilarity(candidate, token) >= 0.72));
-      if (fuzzy) hit = 1.5;
+      const fuzzy = allTokens.find(candidate => /^[a-z]{4,}$/.test(token) && /^[a-z]{4,}$/.test(candidate) &&
+        (((candidate.startsWith(token) || token.startsWith(candidate)) && Math.abs(candidate.length - token.length) <= 3) || diceSimilarity(candidate, token) >= 0.72));
+      if (fuzzy) hit = 0.75;
     }
     if (hit) { score += hit; matched.push(token); }
   }
   const coverage = matched.length / queryTokens.length;
   score *= 0.4 + 0.6 * coverage;
-  const phrase = normalizeSearchText(query.trim());
-  if (phrase.length > 3 && normalizeSearchText(`${row.title} ${row.snippet}`).includes(phrase)) score += 4;
+  const phrase = rankTokens(query).join(" ");
+  const titlePhrase = rankTokens(row.title).join(" ");
+  if (phrase && titlePhrase === phrase) score += 10;
+  else if (phrase && ` ${titlePhrase} `.includes(` ${phrase} `)) score += 5;
   score += Math.min(3, (row.providers?.length || 1) - 1) * 1.5;
   return { score: Math.round(score * 1000) / 1000, coverage: Math.round(coverage * 1000) / 1000, matchedTokens: matched };
 }
@@ -158,6 +180,17 @@ function rankResultsByRelevance(query, rows, region) {
     return b.score - a.score || a.index - b.index;
   });
   return scored.map(item => ({ ...item.row, relevance: item.coverage, relevanceScore: item.score }));
+}
+function diversifyWebResults(ranked, limit, scoped = false) {
+  if (scoped) return ranked.slice(0, limit);
+  const domains = new Map(), selected = [], deferred = [];
+  for (const row of ranked) {
+    const key = row.source === "wikipedia" ? "wikipedia.org" : new URL(row.url).hostname.replace(/^www\./, "");
+    const count = domains.get(key) || 0;
+    if (count >= 2) deferred.push(row);
+    else { selected.push(row); domains.set(key, count + 1); }
+  }
+  return [...selected, ...deferred].slice(0, limit);
 }
 function canonicalKey(url) {
   try { const u = new URL(url); if (!/^https?:$/.test(u.protocol) || u.username || u.password) return ""; u.hash = ""; for (const k of [...u.searchParams.keys()]) if (/^utm_/i.test(k) || /^(fbclid|gclid|mc_cid|mc_eid)$/i.test(k)) u.searchParams.delete(k); u.hostname = u.hostname.toLowerCase(); return u.pathname === "/" && !u.search ? u.origin : u.href; }
@@ -207,7 +240,25 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
   const cacheTtlMs = Math.max(0, Math.min(600000, Number(env.WEB_SEARCH_CACHE_TTL_MS) || 30000));
   const cache = new Map(); const MAX_CACHE = 200; const cooldowns = new Map();
   const health = Object.create(null);
+  let stackBackoffUntil = 0;
   const providers = {
+    stackoverflow: { available: () => true, async run(q, { offset, signal }) {
+      const u = new URL("https://api.stackexchange.com/2.3/search/advanced");
+      u.search = new URLSearchParams({ q, site: "stackoverflow", sort: "relevance", pagesize: String(WEB_FEED_STEP), page: String(1 + offset / WEB_FEED_STEP) }).toString();
+      const response = await fetchText(u.href, { signal, timeoutMs: Math.min(2800, timeoutMs), maxRedirects: 0 });
+      if (!response.ok) throw Object.assign(new Error("Stack Exchange API request failed"), { status: response.status, retryAfterMs: response.retryAfterMs });
+      const payload = JSON.parse(response.text);
+      if (Number(payload.backoff) > 0) stackBackoffUntil = Date.now() + Number(payload.backoff) * 1000;
+      if (payload.quota_remaining === 0) stackBackoffUntil = Math.max(stackBackoffUntil, Date.now() + 60 * 60 * 1000);
+      if (!Array.isArray(payload.items)) throw new Error("Invalid Stack Exchange API response");
+      const results = payload.items.slice(0, WEB_FEED_STEP).flatMap(item => {
+        const url = safeHttpUrl(item?.link);
+        if (!/^https:\/\/stackoverflow\.com\/questions\/\d+(?:\/|$)/.test(url)) return [];
+        const title = cheerio.load(String(item.title || "").slice(0, 600), null, false).text();
+        return [row(url, title, Array.isArray(item.tags) ? item.tags.join(" · ") : "", "stackoverflow")].filter(Boolean);
+      });
+      return { results, more: payload.has_more === true };
+    } },
     wikipedia: { available: () => true, async run(q, { offset, lang, signal }) {
       const u = new URL(`https://${referenceHost(lang)}/w/api.php`);
       u.search = new URLSearchParams({ action: "query", list: "search", format: "json", formatversion: "2",
@@ -342,7 +393,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       return { name, results: [], ms, error: info.code, classification: info.classification };
     } finally { clearTimeout(timer); if (abortListener) controller.signal.removeEventListener("abort", abortListener); params.signal?.removeEventListener("abort", abortUpstream); }
   }
-  async function search(query, { offset = 0, engine = "", lang = "", signal, limit = 20, noCache = false, region = "", shopping = false, feed = false, reference = false } = {}) {
+  async function search(query, { offset = 0, engine = "", lang = "", signal, limit = 20, noCache = false, region = "", shopping = false, feed = false, reference = false, topic = "" } = {}) {
     const requestStartedAt = Date.now(); let firstResultAt = null;
     const requestedLimit = Math.max(1, Math.min(50, Number(limit) || 20));
     const q = cleanText(query, 600); if (!q) return { provider: "none", results: [], attempts: [], responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: null };
@@ -354,9 +405,12 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
     const referenceLang = (regionalLanguage || lang).toLowerCase().split("-")[0];
     const includeReference = feed && reference && !engine && !shopping && scope.text &&
       allowsSiteUrl(scope, `https://${referenceHost(referenceLang)}/`);
-    const requested = [...new Set(engine && Object.hasOwn(providers, engine) && engine !== "wikipedia" ? [engine]
-      : order.filter(name => name !== "wikipedia" && Object.hasOwn(providers, name)))];
-    const key = JSON.stringify([requested, offset, region, shopping, feed, !!includeReference, requestedLimit, regionalLanguage || lang, q.toLowerCase()]);
+    const specialist = new Set(["wikipedia", "stackoverflow"]);
+    const includeStack = feed && reference && !engine && !shopping && allowsSiteUrl(scope, "https://stackoverflow.com/") &&
+      (scope.include.includes("stackoverflow.com") || /\b(?:javascript|typescript|python|pandas|numpy|rust|kotlin|sql|postgresql|golang|node\.js|reactjs|css|html|docker|kubernetes|linux|git|regex)\b/i.test(scope.text));
+    const requested = [...new Set(engine && Object.hasOwn(providers, engine) && !specialist.has(engine) ? [engine]
+      : order.filter(name => !specialist.has(name) && Object.hasOwn(providers, name)))];
+    const key = JSON.stringify([requested, offset, region, shopping, feed, !!includeReference, !!includeStack, topic, requestedLimit, regionalLanguage || lang, q.toLowerCase()]);
     const hit = noCache ? null : cache.get(key);
     if (hit && Date.now() - hit.time < cacheTtlMs) return { ...hit.value, cached: true, responseTimeMs: Date.now() - requestStartedAt };
     const attempts = []; let eligible = [];
@@ -374,6 +428,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
     }
     if (feed && offset) eligible = eligible.filter(name => ["google", "brave", "bing"].includes(name));
     if (includeReference && !(cooldowns.get("wikipedia") > Date.now())) eligible.unshift("wikipedia");
+    if (includeStack && !(Math.max(stackBackoffUntil, cooldowns.get("stackoverflow") || 0) > Date.now())) eligible.unshift("stackoverflow");
     const requestController = new AbortController();
     let callerCancelled = false, deadlineExpired = false, earlyCancelled = false;
     const observedResultKeys = new Set();
@@ -389,7 +444,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       while (cursor < eligible.length && !requestController.signal.aborted) {
         const index = cursor++, name = eligible[index];
         const providerLang = regionalLanguage ? (name === "brave" ? braveLanguage(regionalLanguage) : regionalLanguage.split("-")[0]) : lang;
-        const item = await runProvider(name, name === "wikipedia" ? scope.text : q, { offset, limit: requestedLimit,
+        const item = await runProvider(name, specialist.has(name) ? scope.text : q, { offset, limit: requestedLimit,
           lang: name === "wikipedia" ? referenceLang : providerLang, region, shopping, feed, filterRows: scopedRows,
           signal: requestController.signal, isCancelled: () => callerCancelled, isDeadlineExpired: () => deadlineExpired,
           isEarlyCancel: () => earlyCancelled, onResults: at => { if (firstResultAt == null) firstResultAt = at; } });
@@ -416,17 +471,23 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
     }
     // Rank the merged provider results by token relevance to the query so the
     // most on-topic pages surface first instead of raw provider arrival order.
-    const ranked = rankResultsByRelevance(scope.active ? scope.text : q, [...merged.values()], region);
-    const results = (feed && scope.text && unicodeWords(scope.text).length ? ranked.filter(row => row.relevance > 0) : ranked).slice(0, requestedLimit);
+    const rankQuery = topic || scope.text || q;
+    const ranked = rankResultsByRelevance(rankQuery, [...merged.values()], region);
+    const relevant = feed ? ranked.filter(row => isTopicalResult(rankQuery, row, { requireTitle: !!topic || !scope.active })) : ranked;
+    const results = feed ? diversifyWebResults(relevant, requestedLimit, scope.active || !!engine) : relevant.slice(0, requestedLimit);
     const source = (feed ? results[0]?.source : successful.find(x => x.results.length)?.name) || "none";
-    const value = { provider: source, results, ranking: { method: "token-relevance" }, total: successful.reduce((n, x) => n + (x.total || x.results.length), 0) || null, more: successful.some(x => x.more), attempts, googleConfigured: configured("google"), braveConfigured: configured("brave"), bingConfigured: configured("bing"), providersUsed: successful.filter(x => x.results.length).map(x => x.name), cancelled: callerCancelled, earlyCancelled, deadlineExceeded: deadlineExpired, responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: firstResultAt == null ? null : firstResultAt - requestStartedAt, diagnostics: { providerCount: eligible.length, parallelism: Math.min(parallelism, eligible.length), overallDeadlineMs: requestBudgetMs, earlyCancelWindowMs, earlyResultThreshold, providers: Object.fromEntries(Object.keys(providers).map(name => [name, healthSummary(name)])), google: healthSummary("google") } };
+    const value = { provider: source, results, ranking: { method: feed ? "topical-diverse-v2" : "token-relevance" }, total: successful.reduce((n, x) => n + (x.total || x.results.length), 0) || null, more: successful.some(x => x.more), attempts, googleConfigured: configured("google"), braveConfigured: configured("brave"), bingConfigured: configured("bing"), providersUsed: successful.filter(x => x.results.length).map(x => x.name), cancelled: callerCancelled, earlyCancelled, deadlineExceeded: deadlineExpired, responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: firstResultAt == null ? null : firstResultAt - requestStartedAt, diagnostics: { providerCount: eligible.length, parallelism: Math.min(parallelism, eligible.length), overallDeadlineMs: requestBudgetMs, earlyCancelWindowMs, earlyResultThreshold, providers: Object.fromEntries(Object.keys(providers).map(name => [name, healthSummary(name)])), google: healthSummary("google") } };
     if (scope.active) {
       value.total = null;
       value.siteFilter = { include: scope.include, exclude: scope.exclude };
     }
     if (feed) {
-      value.more = results.length > 0 && value.more && offset + WEB_FEED_STEP < WEB_FEED_INDEX_OFFSET;
+      // A valid later page may follow a thin page; do not treat a filtered
+      // batch as proof of exhaustion once the feed has already begun.
+      value.more = (results.length > 0 || offset > 0) && value.more && offset + WEB_FEED_STEP < WEB_FEED_INDEX_OFFSET;
       value.nextOffset = value.more ? offset + WEB_FEED_STEP : null;
+      value.status = results.length ? "ok" : callerCancelled ? "cancelled" :
+        successful.some(item => !item.error && !item.cancelledAfterSufficientResults) ? "empty" : "unavailable";
     } else if (scope.active) {
       const nextOffset = offset + Math.min(requestedLimit, ...successful.filter(item => item.more).map(item => item.stride));
       value.more = value.more && nextOffset < 60;
@@ -439,4 +500,4 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
   return { search, googleConfigured: () => configured("google"), order, providers: Object.keys(providers), diagnostics: () => ({ adaptiveOrdering: true, maxProviders, parallelism, overallDeadlineMs, providers: Object.fromEntries(Object.keys(providers).map(name => [name, healthSummary(name)])) }) };
 }
 
-module.exports = { createWebSearch, WEB_FEED_STEP, WEB_FEED_INDEX_OFFSET, parseDuckDuckGoHtml, parseBingHtml, parseMojeekHtml, parseEcosiaHtml, parseStartpageHtml, parseYahooHtml, parseGoogleApi, parseBraveApi, parseBingApi, unwrapBing, unwrapDuckDuckGo, classifyGoogleResponse, canonicalKey, rankResultsByRelevance, scoreResultRelevance, diceSimilarity };
+module.exports = { createWebSearch, WEB_FEED_STEP, WEB_FEED_INDEX_OFFSET, parseDuckDuckGoHtml, parseBingHtml, parseMojeekHtml, parseEcosiaHtml, parseStartpageHtml, parseYahooHtml, parseGoogleApi, parseBraveApi, parseBingApi, unwrapBing, unwrapDuckDuckGo, classifyGoogleResponse, canonicalKey, rankResultsByRelevance, scoreResultRelevance, isTopicalResult, diversifyWebResults, minimumMatches, diceSimilarity };

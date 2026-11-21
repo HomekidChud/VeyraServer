@@ -126,6 +126,37 @@ test("Web feeds can use relevant Wikipedia articles when the search provider ret
   assert.deepEqual(calls.filter(url => url.hostname === "hi.wikipedia.org").map(url => url.searchParams.get("sroffset")), ["0", "10"]);
 });
 
+test("Web feed surfaces real technical answers, keeps providers distinct, and respects backoff", async () => {
+  const calls = [];
+  const service = createWebSearch({ env: { WEB_SEARCH_ORDER: "bing", BING_SEARCH_API_KEY: "fixture" }, fetchText: async raw => {
+    const url = new URL(raw);
+    calls.push(url);
+    if (url.hostname === "api.stackexchange.com") {
+      assert.equal(url.searchParams.get("site"), "stackoverflow");
+      assert.equal(url.searchParams.get("page"), "1");
+      return response({ backoff: 70, has_more: true, items: [
+        { title: "How to read CSV files in pandas?", link: "https://stackoverflow.com/questions/123/example", tags: ["python", "pandas"] },
+        { title: "Read CSV using pandas", link: "https://stackoverflow.com.example/questions/123" }
+      ] });
+    }
+    if (url.hostname.endsWith(".wikipedia.org")) {
+      return response({ query: { search: [{ ns: 0, title: "Pandas (software)", snippet: "A data analysis library" }] } });
+    }
+    return response({ webPages: { value: [
+      { url: "https://example.in/pandas/read_csv", name: "pandas.read_csv" },
+      { url: "https://example.in/film", name: "Pandas in film" }
+    ] } });
+  } });
+  const options = { feed: true, reference: true, region: "IN", noCache: true };
+  const d = await service.search("read csv pandas", options);
+  assert.deepEqual(new Set(d.results.map(r => r.source)), new Set(["bing", "stackoverflow"]));
+  assert.equal(d.results.length, 2);
+  assert.equal(d.nextOffset, 10);
+  await service.search("read csv pandas", { ...options, offset: 10 });
+  await service.search("read csv pandas", { ...options, engine: "bing" });
+  assert.equal(calls.filter(url => url.hostname === "api.stackexchange.com").length, 1);
+});
+
 test("India applies to image mix, video and news requests without inventing research market filters", async () => {
   const calls = [];
   const service = createVerticalSearch({ env: { BRAVE_SEARCH_API_KEY: "fixture", VEYRA_YOUTUBE_SEARCH: "1", YOUTUBE_DATA_API_KEY: "fixture" }, indexedImages: () => [], fetchText: async raw => {

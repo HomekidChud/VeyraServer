@@ -39,7 +39,8 @@ test("image fallback validates artwork, license, provenance, cache and scoped pa
       continue: { gsroffset: 12 }
     };
   };
-  const service = mock({ "api.search.brave.com": { status: 429 }, "commons.wikimedia.org": commons }, { env: { BRAVE_SEARCH_API_KEY: "fixture" } });
+  const service = mock({ "api.search.brave.com": { status: 429 }, "commons.wikimedia.org": commons,
+    "api.openverse.org": { results: [] } }, { env: { BRAVE_SEARCH_API_KEY: "fixture" } });
   const first = await service.search("images", "Welsh lake", { noCache: false });
   assert.equal(first.provider, "wikimedia");
   assert.equal(first.results[0].license, "CC BY 4.0");
@@ -57,6 +58,48 @@ test("image fallback validates artwork, license, provenance, cache and scoped pa
   assert.equal(service.calls.at(-1).url.searchParams.get("gsrsearch"), "Welsh lake");
   await service.search("images", "site: Welsh lake");
   assert.equal(service.calls.length, 5);
+});
+
+test("sparse Commons results can switch to relevant, credited Openverse photos", async () => {
+  const photo = { id: "e211d652-746e-4c8a-b955-30d114360b8f", title: "Desk cable management",
+    foreign_landing_url: "https://www.flickr.com/photos/example/1", url: "https://live.staticflickr.com/example.jpg",
+    mature: false, license: "by", license_version: "2.0", creator: "A. Photographer" };
+  const service = mock({
+    "commons.wikimedia.org": { query: { pages: [{ title: "File:Different topic.jpg", imageinfo: [
+      { mime: "image/jpeg", descriptionurl: "https://commons.wikimedia.org/wiki/File:Different.jpg", thumburl: "https://thumb.wikimedia.org/other.jpg" }
+    ] }] } },
+    "api.openverse.org": url => {
+      assert.equal(url.searchParams.has("mature"), false, "Openverse rejects the legacy parameter alongside the sensitivity switch");
+      assert.equal(url.searchParams.get("unstable__include_sensitive_results"), "false");
+      return { page_count: 2, results: [photo, { ...photo, mature: true }, { ...photo, unstable__sensitivity: ["fixture"], url: "https://live.staticflickr.com/sensitive.jpg" },
+        { ...photo, title: "Someone at a press conference", url: "https://live.staticflickr.com/other.jpg" }] };
+    }
+  }, { indexedImages: () => [] });
+  const d = await service.search("images", "desk cable management");
+  assert.equal(d.provider, "openverse");
+  assert.equal(d.nextPage, 1);
+  assert.deepEqual(d.results.map(r => [r.title, r.source, r.license, r.thumbnail]), [[photo.title, "A. Photographer · Openverse", "CC BY 2.0", `https://api.openverse.org/v1/images/${photo.id}/thumb/`]]);
+  await service.search("images", "desk cable management", { provider: d.provider, page: d.nextPage });
+  assert.equal(service.calls.at(-1).url.searchParams.get("page"), "2");
+});
+
+test("the requested subject, not generic action words, controls video results", async () => {
+  const service = mock({ "sepiasearch.org": { total: 2, data: [
+    { name: "Fix leaking car seals", url: "https://video.example/w/car-seals", nsfw: false, privacy: { id: 1 } },
+    { name: "Repair a leaking tap", url: "https://video.example/w/plumbing", nsfw: false, privacy: { id: 1 } }
+  ] } });
+  assert.deepEqual((await service.search("videos", "fix a leaking tap")).results.map(r => r.title), ["Repair a leaking tap"]);
+});
+
+test("News breaks topical ties in favor of recent coverage and collapses duplicate headlines", async () => {
+  const rss = (title, date, url) => `<item><title>${title}</title><pubDate>${date}</pubDate><link>${url}</link></item>`;
+  const service = mock({ "news.google.com": `<rss version="2.0"><channel>${
+    rss("India space launch historical report", "Fri, 12 Jul 2019 01:00:00 GMT", "https://news.example/old")}${
+    rss("India space launch update", new Date(Date.now() - 3600000).toUTCString(), "https://news.example/new")}${
+    rss("India Space Launch Update!", new Date(Date.now() - 7200000).toUTCString(), "https://news.example/copy")
+  }</channel></rss>` });
+  const d = await service.search("news", "India space launch", { region: "IN" });
+  assert.deepEqual(d.results.map(r => r.url), ["https://news.example/new", "https://news.example/old"]);
 });
 
 test("deduplicates and paginates images from both providers and the local crawler", async () => {
