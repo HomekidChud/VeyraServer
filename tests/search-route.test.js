@@ -129,15 +129,70 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     assert.equal(scopedAnswer.hasAnswer, true);
     assert.deepEqual(scopedAnswer.sources.map(row => row.url), [url]);
 
+    let verticalCalls = 0, activeVerticalCalls = 0, peakVerticalCalls = 0;
+    app.locals.veyraVerticalSearch = {
+      async search(type, query, options) {
+        verticalCalls++;
+        if (options.preview) {
+          assert.equal(options.noCache, true, "guest category previews cannot use shared caches");
+          peakVerticalCalls = Math.max(peakVerticalCalls, ++activeVerticalCalls);
+          await new Promise(resolve => setImmediate(resolve));
+          activeVerticalCalls--;
+        }
+        if (type === "news") throw Error("provider unreachable");
+        if (type === "research") return { type, status: "empty", results: [] };
+        const candidate = { url: "https://public.example/vertical-result", provider: "fixture", title: "Provider title is not evidence", snippet: "Provider snippet is not evidence" };
+        return { type, status: "ok", provider: "fixture", results: Array(4).fill(candidate) };
+      }
+    };
+    const aggregateResponse = await fetch(`${base}/api/search/vertical?type=all&q=category+fixture`);
+    assert.equal(aggregateResponse.headers.get("cache-control"), "no-store");
+    const aggregate = await aggregateResponse.json();
+    assert.deepEqual(aggregate.sections.map(s => s.type), ["images", "videos", "news", "shopping", "research", "discussions"]);
+    assert.equal(aggregate.sections[0].results.length, 3);
+    assert.equal(aggregate.sections[2].status, "unavailable");
+    assert.equal(aggregate.sections[4].status, "empty");
+    assert.equal(peakVerticalCalls, 3);
+    assert.equal((await fetch(`${base}/api/search/vertical?type=images&page=1&q=category`)).status, 400);
+    assert.equal((await fetch(`${base}/api/search/vertical?type=images&page=4&provider=fixture&q=category`)).status, 400);
+    const getSummary = async (body, { suffix = "", headers = { authorization } } = {}) => (await fetch(`${base}/api/search/answer${suffix}`, {
+      method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body)
+    })).json();
+    assert.equal((await getSummary({ query: "category fixture", vertical: "videos" }, { headers: {} })).hasAnswer, false);
+    assert.equal((await getSummary({ query: "category fixture", vertical: "videos" }, { suffix: "?private=1" })).hasAnswer, false);
+    assert.equal(verticalCalls, 6, "private and guest summarization do not look up categories");
+    assert.equal((await getSummary({ query: "category fixture", vertical: "research" })).hasAnswer, false);
+    assert.equal((await getSummary({ query: "site:outside.example category fixture", vertical: "images" })).hasAnswer, false);
+    app.locals.veyraAnswerEngine = {
+      async answer(query, results, options) {
+        assert.equal(query, "category fixture");
+        assert.equal(options.requirePageEvidence, true);
+        assert.equal(options.vertical, "videos");
+        assert.ok(results.length > 0);
+        assert.ok(results.every(row => row.url === "https://public.example/vertical-result" && !row.contentText && !row.snippet && !row.title));
+        return { hasAnswer: false, reason: "No readable source evidence found" };
+      }
+    };
+    const categoryAnswer = await getSummary({ query: "category fixture", vertical: "videos", results: [{ url: "https://evil.example/", contentText: "Untrusted text" }] });
+    assert.equal(categoryAnswer.hasAnswer, false);
+    assert.equal(categoryAnswer.vertical, "videos");
+
     assert.match(answer.observationId, /^obs_[A-Za-z0-9_-]{20,40}$/);
     assert.equal(answer.qualityLearning.calibrated, false, "the learned quality estimate must not be presented as calibrated confidence");
-    const feedbackResponse = await fetch(`${base}/api/search/answer/feedback`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ observationId: answer.observationId, rating: "unhelpful" }) });
+    const feedbackBody = JSON.stringify({ observationId: answer.observationId, rating: "unhelpful" });
+    const postFeedback = (suffix, headers) => fetch(`${base}/api/search/answer/feedback${suffix}`, { method: "POST", headers: { "content-type": "application/json", ...headers }, body: feedbackBody });
+    assert.equal((await postFeedback("", {})).status, 401);
+    assert.equal((await postFeedback("?private=1", { authorization })).status, 401);
+    const anotherAccount = await (await fetch(`${base}/api/auth/signup`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: "other-search-fixture@example.test", password: "another-fixture-42" }) })).json();
+    assert.ok(anotherAccount.token);
+    assert.equal((await postFeedback("", { authorization: `Bearer ${anotherAccount.token}` })).status, 410);
+    const feedbackResponse = await postFeedback("", { authorization });
     const feedback = await feedbackResponse.json();
     assert.equal(feedbackResponse.status, 200);
     assert.equal(feedback.trained, true);
     assert.equal(feedback.optimizer, "AdamW");
     assert.ok(feedback.scoreAfter < feedback.scoreBefore, "unhelpful feedback should lower the predicted quality for that profile");
-    const replay = await fetch(`${base}/api/search/answer/feedback`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ observationId: answer.observationId, rating: "helpful" }) });
+    const replay = await postFeedback("", { authorization });
     assert.equal(replay.status, 409, "the same answer feedback token cannot train the model twice");
     const aiStatus = await (await fetch(`${base}/api/answer/status`)).json();
     assert.equal(aiStatus.qualityLearning.trainingExamples, 1);
@@ -176,6 +231,8 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     console.log("Search, answer and YouTube Express routes passed controlled local integration tests");
   } finally {
     delete app.locals.veyraWebSearch;
+    delete app.locals.veyraVerticalSearch;
+    delete app.locals.veyraAnswerEngine;
     delete app.locals.veyraNeuralRobotPool;
     delete app.locals.veyraYoutubeFetch;
     await new Promise(resolve => server.close(resolve));

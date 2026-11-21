@@ -1,0 +1,259 @@
+"use strict";
+
+const cheerio = require("cheerio");
+const { isIP } = require("node:net");
+const { parseSiteScope, allowsSiteUrl } = require("./search-site-scope");
+const { rankVertical, rankerVersion } = require("./vertical-ranker");
+
+const TYPES = Object.freeze(["images", "videos", "news", "shopping", "research", "discussions"]);
+const PAGE_SIZE = 12;
+const ENDPOINT = "https://api.search.brave.com/res/v1";
+const TIMEOUT = 4400;
+const THUMB_HOSTS = new Set(["imgs.search.brave.com", "upload.wikimedia.org", "thumb.wikimedia.org", "i.ebayimg.com", "i.ytimg.com"]);
+
+function safeUrl(value) {
+  try {
+    const u = new URL(value);
+    if (!/^https?:$/.test(u.protocol) || u.username || u.password || u.port ||
+        !u.hostname.includes(".") || isIP(u.hostname) || /(?:^|\.)(localhost|local|internal)$/i.test(u.hostname)) return "";
+    u.hash = "";
+    return u.href.length <= 2048 ? u.href : "";
+  } catch { return ""; }
+}
+function thumbnail(value) {
+  const url = safeUrl(value);
+  return url && url.startsWith("https:") && THUMB_HOSTS.has(new URL(url).hostname) ? url : "";
+}
+function plain(value, max = 300) {
+  if (typeof value !== "string") return "";
+  const $ = cheerio.load(value.slice(0, 5000), {}, false);
+  $("script,style,iframe").remove();
+  return $.root().text().replace(/\s+/g, " ").trim().slice(0, max);
+}
+function isoDate(value) {
+  if (!value) return "";
+  const n = Date.parse(value);
+  return Number.isFinite(n) ? new Date(n).toISOString() : "";
+}
+function matchingHost(host, names) { return names.some(name => host === name || host.endsWith(`.${name}`)); }
+function testLink(type, value) {
+  const url = safeUrl(value);
+  if (!url) return false;
+  const u = new URL(url);
+  if (type === "videos") return (matchingHost(u.hostname, ["youtube.com"]) && ((u.pathname === "/watch" && /^[\w-]{11}$/.test(u.searchParams.get("v") || "")) || /^\/shorts\/[\w-]{11}\/?$/.test(u.pathname))) || (matchingHost(u.hostname, ["vimeo.com"]) && /\/\d+\/?$/.test(u.pathname));
+  if (type === "shopping") return (matchingHost(u.hostname, ["amazon.com", "amazon.co.uk"]) && /\/(?:dp|gp\/product)\/[A-Z0-9]{10}(?:\/|$)/i.test(u.pathname)) || (matchingHost(u.hostname, ["ebay.com", "ebay.co.uk"]) && /^\/itm\/(?:[^/]+\/)?\d+\/?$/.test(u.pathname)) || (matchingHost(u.hostname, ["etsy.com"]) && /\/listing\/\d+(?:\/|$)/.test(u.pathname));
+  return true;
+}
+function row(type, provider, item) {
+  const url = safeUrl(item.url), title = plain(item.title);
+  if (!url || !title) return null;
+  const amount = String(item.price?.value ?? "");
+  const price = /^\d{1,12}(?:\.\d{1,4})?$/.test(amount) && /^[A-Z]{3}$/.test(item.price?.currency || "") ? { value: amount, currency: item.price.currency } : null;
+  return {
+    type, provider, url, title, source: plain(item.source, 120) || new URL(url).hostname.replace(/^www\./, ""),
+    snippet: plain(item.snippet, 500), thumbnail: thumbnail(item.thumbnail),
+    publishedAt: isoDate(item.publishedAt), duration: plain(item.duration, 32), license: plain(item.license, 48),
+    condition: plain(item.condition, 60), price
+  };
+}
+function queryUrl(origin, params) {
+  const url = new URL(origin);
+  for (const [key, value] of Object.entries(params)) if (value !== "" && value != null) url.searchParams.set(key, String(value));
+  return url.href;
+}
+
+function createVerticalSearch({ fetchText, webSearch, env = process.env }) {
+  const cache = new Map(), cooldown = new Map();
+  let ebayToken, ebayTokenPromise;
+  const braveKey = String(env.BRAVE_SEARCH_API_KEY || "").trim();
+  const market = /^[A-Z]{2}$/.test(String(env.VEYRA_EBAY_MARKET || "")) ? env.VEYRA_EBAY_MARKET : "GB";
+  async function get(url, signal, options = {}) {
+    if (signal?.aborted) throw new Error("Cancelled");
+    const response = await fetchText(url, { signal, timeoutMs: TIMEOUT, ...options });
+    if (!response.ok) throw Object.assign(new Error("Provider request failed"), { status: response.status });
+    return options.raw ? response.text : JSON.parse(response.text);
+  }
+  async function brave(type, q, { page, lang, signal }) {
+    const offset = type === "images" ? null : page;
+    const json = await get(queryUrl(`${ENDPOINT}/${type}/search`, { q, count: type === "images" ? PAGE_SIZE * 4 : PAGE_SIZE, offset, search_lang: lang, safesearch: "strict" }), signal, { headers: { "X-Subscription-Token": braveKey } });
+    if (!Array.isArray(json.results)) throw new Error("Invalid results");
+    const results = json.results.map(item => row(type, "brave", {
+      ...item, source: item.source || item.video?.creator || item.meta_url?.hostname,
+      thumbnail: item.thumbnail?.src, snippet: item.description, duration: item.video?.duration,
+      publishedAt: item.page_age || item.video?.published
+    }));
+    return { provider: "brave", results, whole: type === "images", more: type !== "images" && (json.query?.more_results_available ?? results.length === PAGE_SIZE) };
+  }
+  async function commons(type, q, { page, signal }) {
+    const json = await get(queryUrl("https://commons.wikimedia.org/w/api.php", {
+      action: "query", format: "json", formatversion: 2, generator: "search", gsrnamespace: 6, gsrsearch: q,
+      gsrlimit: PAGE_SIZE, gsroffset: page * PAGE_SIZE, prop: "imageinfo", iiprop: "url|mime|extmetadata",
+      iiextmetadatafilter: "LicenseShortName", iiurlwidth: 480
+    }), signal);
+    if (json.error) throw new Error("Invalid Commons response");
+    const results = (json.query?.pages || []).sort((a, b) => (a.index || 0) - (b.index || 0)).map(item => {
+      const image = item.imageinfo?.[0];
+      if (!image?.mime?.startsWith("image/") || !thumbnail(image.thumburl)) return null;
+      return row(type, "wikimedia", { title: item.title.replace(/^File:/, "").replace(/\.[\w]{2,5}$/, ""), url: image.descriptionurl, thumbnail: image.thumburl, source: "Wikimedia Commons", license: image.extmetadata?.LicenseShortName?.value });
+    });
+    return { provider: "wikimedia", results, more: json.continue?.gsroffset === (page + 1) * PAGE_SIZE };
+  }
+  async function newsFeed(type, q, { lang, signal }) {
+    const region = lang === "en" ? "GB" : ({ fr: "FR", de: "DE", es: "ES", it: "IT", pt: "BR", nl: "NL", ja: "JP" })[lang] || "GB";
+    const xml = await get(queryUrl("https://news.google.com/rss/search", { q, hl: `${lang}-${region}`, gl: region, ceid: `${region}:${lang}` }), signal, { raw: true, accept: "application/rss+xml,application/xml" });
+    const $ = cheerio.load(xml, { xml: true });
+    if (!$("rss > channel").length) throw new Error("Invalid RSS feed");
+    const results = $("channel > item").slice(0, PAGE_SIZE * 4).toArray().map(node => {
+      const item = $(node);
+      return row(type, "google-news-rss", { url: item.children("link").text(), title: item.children("title").text(), source: item.children("source").text(), publishedAt: item.children("pubDate").text() });
+    });
+    return { provider: "google-news-rss", results, whole: true };
+  }
+  async function crossref(type, q, { page, signal }) {
+    const json = await get(queryUrl("https://api.crossref.org/works", { "query.bibliographic": q, rows: PAGE_SIZE, offset: page * PAGE_SIZE, select: "DOI,title,container-title,publisher,published,type,author", filter: "type:journal-article" }), signal);
+    if (!Array.isArray(json.message?.items)) throw new Error("Invalid Crossref response");
+    const results = json.message.items.map(item => {
+      if (!/^10\.\d{4,9}\/\S{1,500}$/i.test(item.DOI || "")) return null;
+      const parts = item.published?.["date-parts"]?.[0];
+      const authors = (item.author || []).slice(0, 3).map(a => [a.given, a.family].filter(Boolean).join(" ")).filter(Boolean);
+      const publishedAt = parts?.length === 3 ? parts.map((n, i) => String(n).padStart(i ? 2 : 4, "0")).join("-") : "";
+      return row(type, "crossref", { title: item.title?.[0], url: `https://doi.org/${item.DOI.split("/").map(encodeURIComponent).join("/")}`, source: item["container-title"]?.[0] || item.publisher, snippet: [authors.join(", "), !publishedAt && parts?.[0]].filter(Boolean).join(" · "), publishedAt });
+    });
+    return { provider: "crossref", results, more: Number(json.message["total-results"]) > (page + 1) * PAGE_SIZE };
+  }
+  async function discussions(type, q, { page, signal }) {
+    const json = await get(queryUrl("https://hn.algolia.com/api/v1/search", { query: q, tags: "story", page, hitsPerPage: PAGE_SIZE }), signal);
+    if (!Array.isArray(json.hits)) throw new Error("Invalid Hacker News response");
+    const results = json.hits.filter(item => /^\d+$/.test(item.objectID)).map(item => row(type, "hacker-news", { url: `https://news.ycombinator.com/item?id=${item.objectID}`, title: item.title, snippet: item.story_text, source: "Hacker News", publishedAt: item.created_at }));
+    return { provider: "hacker-news", results, more: json.nbPages > page + 1 };
+  }
+  async function youtube(type, q, { signal, lang }) {
+    // search.list is expensive; the optional adapter is only used after Brave.
+    const json = await get(queryUrl("https://www.googleapis.com/youtube/v3/search", { part: "snippet", q, type: "video", maxResults: PAGE_SIZE, safeSearch: "strict", relevanceLanguage: lang, key: env.YOUTUBE_DATA_API_KEY }), signal);
+    if (!Array.isArray(json.items)) throw new Error("Invalid YouTube response");
+    const results = json.items.filter(item => /^[\w-]{11}$/.test(item.id?.videoId || "")).map(item => row(type, "youtube", {
+      url: `https://www.youtube.com/watch?v=${item.id.videoId}`, title: item.snippet?.title, source: item.snippet?.channelTitle,
+      snippet: item.snippet?.description, publishedAt: item.snippet?.publishedAt, thumbnail: item.snippet?.thumbnails?.medium?.url
+    }));
+    return { provider: "youtube", results, more: false };
+  }
+  async function peertube(type, q, { page, signal }) {
+    const json = await get(queryUrl("https://sepiasearch.org/api/v1/search/videos", {
+      search: q, start: page * PAGE_SIZE, count: PAGE_SIZE, nsfw: "false", sort: "-match"
+    }), signal);
+    if (!Array.isArray(json.data)) throw new Error("Invalid Sepia Search response");
+    const results = json.data.filter(item => item.nsfw === false && item.privacy?.id === 1).map(item => {
+      const url = safeUrl(item.url);
+      if (!url || !/^\/(?:videos\/watch|w)\/[\w-]+\/?$/.test(new URL(url).pathname)) return null;
+      const seconds = Math.floor(Number(item.duration));
+      const duration = seconds > 0 ? `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}` : "";
+      // Federated preview hosts are deliberately not given a wildcard CSP rule.
+      return row(type, "peertube", { url, title: item.name, snippet: item.truncatedDescription || item.description, source: item.channel?.displayName || item.account?.displayName, duration, publishedAt: item.publishedAt });
+    });
+    return { provider: "peertube", results, more: json.total > (page + 1) * PAGE_SIZE };
+  }
+  async function ebay(type, q, { page, signal }) {
+    if (!ebayToken || ebayToken.until <= Date.now()) {
+      if (!ebayTokenPromise) {
+        const auth = Buffer.from(`${env.EBAY_CLIENT_ID}:${env.EBAY_CLIENT_SECRET}`).toString("base64");
+        ebayTokenPromise = get("https://api.ebay.com/identity/v1/oauth2/token", undefined, {
+          method: "POST", headers: { Authorization: `Basic ${auth}`, "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ grant_type: "client_credentials", scope: "https://api.ebay.com/oauth/api_scope" }).toString()
+        }).then(json => {
+          if (typeof json.access_token !== "string" || !json.access_token || !(Number(json.expires_in) > 0)) throw new Error("Invalid eBay token");
+          return ebayToken = { value: json.access_token, until: Date.now() + Math.max(0, Math.min(7200, Number(json.expires_in)) - 30) * 1000 };
+        }).finally(() => { ebayTokenPromise = null; });
+      }
+      await ebayTokenPromise;
+    }
+    let json;
+    try {
+      json = await get(queryUrl("https://api.ebay.com/buy/browse/v1/item_summary/search", { q, limit: PAGE_SIZE, offset: page * PAGE_SIZE, filter: "buyingOptions:{FIXED_PRICE}" }), signal, {
+        headers: { Authorization: `Bearer ${ebayToken.value}`, "X-EBAY-C-MARKETPLACE-ID": `EBAY_${market}` }
+      });
+    } catch (error) { if (error.status === 401) ebayToken = null; throw error; }
+    if (!Array.isArray(json.itemSummaries) && json.total !== 0) throw new Error("Invalid eBay listing response");
+    const results = (json.itemSummaries || []).filter(item => {
+      const url = safeUrl(item.itemWebUrl);
+      if (!url) return false;
+      const u = new URL(url);
+      return matchingHost(u.hostname, ["ebay.com", "ebay.co.uk", "ebay.de", "ebay.fr", "ebay.ca", "ebay.com.au"]) && /^\/itm\/(?:[^/]+\/)?\d+\/?$/.test(u.pathname);
+    }).map(item => row(type, "ebay", {
+      url: item.itemWebUrl, title: item.title, source: item.seller?.username ? `eBay · ${item.seller.username}` : "eBay",
+      thumbnail: item.image?.imageUrl, condition: item.condition, price: item.price
+    }));
+    return { provider: "ebay", results, more: !!json.next };
+  }
+  async function webCategory(type, q, { page, signal, lang, noCache }) {
+    // No site operators here: the existing web engine treats multiple sites
+    // as an intersection, not a disjunction. Enforce concrete URLs below.
+    const packed = await webSearch(`${q} ${type === "videos" ? "YouTube video" : "buy online"}`, { offset: page * PAGE_SIZE, limit: PAGE_SIZE, lang, signal, noCache });
+    if (packed.attempts?.length && packed.attempts.every(attempt => attempt.error || attempt.skipped)) throw new Error("No provider reached");
+    const results = (packed.results || []).filter(item => testLink(type, item.url)).map(item => {
+      let poster = "";
+      if (type === "videos") {
+        const u = new URL(item.url);
+        const videoId = u.searchParams.get("v") || /^\/shorts\/([\w-]{11})/.exec(u.pathname)?.[1];
+        if (matchingHost(u.hostname, ["youtube.com"]) && videoId) poster = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+      }
+      return row(type, "web-discovery", { url: item.url, title: item.title, source: item.source, snippet: item.snippet || item.description, thumbnail: poster });
+    });
+    return { provider: "web-discovery", results, more: !!packed.more };
+  }
+  function adapters(type, page, preview) {
+    const list = [];
+    if (braveKey && ["images", "videos", "news"].includes(type)) list.push(["brave", brave]);
+    if (type === "images") list.push(["wikimedia", commons]);
+    if (type === "videos" && !page && !preview && env.YOUTUBE_DATA_API_KEY && env.VEYRA_YOUTUBE_SEARCH === "1") list.push(["youtube", youtube]);
+    if (type === "videos") list.push(["peertube", peertube]);
+    if (type === "news") list.push(["google-news-rss", newsFeed]);
+    if (type === "shopping" && env.EBAY_CLIENT_ID && env.EBAY_CLIENT_SECRET) list.push(["ebay", ebay]);
+    if (type === "videos" || type === "shopping") list.push(["web-discovery", webCategory]);
+    if (type === "research") list.push(["crossref", crossref]);
+    if (type === "discussions") list.push(["hacker-news", discussions]);
+    return list;
+  }
+  async function search(type, rawQuery, { page = 0, lang = "en", signal, noCache = true, provider = "", preview = false } = {}) {
+    if (!TYPES.includes(type)) throw new Error("Unknown vertical");
+    const started = Date.now(), scope = parseSiteScope(rawQuery), q = String(rawQuery).trim().slice(0, 400);
+    const language = /^[a-z]{2}$/i.test(lang) ? lang.toLowerCase() : "en";
+    const siteFilter = scope.active ? { include: scope.include, exclude: scope.exclude, invalid: scope.invalid } : null;
+    const empty = status => ({ type, status, provider: "none", ranking: rankerVersion, results: [], nextPage: null, siteFilter, responseTimeMs: Date.now() - started });
+    if (scope.invalid) return empty("invalid-scope");
+    if (!q || (scope.active && !scope.text)) return empty("empty");
+    const attempts = [];
+    for (const [name, run] of adapters(type, page, preview)) {
+      if (signal?.aborted) return empty("cancelled");
+      if (provider && provider !== name) continue;
+      const breaker = `${name}:${name === "brave" ? type : ""}`;
+      if ((cooldown.get(breaker) || 0) > Date.now()) { attempts.push("unavailable"); continue; }
+      const singleFeed = name === "google-news-rss" || (name === "brave" && type === "images");
+      const key = JSON.stringify([name, type, q, language, singleFeed ? 0 : page]);
+      const saved = noCache ? null : cache.get(key);
+      try {
+        const providerQuery = name === "brave" ? q : (scope.text || q).slice(0, 400);
+        const packed = saved?.until > Date.now() ? saved.packed : await run(type, providerQuery, { page, lang: language, signal, noCache });
+        if (signal?.aborted) return empty("cancelled");
+        const seen = new Set();
+        const known = packed.results.filter(item => item && allowsSiteUrl(scope, item.url) && !seen.has(item.url) && seen.add(item.url));
+        const ranked = rankVertical(scope.text || q, known);
+        const results = packed.whole ? ranked.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE) : ranked;
+        const hasNext = packed.whole ? ranked.length > (page + 1) * PAGE_SIZE : packed.more;
+        if (!results.length && !provider) { attempts.push("empty"); continue; }
+        if (!noCache && results.length && !(saved?.until > Date.now())) {
+          cache.set(key, { packed, until: Date.now() + 45_000 });
+          if (cache.size > 100) cache.delete(cache.keys().next().value);
+        }
+        return { ...empty(results.length ? "ok" : "empty"), results, provider: packed.provider, nextPage: hasNext && page < 3 ? page + 1 : null, observedAt: new Date().toISOString() };
+      } catch (error) {
+        if (signal?.aborted) return empty("cancelled");
+        if ([401, 403, 429].includes(error.status)) cooldown.set(breaker, Date.now() + 30_000);
+        attempts.push("unavailable");
+      }
+    }
+    return empty(attempts.includes("empty") ? "empty" : "unavailable");
+  }
+  return { search };
+}
+
+module.exports = { createVerticalSearch, TYPES, PAGE_SIZE, safeUrl };

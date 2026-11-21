@@ -14,6 +14,7 @@ const { VpnManager } = require("./network/vpn");
 const { createShield } = require("./network/shield");
 const { upstreamHeaderCapOptions } = require("./network/header-cap");
 const { createWebSearch } = require("./services/websearch");
+const { createVerticalSearch, TYPES: SEARCH_VERTICALS, safeUrl: verticalResultUrl } = require("./services/vertical-search");
 const { parseSiteScope, allowsSiteUrl } = require("./services/search-site-scope");
 const { installBrandRoutes, isReservedOriginPath, brandNotFoundHtml } = require("./services/brand");
 const VEYRA_VERSION = require("../package.json").version;
@@ -1592,6 +1593,17 @@ const webSearch = createWebSearch({
   },
   env: process.env,
   log: (level, source, message) => serverLog(level, source, message)
+});
+const verticalSearch = createVerticalSearch({
+  webSearch: (query, opts) => (app.locals.veyraWebSearch || webSearch).search(query, opts),
+  fetchText: async (url, opts) => {
+    const r = await fetchBuffer(url, {
+      method: opts.method, body: opts.body, headers: opts.headers, accept: opts.accept || "application/json",
+      timeout: opts.timeoutMs, signal: opts.signal, retries: 0, maxRedirects: 0, limit: 1024 * 1024,
+      userAgent: `VeyraSearch/${VEYRA_VERSION} (+https://github.com/HomekidChud/VeyraServer)`
+    });
+    return { ok: r.ok && !r.truncated, status: r.status, text: r.body.toString("utf8") };
+  }
 });
 
 const acquisitionManager = new AcquisitionManager({
@@ -6105,6 +6117,37 @@ app.get('/api/search/web', async (req, res) => {
   } finally { request.dispose(); }
 });
 
+app.get("/api/search/vertical", async (req, res) => {
+  const type = typeof req.query.type === "string" ? req.query.type : "";
+  const q = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 600) : "";
+  const page = Number(req.query.page ?? 0);
+  const provider = typeof req.query.provider === "string" ? req.query.provider : "";
+  if ((type !== "all" && !SEARCH_VERTICALS.includes(type)) || !Number.isInteger(page) || page < 0 || page > 3 || (page > 0 && !provider) || !/^[a-z-]{0,24}$/.test(provider) || (type === "all" && (page || provider))) {
+    return respondError(res, 400, "Invalid search category or page.", "INVALID_SEARCH_CATEGORY");
+  }
+  const request = requestAbortSignal(req, res);
+  try {
+    const signal = AbortSignal.any([request.signal, AbortSignal.timeout(type === "all" ? 12000 : 9000)]);
+    const service = app.locals.veyraVerticalSearch || verticalSearch;
+    const options = { page, provider, lang: req.query.lang, signal, noCache: req.veyraPrivateTraffic || !CFG.globalCacheEnabled, preview: type === "all" };
+    if (type !== "all") return res.json({ ok: true, ...await service.search(type, q, options) });
+    let cursor = 0;
+    const sections = Array(SEARCH_VERTICALS.length);
+    await Promise.all(Array.from({ length: 3 }, async () => {
+      while (cursor < SEARCH_VERTICALS.length && !signal.aborted) {
+        const index = cursor++, category = SEARCH_VERTICALS[index];
+        try {
+          const section = await service.search(category, q, options);
+          sections[index] = { ...section, results: section.results.slice(0, 3) };
+        } catch { sections[index] = { type: category, status: "unavailable", results: [] }; }
+      }
+    }));
+    res.json({ ok: true, type, sections: SEARCH_VERTICALS.map((category, index) => sections[index] || { type: category, status: "unavailable", results: [] }) });
+  } catch {
+    if (!request.signal.aborted) respondError(res, 502, "This search category is temporarily unavailable.", "SEARCH_CATEGORY_ERROR");
+  } finally { request.dispose(); }
+});
+
 app.get('/api/browser/status', (req, res) => res.json({ ok: true, ...browserEngine.status(), failover: failoverController ? failoverController.report() : null, snapshots: snapshotStore ? snapshotStore.report() : null, config: { backend: CFG.browserBackend, enabled: CFG.browserEnabled, headless: CFG.browserHeadless, maxSessions: CFG.maxBrowserSessions, maxPages: CFG.maxBrowserPages, maxContexts: CFG.maxBrowserContexts } }));
 
 
@@ -6157,11 +6200,11 @@ function queueNeuralIndexFindings(query, sources = []) {
 }
 const aiAnswerEngine = new AIAnswerEngine({ acquisitionManager });
 const aiAnswerFeedbackObservations = new Map();
-function rememberAIAnswerForFeedback(id, answer) {
+function rememberAIAnswerForFeedback(id, answer, userId) {
   const now = Date.now();
   for (const [key, value] of aiAnswerFeedbackObservations) if (now - value.createdAt > 24 * 60 * 60 * 1000) aiAnswerFeedbackObservations.delete(key);
   const features = aiAnswerEngine.qualityModel.features({ answer: answer.answer, grounding: answer.grounding, sources: answer.sources, intent: answer.intent });
-  aiAnswerFeedbackObservations.set(id, { features: Array.from(features), createdAt: now, feedbackGiven: false });
+  aiAnswerFeedbackObservations.set(id, { features: Array.from(features), createdAt: now, feedbackGiven: false, userId });
   while (aiAnswerFeedbackObservations.size > 2000) aiAnswerFeedbackObservations.delete(aiAnswerFeedbackObservations.keys().next().value);
 }
 async function persistAIObservation(id, query, results, answer) {
@@ -6172,22 +6215,35 @@ async function persistAIObservation(id, query, results, answer) {
   await mongoStore.recordAIObservation({ id, query, answer: answer?.answer || "", hasAnswer: !!answer?.hasAnswer, generatedBy: answer?.generatedBy || "", sources: answer?.sources || [], results: rows, pipeline: answer?.pipeline || {}, grounding: answer?.grounding || {} });
 }
 app.post('/api/search/answer', async (req, res) => {
-  if (req.query.private === "1" || !authStore.userFromRequest(req)) {
+  const user = authStore.userFromRequest(req);
+  if (req.query.private === "1" || !user) {
     req.veyraPrivateTraffic = true;
     return res.set("Cache-Control", "no-store").json({ hasAnswer: false, reason: "AI answers are off in private browsing." });
   }
   const routeStartedAt = Date.now();
   const request = requestAbortSignal(req, res);
   try {
-    const { query } = req.body;
-    let { results } = req.body;
+    const query = typeof req.body?.query === "string" ? req.body.query.trim().slice(0, 600) : "";
+    const vertical = req.body?.vertical;
+    let { results } = req.body || {};
     let retrievalDiagnostics = null;
     if (!query) return res.json({ hasAnswer: false, reason: 'No query provided' });
+    if (vertical != null && !SEARCH_VERTICALS.includes(vertical)) return respondError(res, 400, "Invalid answer category.", "INVALID_SEARCH_CATEGORY");
     const scope = parseSiteScope(String(query).trim());
     if (scope.invalid) return res.json({ hasAnswer: false, reason: "Use a valid hostname with site:." });
     const inScope = row => row && allowsSiteUrl(scope, row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl));
     if (scope.active && Array.isArray(results)) results = results.filter(inScope);
-    if (!Array.isArray(results) || !results.length) {
+    if (vertical) {
+      const section = await (app.locals.veyraVerticalSearch || verticalSearch).search(vertical, query, {
+        signal: AbortSignal.any([request.signal, AbortSignal.timeout(7500)]), lang: req.body.lang, noCache: !CFG.globalCacheEnabled
+      });
+      // Use server-discovered source links only. A product price, image,
+      // video description, or research listing is not verified page evidence.
+      results = section.results.filter(row => row && verticalResultUrl(row.url) && inScope(row))
+        .slice(0, 6).map(row => ({ url: row.url, provider: row.provider }));
+      retrievalDiagnostics = { vertical, provider: section.provider, candidates: results.length };
+      if (!results.length) return res.json({ hasAnswer: false, reason: "No source pages are available in this category to support a summary.", vertical });
+    } else if (!Array.isArray(results) || !results.length) {
       const normalizedQuery = String(query).slice(0, CFG.maxSearchQueryChars);
       const localSearchStartedAt = Date.now();
       const local = localSearch(query, 0, Math.min(4, CFG.maxSearchResults), { includeText: true, maxTextChars: 30000 });
@@ -6217,28 +6273,34 @@ app.post('/api/search/answer', async (req, res) => {
       results = [...combined.values()].filter(inScope);
       retrievalDiagnostics = { localCandidates: local.results.length, localSearchMs, externalDiscoveryMs: Date.now() - externalDiscoveryStartedAt, external: discovered.metrics, providers: discovered.attempts || [], mergedCandidates: results.length, webSearchResults: externalDiscoveries.slice(0, CFG.maxSearchResults).map(row => ({ url: row.url, title: row.title || "", snippet: String(row.snippet || row.description || "").slice(0, 700), provider: row.provider || "", providers: row.providers || [] })).filter(row => row.url) };
     }
-    const answer = await aiAnswerEngine.answer(scope.active ? scope.text : query, results || [], { signal: request.signal, retrievalDiagnostics, ...(scope.active ? { allowSource: inScope } : {}) });
+    const answer = await (app.locals.veyraAnswerEngine || aiAnswerEngine).answer(scope.active ? scope.text : query, results || [], {
+      signal: request.signal, retrievalDiagnostics, requirePageEvidence: !!vertical, vertical,
+      ...(scope.active ? { allowSource: inScope } : {})
+    });
+    if (vertical) answer.vertical = vertical;
     if (scope.active && (answer.sources || []).some(row => !inScope(row))) return res.json({ hasAnswer: false, reason: "An answer could not be grounded within the requested site." });
-    if (retrievalDiagnostics) answer.searchResults = retrievalDiagnostics.webSearchResults || [];
+    if (retrievalDiagnostics?.webSearchResults) answer.searchResults = retrievalDiagnostics.webSearchResults;
     const routeResponseTimeMs = Date.now() - routeStartedAt;
     answer.responseTimeMs = routeResponseTimeMs;
     answer.pipeline = { ...(answer.pipeline || {}), answerGenerationMs: answer.pipeline?.latencyMs ?? null, responseTimeMs: routeResponseTimeMs };
     if (answer.hasAnswer) {
       const observationId = `obs_${crypto.randomBytes(18).toString("base64url")}`;
       answer.observationId = observationId;
-      rememberAIAnswerForFeedback(observationId, answer);
-      void persistAIObservation(observationId, query, results || [], answer).catch(e => serverLog("warn", "AI", `AI observation persistence failed: ${e.message}`));
+      rememberAIAnswerForFeedback(observationId, answer, user.id);
+      if (!vertical) void persistAIObservation(observationId, query, results || [], answer).catch(e => serverLog("warn", "AI", `AI observation persistence failed: ${e.message}`));
     }
     res.json(answer);
   } catch (e) { res.json({ hasAnswer: false, reason: "Answer retrieval or synthesis failed.", code: /^[A-Z0-9_:-]{1,64}$/i.test(String(e?.code || "")) ? String(e.code) : "ANSWER_PIPELINE_ERROR" }); }
   finally { request.dispose(); }
 });
 app.post("/api/search/answer/feedback", async (req, res) => {
+  const user = authStore.userFromRequest(req);
+  if (req.query.private === "1" || !user) return respondError(res, 401, "Sign in to submit answer feedback.", "ANSWER_FEEDBACK_AUTH_REQUIRED");
   const observationId = String(req.body?.observationId || "");
   const rating = String(req.body?.rating || "").toLowerCase();
   if (!/^obs_[A-Za-z0-9_-]{20,40}$/.test(observationId) || !["helpful", "unhelpful"].includes(rating)) return res.status(400).json({ ok: false, error: "A valid observationId and helpful/unhelpful rating are required." });
   const observation = aiAnswerFeedbackObservations.get(observationId);
-  if (!observation) return res.status(410).json({ ok: false, error: "This answer feedback token has expired or is unknown." });
+  if (!observation || observation.userId !== user.id) return res.status(410).json({ ok: false, error: "This answer feedback token has expired or is unknown." });
   if (observation.feedbackGiven) return res.status(409).json({ ok: false, error: "Feedback was already recorded for this answer." });
   const training = aiAnswerEngine.qualityModel.train(observation.features, rating === "helpful");
   observation.feedbackGiven = true;

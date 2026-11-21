@@ -42,6 +42,7 @@ assert.equal(verified.unsupported, 0);
 const invented = engine.verifyAnswer("Hi is a greeting that cures migraines in every patient. [S1]", evidence);
 assert.equal(invented.supported, 0);
 assert.equal(invented.unsupported, 1, "valid citation ID alone must not make an unsupported claim pass");
+assert.equal(engine.verifyAnswer(`${local.answer} Costs £100`, evidence, { strict: true }).unsupported, 1, "category summaries must not ignore a short or unpunctuated claim");
 const quality = engine.evidenceQuality(evidence, evidence.slice(0, 1), verified, engine.detectIntent("What is hi?"));
 assert.ok(quality.score >= 0 && quality.score <= 1);
 assert.match(quality.label, /evidence|verify/i);
@@ -80,6 +81,28 @@ assert.equal(qualityEvaluation.after.byCase["invented-citation"].overlapPassed, 
 assert.ok(qualityEvaluation.after.logLoss < qualityEvaluation.before.logLoss, "offline scorer should improve fixture loss");
 
 (async () => {
+  const classifier = new AIAnswerEngine({ allowExtractiveFallback: true });
+  classifier.fetchContents = async () => [];
+  classifier.synthesizeWithLLM = async () => assert.fail("Provider should not be called without source-page evidence");
+  const snippetOnly = await classifier.answer("Welsh landscape", [{ url: "https://images.example/landscape", snippet: "Welsh landscape photography is presented in this collection." }], { requirePageEvidence: true, vertical: "images" });
+  assert.equal(snippetOnly.hasAnswer, false);
+  assert.equal(snippetOnly.reason, "No readable source evidence found");
+
+  const verifiedSource = { url: "https://images.example/landscape", text: "The Welsh landscape collection records the appearance of mountain ridges in winter. The photographer took each landscape image from a public footpath. The photographs are part of a collection of mountain landscapes.", extractionStatus: "extracted", pageTitle: "Mountain landscapes", rank: 1 };
+  classifier.fetchContents = async () => [verifiedSource];
+  classifier.synthesizeWithLLM = async (q, intent, sources, diagnostics, vertical) => {
+    assert.equal(vertical, "images");
+    assert.equal(sources[0].title, "Mountain landscapes");
+    return { answer: "The Welsh landscape collection records the appearance of mountain ridges in winter. [S1]", keyPoints: ["Not verified"], caveats: ["Not verified"] };
+  };
+  const groundedCategory = await classifier.answer("Welsh landscape", [{ url: verifiedSource.url }], { requirePageEvidence: true, vertical: "images" });
+  assert.equal(groundedCategory.hasAnswer, true);
+  assert.equal(groundedCategory.sources[0].extractionStatus, "extracted");
+  assert.deepEqual(groundedCategory.keyPoints, []);
+  assert.deepEqual(groundedCategory.caveats, []);
+  classifier.synthesizeWithLLM = async () => null;
+  assert.equal((await classifier.answer("Welsh landscape", [{ url: verifiedSource.url }], { requirePageEvidence: true, vertical: "images" })).hasAnswer, false, "no extractive fallback for a category");
+
   const feedbackStore = new MongoStore({ uri: "" });
   let feedbackWrite = null;
   feedbackStore.withDb = async callback => callback({ collection(name) { return { async updateOne(filter, update, options) { feedbackWrite = { name, filter, update, options }; return { acknowledged: true }; } }; } });
