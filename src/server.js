@@ -16,9 +16,9 @@ const { VpnManager } = require("./network/vpn");
 const { createShield } = require("./network/shield");
 const { upstreamHeaderCapOptions } = require("./network/header-cap");
 const { createWebSearch } = require("./services/websearch");
-const { languageTag, normalizeSearchText, unicodeWords, queryLanguage } = require("./services/search-language");
+const { languageTag, normalizeSearchText, unicodeWords } = require("./services/search-language");
 const { walkSitemap, hasRel } = require("./services/crawl-sitemap");
-const { RESEARCH_BATCHES, researchBatch } = require("./services/research-search");
+const { india, indiaAffinity } = require("./services/search-region");
 const { createVerticalSearch, TYPES: SEARCH_VERTICALS, LAST_IMAGE_PAGE, safeUrl: verticalResultUrl } = require("./services/vertical-search");
 const { publicImageUrl, imageIdentity } = require("./services/crawl-page-data");
 const { parseSiteScope, allowsSiteUrl } = require("./services/search-site-scope");
@@ -3698,7 +3698,8 @@ function localSearch(query, offset, limit, options = {}) {
   }
   const ranked = [...candidateScores.entries()].map(([url, score]) => {
     const neural = neuralModel.scoreUrl(url, { type: "html", internal: true });
-    return [url, score + (neural - 0.5) * 0.35, neural];
+    const regionalBoost = india(options.region) ? indiaAffinity(searchIndex.get(url)) : 0;
+    return [url, score * (1 + regionalBoost * 0.16) + (neural - 0.5) * 0.35, neural];
   }).sort((a,b) => b[1] - a[1] || a[0].localeCompare(b[0]));
   const total = ranked.length;
   const results = ranked.slice(offset, offset + limit).map(([url, score, neuralScore]) => {
@@ -6312,7 +6313,7 @@ app.get('/api/search', (req, res) => {
     const offset = Math.max(0, Number(req.query.offset || 0) || 0);
     const limit = Math.min(CFG.maxSearchResults, Math.max(1, Number(req.query.limit || 20) || 20));
     const started = Date.now();
-    const result = localSearch(query, offset, limit);
+    const result = localSearch(query, offset, limit, { region: req.query.region });
     res.json({ ok: true, ...result, provider: "veyra-index", responseTimeMs: Date.now() - started });
   } catch (e) { respondError(res, 500, e.message, "SEARCH_ERROR"); }
 });
@@ -6336,35 +6337,9 @@ function requestAbortSignal(req, res) {
   res.once("close", abort);
   return { signal: controller.signal, dispose() { req.removeListener("aborted", abort); res.removeListener("close", abort); } };
 }
-let activeDeepSearches = 0;
-app.get("/api/search/deep", async (req, res) => {
+app.get("/api/search/deep", (req, res) => {
   res.set("Cache-Control", "no-store");
-  req.veyraPrivateTraffic = true;
-  const query = typeof req.query.q === "string" ? req.query.q.trim() : "";
-  const rawPage = req.query.page ?? "0";
-  const page = /^\d{1,2}$/.test(typeof rawPage === "string" ? rawPage : "") ? Number(rawPage) : -1;
-  if (!query || query.length > 600 || page < 0 || page >= RESEARCH_BATCHES) {
-    return respondError(res, 400, "Provide a search query and a valid results page.", "INVALID_DEEP_SEARCH");
-  }
-  const scope = parseSiteScope(query);
-  if (scope.invalid) return res.json({ ok: true, provider: "veyra-deep", results: [], nextPage: null, siteFilter: { invalid: true } });
-  if (activeDeepSearches >= 3) {
-    res.set("Retry-After", "2");
-    return respondError(res, 429, "Deep Search is busy. Try again in a moment.", "DEEP_SEARCH_BUSY");
-  }
-  const preferred = languageTag(req.query.lang);
-  const lang = queryLanguage(scope.text, preferred === "x-default" ? "" : preferred);
-  const request = requestAbortSignal(req, res);
-  const started = Date.now();
-  activeDeepSearches++;
-  try {
-    const service = app.locals.veyraWebSearch || webSearch;
-    const result = await researchBatch({ query, scope, page, lang, signal: request.signal,
-      localSearch, webSearch: service.search.bind(service) });
-    if (!request.signal.aborted) res.json({ ok: true, ...result, responseTimeMs: Date.now() - started });
-  } catch {
-    if (!request.signal.aborted) respondError(res, 502, "Deep Search is temporarily unavailable.", "DEEP_SEARCH_UNAVAILABLE");
-  } finally { activeDeepSearches--; request.dispose(); }
+  return respondError(res, 410, "Deep Search has been retired. Use Web search instead.", "SEARCH_MODE_RETIRED");
 });
 
 app.get('/api/search/web', async (req, res) => {
@@ -6379,12 +6354,12 @@ app.get('/api/search/web', async (req, res) => {
     const validEngine = new Set(["google", "brave", "bing", "duckduckgo", ""]);
     const selected = validEngine.has(engine) ? engine : "";
     const offset = Math.max(0, Math.floor(Number(req.query.offset || 0)) || 0);
-    const lang = String(req.query.lang || "en").slice(0, 16);
+    const lang = String(req.query.lang || "en").slice(0, 35);
     const limit = Math.min(CFG.maxSearchResults, Math.max(1, Math.floor(Number(req.query.limit || 20)) || 20));
     const started = Date.now();
     const scope = parseSiteScope(input);
     if (scope.invalid) return res.json({ ok: true, results: [], provider: "none", siteFilter: { invalid: true }, more: false, source: "web", responseTimeMs: Date.now() - started });
-    const result = await (app.locals.veyraWebSearch || webSearch).search(q, { offset, limit, engine: selected, lang, signal: request.signal, noCache: isPrivate || !CFG.globalCacheEnabled });
+    const result = await (app.locals.veyraWebSearch || webSearch).search(q, { offset, limit, engine: selected, lang, region: req.query.region, signal: request.signal, noCache: isPrivate || !CFG.globalCacheEnabled });
     const results = (result.results || []).filter(row => row && allowsSiteUrl(scope, row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl)));
     if (!isPrivate) queueNeuralIndexFindings(q, results);
     res.json({ ok: true, ...result, ...(scope.active ? { total: null, siteFilter: { include: scope.include, exclude: scope.exclude } } : {}), results, source: "web", responseTimeMs: Date.now() - started });
@@ -6406,7 +6381,7 @@ app.get("/api/search/vertical", async (req, res) => {
   try {
     const signal = AbortSignal.any([request.signal, AbortSignal.timeout(type === "all" ? 12000 : 9000)]);
     const service = app.locals.veyraVerticalSearch || verticalSearch;
-    const options = { page, provider, lang: req.query.lang, signal, noCache: req.veyraPrivateTraffic || !CFG.globalCacheEnabled, preview: type === "all" };
+    const options = { page, provider, lang: req.query.lang, region: req.query.region, signal, noCache: req.veyraPrivateTraffic || !CFG.globalCacheEnabled, preview: type === "all" };
     if (type !== "all") return res.json({ ok: true, ...await service.search(type, q, options) });
     let cursor = 0;
     const sections = Array(SEARCH_VERTICALS.length);
@@ -6512,7 +6487,7 @@ app.post('/api/search/answer', async (req, res) => {
     if (scope.active && Array.isArray(results)) results = results.filter(inScope);
     if (vertical) {
       const section = await (app.locals.veyraVerticalSearch || verticalSearch).search(vertical, query, {
-        signal: AbortSignal.any([request.signal, AbortSignal.timeout(7500)]), lang: req.body.lang, noCache: !CFG.globalCacheEnabled
+        signal: AbortSignal.any([request.signal, AbortSignal.timeout(7500)]), lang: req.body.lang, region: req.body.region, noCache: !CFG.globalCacheEnabled
       });
       // Use server-discovered source links only. A product price, image,
       // video description, or research listing is not verified page evidence.

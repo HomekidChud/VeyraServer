@@ -1,13 +1,9 @@
 "use strict";
 const { parseSiteScope, allowsSiteUrl } = require("./search-site-scope");
 const { normalizeSearchText, unicodeWords, braveLanguage } = require("./search-language");
+const { india, indiaLanguage, indiaAffinity, inrPrice, isIndianProductUrl } = require("./search-region");
 
 const cheerio = require("cheerio");
-const WIKI_EDITIONS = new Set("ar bg bn ca cs cy da de el en es et eu fa fi fr gl gu he hi hr hu hy id is it ja ka km kn ko lo lt lv ml mr ms my ne nl no pa pl pt ro ru sa sk sl sr sv sw ta te th tr uk ur vi zh".split(" "));
-function wikiEdition(lang, scope) {
-  const candidates = [lang.split("-")[0], "en", ...scope.include.map(host => /^([a-z]+)\.wikipedia\.org$/.exec(host)?.[1])];
-  return candidates.find(candidate => WIKI_EDITIONS.has(candidate) && allowsSiteUrl(scope, `https://${candidate}.wikipedia.org`));
-}
 
 function cleanText(s, max = 400) { return String(s || "").replace(/\s+/g, " ").trim().slice(0, max); }
 function safeHttpUrl(raw) {
@@ -43,7 +39,17 @@ function parseBingHtml(html) {
   $("li.b_algo").each((_, el) => { const box = $(el); const a = box.find("h2 a").first(); const item = row(unwrapBing(a.attr("href")), a.text(), box.find(".b_caption p, p.b_lineclamp2, p.b_lineclamp3, p.b_lineclamp4, p").first().text(), "bing"); if (item) out.push(item); });
   return out;
 }
-function parseGoogleApi(json) { return (Array.isArray(json?.items) ? json.items : []).map(x => row(x.link, x.title, x.snippet, "google")).filter(Boolean); }
+function parseGoogleApi(json, shopping = false) {
+  return (Array.isArray(json?.items) ? json.items : []).flatMap(x => {
+    const result = row(x.link, x.title, x.snippet, "google");
+    if (!result) return [];
+    // Multiple offers can refer to variants or unrelated products on that page.
+    const offers = x.pagemap?.offer;
+    const price = shopping && Array.isArray(offers) && offers.length === 1
+      ? inrPrice({ value: offers[0]?.price, currency: offers[0]?.pricecurrency }) : null;
+    return [{ ...result, ...(price ? { price } : {}) }];
+  });
+}
 function parseBraveApi(json) { return (Array.isArray(json?.web?.results) ? json.web.results : []).map(x => row(x.url, x.title, x.description || x.snippet, "brave")).filter(Boolean); }
 function parseBingApi(json) { return (Array.isArray(json?.webPages?.value) ? json.webPages.value : []).map(x => row(x.url, x.name || x.title, x.snippet, "bing")).filter(Boolean); }
 function parseMojeekHtml(html) {
@@ -136,10 +142,10 @@ function scoreResultRelevance(query, row) {
   score += Math.min(3, (row.providers?.length || 1) - 1) * 1.5;
   return { score: Math.round(score * 1000) / 1000, coverage: Math.round(coverage * 1000) / 1000, matchedTokens: matched };
 }
-function rankResultsByRelevance(query, rows) {
+function rankResultsByRelevance(query, rows, region) {
   const scored = rows.map((row, index) => {
     const relevance = scoreResultRelevance(query, row);
-    return { row, index, ...relevance };
+    return { row, index, ...relevance, score: relevance.score + (india(region) && relevance.coverage ? indiaAffinity(row) * 1.5 : 0) };
   });
   const anyMatched = scored.some(item => item.coverage > 0);
   scored.sort((a, b) => {
@@ -197,42 +203,21 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
   const cacheTtlMs = Math.max(0, Math.min(600000, Number(env.WEB_SEARCH_CACHE_TTL_MS) || 30000));
   const cache = new Map(); const MAX_CACHE = 200; const cooldowns = new Map();
   const health = Object.create(null);
-  let wikipediaActive = false;
   const providers = {
-    wikipedia: { available: () => env.WEB_SEARCH_DEEP_WIKIPEDIA !== "0", async run(_query, { offset, wiki, scope, signal }) {
-      const origin = `https://${wiki}.wikipedia.org`;
-      const url = new URL("/w/api.php", origin);
-      url.search = new URLSearchParams({ action: "query", list: "search", format: "json", formatversion: "2",
-        srsearch: scope.text, srnamespace: "0", srlimit: "10", sroffset: String(offset), srprop: "snippet", maxlag: "5" });
-      wikipediaActive = true;
-      try {
-        const response = await fetchText(url.href, { signal, accept: "application/json", timeoutMs: Math.min(timeoutMs, 5000),
-          userAgent: "VeyraSearch/8.21 (+https://github.com/HomekidChud/VeyraServer)", maxRedirects: 0 });
-        if (!response.ok) throw Object.assign(new Error("Wikipedia search unavailable"), { status: response.status, retryAfterMs: response.retryAfterMs });
-        const data = JSON.parse(response.text);
-        if (data.error) throw Object.assign(new Error("Wikipedia search unavailable"), { status: data.error.code === "maxlag" ? 503 : 400, retryAfterMs: response.retryAfterMs });
-        if (!Array.isArray(data.query?.search)) throw new Error("Invalid Wikipedia search response");
-        const results = data.query.search.slice(0, 10).flatMap(item => {
-          if (typeof item.title !== "string" || !item.title || item.title.length > 300) return [];
-          const url = `${origin}/wiki/${encodeURIComponent(item.title.replaceAll(" ", "_"))}`;
-          const snippet = cheerio.load(String(item.snippet || "").slice(0, 2000)).text();
-          const result = row(url, item.title, snippet, "wikipedia");
-          return result ? [{ ...result, lang: wiki }] : [];
-        });
-        return { results, more: data.continue?.sroffset === offset + 10, total: null };
-      } finally { wikipediaActive = false; }
-    } },
-    google: { available: () => !!(googleKey && googleCx), async run(q, { offset, lang, signal }) {
+    google: { available: () => !!(googleKey && googleCx), async run(q, { offset, lang, region, shopping, signal }) {
       const u = new URL("https://www.googleapis.com/customsearch/v1"); u.searchParams.set("key", googleKey); u.searchParams.set("cx", googleCx); u.searchParams.set("q", q); u.searchParams.set("num", "10"); if (offset) u.searchParams.set("start", String(Math.min(91, offset + 1))); if (lang) u.searchParams.set("hl", lang);
+      if (region) u.searchParams.set("gl", region.toLowerCase());
       const r = await fetchText(u.href, { accept: "application/json", signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Google Custom Search API request failed"), { status: r.status, retryAfterMs: r.retryAfterMs });
-      const json = JSON.parse(r.text); return { results: parseGoogleApi(json), total: json.searchInformation?.totalResults ?? null, more: !!json.queries?.nextPage?.length, stride: 10 };
+      const json = JSON.parse(r.text); return { results: parseGoogleApi(json, shopping), total: json.searchInformation?.totalResults ?? null, more: !!json.queries?.nextPage?.length, stride: 10 };
     } },
-    brave: { available: () => !!braveKey, async run(q, { offset, lang, signal }) {
+    brave: { available: () => !!braveKey, async run(q, { offset, lang, region, signal }) {
       const u = new URL("https://api.search.brave.com/res/v1/web/search"); u.searchParams.set("q", q); u.searchParams.set("count", "20"); if (offset) u.searchParams.set("offset", String(Math.min(9, Math.floor(offset / 20)))); if (lang) u.searchParams.set("search_lang", lang);
+      if (region) u.searchParams.set("country", region);
       const r = await fetchText(u.href, { accept: "application/json", headers: { "X-Subscription-Token": braveKey }, signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Brave Search API request failed"), { status: r.status, retryAfterMs: r.retryAfterMs }); const json = JSON.parse(r.text); return { results: parseBraveApi(json), total: null, more: !!json?.query?.more_results_available };
     } },
-    bing: { available: () => true, async run(q, { offset, lang, signal, limit }) {
+    bing: { available: () => true, async run(q, { offset, lang, region, signal, limit }) {
       const u = new URL(bingKey ? "https://api.bing.microsoft.com/v7.0/search" : "https://www.bing.com/search"); u.searchParams.set("q", q);
+      if (region) u.searchParams.set("cc", region);
       const requestedLimit = Math.max(1, Math.min(100, Number(limit) || 30));
       if (bingKey) { u.searchParams.set("count", String(requestedLimit)); u.searchParams.set("offset", String(offset || 0)); if (lang) u.searchParams.set("setLang", lang); }
       else {
@@ -275,8 +260,8 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       const r = await fetchText(u.href, { accept: "text/html", signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Yahoo search request failed"), { status: r.status, retryAfterMs: r.retryAfterMs });
       return { results: parseYahooHtml(r.text), total: null };
     } },
-    duckduckgo: { available: () => true, async run(q, { offset, lang, signal }) {
-      const u = new URL("https://html.duckduckgo.com/html/"); u.searchParams.set("q", q); if (offset) u.searchParams.set("s", String(offset)); if (lang) u.searchParams.set("kl", lang === "en" ? "wt-wt" : `${lang}-${lang}`);
+    duckduckgo: { available: () => true, async run(q, { offset, lang, region, signal }) {
+      const u = new URL("https://html.duckduckgo.com/html/"); u.searchParams.set("q", q); if (offset) u.searchParams.set("s", String(offset)); if (region || lang) u.searchParams.set("kl", region ? "in-en" : lang === "en" ? "wt-wt" : `${lang}-${lang}`);
       const r = await fetchText(u.href, { accept: "text/html", signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("DuckDuckGo search request failed"), { status: r.status, retryAfterMs: r.retryAfterMs });
       if (/anomaly-modal|challenge-form|bots use DuckDuckGo too/i.test(r.text)) throw Object.assign(new Error("DuckDuckGo returned a verification challenge"), { status: 429 }); return { results: parseDuckDuckGoHtml(r.text), total: null };
     } }
@@ -333,25 +318,21 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       return { name, results: [], ms, error: info.code, classification: info.classification };
     } finally { clearTimeout(timer); if (abortListener) controller.signal.removeEventListener("abort", abortListener); params.signal?.removeEventListener("abort", abortUpstream); }
   }
-  async function search(query, { offset = 0, engine = "", lang = "", signal, limit = 20, noCache = false, researchPage = null, budgetMs = 12000 } = {}) {
+  async function search(query, { offset = 0, engine = "", lang = "", signal, limit = 20, noCache = false, region = "", shopping = false } = {}) {
     const requestStartedAt = Date.now(); let firstResultAt = null;
-    const research = Number.isSafeInteger(researchPage) && researchPage >= 0 && researchPage < 10;
-    // Page only adapters with explicit continuation or a stable offset. Other
-    // adapters may still contribute to the first batch.
-    const pageable = new Set(["brave", "bing", "google", "wikipedia"]);
     const requestedLimit = Math.max(1, Math.min(50, Number(limit) || 20));
     const q = cleanText(query, 600); if (!q) return { provider: "none", results: [], attempts: [], responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: null };
     const scope = parseSiteScope(q);
     if (scope.invalid) return { provider: "none", results: [], attempts: [], more: false, siteFilter: { invalid: true }, responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: null };
-    const wiki = research && scope.text && wikiEdition(lang, scope);
-    const requested = [...new Set(engine && Object.hasOwn(providers, engine) ? [engine] :
-      [...(wiki ? ["wikipedia"] : []), ...order.filter(name => name !== "wikipedia" && Object.hasOwn(providers, name))])];
-    const key = `${requested.join(",")}|${offset}|${researchPage}|${requestedLimit}|${lang}|${q.toLowerCase()}`; const hit = noCache ? null : cache.get(key);
+    region = india(region) ? "IN" : "";
+    shopping = Boolean(region && shopping);
+    const regionalLanguage = region ? indiaLanguage(scope.text || q, lang) : "";
+    const requested = [...new Set(engine && Object.hasOwn(providers, engine) ? [engine] : order.filter(name => Object.hasOwn(providers, name)))];
+    const key = JSON.stringify([requested, offset, region, shopping, requestedLimit, regionalLanguage || lang, q.toLowerCase()]);
+    const hit = noCache ? null : cache.get(key);
     if (hit && Date.now() - hit.time < cacheTtlMs) return { ...hit.value, cached: true, responseTimeMs: Date.now() - requestStartedAt };
     const attempts = []; let eligible = [];
     for (const name of requested) {
-      if (name === "wikipedia" && !wiki) continue;
-      if (research && researchPage > 0 && !pageable.has(name)) continue;
       if (!configured(name)) { attempts.push({ provider: name, skipped: "not-configured" }); continue; }
       if ((cooldowns.get(name) || 0) > Date.now()) { attempts.push({ provider: name, skipped: "cooldown" }); continue; }
       eligible.push(name);
@@ -366,8 +347,9 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
     const requestController = new AbortController();
     let callerCancelled = false, deadlineExpired = false, earlyCancelled = false;
     const observedResultKeys = new Set();
-    const scopedRows = rows => scope.active ? rows.filter(result => allowsSiteUrl(scope, result.url)) : rows;
-    const requestBudgetMs = research ? Math.max(1, Math.min(overallDeadlineMs, 12000, budgetMs)) : overallDeadlineMs;
+    const scopedRows = rows => scope.active || shopping ? rows.filter(result =>
+      (!scope.active || allowsSiteUrl(scope, result.url)) && (!shopping || isIndianProductUrl(result.url))) : rows;
+    const requestBudgetMs = overallDeadlineMs;
     const deadlineAt = Date.now() + requestBudgetMs;
     const abortForCaller = () => { callerCancelled = true; requestController.abort(); };
     if (signal?.aborted) abortForCaller(); else signal?.addEventListener("abort", abortForCaller, { once: true });
@@ -376,17 +358,11 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
     async function worker() {
       while (cursor < eligible.length && !requestController.signal.aborted) {
         const index = cursor++, name = eligible[index];
-        if (name === "wikipedia" && wikipediaActive) {
-          attempts.push({ provider: name, skipped: "busy" });
-          continue;
-        }
-        const providerOffset = research ? researchPage * (name === "brave" ? 20 : 10) : offset;
-        const providerLang = research && name === "brave" ? braveLanguage(lang) : lang;
-        const item = await runProvider(name, q, { offset: providerOffset, limit: requestedLimit, lang: providerLang, filterRows: scopedRows, wiki, scope,
+        const providerLang = regionalLanguage ? (name === "brave" ? braveLanguage(regionalLanguage) : regionalLanguage.split("-")[0]) : lang;
+        const item = await runProvider(name, q, { offset, limit: requestedLimit, lang: providerLang, region, shopping, filterRows: scopedRows,
           signal: requestController.signal, isCancelled: () => callerCancelled, isDeadlineExpired: () => deadlineExpired,
           isEarlyCancel: () => earlyCancelled, onResults: at => { if (firstResultAt == null) firstResultAt = at; } });
         settled[index] = item;
-        if (research) continue;
         for (const result of item.results) { const key = canonicalKey(result.url); if (key) observedResultKeys.add(key); }
         if (!callerCancelled && !deadlineExpired && !earlyCancelled && observedResultKeys.size >= earlyResultThreshold && deadlineAt - Date.now() <= earlyCancelWindowMs) {
           earlyCancelled = true; requestController.abort();
@@ -401,22 +377,23 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
     for (const item of successful) for (const result of item.results) {
       const id = canonicalKey(result.url); const existing = merged.get(id);
       if (!existing) merged.set(id, { ...result, providers: [item.name], source: item.name });
-      else { if (!existing.providers.includes(item.name)) existing.providers.push(item.name); if (result.snippet.length > existing.snippet.length) existing.snippet = result.snippet; }
+      else {
+        if (!existing.providers.includes(item.name)) existing.providers.push(item.name);
+        if (result.snippet.length > existing.snippet.length) existing.snippet = result.snippet;
+        if (result.price && !existing.price) existing.price = result.price;
+      }
     }
     // Rank the merged provider results by token relevance to the query so the
     // most on-topic pages surface first instead of raw provider arrival order.
-    const ranked = rankResultsByRelevance(scope.active ? scope.text : q, [...merged.values()]);
-    const results = research ? ranked.slice(0, maxProviders * 20) : ranked.slice(0, requestedLimit);
+    const results = rankResultsByRelevance(scope.active ? scope.text : q, [...merged.values()], region).slice(0, requestedLimit);
     const source = successful.find(x => x.results.length)?.name || "none";
     const value = { provider: source, results, ranking: { method: "token-relevance" }, total: successful.reduce((n, x) => n + (x.total || x.results.length), 0) || null, more: successful.some(x => x.more), attempts, googleConfigured: configured("google"), braveConfigured: configured("brave"), bingConfigured: configured("bing"), providersUsed: successful.filter(x => x.results.length).map(x => x.name), cancelled: callerCancelled, earlyCancelled, deadlineExceeded: deadlineExpired, responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: firstResultAt == null ? null : firstResultAt - requestStartedAt, diagnostics: { providerCount: eligible.length, parallelism: Math.min(parallelism, eligible.length), overallDeadlineMs: requestBudgetMs, earlyCancelWindowMs, earlyResultThreshold, providers: Object.fromEntries(Object.keys(providers).map(name => [name, healthSummary(name)])), google: healthSummary("google") } };
     if (scope.active) {
       value.total = null;
       value.siteFilter = { include: scope.include, exclude: scope.exclude };
-      if (!research) {
-        const nextOffset = offset + Math.min(requestedLimit, ...successful.filter(item => item.more).map(item => item.stride));
-        value.more = value.more && nextOffset < 60;
-        if (value.more) value.nextOffset = nextOffset;
-      }
+      const nextOffset = offset + Math.min(requestedLimit, ...successful.filter(item => item.more).map(item => item.stride));
+      value.more = value.more && nextOffset < 60;
+      if (value.more) value.nextOffset = nextOffset;
       if (!results.length) value.timeToFirstResultMs = null;
     }
     if (!noCache && !callerCancelled && results.length && cacheTtlMs) { cache.set(key, { time: Date.now(), value }); while (cache.size > MAX_CACHE) cache.delete(cache.keys().next().value); }

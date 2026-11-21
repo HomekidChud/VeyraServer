@@ -29,6 +29,7 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
       webSearchCalls += 1;
       if (query === "mock web route query") {
         assert.equal(options.engine, "bing");
+        assert.equal(options.region, "IN");
         assert.equal(options.limit, 20, "Veyra web search should request 20 results by default");
         return { provider: "mock-provider", results: [{ url: "https://search-fixture.example/result", title: "Mock result", snippet: "Controlled route fixture", provider: "mock-provider" }], attempts: [{ provider: "mock-provider", count: 1 }] };
       }
@@ -66,7 +67,7 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     assert.equal(signup.status, 201, JSON.stringify(login));
     assert.ok(login.token, "the regular fixture account can sign in");
     const authorization = `Bearer ${login.token}`;
-    const webResponse = await fetch(`${base}/api/search/web?q=mock%20web%20route%20query&engine=bing`, { headers: { authorization } });
+    const webResponse = await fetch(`${base}/api/search/web?q=mock%20web%20route%20query&engine=bing&region=IN`, { headers: { authorization } });
     const webPayload = await webResponse.json();
     assert.equal(webResponse.status, 200);
     assert.equal(webPayload.ok, true);
@@ -78,6 +79,11 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     assert.deepEqual(crawlArgs.seeds, ["https://search-fixture.example/result"]);
     assert.equal(crawlArgs.query, "mock web route query");
     assert.ok(crawlArgs.options.maxPages <= CFG.indexAiMaxPages);
+    assert.equal(webSearchCalls, 1);
+    const retired = await fetch(`${base}/api/search/deep?q=old+bookmark`);
+    assert.equal(retired.status, 410);
+    assert.equal(retired.headers.get("cache-control"), "no-store");
+    assert.equal((await retired.json()).code, "SEARCH_MODE_RETIRED");
     assert.equal(webSearchCalls, 1);
     for (const [suffix, headers] of [["", {}], ["&private=1", { authorization }]]) {
       const privateResponse = await fetch(`${base}/api/search/web?q=private%20fixture${suffix}`, { headers });
@@ -134,6 +140,7 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
       async search(type, query, options) {
         verticalCalls++;
         if (options.preview) {
+          assert.equal(options.region, "IN");
           assert.equal(options.noCache, true, "guest category previews cannot use shared caches");
           peakVerticalCalls = Math.max(peakVerticalCalls, ++activeVerticalCalls);
           await new Promise(resolve => setImmediate(resolve));
@@ -149,7 +156,7 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
         return { type, status: "ok", provider: "fixture", results: Array(4).fill(candidate) };
       }
     };
-    const aggregateResponse = await fetch(`${base}/api/search/vertical?type=all&q=category+fixture`);
+    const aggregateResponse = await fetch(`${base}/api/search/vertical?type=all&q=category+fixture&region=IN`);
     assert.equal(aggregateResponse.headers.get("cache-control"), "no-store");
     const aggregate = await aggregateResponse.json();
     assert.deepEqual(aggregate.sections.map(s => s.type), ["images", "videos", "news", "shopping", "research", "discussions"]);
