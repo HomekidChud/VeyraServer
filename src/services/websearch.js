@@ -2,10 +2,12 @@
 const { parseSiteScope, allowsSiteUrl } = require("./search-site-scope");
 const { unicodeWords, braveLanguage } = require("./search-language");
 const { india, indiaLanguage, indiaAffinity, inrPrice, isIndianProductUrl } = require("./search-region");
+const { createSiteSearch } = require("./site-search");
 
 const cheerio = require("cheerio");
 const WEB_FEED_STEP = 10;
 const WEB_FEED_INDEX_OFFSET = 100;
+const GENERAL_ENGINES = Object.freeze(["searxng", "brave", "bing", "duckduckgo", "google", "mojeek", "ecosia", "yahoo", "startpage"]);
 const REFERENCE_LANGS = new Set("as bn en gu hi kn ml mr ne or pa sa ta te ur".split(" "));
 const referenceHost = lang => `${REFERENCE_LANGS.has(lang) ? lang : "en"}.wikipedia.org`;
 
@@ -15,8 +17,9 @@ function safeHttpUrl(raw) {
 }
 function displayUrl(value) { try { const u = new URL(value); return (u.hostname.replace(/^www\./, "") + (u.pathname === "/" ? "" : u.pathname)).slice(0, 120); } catch { return value; } }
 function row(url, title, snippet, source) {
-  const href = safeHttpUrl(url); if (!href || !title) return null;
-  return { url: href, canonicalUrl: href.replace(/#.*$/, "").replace(/\/$/, ""), title: cleanText(title, 300), snippet: cleanText(snippet, 700), displayUrl: displayUrl(href), source };
+  const href = safeHttpUrl(url), label = cleanText(title, 300);
+  if (!href || !label) return null;
+  return { url: href, canonicalUrl: href.replace(/#.*$/, "").replace(/\/$/, ""), title: label, snippet: cleanText(snippet, 700), displayUrl: displayUrl(href), source };
 }
 function unwrapDuckDuckGo(href) {
   try { const u = new URL(String(href || "").startsWith("//") ? "https:" + href : String(href || ""), "https://duckduckgo.com"); return /(^|\.)duckduckgo\.com$/i.test(u.hostname) && u.pathname === "/l/" ? u.searchParams.get("uddg") || "" : u.href; } catch { return ""; }
@@ -230,18 +233,19 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
   const googleCx = env.GOOGLE_SEARCH_CX || env.GOOGLE_CSE_ID || "";
   const braveKey = env.BRAVE_SEARCH_API_KEY || "";
   const bingKey = env.BING_SEARCH_API_KEY || "";
-  const order = String(env.WEB_SEARCH_ORDER || "brave,bing,duckduckgo,google,mojeek,ecosia,yahoo,startpage").split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+  const order = String(env.WEB_SEARCH_ORDER || GENERAL_ENGINES.join(",")).split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
   const timeoutMs = Math.max(250, Math.min(30000, Number(env.WEB_SEARCH_PROVIDER_TIMEOUT_MS) || 8000));
-  const maxProviders = Math.max(1, Math.min(8, Number(env.WEB_SEARCH_MAX_PROVIDERS) || 6));
+  const maxProviders = Math.max(1, Math.min(GENERAL_ENGINES.length, Number(env.WEB_SEARCH_MAX_PROVIDERS) || 6));
   const parallelism = Math.max(1, Math.min(8, Number(env.WEB_SEARCH_CONCURRENCY) || 6));
   const overallDeadlineMs = Math.max(250, Math.min(60000, Number(env.WEB_SEARCH_DEADLINE_MS) || 12000));
   const earlyCancelWindowMs = Math.max(0, Math.min(5000, env.WEB_SEARCH_EARLY_CANCEL_WINDOW_MS == null ? 1000 : Number(env.WEB_SEARCH_EARLY_CANCEL_WINDOW_MS) || 0));
   const earlyResultThreshold = Math.max(1, Math.min(200, Number(env.WEB_SEARCH_EARLY_RESULT_THRESHOLD) || 40));
   const cacheTtlMs = Math.max(0, Math.min(600000, Number(env.WEB_SEARCH_CACHE_TTL_MS) || 30000));
-  const cache = new Map(); const MAX_CACHE = 200; const cooldowns = new Map();
+  const cache = new Map(); const MAX_CACHE = 200; const cooldowns = new Map(), nextAllowed = new Map();
   const health = Object.create(null);
   let stackBackoffUntil = 0;
   const providers = {
+    ...createSiteSearch({ fetchText, env, row, step: WEB_FEED_STEP, timeoutMs }),
     stackoverflow: { available: () => true, async run(q, { offset, signal }) {
       const u = new URL("https://api.stackexchange.com/2.3/search/advanced");
       u.search = new URLSearchParams({ q, site: "stackoverflow", sort: "relevance", pagesize: String(WEB_FEED_STEP), page: String(1 + offset / WEB_FEED_STEP) }).toString();
@@ -315,7 +319,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       const json = JSON.parse(r.text); const results = parseBingApi(json);
       return { results, total: json?.webPages?.totalEstimatedMatches ?? null, more: results.length >= requestedLimit };
     } },
-    mojeek: { available: () => true, async run(q, { offset, lang, signal }) {
+    mojeek: { firstPage: true, available: () => true, async run(q, { offset, lang, signal }) {
       const u = new URL("https://www.mojeek.com/search"); u.searchParams.set("q", q); u.searchParams.set("t", String(Math.min(50, 10 + (Number(offset) || 0)))); if (lang) u.searchParams.set("lb", lang);
       const r = await fetchText(u.href, { accept: "text/html", signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Mojeek search request failed"), { status: r.status, retryAfterMs: r.retryAfterMs });
       return { results: parseMojeekHtml(r.text), total: null };
@@ -323,19 +327,22 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
     ecosia: { available: () => true, async run(q, { offset, lang, signal }) {
       const u = new URL("https://www.ecosia.org/search"); u.searchParams.set("q", q); if (offset) u.searchParams.set("p", String(Math.floor(Number(offset) / 10) + 1)); if (lang) u.searchParams.set("hl", lang);
       const r = await fetchText(u.href, { accept: "text/html", signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Ecosia search request failed"), { status: r.status, retryAfterMs: r.retryAfterMs });
-      return { results: parseEcosiaHtml(r.text), total: null };
+      const results = parseEcosiaHtml(r.text);
+      return { results, total: null, more: results.length >= WEB_FEED_STEP, stride: WEB_FEED_STEP };
     } },
     startpage: { available: () => true, async run(q, { offset, lang, signal }) {
       const u = new URL("https://www.startpage.com/sp/search"); u.searchParams.set("query", q); if (offset) u.searchParams.set("page", String(Math.floor(Number(offset) / 10) + 1)); if (lang) u.searchParams.set("language", lang);
       const r = await fetchText(u.href, { accept: "text/html", signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Startpage search request failed"), { status: r.status, retryAfterMs: r.retryAfterMs });
-      return { results: parseStartpageHtml(r.text), total: null };
+      const results = parseStartpageHtml(r.text);
+      return { results, total: null, more: results.length >= WEB_FEED_STEP, stride: WEB_FEED_STEP };
     } },
     yahoo: { available: () => true, async run(q, { offset, lang, signal }) {
-      const u = new URL("https://search.yahoo.com/search"); u.searchParams.set("p", q); if (offset) u.searchParams.set("b", String((Math.floor(Number(offset) / 10) + 1) * 10 + 1)); if (lang) u.searchParams.set("vl", lang);
+      const u = new URL("https://search.yahoo.com/search"); u.searchParams.set("p", q); if (offset) u.searchParams.set("b", String(Number(offset) + 1)); if (lang) u.searchParams.set("vl", lang);
       const r = await fetchText(u.href, { accept: "text/html", signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Yahoo search request failed"), { status: r.status, retryAfterMs: r.retryAfterMs });
-      return { results: parseYahooHtml(r.text), total: null };
+      const results = dedupe(parseYahooHtml(r.text));
+      return { results, total: null, more: results.length >= WEB_FEED_STEP, stride: WEB_FEED_STEP };
     } },
-    duckduckgo: { available: () => true, async run(q, { offset, lang, region, signal }) {
+    duckduckgo: { firstPage: true, available: () => true, async run(q, { offset, lang, region, signal }) {
       const u = new URL("https://html.duckduckgo.com/html/"); u.searchParams.set("q", q); if (offset) u.searchParams.set("s", String(offset)); if (region || lang) u.searchParams.set("kl", region ? "in-en" : lang === "en" ? "wt-wt" : `${lang}-${lang}`);
       const r = await fetchText(u.href, { accept: "text/html", signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("DuckDuckGo search request failed"), { status: r.status, retryAfterMs: r.retryAfterMs });
       if (/anomaly-modal|challenge-form|bots use DuckDuckGo too/i.test(r.text)) throw Object.assign(new Error("DuckDuckGo returned a verification challenge"), { status: 429 }); return { results: parseDuckDuckGoHtml(r.text), total: null };
@@ -393,7 +400,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       return { name, results: [], ms, error: info.code, classification: info.classification };
     } finally { clearTimeout(timer); if (abortListener) controller.signal.removeEventListener("abort", abortListener); params.signal?.removeEventListener("abort", abortUpstream); }
   }
-  async function search(query, { offset = 0, engine = "", lang = "", signal, limit = 20, noCache = false, region = "", shopping = false, feed = false, reference = false, topic = "" } = {}) {
+  async function search(query, { offset = 0, engine = "", lang = "", signal, limit = 20, noCache = false, region = "", shopping = false, feed = false, reference = false, topic = "", privateSearch = false } = {}) {
     const requestStartedAt = Date.now(); let firstResultAt = null;
     const requestedLimit = Math.max(1, Math.min(50, Number(limit) || 20));
     const q = cleanText(query, 600); if (!q) return { provider: "none", results: [], attempts: [], responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: null };
@@ -408,13 +415,18 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
     const specialist = new Set(["wikipedia", "stackoverflow"]);
     const includeStack = feed && reference && !engine && !shopping && allowsSiteUrl(scope, "https://stackoverflow.com/") &&
       (scope.include.includes("stackoverflow.com") || /\b(?:javascript|typescript|python|pandas|numpy|rust|kotlin|sql|postgresql|golang|node\.js|reactjs|css|html|docker|kubernetes|linux|git|regex)\b/i.test(scope.text));
-    const requested = [...new Set(engine && Object.hasOwn(providers, engine) && !specialist.has(engine) ? [engine]
-      : order.filter(name => !specialist.has(name) && Object.hasOwn(providers, name)))];
-    const key = JSON.stringify([requested, offset, region, shopping, feed, !!includeReference, !!includeStack, topic, requestedLimit, regionalLanguage || lang, q.toLowerCase()]);
+    const native = feed && reference && !engine && !shopping && !privateSearch && scope.text
+      ? Object.entries(providers).filter(([, p]) => p.native && !(offset && p.firstPage) &&
+        p.hosts.some(host => allowsSiteUrl(scope, `https://${host}/`)) && (scope.include.length || p.intent.test(scope.text)))
+        .map(([name]) => name) : [];
+    const requested = [...new Set(engine && GENERAL_ENGINES.includes(engine) ? [engine]
+      : order.filter(name => GENERAL_ENGINES.includes(name)))].filter(name => !(name === "searxng" && privateSearch));
+    const key = JSON.stringify([requested, native, offset, region, shopping, feed, !!includeReference, !!includeStack, topic, requestedLimit, regionalLanguage || lang, q.toLowerCase()]);
     const hit = noCache ? null : cache.get(key);
     if (hit && Date.now() - hit.time < cacheTtlMs) return { ...hit.value, cached: true, responseTimeMs: Date.now() - requestStartedAt };
     const attempts = []; let eligible = [];
     for (const name of requested) {
+      if (feed && offset && providers[name].firstPage) continue;
       if (!configured(name)) { attempts.push({ provider: name, skipped: "not-configured" }); continue; }
       if ((cooldowns.get(name) || 0) > Date.now()) { attempts.push({ provider: name, skipped: "cooldown" }); continue; }
       eligible.push(name);
@@ -426,7 +438,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
         eligible.sort((a, b) => providerUtility(b) - providerUtility(a) || originalOrder.get(a) - originalOrder.get(b));
       }
     }
-    if (feed && offset) eligible = eligible.filter(name => ["google", "brave", "bing"].includes(name));
+    eligible.unshift(...native.filter(name => !(cooldowns.get(name) > Date.now())).slice(0, 3));
     if (includeReference && !(cooldowns.get("wikipedia") > Date.now())) eligible.unshift("wikipedia");
     if (includeStack && !(Math.max(stackBackoffUntil, cooldowns.get("stackoverflow") || 0) > Date.now())) eligible.unshift("stackoverflow");
     const requestController = new AbortController();
@@ -443,8 +455,13 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
     async function worker() {
       while (cursor < eligible.length && !requestController.signal.aborted) {
         const index = cursor++, name = eligible[index];
+        const interval = providers[name].minInterval;
+        if (interval) {
+          if (nextAllowed.get(name) > Date.now()) { attempts.push({ provider: name, skipped: "rate-pacing" }); continue; }
+          nextAllowed.set(name, Date.now() + interval);
+        }
         const providerLang = regionalLanguage ? (name === "brave" ? braveLanguage(regionalLanguage) : regionalLanguage.split("-")[0]) : lang;
-        const item = await runProvider(name, specialist.has(name) ? scope.text : q, { offset, limit: requestedLimit,
+        const item = await runProvider(name, specialist.has(name) || providers[name].native ? scope.text : q, { offset, limit: requestedLimit,
           lang: name === "wikipedia" ? referenceLang : providerLang, region, shopping, feed, filterRows: scopedRows,
           signal: requestController.signal, isCancelled: () => callerCancelled, isDeadlineExpired: () => deadlineExpired,
           isEarlyCancel: () => earlyCancelled, onResults: at => { if (firstResultAt == null) firstResultAt = at; } });
@@ -465,6 +482,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       if (!existing) merged.set(id, { ...result, providers: [item.name], source: item.name });
       else {
         if (!existing.providers.includes(item.name)) existing.providers.push(item.name);
+        if (result.upstreamEngines) existing.upstreamEngines = [...new Set([...(existing.upstreamEngines || []), ...result.upstreamEngines])].slice(0, 12);
         if (result.snippet.length > existing.snippet.length) existing.snippet = result.snippet;
         if (result.price && !existing.price) existing.price = result.price;
       }
@@ -484,7 +502,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
     if (feed) {
       // A valid later page may follow a thin page; do not treat a filtered
       // batch as proof of exhaustion once the feed has already begun.
-      value.more = (results.length > 0 || offset > 0) && value.more && offset + WEB_FEED_STEP < WEB_FEED_INDEX_OFFSET;
+      value.more = !callerCancelled && value.more && offset + WEB_FEED_STEP < WEB_FEED_INDEX_OFFSET;
       value.nextOffset = value.more ? offset + WEB_FEED_STEP : null;
       value.status = results.length ? "ok" : callerCancelled ? "cancelled" :
         successful.some(item => !item.error && !item.cancelledAfterSufficientResults) ? "empty" : "unavailable";
@@ -500,4 +518,4 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
   return { search, googleConfigured: () => configured("google"), order, providers: Object.keys(providers), diagnostics: () => ({ adaptiveOrdering: true, maxProviders, parallelism, overallDeadlineMs, providers: Object.fromEntries(Object.keys(providers).map(name => [name, healthSummary(name)])) }) };
 }
 
-module.exports = { createWebSearch, WEB_FEED_STEP, WEB_FEED_INDEX_OFFSET, parseDuckDuckGoHtml, parseBingHtml, parseMojeekHtml, parseEcosiaHtml, parseStartpageHtml, parseYahooHtml, parseGoogleApi, parseBraveApi, parseBingApi, unwrapBing, unwrapDuckDuckGo, classifyGoogleResponse, canonicalKey, rankResultsByRelevance, scoreResultRelevance, isTopicalResult, diversifyWebResults, minimumMatches, diceSimilarity };
+module.exports = { createWebSearch, GENERAL_ENGINES, WEB_FEED_STEP, WEB_FEED_INDEX_OFFSET, parseDuckDuckGoHtml, parseBingHtml, parseMojeekHtml, parseEcosiaHtml, parseStartpageHtml, parseYahooHtml, parseGoogleApi, parseBraveApi, parseBingApi, unwrapBing, unwrapDuckDuckGo, classifyGoogleResponse, canonicalKey, rankResultsByRelevance, scoreResultRelevance, isTopicalResult, diversifyWebResults, minimumMatches, diceSimilarity };

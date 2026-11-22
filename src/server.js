@@ -15,7 +15,7 @@ const { pageActionsRuntime } = require("./browser/page-actions-runtime");
 const { VpnManager } = require("./network/vpn");
 const { createShield } = require("./network/shield");
 const { upstreamHeaderCapOptions } = require("./network/header-cap");
-const { createWebSearch, WEB_FEED_STEP, WEB_FEED_INDEX_OFFSET, canonicalKey, rankResultsByRelevance, isTopicalResult, diversifyWebResults, minimumMatches } = require("./services/websearch");
+const { createWebSearch, GENERAL_ENGINES, WEB_FEED_STEP, WEB_FEED_INDEX_OFFSET, canonicalKey, rankResultsByRelevance, isTopicalResult, diversifyWebResults, minimumMatches } = require("./services/websearch");
 const { languageTag, normalizeSearchText, unicodeWords } = require("./services/search-language");
 const { walkSitemap, hasRel } = require("./services/crawl-sitemap");
 const { india, indiaAffinity, isIndianProductUrl } = require("./services/search-region");
@@ -6390,15 +6390,14 @@ app.get("/api/search/deep", (req, res) => {
 
 app.get('/api/search/web', async (req, res) => {
   const request = requestAbortSignal(req, res);
-  const isPrivate = req.query.private === "1" || !authStore.userFromRequest(req);
+  const isPrivate = req.query.private === "1" || req.query.incognito === "1" || !authStore.userFromRequest(req);
   if (isPrivate) { req.veyraPrivateTraffic = true; res.set("Cache-Control", "no-store"); }
   try {
     const input = String(req.query.q || "").trim();
     const q = input.slice(0, 600);
     if (!q) return res.json({ ok: true, provider: "none", results: [], attempts: [], responseTimeMs: 0 });
     const engine = String(req.query.engine || "").trim().toLowerCase();
-    const validEngine = new Set(["google", "brave", "bing", "duckduckgo", ""]);
-    const selected = validEngine.has(engine) ? engine : "";
+    const selected = GENERAL_ENGINES.includes(engine) ? engine : "";
     const offset = Math.max(0, Math.floor(Number(req.query.offset || 0)) || 0);
     const feed = req.query.feed === "1";
     const lang = String(req.query.lang || "en").slice(0, 35);
@@ -6419,7 +6418,8 @@ app.get('/api/search/web', async (req, res) => {
     if (feed && selected && offset >= WEB_FEED_INDEX_OFFSET) return respondError(res, 400, "Index offsets are not available for an explicit engine.", "INVALID_SEARCH_OFFSET");
     if (feed && offset >= WEB_FEED_INDEX_OFFSET) return reply(fromIndex(offset - WEB_FEED_INDEX_OFFSET));
     const result = await (app.locals.veyraWebSearch || webSearch).search(q, { offset, limit, engine: selected, lang, region: req.query.region,
-      signal: request.signal, noCache: isPrivate || !CFG.globalCacheEnabled, feed, reference: true });
+      signal: request.signal, noCache: isPrivate || !CFG.globalCacheEnabled, feed, reference: true,
+      privateSearch: req.query.incognito === "1" });
     const external = (result.results || []).filter(row => row && canonicalKey(row.url) && allowsSiteUrl(scope, row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl)));
     if (!isPrivate && (!feed || !offset)) queueNeuralIndexFindings(q, external);
     if (feed && !selected) {
@@ -6455,7 +6455,7 @@ app.get("/api/search/vertical", async (req, res) => {
   try {
     const signal = AbortSignal.any([request.signal, AbortSignal.timeout(type === "all" ? 12000 : 9000)]);
     const service = app.locals.veyraVerticalSearch || verticalSearch;
-    const options = { page, provider, lang: req.query.lang, region: req.query.region, signal, noCache: req.veyraPrivateTraffic || !CFG.globalCacheEnabled, preview: type === "all", privateSearch: req.query.private === "1" && req.query.incognito === "1" };
+    const options = { page, provider, lang: req.query.lang, region: req.query.region, signal, noCache: req.veyraPrivateTraffic || req.query.incognito === "1" || !CFG.globalCacheEnabled, preview: type === "all", privateSearch: req.query.incognito === "1" };
     if (type !== "all") return res.json({ ok: true, ...await service.search(type, q, options) });
     let cursor = 0;
     const sections = Array(SEARCH_VERTICALS.length);

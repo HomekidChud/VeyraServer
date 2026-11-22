@@ -329,6 +329,61 @@ test("normalizes Brave, RSS, DOI, and Hacker News feeds without unsafe links", a
   for (const bad of ["javascript:alert(1)", "https://a:b@merchant.example/thing", "http://127.0.0.1/test", "http://box.local/test", "https://merchant.example:1234/test"]) assert.equal(safeUrl(bad), "");
 });
 
+test("federates research sources, deduplicates DOI aliases and honors a publisher scope", async () => {
+  const service = mock({
+    "api.crossref.org": { message: { items: [{ DOI: "10.1234/A", title: ["Malaria vaccine study"] }], "total-results": 20 } },
+    "www.ebi.ac.uk": { resultList: { result: [
+      { doi: "10.1234/a", id: "123", source: "MED", title: "Malaria vaccine study" },
+      { doi: "10.1234/b", id: "124", source: "MED", title: "Malaria vaccine efficacy" },
+      { id: "../123", source: "MED", title: "Malaria vaccine unsafe URL" },
+      { id: "125", source: "MED", title: "Unrelated article" }
+    ] } }
+  });
+  const page = await service.search("research", "malaria vaccine");
+  assert.equal(page.provider, "research-mix");
+  assert.equal(page.results.length, 2);
+  assert.deepEqual(new Set(page.results.map(x => x.provider)), new Set(["crossref", "europe-pmc"]));
+  assert.equal(page.nextPage, 1);
+  const next = await service.search("research", "malaria vaccine", { page: 1, provider: page.provider });
+  assert.ok(next.results.every(x => x.provider === "crossref"));
+  const scoped = await service.search("research", "site:europepmc.org malaria vaccine");
+  assert.equal(scoped.results.length, 2);
+  assert.ok(scoped.results.every(x => x.url.startsWith("https://europepmc.org/article/MED/")));
+});
+
+test("searches an eligible Stack Exchange community alongside HN, except in incognito", async () => {
+  const service = mock({
+    "api.stackexchange.com": { has_more: true, items: [
+      { link: "https://cooking.stackexchange.com/questions/7/dosa", title: "Dosa batter fermentation", tags: ["fermentation"] },
+      { link: "https://cooking.stackexchange.com.invalid/questions/7/dosa", title: "Dosa batter lookalike" }
+    ] },
+    "hn.algolia.com": { hits: [{ objectID: "12", title: "A guide to dosa batter" }], nbPages: 1 }
+  });
+  const page = await service.search("discussions", "dosa batter");
+  assert.equal(page.provider, "discussion-mix");
+  assert.deepEqual(new Set(page.results.map(x => x.provider)), new Set(["stack-exchange", "hacker-news"]));
+  assert.equal(page.nextPage, 1);
+  assert.equal((await service.search("discussions", "site:cooking.stackexchange.com dosa batter")).results.length, 1);
+  const count = service.calls.filter(call => call.url?.hostname === "api.stackexchange.com").length;
+  assert.equal((await service.search("discussions", "dosa batter", { privateSearch: true })).provider, "hacker-news");
+  assert.equal(service.calls.filter(call => call.url?.hostname === "api.stackexchange.com").length, count);
+});
+
+test("NASA Images results cite the item page and use only NASA-hosted image previews", async () => {
+  const service = mock({
+    "images-api.nasa.gov": { collection: { metadata: { total_hits: 20 }, items: [
+      { data: [{ nasa_id: "PIA00001", media_type: "image", title: "Jupiter plume" }], links: [{ href: "https://images-assets.nasa.gov/image/PIA00001/preview.jpg", rel: "preview" }] },
+      { data: [{ nasa_id: "TEST", media_type: "image", title: "Jupiter lookalike" }], links: [{ href: "https://images-assets.nasa.gov.invalid/image/test.jpg", rel: "preview" }] },
+      { data: [{ nasa_id: "TEST", media_type: "video", title: "Jupiter video" }], links: [{ href: "https://images-assets.nasa.gov/image/test.jpg", rel: "preview" }] }
+    ] } }
+  });
+  const page = await service.search("images", "site:images.nasa.gov Jupiter");
+  assert.equal(page.provider, "nasa-library");
+  assert.equal(page.results.length, 1);
+  assert.equal(page.results[0].url, "https://images.nasa.gov/details/PIA00001");
+  assert.equal(page.nextPage, 1);
+});
+
 test("checked-in category weights are reproducible from topic-disjoint hand-labeled data", () => {
   assert.deepEqual(checkpoint, trainModel());
   assert.equal(new Set([...fixture.train, ...fixture.holdout].map(row => row[1].toLowerCase())).size, fixture.train.length + fixture.holdout.length);
