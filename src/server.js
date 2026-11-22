@@ -24,6 +24,7 @@ const { merchantProductUrl, PRODUCT_BYTES } = require("./services/india-storefro
 const { publicImageUrl, imageIdentity } = require("./services/crawl-page-data");
 const { parseSiteScope, allowsSiteUrl } = require("./services/search-site-scope");
 const { rankMatchBatch, matchModelVersion } = require("./services/search-match");
+const { createSourceSearch, defaultEvidence, sourcePageUrl } = require("./services/source-search");
 const { installBrandRoutes, isReservedOriginPath, brandNotFoundHtml } = require("./services/brand");
 const VEYRA_VERSION = require("../package.json").version;
 const { SessionManager } = require("./core/session-manager");
@@ -1605,6 +1606,7 @@ async function fetchBuffer(url, opts = {}) {
           acceptRanges: response.headers.get("accept-ranges") || "",
           allow: response.headers.get("allow") || "",
           linkHeader: response.headers.get("link") || "",
+          robotsTag: response.headers.get("x-robots-tag") || "",
           contentDisposition: response.headers.get("content-disposition") || "",
           allow: response.headers.get("allow") || "",
           setCookieHeader: response.headers.get("set-cookie") || "",
@@ -1700,6 +1702,45 @@ async function fetchIndiaCatalog(url, { signal, kind }) {
   if (!r.ok || (kind === "catalog" && r.truncated)) throw new Error("Storefront request failed");
   return r.body.toString("utf8");
 }
+
+const sourceSearchEnabled = boolEnv("VEYRA_SOURCE_SEARCH", true);
+const searchRobots = new Map();
+async function readSearchSource(url, { signal, allowUrl }) {
+  const agent = merchantUserAgent;
+  const fetchSource = app.locals.veyraSourceSearchFetch || fetchBuffer;
+  const canRead = async target => {
+    signal.throwIfAborted();
+    if (sourcePageUrl(target) !== target || normalizeUrl(target, undefined, { preserveQuery: true }) !== target ||
+        !allowUrl(target) || !sameRedirectHost(url, target) ||
+        (url.startsWith("https:") && !target.startsWith("https:"))) throw new Error("Source outside crawl scope");
+    const origin = new URL(target).origin;
+    let policy = searchRobots.get(origin);
+    if (!policy || policy.expiresAt <= Date.now()) {
+      const r = await fetchSource(`${origin}/robots.txt`, { timeout: 850, bodyTimeoutMs: 850, signal,
+        limit: 256 * 1024, maxRedirects: 0, retries: 0, userAgent: agent, accept: "text/plain,*/*;q=0.1" });
+      const text = r.body.toString("utf8");
+      if (r.truncated || (r.ok && (!/^text\/plain\b/i.test(r.contentType) || r.cfMitigated ||
+          detectChallenge(text, r.contentType, r.status))) || (!r.ok && ![404, 410].includes(r.status))) {
+        throw new Error("Source crawl policy unavailable");
+      }
+      policy = { group: r.ok ? robotsMatchGroup(parseRobots(text), agent) : null, expiresAt: Date.now() + 10 * 60_000 };
+      searchRobots.set(origin, policy);
+      if (searchRobots.size > 512) searchRobots.delete(searchRobots.keys().next().value);
+    }
+    // Leave publishers requesting slower pacing to the scheduled crawler.
+    if (!robotsAllowed(target, policy) || policy.group?.crawlDelayMs) throw new Error("Source disallows live crawling");
+  };
+  await canRead(url);
+  const r = await fetchSource(url, { timeout: 1200, bodyTimeoutMs: 1000, signal, limit: 768 * 1024, maxRedirects: 2,
+    retries: 0, userAgent: agent, accept: "text/html,application/xhtml+xml", beforeRedirect: canRead });
+  const body = r.body.toString("utf8");
+  if (!r.ok || r.truncated || r.cfMitigated || !/^(?:text\/html|application\/xhtml\+xml)\b/i.test(r.contentType) ||
+      /\b(?:private|no-store)\b/i.test(r.cacheControl) || /(?:^|,)\s*(?:\*|cookie|authorization)\s*(?:,|$)/i.test(r.vary) ||
+      detectChallenge(body, r.contentType, r.status)) return null;
+  return { body, finalUrl: r.finalUrl, robotsTag: r.robotsTag };
+}
+const sourceSearch = createSourceSearch({ readPage: readSearchSource });
+
 const verticalSearch = createVerticalSearch({
   webSearch: (query, opts) => (app.locals.veyraWebSearch || webSearch).search(query, opts),
   fetchIndiaCatalog,
@@ -6509,30 +6550,61 @@ app.get('/api/search/web', async (req, res) => {
       return { ...local, provider: "veyra-index", results: local.results.map(row => ({ ...row, canonicalUrl: canonicalKey(row.url) || row.url })),
         nextOffset: more ? WEB_FEED_INDEX_OFFSET + next : null, more };
     };
-    const reply = result => res.json({ ok: true, ...result, results: rankMatchBatch(q, result.results, "web"), matchModel: matchModelVersion, ...(scope.active ? { total: null, siteFilter: { include: scope.include, exclude: scope.exclude } } : {}), source: "web", responseTimeMs: Date.now() - started });
+    const sourceLane = sourceSearchEnabled && !selected && req.query.incognito !== "1";
+    const reply = result => res.json({ ok: true, ...result, results: rankMatchBatch(q, sourceLane
+      ? result.results.map(row => ({ ...row, evidence: row.evidence || defaultEvidence(row) })) : result.results, "web"),
+      matchModel: matchModelVersion, ...(scope.active ? { total: null, siteFilter: { include: scope.include, exclude: scope.exclude } } : {}), source: "web", responseTimeMs: Date.now() - started });
     if (feed && (!Number.isSafeInteger(offset) || offset > WEB_FEED_INDEX_OFFSET + CFG.maxIndexDocs || (offset < WEB_FEED_INDEX_OFFSET && offset % WEB_FEED_STEP))) return respondError(res, 400, "Invalid search feed offset.", "INVALID_SEARCH_OFFSET");
     if (feed && selected && offset >= WEB_FEED_INDEX_OFFSET) return respondError(res, 400, "Index offsets are not available for an explicit engine.", "INVALID_SEARCH_OFFSET");
     if (feed && offset >= WEB_FEED_INDEX_OFFSET) return reply(fromIndex(offset - WEB_FEED_INDEX_OFFSET));
-    const result = await (app.locals.veyraWebSearch || webSearch).search(q, { offset, limit, engine: selected, lang, region: req.query.region,
-      signal: request.signal, noCache: isPrivate || !CFG.globalCacheEnabled, feed, reference: true,
-      privateSearch: req.query.incognito === "1" });
-    const external = (result.results || []).filter(row => row && canonicalKey(row.url) && allowsSiteUrl(scope, row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl)));
+    const evidenceService = app.locals.veyraSourceSearch || sourceSearch;
+    const firstSourcePage = sourceLane && !offset;
+    const inScope = row => row && canonicalKey(row.url) && allowsSiteUrl(scope, row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl));
+    const [result, discovered] = await Promise.all([
+      (app.locals.veyraWebSearch || webSearch).search(q, { offset, limit, engine: selected, lang, region: req.query.region,
+        signal: request.signal, noCache: isPrivate || !CFG.globalCacheEnabled, feed, reference: true,
+        privateSearch: req.query.incognito === "1" }).catch(error => {
+        if (!firstSourcePage) throw error;
+        return { provider: "none", results: [], status: "unavailable" };
+      }),
+      firstSourcePage ? evidenceService.discover(scope, { signal: request.signal }).catch(() => []) : []
+    ]);
+    const external = (result.results || []).filter(inScope);
     if (!isPrivate && (!feed || !offset)) queueNeuralIndexFindings(q, external);
+    let candidates = external;
+    if (firstSourcePage && discovered.length) {
+      const merged = new Map(external.map(row => [canonicalKey(row.url), row]));
+      for (const found of discovered.filter(inScope)) {
+        const key = canonicalKey(found.url);
+        const old = merged.get(key);
+        if (!old || old.source === "veyra-crawl") merged.set(key, found);
+        else merged.set(key, { ...old, ...found, providers: [...new Set([...(old.providers || [old.source || old.provider].filter(Boolean)), "veyra-crawl"])] });
+      }
+      candidates = diversifyWebResults(rankResultsByRelevance(scope.text, [...merged.values()], req.query.region), limit, scope.active);
+    }
+    const provider = result.provider && result.provider !== "none" && external.length ? result.provider :
+      (candidates.length && discovered.length ? "veyra-crawl" : result.provider);
+    const enrich = rows => firstSourcePage && rows.length
+      ? evidenceService.enrich(scope, rows, { signal: request.signal }).catch(() => rows) : rows;
     if (feed && !selected) {
       const local = fromIndex(0);
-      if (!external.length && !result.nextOffset && local.results.length) return reply(local);
-      let results = external;
-      if (!offset && !scope.active && external.length && limit >= 8 && local.results.length) {
-        const merged = new Map(external.map(row => [canonicalKey(row.url), row]));
+      if (!candidates.length && !result.nextOffset && local.results.length) return reply(local);
+      let results = candidates;
+      if (!offset && !scope.active && candidates.length && limit >= 8 && local.results.length) {
+        const merged = new Map(candidates.map(row => [canonicalKey(row.url), row]));
         for (const row of local.results.slice(0, 4)) {
           if (!merged.has(row.canonicalUrl) && isTopicalResult(scope.text, row, { requireTitle: true })) merged.set(row.canonicalUrl, row);
         }
-        if (merged.size > external.length) results = diversifyWebResults(rankResultsByRelevance(scope.text, [...merged.values()], req.query.region), limit);
+        if (merged.size > candidates.length) results = diversifyWebResults(rankResultsByRelevance(scope.text, [...merged.values()], req.query.region), limit);
       }
-      return reply({ ...result, results, ...(results.length ? { status: "ok" } : {}),
+      return reply({ ...result, provider, results: await enrich(results), ...(results.length ? { status: "ok" } : {}),
         ...(!result.nextOffset && local.results.length ? { nextOffset: WEB_FEED_INDEX_OFFSET, more: true } : {}) });
     }
-    reply({ ...result, results: external });
+    if (firstSourcePage && !candidates.length && !result.nextOffset) {
+      const local = fromIndex(0);
+      if (local.results.length) return reply({ ...local, more: false, nextOffset: null, status: "ok" });
+    }
+    reply({ ...result, provider, results: await enrich(candidates), ...(firstSourcePage && candidates.length ? { status: "ok" } : {}) });
   } catch (e) {
     respondError(res, 502, "Veyra web search is temporarily unavailable.", "SEARCH_WEB_ERROR");
   } finally { request.dispose(); }
