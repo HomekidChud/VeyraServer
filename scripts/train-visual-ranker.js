@@ -1,9 +1,10 @@
 "use strict";
 // Offline only. CPU-baseline visual classifier for an explicitly licensed local corpus.
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
-const { createHash } = require("node:crypto");
 const { spawnSync } = require("node:child_process");
+const { ID, readLedger, digest } = require("./media-rights-ledger");
 
 const SIDE = 24, FRAME_BYTES = SIDE * SIDE * 3, MAX_BYTES = 128 * 1024 * 1024;
 const extensions = {
@@ -48,27 +49,60 @@ function visualFeatures(file, kind) {
   return { vector: [...vector, movement / Math.max(1, frames.length - 1)], frames: frames.length };
 }
 
-function loadCorpus(root, rows) {
+function readMediaBytes(file) {
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK || 0) | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.size < 1 || stat.size > MAX_BYTES) throw new Error("Each media file must be non-empty and at most 128 MiB");
+    const bytes = Buffer.alloc(stat.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = fs.readSync(fd, bytes, offset, bytes.length - offset, offset);
+      if (!count) break;
+      offset += count;
+    }
+    if (offset !== bytes.length || fs.readSync(fd, Buffer.alloc(1), 0, 1, offset)) throw new Error("Media changed while it was being read");
+    return bytes;
+  } finally { fs.closeSync(fd); }
+}
+
+function decodeApproved(row) {
+  const bytes = readMediaBytes(row.file);
+  if (digest(bytes) !== row.sha256) throw new Error(`Approved media changed before decode for asset ${row.assetId}`);
+  // FFmpeg needs seekable MP4 input. Decode a private copy of exactly the bytes
+  // that passed the digest check, not a pathname that might have been replaced.
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "veyra-approved-media-"));
+  try {
+    const copy = path.join(scratch, `asset${path.extname(row.file)}`);
+    fs.writeFileSync(copy, bytes, { flag: "wx", mode: 0o600 });
+    return visualFeatures(copy, row.kind);
+  } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
+}
+
+function loadCorpus(root, rows, checkRights) {
+  if (typeof checkRights !== "function") throw new Error("A verified rights ledger is required");
   if (!Array.isArray(rows) || rows.length < 4 || rows.length > 1000) throw new Error("Use 4–1000 manifest entries, each with an independent label");
   root = fs.realpathSync(root);
-  const seenFiles = new Set(), groups = new Map();
+  const seenFiles = new Set(), seenIds = new Set(), groups = new Map();
   return rows.map(entry => {
     if (!Object.hasOwn(extensions, entry?.kind) || !["train", "holdout"].includes(entry.split) ||
         typeof entry.file !== "string" || path.isAbsolute(entry.file) || !extensions[entry.kind].test(entry.file) ||
         typeof entry.label !== "string" || !/^[\p{L}\p{N}][\p{L}\p{N} _-]{0,79}$/u.test(entry.label) ||
-        typeof entry.group !== "string" || !/^[\w-]{1,100}$/.test(entry.group) ||
-        typeof entry.permission !== "string" || !entry.permission.trim() || entry.permission.length > 250) throw new Error("Invalid manifest entry");
+        typeof entry.group !== "string" || !ID.test(entry.group) ||
+        typeof entry.assetId !== "string" || !ID.test(entry.assetId)
+        || Object.hasOwn(entry, "permission")) throw new Error("Invalid manifest entry; use an assetId in the rights ledger instead of a permission note");
     const file = fs.realpathSync(path.resolve(root, entry.file));
-    const stat = fs.statSync(file);
     const relative = path.relative(root, file);
     if (!relative || relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative) ||
-        !extensions[entry.kind].test(file) || !stat.isFile() || stat.size > MAX_BYTES) throw new Error("Each file must be inside the corpus, of the declared type and at most 128 MiB");
-    const hash = createHash("sha256").update(fs.readFileSync(file)).digest("hex");
-    if (seenFiles.has(hash)) throw new Error("Duplicate media detected");
-    seenFiles.add(hash);
+        !extensions[entry.kind].test(file)) throw new Error("Each file must be inside the corpus and of the declared type");
+    const sha256 = digest(readMediaBytes(file));
+    if (seenFiles.has(sha256) || seenIds.has(entry.assetId)) throw new Error("Duplicate media or asset ID detected");
+    seenFiles.add(sha256);
+    seenIds.add(entry.assetId);
     if (groups.has(entry.group) && groups.get(entry.group) !== entry.split) throw new Error("One media group crosses the train/holdout boundary");
     groups.set(entry.group, entry.split);
-    return { kind: entry.kind, label: entry.label, split: entry.split, file };
+    checkRights({ assetId: entry.assetId, group: entry.group, split: entry.split, sha256 });
+    return { assetId: entry.assetId, sha256, kind: entry.kind, label: entry.label, split: entry.split, file };
   });
 }
 
@@ -106,13 +140,28 @@ function trainVisual(examples) {
     decodedFrames: examples.reduce((sum, row) => sum + row.frames, 0), evaluation };
 }
 
-if (require.main === module) {
-  const [manifest, output] = process.argv.slice(2);
-  if (!manifest || !output || process.argv.length !== 4) throw new Error("Usage: node scripts/train-visual-ranker.js dataset/manifest.json output.json");
+function main(args) {
+  const usage = "Usage:\n  node scripts/train-visual-ranker.js --check-rights manifest.json rights-ledger.json\n"
+    + "  node scripts/train-visual-ranker.js manifest.json rights-ledger.json output.json";
+  const checkOnly = args[0] === "--check-rights";
+  if (args.length !== 3 || args.slice(checkOnly ? 1 : 0).some(value => !value || value.startsWith("--"))) throw new Error(usage);
+  const [manifest, ledgerFile, output] = checkOnly ? args.slice(1) : args;
+  const ledger = readLedger(ledgerFile);
   const rows = JSON.parse(fs.readFileSync(manifest, "utf8"));
-  const corpus = loadCorpus(path.dirname(manifest), rows);
-  const report = trainVisual(corpus.map(({ file, ...row }) => ({ ...row, ...visualFeatures(file, row.kind) })));
-  fs.writeFileSync(output, JSON.stringify(report, null, 2) + "\n", { flag: "wx" });
+  const corpus = loadCorpus(path.dirname(manifest), rows, ledger.check);
+  if (checkOnly) {
+    console.log(JSON.stringify({ approved: corpus.length, images: corpus.filter(row => row.kind === "images").length,
+      videos: corpus.filter(row => row.kind === "videos").length, ledgerSha256: ledger.sha256 }));
+    return;
+  }
+  const report = trainVisual(corpus.map(row => ({ kind: row.kind, label: row.label, split: row.split, ...decodeApproved(row) })));
+  report.rights = { ledgerId: ledger.id, ledgerSha256: ledger.sha256, assetIds: corpus.map(row => row.assetId).sort() };
+  fs.writeFileSync(output, JSON.stringify(report, null, 2) + "\n", { flag: "wx", mode: 0o600 });
   console.log(JSON.stringify({ trainingExamples: report.trainingExamples, decodedFrames: report.decodedFrames, evaluation: report.evaluation }));
+}
+
+if (require.main === module) {
+  try { main(process.argv.slice(2)); }
+  catch (error) { console.error(error.message); process.exitCode = 1; }
 }
 module.exports = { visualFeatures, loadCorpus, trainVisual };
