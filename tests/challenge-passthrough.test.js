@@ -67,6 +67,18 @@ function unusualTrafficHtml() {
   await new Promise((resolve, reject) => { server.once("listening", resolve); server.once("error", reject); });
   const base = `http://127.0.0.1:${server.address().port}`;
   try {
+    const retired = await fetch(`${base}/api/challenge/solve`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ url: "https://example.com/" }),
+    });
+    assert.equal(retired.status, 410, "the legacy automatic solver must stay disabled");
+    const status = await (await fetch(`${base}/api/challenge/status`)).json();
+    assert.equal(status.status, "disabled");
+    assert.equal(status.detectionEnabled, true);
+    const diagnostic = await (await fetch(`${base}/api/challenge/check?statusCode=403&html=${encodeURIComponent("Checking your browser · Cloudflare")}`)).json();
+    assert.deepEqual(diagnostic, { isChallenge: true, type: "cloudflare" });
+
     app.locals.veyraProxyFetchBuffer = async () => ({
       ok: true, status: 403, contentType: "text/html; charset=utf-8",
       body: Buffer.from(securityVerificationHtml(), "utf8"),

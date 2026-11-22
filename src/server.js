@@ -41,7 +41,7 @@ const { NeuralRobotPool } = require("./services/neural-robots");
 const { NeuralCrawlerModel } = require("./services/neural-crawler");
 const { NeuralLearningWorker } = require("./services/neural-learning");
 const { createPublicCrawlTrainer, trainingUrl } = require("./services/neural-training-data");
-const { ChallengeSolver } = require("./browser/challenge-solver");
+const { isChallengePage, detectChallengeType } = require("./browser/challenge-detector");
 const { CastServer, InternetConnectionManager } = require("./network/cast-server");
 const { WsRelay } = require("./network/ws-relay");
 const { AIAnswerEngine } = require("./services/ai-answer");
@@ -8397,20 +8397,16 @@ app.post("/api/robots/reset", (req, res) => { neuralRobotPool.resetAll(); res.js
 
 
 
-const challengeSolver = new ChallengeSolver({ log: (level, source, msg) => serverLog(level, source, msg) });
-app.get("/api/challenge/status", (req, res) => res.json(challengeSolver.report()));
-app.post("/api/challenge/solve", async (req, res) => {
-  try {
-    const { url, html, statusCode, headers } = req.body;
-    if (!url) return res.status(400).json({ error: "URL required" });
-    const result = await challengeSolver.solve(url, html || "", statusCode || 403, headers || {});
-    res.json({ ok: !!result, result });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+app.get("/api/challenge/status", (req, res) => res.json({
+  status: "disabled", detectionEnabled: true, cookieDomains: 0, totalCookies: 0, challengeCacheSize: 0
+}));
+app.post("/api/challenge/solve", (req, res) => {
+  return respondError(res, 410, "Automatic challenge solving is disabled. Complete the security check on the original site.", "CHALLENGE_SOLVER_DISABLED");
 });
 app.get("/api/challenge/check", (req, res) => {
   const html = req.query.html || "";
   const statusCode = Number(req.query.statusCode) || 200;
-  res.json({ isChallenge: challengeSolver.isChallengePage(html, statusCode), type: challengeSolver.detectChallengeType(html) });
+  res.json({ isChallenge: isChallengePage(html, statusCode), type: detectChallengeType(html) });
 });
 
 
