@@ -23,23 +23,24 @@ Include independently rated positives and negatives for each query. The trainer 
 
 Use an updated FFmpeg and locally staged files you own or have permission to use for training. The offline trainer reads image pixels and samples up to eight RGB frames from the first 16 seconds of video. It extracts color, layout, edge, and frame-to-frame change features and trains a small supervised classifier, with separate held-out image and video scores. It does not infer semantic similarity between queries and media, scrape media providers, download URLs, or modify live rankings.
 
-Create a manifest JSON array in the corpus directory, with both training and holdout groups and both splits represented in every class. Each item uses this shape:
+First create the restricted [media rights ledger](media-rights-ledger.md) and run preflight. A free-form manifest permission note is no longer accepted. Create a manifest JSON array in the corpus directory, with both training and holdout groups and both splits represented in every class. Each item uses this shape:
 
 ```json
 {
+  "assetId": "clip-017",
   "file": "approved/clip.mp4",
   "kind": "videos",
   "label": "outdoors",
   "split": "train",
-  "group": "shoot-17",
-  "permission": "Self-produced; approved for model training."
+  "group": "shoot-17"
 }
 ```
 
 Use `images` for JPG, PNG, WebP, or PPM and `videos` for MP4, MOV, WebM, or MKV. Group all related assets, edits, clips and adjacent shots together; never split one source production across train and holdout. The CLI also rejects exact duplicates. Train in a restricted offline environment with the approved corpus staged separately from private data. Keep licenses and any required attribution with the data, not in published model files.
 
 ```sh
-node scripts/train-visual-ranker.js ./corpus/manifest.json ./visual-model.json
+npm run check:visual-rights -- /private/corpus/manifest.json /private/corpus/rights-ledger.json
+node scripts/train-visual-ranker.js /private/corpus/manifest.json /private/corpus/rights-ledger.json /private/run/visual-model.json
 npm run test:visual-ranker
 ```
 
