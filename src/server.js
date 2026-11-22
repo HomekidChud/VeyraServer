@@ -33,6 +33,7 @@ const { WorkerPool } = require("./core/worker-pool");
 const { MongoStore } = require("./core/mongo-store");
 const youtubeCompat = require("./browser/youtube");
 const mediaErrors = require("./browser/media-errors");
+const { watchEmptyProxyShell } = require("./browser/proxy-shell");
 const { isMainThread } = require("worker_threads");
 const { NeuralRobotPool } = require("./services/neural-robots");
 const { NeuralCrawlerModel } = require("./services/neural-crawler");
@@ -3103,9 +3104,10 @@ function injectRuntime(html, original, sid = "") {
       }catch(e){}
     }catch(e){}
   })()}catch(e){}
-  // Empty SPA shell detector (Roblox, browser.lol, etc.): if the main root stays
-  // empty after scripts have had a chance to run, ask the parent to switch to Chromium.
-  try{(function(){var fired=false;function check(){if(fired)return;try{var root=document.querySelector('#root,#app,#__next,[data-reactroot],#react-root');var body=document.body;var text=(body&&body.innerText||'').replace(/\\s+/g,' ').trim();var kids=body?body.children.length:0;var emptyRoot=root&&!(root.textContent||'').trim()&&root.children.length===0;var sparse=!text||text.length<40&&kids<4;if(emptyRoot||sparse){fired=true;topPost({type:'veyra:browser-required',reason:'empty-spa-shell',sessionId:SESSION_ID,pageUrl:virtualUrl})}}catch{}}setTimeout(check,2500);setTimeout(check,6000)})()}catch{}
+  // Give slow apps time to hydrate and leave working game/media surfaces alone.
+  try{(${watchEmptyProxyShell.toString()})(document,window,()=>{
+    if(rootProxiedFrame())topPost({type:'veyra:browser-required',reason:'empty-spa-shell',sessionId:SESSION_ID,pageUrl:virtualUrl});
+  })}catch{}
   const nativeFetch=window.fetch;if(nativeFetch)window.fetch=function(input,init){
     const started=performance.now(); const method=String(init&&init.method||input&&input.method||'GET').toUpperCase(); const original=realUrl(input); let target=''; let reqX={initiator:'fetch'};try{reqX.requestHeaders=hdrObj(init&&init.headers||(typeof Request!=='undefined'&&input instanceof Request?input.headers:null));if(init&&typeof init.body==='string')reqX.requestBody=init.body.slice(0,20000)}catch{}
     try{target=resolve(input);if(shouldProxy(target)){const ok=r=>{net(method,target,r.status,performance.now()-started,r.ok,r,reqX);return r},bad=e=>{net(method,target,0,performance.now()-started,false,null,{...reqX,error:String(e&&e.message||e)});throw e};const dest=proxy('resource',target);if(typeof Request!=='undefined'&&input instanceof Request){const src=input;const hasBody=!/^(GET|HEAD)$/i.test(src.method)&&!(init&&'body' in init);return (hasBody?src.clone().arrayBuffer():Promise.resolve(undefined)).then(buf=>{const opts={method:src.method,headers:src.headers,credentials:src.credentials,cache:src.cache,redirect:src.redirect,integrity:src.integrity,signal:src.signal};if(buf&&buf.byteLength)opts.body=buf;if(src.keepalive&&!(buf&&buf.byteLength>60000))opts.keepalive=true;return nativeFetch(dest,Object.assign(opts,init||{}))}).then(ok,bad)}if(init&&init.body&&typeof ReadableStream!=='undefined'&&init.body instanceof ReadableStream){return new Response(init.body).arrayBuffer().then(buf=>{const o=Object.assign({},init,{body:buf});delete o.duplex;return nativeFetch(dest,o)}).then(ok,bad)}return nativeFetch(dest,init).then(ok,bad);}}catch{}
@@ -5294,8 +5296,10 @@ const vpnErrStatus = code => ({ VPN_DISABLED: 503, VPN_NOT_CONFIGURED: 404, VPN_
 
 
 
+const deployRevision = /^[a-f0-9]{40}$/i.test(process.env.RENDER_GIT_COMMIT || "") ? process.env.RENDER_GIT_COMMIT : "";
 app.get(['/health', '/api/health'], (req, res) => res.set("Cache-Control", "no-store")
-  .json({ ok: true, uptime: Math.round(process.uptime()), plan: VEYRA_CONFIG.plan.label, time: new Date().toISOString() }));
+  .json({ ok: true, uptime: Math.round(process.uptime()), plan: VEYRA_CONFIG.plan.label, time: new Date().toISOString(),
+    ...(deployRevision ? { revision: deployRevision } : {}) }));
 
 let vpnProfileHydration, vpnProfileRefreshAt = 0;
 function loadConfiguredVpnProfiles() {
@@ -6814,7 +6818,9 @@ function extractWarmUrls(html, base, sid) {
   const out = new Map();
   const add = (raw, priority = 20, type = "asset") => {
     const u = resolveResource(raw, base);
-    if (!u) return;
+    // Runtime tile/asset placeholders aren't real fetch targets. Filter both
+    // raw and percent-encoded forms before preloading or server-side warming.
+    if (!u || /(?:\{[a-z][a-z0-9_]*\}|%7b[a-z][a-z0-9_]*%7d)/i.test(u)) return;
     const safeType = warmTypeForUrl(u, type);
     const current = out.get(u);
     if (!current || priority > current.priority) out.set(u, { url: u, priority, type: safeType });

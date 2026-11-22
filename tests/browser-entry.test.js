@@ -12,6 +12,7 @@ process.env.VEYRA_ENV = "test";
 process.env.GATE_ENABLED = "false";
 process.env.FRONTEND_ORIGIN = "https://homekidchud.github.io,https://localhost";
 process.env.VEYRA_FRONTEND_URL = "https://homekidchud.github.io/VeyraBrowser/";
+process.env.RENDER_GIT_COMMIT = "a".repeat(40);
 delete process.env.MONGODB_URI;
 
 const { app } = require("../src/server");
@@ -43,7 +44,9 @@ test("top-level search is sent to the Browser; APIs and proxy frames retain thei
       const health = await request(p, { headers: html });
       assert.equal(health.status, 200);
       assert.equal(health.headers.get("cache-control"), "no-store");
-      assert.equal((await health.json()).ok, true);
+      const status = await health.json();
+      assert.equal(status.ok, true);
+      assert.equal(status.revision, "a".repeat(40));
     }
     for (const origin of ["https://homekidchud.github.io", "https://localhost", "https://untrusted.example"]) {
       const preflight = await request("/api/session", {
