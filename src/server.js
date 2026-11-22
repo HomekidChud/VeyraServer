@@ -25,6 +25,7 @@ const { publicImageUrl, imageIdentity } = require("./services/crawl-page-data");
 const { parseSiteScope, allowsSiteUrl } = require("./services/search-site-scope");
 const { rankMatchBatch, matchModelVersion } = require("./services/search-match");
 const { createSourceSearch, defaultEvidence, sourcePageUrl } = require("./services/source-search");
+const { referenceResults } = require("./services/reference-catalog");
 const { installBrandRoutes, isReservedOriginPath, brandNotFoundHtml } = require("./services/brand");
 const VEYRA_VERSION = require("../package.json").version;
 const { SessionManager } = require("./core/session-manager");
@@ -6559,12 +6560,13 @@ app.get('/api/search/web', async (req, res) => {
     if (feed && offset >= WEB_FEED_INDEX_OFFSET) return reply(fromIndex(offset - WEB_FEED_INDEX_OFFSET));
     const evidenceService = app.locals.veyraSourceSearch || sourceSearch;
     const firstSourcePage = sourceLane && !offset;
+    const references = !selected && !offset ? referenceResults(scope, Math.min(3, limit)) : [];
     const inScope = row => row && canonicalKey(row.url) && allowsSiteUrl(scope, row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl));
     const [result, discovered] = await Promise.all([
       (app.locals.veyraWebSearch || webSearch).search(q, { offset, limit, engine: selected, lang, region: req.query.region,
         signal: request.signal, noCache: isPrivate || !CFG.globalCacheEnabled, feed, reference: true,
         privateSearch: req.query.incognito === "1" }).catch(error => {
-        if (!firstSourcePage) throw error;
+        if (!firstSourcePage && !references.length) throw error;
         return { provider: "none", results: [], status: "unavailable" };
       }),
       firstSourcePage ? evidenceService.discover(scope, { signal: request.signal }).catch(() => []) : []
@@ -6572,7 +6574,7 @@ app.get('/api/search/web', async (req, res) => {
     const external = (result.results || []).filter(inScope);
     if (!isPrivate && (!feed || !offset)) queueNeuralIndexFindings(q, external);
     let candidates = external;
-    if (firstSourcePage && discovered.length) {
+    if (discovered.length || references.length) {
       const merged = new Map(external.map(row => [canonicalKey(row.url), row]));
       for (const found of discovered.filter(inScope)) {
         const key = canonicalKey(found.url);
@@ -6580,10 +6582,13 @@ app.get('/api/search/web', async (req, res) => {
         if (!old || old.source === "veyra-crawl") merged.set(key, found);
         else merged.set(key, { ...old, ...found, providers: [...new Set([...(old.providers || [old.source || old.provider].filter(Boolean)), "veyra-crawl"])] });
       }
+      for (const reference of references) {
+        if (!merged.has(reference.canonicalUrl)) merged.set(reference.canonicalUrl, reference);
+      }
       candidates = diversifyWebResults(rankResultsByRelevance(scope.text, [...merged.values()], req.query.region), limit, scope.active);
     }
     const provider = result.provider && result.provider !== "none" && external.length ? result.provider :
-      (candidates.length && discovered.length ? "veyra-crawl" : result.provider);
+      (candidates[0]?.source || result.provider);
     const enrich = rows => firstSourcePage && rows.length
       ? evidenceService.enrich(scope, rows, { signal: request.signal }).catch(() => rows) : rows;
     if (feed && !selected) {
@@ -6604,7 +6609,7 @@ app.get('/api/search/web', async (req, res) => {
       const local = fromIndex(0);
       if (local.results.length) return reply({ ...local, more: false, nextOffset: null, status: "ok" });
     }
-    reply({ ...result, provider, results: await enrich(candidates), ...(firstSourcePage && candidates.length ? { status: "ok" } : {}) });
+    reply({ ...result, provider, results: await enrich(candidates), ...((firstSourcePage || references.length) && candidates.length ? { status: "ok" } : {}) });
   } catch (e) {
     respondError(res, 502, "Veyra web search is temporarily unavailable.", "SEARCH_WEB_ERROR");
   } finally { request.dispose(); }

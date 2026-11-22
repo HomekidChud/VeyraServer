@@ -11,11 +11,13 @@ const COLLECTION = [
   ["nioujJogJZw", "Crispy Dosa with Cast Iron Dosa Pan & Wet Grinder - Pro Tips | Right Way to Make Crisp Dosa Batter", "Hebbars Kitchen", "Traditional crispy dosa recipe with ground rice and lentil batter."],
   ["J75VQSxOtdo", "cripsy roasted hotel style masala dosa recipe | ಹೋಟೆಲ್ ಮಸಾಲ ದೋಸೆ | how to make crispy masale dose", "Hebbars Kitchen", "Crispy masala dosa recipe with potato filling."],
   ["0XsNCe0nd_0", "4 must try crispy dosa recipes for morning breakfast | easy & tasty dosa recipes | healthy dosa", "Hebbars Kitchen", "Crispy dosa recipes for breakfast, including instant and rava dosa."],
-  ["uT5Y38EcXJ8", "2 instant crispy dosa recipe - aloo dosa, besan dosa & red chutney | instant south indian breakfast", "Hebbars Kitchen", "Two instant crispy dosa recipes with potato or gram flour."]
+  ["uT5Y38EcXJ8", "2 instant crispy dosa recipe - aloo dosa, besan dosa & red chutney | instant south indian breakfast", "Hebbars Kitchen", "Two instant crispy dosa recipes with potato or gram flour."],
+  ["Xbl7XjFYsN4", "import asyncio: Learn Python's AsyncIO #1 - The Async Ecosystem", "EdgeDB", "A Python asyncio tutorial series linked from the official Python documentation, starting with async programming.", "asyncio"],
+  ["l4Nn-y9ktd4", "Łukasz Langa - Thinking In Coroutines - PyCon 2016", "PyCon 2016", "A PyCon talk on Python asyncio, its event loop, coroutines, futures, and async/await.", "asyncio"]
 ];
 
-const catalog = COLLECTION.map(([id, title, source, snippet], index) => Object.freeze({
-  topic: index < 3 ? "tap" : "dosa",
+const catalog = COLLECTION.map(([id, title, source, snippet, topic], index) => Object.freeze({
+  topic: topic || (index < 3 ? "tap" : "dosa"),
   title, source, snippet, url: `https://www.youtube.com/watch?v=${id}`,
   thumbnail: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`
 }));
@@ -26,11 +28,13 @@ function videoMatches(value) {
     dosai: "dosa", dosas: "dosa", dose: "dosa", "डोसा": "dosa", "ದೋಸೆ": "dosa", "தோசை": "dosa", crisp: "crispy", crispier: "crispy" };
   const normalize = list => list.map(word => Object.hasOwn(aliases, word) ? aliases[word] : word);
   const query = normalize(words);
-  const group = query.includes("dosa") ? "dosa" : query.includes("tap") && query.includes("leak") ? "tap" : "";
+  const group = query.includes("dosa") ? "dosa" : query.includes("tap") && query.includes("leak") ? "tap" :
+    query.includes("asyncio") ? "asyncio" : "";
   if (!group) return [];
   const generic = new Set((group === "tap"
     ? "how to do i fix repair repairing fixing replacement replace change stop the a my of for leaking leak tap diy video videos watch guide tutorial in"
-    : "how to do i make making prepare cook the a my of for video videos watch guide tutorial recipe recipes dosa in at home बनाना रेसिपी").split(" "));
+    : group === "dosa" ? "how to do i make making prepare cook the a my of for video videos watch guide tutorial recipe recipes dosa in at home बनाना रेसिपी"
+    : "how to do i the a my of for video videos watch guide tutorial learn introduction beginner beginners in").split(" "));
   const qualifiers = query.filter(word => !generic.has(word));
   return catalog.filter(item => {
     if (item.topic !== group) return false;
