@@ -26,4 +26,12 @@ function watchEmptyProxyShell(doc, view, onBlank) {
   }, 2500);
 }
 
-module.exports = { watchEmptyProxyShell };
+function announceProxyStatus(html, status, pageUrl, sessionId) {
+  if (![401, 403, 429, 451, 500, 502, 503, 504].includes(status)) return html;
+  const message = JSON.stringify({ type: "veyra:proxy-status", status, pageUrl, sessionId }).replace(/</g, "\\u003c");
+  // Keep the upstream body and status intact. Nested frames do not notify the shell.
+  const script = `<script>if(parent===top&&parent!==window)parent.postMessage(${message},"*");</script>`;
+  return /<\/body\s*>/i.test(html) ? html.replace(/<\/body\s*>/i, closing => script + closing) : html + script;
+}
+
+module.exports = { watchEmptyProxyShell, announceProxyStatus };
