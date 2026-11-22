@@ -67,6 +67,22 @@ test("keyword discovery reads the matching reference directly and still needs a 
   assert.deepEqual(await noMatch.discover(parseSiteScope("Python asyncio")), []);
 });
 
+test("an exact catalog link only gets Strong on enrichment if its page was read", async () => {
+  const scope = parseSiteScope("Python asyncio");
+  const fixture = "The asyncio library lets you write concurrent code using asynchronous tasks, coroutines, and the async/await syntax.";
+  const reference = { url: "https://docs.python.org/3/library/asyncio.html", source: "veyra-reference", snippet: "" };
+  const readPage = async () => html(`<p>${fixture}</p>`, { title: "asyncio" });
+  for (const [row, basis] of [[reference, "catalog-passage"],
+    [{ ...reference, url: "https://docs.python.org/3/howto/a-conceptual-overview-of-asyncio.html" }, "page-passage"]]) {
+    const service = createSourceSearch({ readPage });
+    const [checked] = await service.enrich(scope, [row]);
+    assert.equal(checked.evidence.basis, basis);
+    assert.equal(checked.snippet, fixture);
+  }
+  const unavailable = createSourceSearch({ readPage: async () => null });
+  assert.deepEqual(await unavailable.enrich(scope, [reference]), [reference]);
+});
+
 test("a link, hidden match, or provider snippet alone does not establish live evidence", async () => {
   const urls = Array.from({ length: 6 }, (_, n) => `https://source${n}.example/orbital-imaging`);
   const rows = urls.map(url => ({ url, title: "Orbital imaging", snippet: sample }));
