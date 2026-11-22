@@ -6413,8 +6413,10 @@ app.get('/api/search/diagnostics', (req, res) => {
 app.get('/api/search/suggest', (req, res) => {
   const q = typeof req.query.q === "string" ? req.query.q.slice(0, CFG.maxSearchQueryChars) : "";
   const limit = Math.min(12, Math.max(1, Math.floor(Number(req.query.limit || 8)) || 8));
-  if (req.query.incognito === "1" || req.query.private === "1") req.veyraPrivateTraffic = true;
-  res.json({ ok: true, suggestions: req.query.incognito === "1" || req.query.private === "1" ? [] : localSearchSuggestions(q, limit) });
+  // The shell marks every guest search as private=1 to prevent retention, not
+  // to disable transient reads. Incognito disables autocomplete separately.
+  req.veyraPrivateTraffic = true;
+  res.json({ ok: true, suggestions: req.query.incognito === "1" ? [] : localSearchSuggestions(q, limit) });
 });
 app.get('/api/search/correct', (req, res) => res.json({ ok: true, ...correctSearchQuery(req.query.q || "") }));
 function requestAbortSignal(req, res) {

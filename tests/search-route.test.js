@@ -64,7 +64,10 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
       assert.equal(response.headers.get("cache-control"), "no-store");
       assert.deepEqual((await response.json()).suggestions, expected);
     }
-    for (const key of ["incognito", "private"]) assert.deepEqual((await (await suggest({ q: "orbital lun", [key]: "1" })).json()).suggestions, []);
+    const guestSuggestions = await suggest({ q: "orbital lun", limit: "1", private: "1" });
+    assert.equal(guestSuggestions.headers.get("cache-control"), "no-store");
+    assert.deepEqual((await guestSuggestions.json()).suggestions, ["orbital lunar"]);
+    assert.deepEqual((await (await suggest({ q: "orbital lun", incognito: "1", private: "1" })).json()).suggestions, []);
     const localResults = (await (await fetch(`${base}/api/search?q=orbital%20lunar`)).json()).results;
     assert.ok(localResults.length && localResults.every(row => Number.isInteger(row.matchPercent) && row.matchPercent >= 1 && row.matchPercent <= 100));
 
