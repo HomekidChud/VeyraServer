@@ -4,6 +4,7 @@ const cheerio = require("cheerio");
 const { isIP } = require("node:net");
 const { allowsSiteUrl } = require("./search-site-scope");
 const { canonicalKey, isTopicalResult, rankResultsByRelevance } = require("./websearch");
+const { referenceResults } = require("./reference-catalog");
 
 // Keep discovery independent from search engines and never turn a user query
 // (including site:) into an outbound URL. These are editorial starting points,
@@ -79,12 +80,17 @@ function extractSource(html, url, robotsTag = "") {
 
 function inspect(scope, page, isCatalog) {
   const { title, url, passages } = page;
+  // The official docs establish the language; a relevant paragraph need not
+  // repeat “Python”, but must still match the subject (e.g. “asyncio”).
+  const pythonTopic = new URL(url).hostname === "docs.python.org"
+    ? scope.text.replace(/\bpython\b/gi, "").replace(/\s+/g, " ").trim() : "";
+  const topic = /[\p{L}\p{N}]/u.test(pythonTopic) ? pythonTopic : scope.text;
   // Require a match in the body independently of the result's title or URL.
   const snippets = passages.map(snippet => ({ snippet }))
-    .filter(row => isTopicalResult(scope.text, row, { snippetOnly: true }));
+    .filter(row => isTopicalResult(topic, row, { snippetOnly: true }));
   if (!snippets.length) return null;
-  const snippet = rankResultsByRelevance(scope.text, snippets)[0].snippet;
-  if (!isTopicalResult(scope.text, { title, url, snippet }, { requireTitle: true })) return null;
+  const snippet = rankResultsByRelevance(topic, snippets)[0].snippet;
+  if (!isTopicalResult(topic, { title, url, snippet }, { requireTitle: true })) return null;
   return {
     url, canonicalUrl: canonicalKey(url), title, snippet, displayUrl: `${new URL(url).hostname}${new URL(url).pathname}`.slice(0, 120),
     evidence: { level: isCatalog && url.startsWith("https:") ? "strong" : "moderate",
@@ -97,7 +103,7 @@ function defaultEvidence(row) {
   return { level: indexed ? "limited" : "unverified", basis: indexed ? "indexed-copy" : "not-checked" };
 }
 
-function createSourceSearch({ readPage, seeds = SEEDS, discoverMs = 2300, evidenceMs = 1600, cooldownMs = 1500 } = {}) {
+function createSourceSearch({ readPage, seeds = SEEDS, lookupReferences = referenceResults, discoverMs = 2300, evidenceMs = 1600, cooldownMs = 1500 } = {}) {
   const catalog = seeds.filter(([url]) => sourcePageUrl(url));
   const hosts = new Map();
   const active = new Set();
@@ -149,7 +155,8 @@ function createSourceSearch({ readPage, seeds = SEEDS, discoverMs = 2300, eviden
     if (!scope.text || !/[\p{L}\p{N}]/u.test(scope.text)) return [];
     const picked = new Map();
     const matching = catalog.filter(([url, intent]) => allowsSiteUrl(scope, url) && intent.test(scope.text));
-    for (const [url] of scope.include.length ? [...matching, ...catalog] : matching) {
+    const direct = lookupReferences(scope).map(row => [row.url]);
+    for (const [url] of [...direct, ...(scope.include.length ? [...matching, ...catalog] : matching)]) {
       if (allowsSiteUrl(scope, url) && !picked.has(publisher(url))) picked.set(publisher(url), sourcePageUrl(url));
       if (picked.size === 6) break;
     }

@@ -435,6 +435,17 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
       return r.json();
     };
     app.locals.veyraWebSearch = { async search() { throw new Error("All discovery providers unavailable"); } };
+    const beforePrivate = sourceCalls.length;
+    for (const q of ["Python asyncio", "site:docs.python.org asyncio"]) {
+      const privateResult = await getSourceResults(q, { incognito: "1", private: "1", region: "IN" });
+      assert.equal(privateResult.status, "ok");
+      assert.equal(privateResult.provider, "veyra-reference");
+      assert.equal(privateResult.results[0].url, "https://docs.python.org/3/library/asyncio.html");
+      assert(privateResult.results.every(row => !Object.hasOwn(row, "evidence") && row.snippet === ""));
+    }
+    assert.equal(sourceCalls.length, beforePrivate, "private catalog lookup performs no publisher requests");
+    assert.equal((await getSourceResults("Python asyncio -site:docs.python.org")).results.length, 0);
+    assert.equal((await getSourceResults("site:elsewhere.example Python asyncio")).results.length, 0);
     const independent = await getSourceResults("site:docs.python.org Python frobnicator");
     assert.equal(independent.provider, "veyra-crawl");
     assert.equal(independent.status, "ok");
@@ -459,6 +470,9 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     assert((await getSourceResults("Python frobnicator", { incognito: "1" })).results.every(row => !row.evidence));
     assert((await getSourceResults("Python frobnicator", { engine: "bing" })).results.every(row => !row.evidence));
     assert((await getSourceResults("Python frobnicator", { offset: "10" })).results.every(row => row.evidence.basis === "not-checked"));
+    for (const opts of [{ engine: "bing" }, { offset: "10" }]) {
+      assert(!(await getSourceResults("Python asyncio", opts)).results.some(row => row.source === "veyra-reference"));
+    }
     assert.equal(sourceCalls.length, callsBeforeSkip, "incognito, explicit engines and pagination do not crawl");
     console.log("Search, answer and YouTube Express routes passed controlled local integration tests");
   } finally {

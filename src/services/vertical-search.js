@@ -33,6 +33,14 @@ function videoTopic(query) {
 }
 const THUMB_HOSTS = new Set(["imgs.search.brave.com", "upload.wikimedia.org", "thumb.wikimedia.org", "i.ebayimg.com", "i.ytimg.com",
   "images-assets.nasa.gov", "science.nasa.gov", "assets.science.nasa.gov", "www.esa.int", "media.esa.int"]);
+const QT_COROUTINES = "https://doc.qt.io/qtforpython-6/_images/coroutines.png";
+const QT_ASYNCIO = "https://doc.qt.io/qtforpython-6/PySide6/QtAsyncio/index.html#coroutines-explained";
+const MEDIA_QUALIFIERS = new Set("a an and for of in to how show me the image images diagram diagrams visual picture".split(" "));
+const ASYNCIO_IMAGE_TERMS = new Set("asyncio async python coroutine coroutines asynchronous event loop qt qtasyncio pyside6 flow await yield resume".split(" "));
+function matchesReferenceImage(scope, query) {
+  const terms = unicodeWords(query).filter(word => !MEDIA_QUALIFIERS.has(word));
+  return terms.includes("asyncio") && terms.every(word => ASYNCIO_IMAGE_TERMS.has(word)) && allowsSiteUrl(scope, QT_ASYNCIO);
+}
 const NASA_INTENT = /\b(?:nasa|space telescope|nebula|saturn|jupiter|mars|apollo \d+|space shuttle|astronaut|moon landing|iss|galax(?:y|ies))\b/i;
 const COMMUNITY_SITES = [
   ["cooking", "cooking.stackexchange.com", "Seasoned Advice", /\b(?:cook(?:ing)?|recipe|food|bake|dosa)\b/i],
@@ -65,6 +73,7 @@ function safeUrl(value) {
 function thumbnail(value) {
   const valueUrl = safeUrl(value);
   if (!valueUrl || !valueUrl.startsWith("https:")) return "";
+  if (value === QT_COROUTINES) return valueUrl;
   const url = new URL(valueUrl);
   if (url.hostname === "api.openverse.org") return /^\/v1\/images\/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\/thumb\/$/i.test(url.pathname) && !url.search ? valueUrl : "";
   if (!THUMB_HOSTS.has(url.hostname)) return "";
@@ -183,7 +192,17 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
     });
     return { provider: "wikimedia", results, more: json.continue?.gsroffset === (page + 1) * count };
   }
-  async function imageMix(type, q, { signal, lang, region, fullQuery }) {
+  function referenceImages(type, q, { scope }) {
+    const provider = "reference-images";
+    const results = matchesReferenceImage(scope, q) ? [row(type, provider, {
+      url: QT_COROUTINES, imageUrl: QT_COROUTINES, thumbnail: QT_COROUTINES, sourcePageUrl: QT_ASYNCIO,
+      title: "Python asyncio coroutine flow diagram", source: "The Qt Company · Qt for Python",
+      snippet: "Asyncio event loop and coroutine flow explaining when asynchronous Python code yields, awaits, and resumes.",
+      license: "GNU FDL 1.3"
+    })] : [];
+    return { provider, results, more: false };
+  }
+  async function imageMix(type, q, { signal, lang, region, fullQuery, scope }) {
     const lanes = [["wikimedia", () => commons(type, q, { page: 0, signal, count: IMAGE_FEED_SIZE })]];
     if (braveKey) lanes.unshift(["brave", () => brave(type, fullQuery, { page: 0, signal, lang, region })]);
     const active = lanes.filter(([name]) => (cooldown.get(`${name}:images`) || 0) <= Date.now());
@@ -193,6 +212,8 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
     }
     signal?.throwIfAborted();
     const feeds = settled.flatMap(item => item.status === "fulfilled" ? [item.value.results.slice(0, IMAGE_FEED_SIZE)] : []);
+    const references = referenceImages(type, q, { scope }).results;
+    if (references.length) feeds.unshift(references);
     const commonsMore = settled.some(item => item.status === "fulfilled" && item.value.provider === "wikimedia" && item.value.more);
     let local = [];
     try { local = indexedImages(fullQuery, region).slice(0, 24).map(item => row(type, "veyra-crawler", item)); } catch {}
@@ -442,6 +463,7 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
       if (braveKey && ["images", "videos", "news"].includes(type)) list.push(["brave", brave]);
       if (type === "images") list.push(["wikimedia", commons]);
     }
+    if (type === "images" && matchesReferenceImage(scope, topic)) list.push(["reference-images", referenceImages]);
     if (type === "images" && !preview) list.push(["openverse", openverse]);
     if (type === "videos" && !page && !preview && env.YOUTUBE_DATA_API_KEY && env.VEYRA_YOUTUBE_SEARCH === "1") list.push(["youtube", youtube]);
     if (type === "videos") list.push(["peertube", peertube]);
@@ -534,6 +556,7 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
         const section = { ...empty(results.length ? "ok" : "empty"), results, provider: packed.provider, nextPage,
           ...(nextProvider ? { nextProvider } : {}), observedAt: new Date().toISOString() };
         if (name === "image-mix" && !provider && !preview && results.length < 6 && !scope.include.length) { sparseImages = section; continue; }
+        if (name === "reference-images" && sparseImages?.results.length) continue;
         if (name === "openverse" && sparseImages && results.length < sparseImages.results.length) return sparseImages;
         return section;
       } catch (error) {

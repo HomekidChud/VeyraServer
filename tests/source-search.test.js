@@ -48,6 +48,25 @@ test("discovery stops after six publishers and one same-origin hop each", async 
   assert(fetched.every(url => /(?:space|child)$/.test(url)));
 });
 
+test("keyword discovery reads the matching reference directly and still needs a topical passage", async () => {
+  const asyncio = "https://docs.python.org/3/library/asyncio.html";
+  const sample = "The asyncio library lets you write concurrent code using asynchronous tasks, coroutines, and the async/await syntax.";
+  for (const [query, expected] of [["Python asyncio", [asyncio]], ["site:docs.python.org asyncio", [asyncio]],
+    ["Python asyncio -site:docs.python.org", []], ["site:elsewhere.example asyncio", []]]) {
+    const visits = [];
+    const service = createSourceSearch({ async readPage(url) {
+      visits.push(url);
+      return html(`<p>${sample}</p>`, { title: "asyncio: Asynchronous I/O" });
+    } });
+    const results = await service.discover(parseSiteScope(query));
+    assert.deepEqual(visits, expected);
+    assert.deepEqual(results.map(row => [row.url, row.evidence.basis, row.snippet]),
+      expected.map(url => [url, "catalog-passage", sample]));
+  }
+  const noMatch = createSourceSearch({ readPage: async () => html("<p>This page explains how to contact the team and where to request accessibility documentation for their website.</p>", { title: "asyncio" }) });
+  assert.deepEqual(await noMatch.discover(parseSiteScope("Python asyncio")), []);
+});
+
 test("a link, hidden match, or provider snippet alone does not establish live evidence", async () => {
   const urls = Array.from({ length: 6 }, (_, n) => `https://source${n}.example/orbital-imaging`);
   const rows = urls.map(url => ({ url, title: "Orbital imaging", snippet: sample }));

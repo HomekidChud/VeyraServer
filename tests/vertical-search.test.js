@@ -94,7 +94,7 @@ test("the requested subject, not generic action words, controls video results", 
 
 test("verified videos surface direct, scoped watch links without a paid provider", async () => {
   const service = mock({ "sepiasearch.org": { total: 0, data: [] } });
-  for (const [q, count] of [["how to fix a leaking tap", 3], ["dripping faucet", 3], ["how to make crispy dosa", 4], ["डोसा", 4]]) {
+  for (const [q, count] of [["how to fix a leaking tap", 3], ["dripping faucet", 3], ["how to make crispy dosa", 4], ["डोसा", 4], ["Python asyncio", 2]]) {
     const page = await service.search("videos", q);
     assert.equal(page.provider, "verified-videos");
     assert.equal(page.results.length, count);
@@ -103,7 +103,25 @@ test("verified videos surface direct, scoped watch links without a paid provider
   assert.equal(service.calls.length, 0);
   assert.equal((await service.search("videos", "site:youtube.com instant crispy dosa")).results.length, 2);
   assert.equal((await service.search("videos", "-site:youtube.com dosa")).results.length, 0);
+  assert.equal((await service.search("videos", "site:youtube.com Python asyncio")).results.length, 2);
+  assert.equal((await service.search("videos", "-site:youtube.com Python asyncio")).results.length, 0);
   assert.equal((await service.search("videos", "dosa rap song")).results.length, 0);
+});
+
+test("keyword technical image keeps the actual publisher, license, and site scope", async () => {
+  const service = mock({ "commons.wikimedia.org": { status: 503 }, "api.openverse.org": { results: [] } }, { indexedImages: () => [] });
+  const image = "https://doc.qt.io/qtforpython-6/_images/coroutines.png";
+  const opts = { region: "IN" };
+  for (const q of ["Python asyncio", "site:doc.qt.io asyncio diagram"]) {
+    const result = await service.search("images", q, opts);
+    assert.equal(result.status, "ok");
+    assert.deepEqual(result.results.map(r => [r.thumbnail, r.imageUrl, r.license]), [[image, image, "GNU FDL 1.3"]]);
+    assert.equal(new URL(result.results[0].sourcePageUrl).hostname, "doc.qt.io");
+    assert.equal(result.nextPage, null);
+  }
+  for (const q of ["-site:doc.qt.io Python asyncio", "Python asyncio rose", "site:another.example asyncio"]) {
+    assert.equal((await service.search("images", q, opts)).results.length, 0);
+  }
 });
 
 test("India catalog accepts in-stock direct product listings and verifies INR without trusting search prices", async () => {
