@@ -418,13 +418,16 @@ app.use(shield.middleware);
 // request is readable by the browser shell as a policy decision.
 let accessGate = null;
 let gateMiddleware = null;
-// NOTE: the cross-session cookie handoff ("/api/handoff/cookies", the
-// "Bring session back" bookmarklet, the paste-import form) was removed.
-// Sign-in now happens inside the fast proxy itself: the site's login and
+// NOTE: the cross-session cookie handoff ("/api/handoff/login", "/api/handoff/return",
+// the "Bring session back" bookmarklet, the paste-import form) was removed.
+// Sign-in happens inside the fast proxy itself: the site's login and
 // OAuth pages load through the proxy in the session's own cookie jar, and
 // OAuth popups open as proxied Veyra tabs with opener semantics relayed
-// by the app. No cookie ever crosses between the user's browser and a
-// Veyra session, or between two Veyra sessions.
+// by the app. No cookie ever crosses between two Veyra sessions. The one
+// deliberate exception is the Launcher extension's sid-scoped
+// "/api/handoff/cookies" import (defined further below): cookies move
+// from the user's own browser into their own Veyra session, only when the
+// user clicks Send in the extension popup.
 const allowedOrigins = CFG.frontendOrigins.includes("*") ? true : CFG.frontendOrigins;
 const browserCorsOptions = {
   origin: allowedOrigins,
@@ -5535,13 +5538,45 @@ app.post('/api/session', (req, res) => {
   rec.incognito = req.body?.incognito === true;
   res.status(201).json({ ok: true, ...sessionInfo(sid, rec), user: user ? authStore.publicUser(user) : null });
 });
-// (Removed) /api/handoff/login, /api/handoff/return and
-// /api/handoff/cookies (bookmarklet + paste cookie import). Sign-in and
-// verification happen inside the fast proxy in the session's own cookie
-// jar; no cookie ever crosses between the user's browser and a Veyra
-// session, or between two Veyra sessions. The session-cookie endpoints
-// below remain: the app uses them to display and clear the session's own
-// jar (devtools cookie panel), never to import foreign cookies.
+// Extension cookie transfer. The Veyra Launcher extension reads a site's
+// cookies (including HttpOnly ones the page itself cannot see) in the
+// user's own browser and imports them into the caller's own Veyra session,
+// for sites whose sign-in cannot complete inside the fast proxy. The sid
+// is discovered locally, from the user's own open Veyra app tab — the
+// extension never learns a sid it could not already read from that tab,
+// and cookies never cross between two Veyra sessions (the sid is required).
+// The user triggers every transfer by hand from the extension popup.
+app.post("/api/handoff/cookies", (req, res) => {
+  const sid = normalizeSessionId(String(req.body?.sid || ""));
+  const rec = sessionManager.peek(sid);
+  if (!rec) return respondError(res, 404, "No such session. Start a Veyra session first.", "SESSION_NOT_FOUND");
+  const target = normalizeUrl(String(req.body?.url || ""));
+  if (!target) return respondError(res, 400, "A valid http(s) url is required.", "BAD_REQUEST");
+  let host = "", secure = false;
+  try { const u = new URL(target); host = u.hostname.toLowerCase(); secure = u.protocol === "https:"; } catch { return respondError(res, 400, "A valid http(s) url is required.", "BAD_REQUEST"); }
+  const raw = String(req.body?.cookies || "").slice(0, 20000);
+  const ua = String(req.body?.userAgent || "").slice(0, 500);
+  // Accept a raw cookie header ("a=1; b=2") or a JSON array of cookies
+  // (the chrome.cookies objects the Launcher extension captures).
+  let arr = null;
+  const trimmed = raw.trim();
+  if (trimmed.startsWith("[")) {
+    try { const parsed = JSON.parse(trimmed); if (Array.isArray(parsed)) arr = parsed; } catch {}
+  }
+  if (!arr) {
+    arr = trimmed.split(";").map(part => {
+      const i = part.indexOf("=");
+      if (i < 1) return null;
+      const name = part.slice(0, i).trim();
+      if (!name) return null;
+      return { name, value: part.slice(i + 1).trim(), domain: host, path: "/", secure, expires: 0 };
+    }).filter(Boolean);
+  }
+  if (!arr.length) return respondError(res, 400, "No valid cookies found. Paste a cookie header like \"name=value; other=value\".", "BAD_REQUEST");
+  sessionManager.importPlaywrightCookies(sid, arr, ua);
+  serverLog("info", "HANDOFF", `Imported ${arr.length} cookie(s) for ${host} into session ${sid.slice(0, 8)} via the Launcher extension.`);
+  res.json({ ok: true, imported: arr.length });
+});
 app.get('/api/session/:sid', (req, res) => {
   const sid = String(req.params.sid);
   if (sessionManager.checkLimit(sid)) return res.json({ ok: true, sessionId: sid, active: false, expired: true, reason: "SESSION_EXPIRED" });
