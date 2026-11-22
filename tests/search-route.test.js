@@ -53,10 +53,20 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
   const url = "https://fixture-search-route.test/veyra-local-answer";
   const article = `<!doctype html><html><head><title>Veyra local route fixture</title><meta name="description" content="Local route integration fixture"></head><body><main><h1>Veyra local route fixture</h1><p>The Veyra local route fixture confirms the answer endpoint can reuse indexed article text without another page fetch.</p><p>Stored source text retains its canonical URL, provider attribution, extraction status and exact passage offsets for citation checks.</p></main></body></html>`;
   assert(indexDocument(url, article), "fixture article should enter the in-memory local index");
+  assert(indexDocument("https://fixture-search-route.test/orbital", "<!doctype html><html><head><title>Orbital lunar livestream</title></head><body><main><p>Orbital lunar livestream commentary from the lunar mission observation deck, including official schedules and an archive for offline viewing.</p></main></body></html>"));
   const server = app.listen(0, "127.0.0.1");
   try {
     await new Promise((resolve, reject) => { server.once("listening", resolve); server.once("error", reject); });
     const base = `http://127.0.0.1:${server.address().port}`;
+    const suggest = input => fetch(`${base}/api/search/suggest?${new URLSearchParams(input)}`);
+    for (const [q, expected] of [["orbital lun", ["orbital lunar"]], ["orbital ", ["orbital lunar"]], ["site:fixture.test lun", []]]) {
+      const response = await suggest({ q, limit: "1" });
+      assert.equal(response.headers.get("cache-control"), "no-store");
+      assert.deepEqual((await response.json()).suggestions, expected);
+    }
+    for (const key of ["incognito", "private"]) assert.deepEqual((await (await suggest({ q: "orbital lun", [key]: "1" })).json()).suggestions, []);
+    const localResults = (await (await fetch(`${base}/api/search?q=orbital%20lunar`)).json()).results;
+    assert.ok(localResults.length && localResults.every(row => Number.isInteger(row.matchPercent) && row.matchPercent >= 1 && row.matchPercent <= 100));
 
     const signup = await fetch(`${base}/api/auth/signup`, {
       method: "POST",
@@ -73,6 +83,7 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     assert.equal(webPayload.ok, true);
     assert.equal(webPayload.provider, "mock-provider");
     assert.equal(webPayload.results[0].url, "https://search-fixture.example/result");
+    assert.ok(webPayload.results[0].matchPercent > 1);
     assert.equal(webPayload.source, "web");
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(crawlCalls, 1, "relevant external search results should be sent to the bounded background index crawler");

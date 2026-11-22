@@ -23,6 +23,7 @@ const { createVerticalSearch, TYPES: SEARCH_VERTICALS, lastVerticalPage, indexed
 const { merchantProductUrl, PRODUCT_BYTES } = require("./services/india-storefronts");
 const { publicImageUrl, imageIdentity } = require("./services/crawl-page-data");
 const { parseSiteScope, allowsSiteUrl } = require("./services/search-site-scope");
+const { rankMatchBatch, matchModelVersion } = require("./services/search-match");
 const { installBrandRoutes, isReservedOriginPath, brandNotFoundHtml } = require("./services/brand");
 const VEYRA_VERSION = require("../package.json").version;
 const { SessionManager } = require("./core/session-manager");
@@ -33,7 +34,7 @@ const { WorkerPool } = require("./core/worker-pool");
 const { MongoStore } = require("./core/mongo-store");
 const youtubeCompat = require("./browser/youtube");
 const mediaErrors = require("./browser/media-errors");
-const { watchEmptyProxyShell } = require("./browser/proxy-shell");
+const { watchEmptyProxyShell, announceProxyStatus } = require("./browser/proxy-shell");
 const { isMainThread } = require("worker_threads");
 const { NeuralRobotPool } = require("./services/neural-robots");
 const { NeuralCrawlerModel } = require("./services/neural-crawler");
@@ -3805,9 +3806,37 @@ function localImageSearch(query, region) {
   return images;
 }
 function localSearchSuggestions(query, limit = 8) {
-  const prefix = String(query || "").trim().toLocaleLowerCase().split(/\s+/).pop() || "";
-  const source = prefix ? [...termCounts.keys()].filter(t => t.startsWith(prefix)) : [...termCounts.keys()];
-  return source.sort((a,b) => (termCounts.get(b) || 0) - (termCounts.get(a) || 0) || a.localeCompare(b)).slice(0, limit);
+  const typed = String(query || "").trimStart().slice(0, CFG.maxSearchQueryChars);
+  if (!typed.trim() || parseSiteScope(typed).active || /[\u0000-\u001f\u007f]/.test(typed)) return [];
+  const fragment = /[\p{L}\p{M}\p{N}'’-]+$/u.exec(typed);
+  if (!fragment && !typed.endsWith(" ")) return [];
+  const prefix = normalizeSearchText(fragment?.[0] || "");
+  const lead = fragment ? typed.slice(0, fragment.index) : typed;
+  const context = [...new Set(tokenizeSearch(lead))].slice(-4);
+  const anchors = context.map(term => invertedIndex.get(term)).filter(Boolean).sort((a,b) => a.size - b.size);
+  if (!prefix && !anchors.length) return [];
+  const nearby = new Map();
+  const nextWord = context.at(-1);
+  let visited = 0;
+  for (const [url] of anchors[0] || []) {
+    if (++visited > 100) break;
+    if (!anchors.every(postings => postings.has(url))) continue;
+    const doc = searchIndex.get(url);
+    for (const field of [doc?.title, doc?.headings, doc?.description]) {
+      const words = tokenizeSearch(field);
+      const found = new Map();
+      for (let i = 0; i < words.length; i++) {
+        const term = words[i];
+        if (term !== prefix && term.startsWith(prefix) && !context.includes(term)) {
+          found.set(term, Math.max(found.get(term) || 0, nextWord && words[i - 1] === nextWord ? 4 : 1));
+        }
+      }
+      for (const [term, weight] of found) nearby.set(term, (nearby.get(term) || 0) + weight);
+    }
+  }
+  const source = prefix ? [...termCounts.keys()].filter(term => term !== prefix && term.startsWith(prefix) && !context.includes(term)) : [...nearby.keys()];
+  return source.sort((a,b) => (nearby.get(b) || 0) - (nearby.get(a) || 0) || (termCounts.get(b) || 0) - (termCounts.get(a) || 0) || a.localeCompare(b))
+    .slice(0, limit).map(term => `${lead}${term}`);
 }
 function editDistance(a, b) {
   const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
@@ -6089,7 +6118,9 @@ app.get('/api/v1/search', requirePlatformKey, (req, res) => {
 // GET /api/v1/suggest?q= — search suggestions from the Veyra index.
 app.get('/api/v1/suggest', requirePlatformKey, (req, res) => {
   const q = String(req.query.q || "").trim().slice(0, CFG.maxSearchQueryChars);
-  res.json({ ok: true, suggestions: localSearchSuggestions(q, 8) });
+  const prefix = q.toLocaleLowerCase().split(/\s+/).pop() || "";
+  const source = [...termCounts.keys()].filter(term => term.startsWith(prefix));
+  res.json({ ok: true, suggestions: source.sort((a, b) => (termCounts.get(b) || 0) - (termCounts.get(a) || 0) || a.localeCompare(b)).slice(0, 8) });
 });
 
 // POST /api/v1/fetch — fetch any public URL through Veyra's proxy
@@ -6369,7 +6400,7 @@ app.get('/api/search', (req, res) => {
     const limit = Math.min(CFG.maxSearchResults, Math.max(1, Number(req.query.limit || 20) || 20));
     const started = Date.now();
     const result = localSearch(query, offset, limit, { region: req.query.region, topical: true });
-    res.json({ ok: true, ...result, provider: "veyra-index", responseTimeMs: Date.now() - started });
+    res.json({ ok: true, ...result, results: rankMatchBatch(query, result.results, "index"), matchModel: matchModelVersion, provider: "veyra-index", responseTimeMs: Date.now() - started });
   } catch (e) { respondError(res, 500, e.message, "SEARCH_ERROR"); }
 });
 app.get('/api/search/stats', (req, res) => res.json({ ok: true, ...searchIndexStats() }));
@@ -6380,9 +6411,10 @@ app.get('/api/search/diagnostics', (req, res) => {
   } catch (error) { respondError(res, 500, error.message, "SEARCH_DIAGNOSTICS_ERROR"); }
 });
 app.get('/api/search/suggest', (req, res) => {
-  const q = String(req.query.q || "").trim().slice(0, CFG.maxSearchQueryChars);
-  const limit = Math.min(12, Math.max(1, Number(req.query.limit || 8) || 8));
-  res.json({ ok: true, suggestions: localSearchSuggestions(q, limit) });
+  const q = typeof req.query.q === "string" ? req.query.q.slice(0, CFG.maxSearchQueryChars) : "";
+  const limit = Math.min(12, Math.max(1, Math.floor(Number(req.query.limit || 8)) || 8));
+  if (req.query.incognito === "1" || req.query.private === "1") req.veyraPrivateTraffic = true;
+  res.json({ ok: true, suggestions: req.query.incognito === "1" || req.query.private === "1" ? [] : localSearchSuggestions(q, limit) });
 });
 app.get('/api/search/correct', (req, res) => res.json({ ok: true, ...correctSearchQuery(req.query.q || "") }));
 function requestAbortSignal(req, res) {
@@ -6422,7 +6454,7 @@ app.get('/api/search/web', async (req, res) => {
       return { ...local, provider: "veyra-index", results: local.results.map(row => ({ ...row, canonicalUrl: canonicalKey(row.url) || row.url })),
         nextOffset: more ? WEB_FEED_INDEX_OFFSET + next : null, more };
     };
-    const reply = result => res.json({ ok: true, ...result, ...(scope.active ? { total: null, siteFilter: { include: scope.include, exclude: scope.exclude } } : {}), source: "web", responseTimeMs: Date.now() - started });
+    const reply = result => res.json({ ok: true, ...result, results: rankMatchBatch(q, result.results, "web"), matchModel: matchModelVersion, ...(scope.active ? { total: null, siteFilter: { include: scope.include, exclude: scope.exclude } } : {}), source: "web", responseTimeMs: Date.now() - started });
     if (feed && (!Number.isSafeInteger(offset) || offset > WEB_FEED_INDEX_OFFSET + CFG.maxIndexDocs || (offset < WEB_FEED_INDEX_OFFSET && offset % WEB_FEED_STEP))) return respondError(res, 400, "Invalid search feed offset.", "INVALID_SEARCH_OFFSET");
     if (feed && selected && offset >= WEB_FEED_INDEX_OFFSET) return respondError(res, 400, "Index offsets are not available for an explicit engine.", "INVALID_SEARCH_OFFSET");
     if (feed && offset >= WEB_FEED_INDEX_OFFSET) return reply(fromIndex(offset - WEB_FEED_INDEX_OFFSET));
@@ -6465,14 +6497,15 @@ app.get("/api/search/vertical", async (req, res) => {
     const signal = AbortSignal.any([request.signal, AbortSignal.timeout(type === "all" ? 12000 : 9000)]);
     const service = app.locals.veyraVerticalSearch || verticalSearch;
     const options = { page, provider, lang: req.query.lang, region: req.query.region, signal, noCache: req.veyraPrivateTraffic || req.query.incognito === "1" || !CFG.globalCacheEnabled, preview: type === "all", privateSearch: req.query.incognito === "1" };
-    if (type !== "all") return res.json({ ok: true, ...await service.search(type, q, options) });
+    const withMatches = (section, category) => ({ ...section, results: rankMatchBatch(q, section.results, category), matchModel: matchModelVersion });
+    if (type !== "all") return res.json({ ok: true, ...withMatches(await service.search(type, q, options), type) });
     let cursor = 0;
     const sections = Array(SEARCH_VERTICALS.length);
     await Promise.all(Array.from({ length: 3 }, async () => {
       while (cursor < SEARCH_VERTICALS.length && !signal.aborted) {
         const index = cursor++, category = SEARCH_VERTICALS[index];
         try {
-          const section = await service.search(category, q, options);
+          const section = withMatches(await service.search(category, q, options), category);
           sections[index] = { ...section, results: section.results.slice(0, 3) };
         } catch { sections[index] = { type: category, status: "unavailable", results: [] }; }
       }
@@ -7438,7 +7471,8 @@ async function proxyRequest(req, res, mode, options = {}) {
       const pageUrl = virtualPageUrl(canonical, result.finalUrl || canonical);
       const enhanced = fullPage.enhanceFullPage(payload.toString("utf8"), pageUrl);
       if (enhanced.enhanced) { payload = Buffer.from(enhanced.html, "utf8"); fullPageEnhanced = true; }
-      payload = Buffer.from(await rewriteOffThread("rewriteHtml", payload.toString("utf8"), [pageUrl, sid], rewriteHtml), "utf8");
+      const rewritten = await rewriteOffThread("rewriteHtml", payload.toString("utf8"), [pageUrl, sid], rewriteHtml);
+      payload = Buffer.from(challenge ? rewritten : announceProxyStatus(rewritten, result.status, pageUrl, sid), "utf8");
     }
     else if (!download && mode === "resource" && result.contentType.toLowerCase().includes("text/css")) payload = Buffer.from(await rewriteOffThread("rewriteCss", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteCssText), "utf8");
     else if (!download && mode === "resource" && /javascript|ecmascript/.test(result.contentType.toLowerCase()) && !shouldSkipYoutubeStaticJsRewrite(result.finalUrl || canonical, result.contentType)) {

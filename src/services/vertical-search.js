@@ -86,7 +86,8 @@ function testLink(type, value, region) {
   const url = safeUrl(value);
   if (!url) return false;
   const u = new URL(url);
-  if (type === "videos") return !!youtubeWatch(u) || (matchingHost(u.hostname, ["vimeo.com"]) && /\/\d+\/?$/.test(u.pathname));
+  if (type === "videos") return !!youtubeWatch(u) || (matchingHost(u.hostname, ["vimeo.com"]) && /\/\d+\/?$/.test(u.pathname))
+    || (["tiktok.com", "www.tiktok.com", "m.tiktok.com"].includes(u.hostname) && /^\/@[A-Za-z0-9_.]{1,32}\/video\/[0-9]{15,22}\/?$/.test(u.pathname));
   if (type === "shopping" && india(region)) return isIndianProductUrl(url);
   if (type === "shopping") return (matchingHost(u.hostname, ["amazon.com", "amazon.co.uk"]) && /\/(?:dp|gp\/product)\/[A-Z0-9]{10}(?:\/|$)/i.test(u.pathname)) || (matchingHost(u.hostname, ["ebay.com", "ebay.co.uk"]) && /^\/itm\/(?:[^/]+\/)?\d+\/?$/.test(u.pathname)) || (matchingHost(u.hostname, ["etsy.com"]) && /\/listing\/\d+(?:\/|$)/.test(u.pathname));
   return true;
@@ -219,16 +220,21 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
     return { provider: "openverse", results, more: Number(json.page_count) > page + 1 };
   }
   async function nasaLibrary(type, q, { page, signal }) {
-    const json = await get(queryUrl("https://images-api.nasa.gov/search", { q, media_type: "image", page: page + 1, page_size: PAGE_SIZE }), signal);
+    const media = type === "videos" ? "video" : "image";
+    const topic = q.replace(/\bnasa\b/gi, " ").replace(/\s+/g, " ").trim() || q;
+    const json = await get(queryUrl("https://images-api.nasa.gov/search", { q: topic, media_type: media, page: page + 1, page_size: PAGE_SIZE }), signal);
     if (!Array.isArray(json.collection?.items)) throw new Error("Invalid NASA library response");
     const results = json.collection.items.slice(0, PAGE_SIZE).flatMap(item => {
       const data = item?.data?.[0], id = data?.nasa_id;
-      if (data?.media_type !== "image" || typeof id !== "string" || !/^[\w.-]{1,100}$/.test(id)) return [];
-      const preview = (Array.isArray(item.links) ? item.links : []).find(link => link.rel === "preview")?.href;
-      if (!thumbnail(preview) || new URL(preview).hostname !== "images-assets.nasa.gov") return [];
+      if (data?.media_type !== media || typeof id !== "string" || !/^[\w][\w. -]{0,119}$/.test(id)) return [];
+      const preview = (Array.isArray(item.links) ? item.links : []).find(link => link?.rel === "preview")?.href;
+      const poster = thumbnail(preview);
+      if (media === "image" && (!poster || new URL(poster).hostname !== "images-assets.nasa.gov")) return [];
       const url = `https://images.nasa.gov/details/${encodeURIComponent(id)}`;
-      return [row(type, "nasa-library", { url, sourcePageUrl: url, title: data.title, snippet: data.description,
-        thumbnail: preview, imageUrl: preview, source: "NASA Image and Video Library", publishedAt: data.date_created })];
+      const snippet = [data.description, ...(Array.isArray(data.keywords) ? data.keywords.slice(0, 10) : [])].filter(item => typeof item === "string").join(" · ");
+      return [row(type, "nasa-library", { url, sourcePageUrl: url, title: data.title, snippet,
+        thumbnail: poster && new URL(poster).hostname === "images-assets.nasa.gov" ? poster : "", imageUrl: poster,
+        source: "NASA Image and Video Library", publishedAt: data.date_created })];
     });
     return { provider: "nasa-library", results, more: Number(json.collection.metadata?.total_hits) > (page + 1) * PAGE_SIZE };
   }
@@ -390,12 +396,12 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
     }));
     return { provider: "ebay", results, more: !!json.next };
   }
-  async function webCategory(type, q, { page, signal, lang, region, noCache, privateSearch, fullQuery }) {
+  async function webCategory(type, q, { page, signal, lang, region, noCache, privateSearch, fullQuery, scope }) {
     // The discovery hint goes to upstreams, but never counts as a match.
     const shopping = type === "shopping" && india(region);
     const topic = type === "videos" ? videoTopic(q) : q;
     const deadline = AbortSignal.timeout(providerTimeoutMs);
-    const packed = await webSearch(`${fullQuery || q} ${type === "videos" ? "YouTube video" : shopping ? "buy online India" : "buy online"}`, {
+    const packed = await webSearch(`${fullQuery || q} ${type === "videos" ? (scope.active || /\btiktok\b/i.test(q) ? "video" : "YouTube video") : shopping ? "buy online India" : "buy online"}`, {
       offset: page * WEB_FEED_STEP, limit: PAGE_SIZE * 2, lang, region, shopping, topic,
       signal: signal ? AbortSignal.any([signal, deadline]) : deadline, noCache, feed: true, privateSearch });
     if (packed.attempts?.length && packed.attempts.every(attempt => attempt.error || attempt.skipped)) throw new Error("No provider reached");
@@ -425,6 +431,8 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
     if (type === "images" && !privateSearch && (provider === "nasa-library" || (scope.include.length && allowsSiteUrl(scope, "https://images.nasa.gov/")))) {
       list.push(["nasa-library", nasaLibrary]);
     }
+    if (type === "videos" && !privateSearch && (provider === "nasa-library" || (scope.include.length && allowsSiteUrl(scope, "https://images.nasa.gov/")) ||
+        (!scope.active && NASA_INTENT.test(topic)))) list.push(["nasa-library", nasaLibrary]);
     if (type === "images" && !privateSearch && !scope.active && NASA_INTENT.test(topic)) list.push(["space-images", spaceImages]);
     if (type === "images" && !preview && typeof indexedImages === "function" && (!provider || provider === "image-mix")) list.push(["image-mix", imageMix]);
     else {
@@ -492,7 +500,8 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
           if (!item || !allowsSiteUrl(scope, item.sourcePageUrl || item.url)) return false;
           const topicalMedia = (type === "videos" && name !== "verified-videos") || (type === "images" && unicodeWords(topic).length > 1 && !/[^\u0000-\u007f]/.test(topic));
           const topicalNative = ["europe-pmc", "stack-exchange", "nasa-library"].includes(item.provider);
-          if ((topicalMedia || topicalNative) && !isTopicalResult(mediaTopic, item, { requireTitle: true })) return false;
+          const intendedTopic = item.provider === "nasa-library" ? mediaTopic.replace(/\bnasa\b/gi, "").trim() || mediaTopic : mediaTopic;
+          if ((topicalMedia || topicalNative) && !isTopicalResult(intendedTopic, item, { requireTitle: item.provider !== "nasa-library" })) return false;
           const key = type === "images" ? imageIdentity(item.imageUrl || item.thumbnail || item.url)
             : type === "videos" ? youtubeWatch(new URL(item.url)) || item.url
             : type === "news" ? unicodeWords(item.title).join(" ") || item.url

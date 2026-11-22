@@ -384,8 +384,48 @@ test("NASA Images results cite the item page and use only NASA-hosted image prev
   assert.equal(page.nextPage, 1);
 });
 
+test("NASA video availability preserves provenance, scope, privacy flags and encoded IDs", async () => {
+  const service = mock({ "images-api.nasa.gov": url => {
+    assert.equal(url.searchParams.get("q"), "moon");
+    assert.equal(url.searchParams.get("media_type"), "video");
+    return { collection: { metadata: { total_hits: 40 }, items: [
+      { data: [{ nasa_id: "Moon Mission 01", media_type: "video", title: "Apollo archive", description: "Landing on the Moon" }],
+        links: [null, { href: "https://images-assets.nasa.gov/video/apollo/preview.jpg", rel: "preview" }] },
+      { data: [{ nasa_id: "Moon Mission 02", media_type: "video", title: "Moon footage" }],
+        links: [{ href: "https://outside.test/photo.jpg", rel: "preview" }] },
+      { data: [{ nasa_id: "../invalid", media_type: "video", title: "Moon" }] },
+      { data: [{ nasa_id: "Apollo03", media_type: "video", title: "Apollo third mission", description: "Watching the Moon from orbit" }] }
+    ] } };
+  }, "sepiasearch.org": { total: 0, data: [] } }, { results: [
+    { url: "https://m.tiktok.com/@nasa/video/6718335390845095173", title: "Moon from NASA", snippet: "Moon video" },
+    { url: "https://www.tiktok.com/@nasa", title: "Moon from NASA", snippet: "Moon profile" }
+  ] });
+  const page = await service.search("videos", "NASA moon");
+  assert.equal(page.provider, "nasa-library");
+  assert.equal(page.nextPage, 1);
+  const rows = new Map(page.results.map(row => [row.url, row]));
+  assert.equal(rows.size, 3);
+  assert.equal(rows.get("https://images.nasa.gov/details/Moon%20Mission%2001").source, "NASA Image and Video Library");
+  assert.equal(rows.get("https://images.nasa.gov/details/Moon%20Mission%2001").thumbnail, "https://images-assets.nasa.gov/video/apollo/preview.jpg");
+  assert.equal(rows.get("https://images.nasa.gov/details/Moon%20Mission%2002").thumbnail, "");
+  assert.equal((await service.search("videos", "NASA moon", { privateSearch: true })).provider === "nasa-library", false);
+  const tiktok = await service.search("videos", "site:tiktok.com moon");
+  assert.deepEqual(tiktok.results.map(row => row.url), ["https://m.tiktok.com/@nasa/video/6718335390845095173"]);
+  assert.equal(service.calls.filter(call => call.url?.hostname === "images-api.nasa.gov").length, 1);
+});
+
 test("checked-in category weights are reproducible from topic-disjoint hand-labeled data", () => {
   assert.deepEqual(checkpoint, trainModel());
   assert.equal(new Set([...fixture.train, ...fixture.holdout].map(row => row[1].toLowerCase())).size, fixture.train.length + fixture.holdout.length);
   assert.ok(evaluate(checkpoint.weights).correct > evaluate([0, 0, 0, 1]).correct);
+});
+
+test("the query-match scorer is reproducible and only trains on independently judged rows", () => {
+  const { train, fixtureGroups, evaluate: compare } = require("../scripts/train-search-match");
+  const { matchPercent, heuristic } = require("../src/services/search-match");
+  const rows = fixtureGroups("train"), heldout = fixtureGroups("holdout");
+  const learned = train(rows);
+  assert.deepEqual(learned, require("../src/services/search-match-weights.json"));
+  assert.throws(() => train([{ ...rows[0], results: [{ title: "Missing label" }, rows[0].results[1]] }]), /independent boolean/);
+  assert.ok(compare(heldout, vector => matchPercent(vector, learned)).correct >= compare(heldout, heuristic).correct);
 });

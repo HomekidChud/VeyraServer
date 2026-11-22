@@ -1,7 +1,23 @@
 "use strict";
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
-const { watchEmptyProxyShell } = require("../src/browser/proxy-shell");
+const { watchEmptyProxyShell, announceProxyStatus } = require("../src/browser/proxy-shell");
+
+test("a refused document keeps its provider markup and sends one status notice from the outer frame", () => {
+  const vm = require("node:vm");
+  const input = "<html><body><p>Site declined the request</p></body></html>";
+  const url = "https://example.test/?q=example";
+  assert.equal(announceProxyStatus(input, 200, url, "session"), input);
+  const output = announceProxyStatus(input, 403, url, "session");
+  const [, script] = output.match(/<script>([^<]+)<\/script>/);
+  assert.equal(output.replace(`<script>${script}</script>`, ""), input);
+  const notices = [];
+  const parent = { postMessage(payload) { notices.push({ ...payload }); } };
+  vm.runInNewContext(script, { parent, top: {}, window: {} });
+  assert.equal(notices.length, 0);
+  vm.runInNewContext(script, { parent, top: parent, window: {} });
+  assert.deepEqual(notices, [{ type: "veyra:proxy-status", status: 403, pageUrl: url, sessionId: "session" }]);
+});
 
 function fixture() {
   let time = 0;
