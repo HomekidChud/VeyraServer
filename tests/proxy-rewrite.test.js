@@ -145,6 +145,11 @@ assert.doesNotMatch(inlineGeoFs, /weatherServer[^;]*\/api\/resource\?url=/);
 assert.doesNotMatch(inlineGeoFs, /multiplayerHost[^;]*\/api\/resource\?url=/);
 assert.match(inlineGeoFs, /\/api\/resource\?url=https%3A%2F%2Fdata\.geo-fs\.com%2Fosm%2F\{z\}%2F\{x\}%2F\{y\}\.png/);
 assert.doesNotMatch(inlineGeoFs, /data\.geo-fs\.com%2Fosm%2F%7Bz%7D/);
+{
+  const markup = rewriteHtml('<html><head><style>.map{background:url("https://data.geo-fs.com/osm/%7Bz%7D/%7Bx%7D/%7By%7D.png")}.plane{background:url("/images/planes/c172.png")}</style><script>var tiles = "https://data.geo-fs.com/osm/{z}/{x}/{y}.png";</script></head></html>', "https://www.geo-fs.com/geofs.php", "tile-preload");
+  assert.doesNotMatch(markup, /<link[^>]*rel="preload"[^>]*geo-fs\.com%2Fosm/);
+  assert.match(markup, /<link[^>]*rel="preload"[^>]*c172\.png/);
+}
 
 // Regression: the rewritten Cesium <script src> ends with "Cesium.js" followed by
 // the proxy's own query params, so Cesium's /((?:.*\/)|^)Cesium\.js(?:\?|#|$)/
