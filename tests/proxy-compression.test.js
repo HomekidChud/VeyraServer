@@ -31,11 +31,14 @@ const { maybeCompressProxyPayload, proxyCompressibleContentType } = require("../
   assert.ok(gz.body.length < payload.length, "compressed payload must be smaller");
   assert.equal(zlib.gunzipSync(gz.body).toString("utf8"), html, "gzip round-trip must be lossless");
 
-  // Brotli is preferred when the client accepts it.
-  const br = await maybeCompressProxyPayload({ headers: { "accept-encoding": "gzip, deflate, br" } }, payload, "text/html");
+  // Brotli is supported, and the client's preference is respected.
+  const br = await maybeCompressProxyPayload({ headers: { "accept-encoding": "br, gzip, deflate" } }, payload, "text/html");
   assert.ok(br, "brotli compression expected");
   assert.equal(br.encoding, "br");
   assert.equal(zlib.brotliDecompressSync(br.body).toString("utf8"), html, "brotli round-trip must be lossless");
+  assert.equal((await maybeCompressProxyPayload({ headers: { "accept-encoding": "br;q=0, gzip;q=0.8" } }, payload, "text/html")).encoding, "gzip");
+  assert.equal((await maybeCompressProxyPayload({ headers: { "accept-encoding": "br;q=0.1, gzip;q=0.9" } }, payload, "text/html")).encoding, "gzip");
+  assert.equal(await maybeCompressProxyPayload({ headers: { "accept-encoding": "br;q=0, gzip;q=0" } }, payload, "text/html"), null);
 
   // Binary content types are never compressed even when accepted.
   assert.equal(await maybeCompressProxyPayload({ headers: { "accept-encoding": "gzip, br" } }, payload, "image/png"), null);
