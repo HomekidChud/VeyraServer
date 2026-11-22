@@ -19,7 +19,8 @@ function lastVerticalPage(type, provider) {
   if (provider === "image-mix") return LAST_IMAGE_PAGE;
   if (provider === "brave" || provider === "web-discovery") return 9;
   if (type === "images" && provider === "wikimedia") return 49;
-  return ["openverse", "peertube", "veyra-crawler", "google-news-rss", "ebay", "crossref", "hacker-news"].includes(provider) ? 19 : 3;
+  return ["openverse", "peertube", "veyra-crawler", "google-news-rss", "ebay", "crossref", "hacker-news",
+    "europe-pmc", "research-mix", "discussion-mix", "stack-exchange", "nasa-library", "space-images"].includes(provider) ? 19 : 3;
 }
 const ENDPOINT = "https://api.search.brave.com/res/v1";
 const TIMEOUT = 4400;
@@ -30,6 +31,25 @@ function videoTopic(query) {
 }
 const THUMB_HOSTS = new Set(["imgs.search.brave.com", "upload.wikimedia.org", "thumb.wikimedia.org", "i.ebayimg.com", "i.ytimg.com",
   "images-assets.nasa.gov", "science.nasa.gov", "assets.science.nasa.gov", "www.esa.int", "media.esa.int"]);
+const NASA_INTENT = /\b(?:nasa|space telescope|nebula|saturn|jupiter|mars|apollo \d+|space shuttle|astronaut|moon landing|iss|galax(?:y|ies))\b/i;
+const COMMUNITY_SITES = [
+  ["cooking", "cooking.stackexchange.com", "Seasoned Advice", /\b(?:cook(?:ing)?|recipe|food|bake|dosa)\b/i],
+  ["diy", "diy.stackexchange.com", "Home Improvement", /\b(?:diy|plumb(?:er|ing)?|leak(?:ing|y)? tap|faucet|home repair)\b/i],
+  ["travel", "travel.stackexchange.com", "Travel Stack Exchange", /\b(?:travel|itinerary|passport|visa)\b/i],
+  ["math", "math.stackexchange.com", "Mathematics Stack Exchange", /\b(?:math(?:ematics)?|calculus|algebra|trigonometry)\b/i],
+  ["gaming", "gaming.stackexchange.com", "Arqade", /\b(?:video game|minecraft|skyrim|zelda|game walkthrough)\b/i],
+  ["electronics", "electronics.stackexchange.com", "Electrical Engineering Stack Exchange", /\b(?:electronics|arduino|transistor|microcontroller|oscilloscope)\b/i],
+  ["unix", "unix.stackexchange.com", "Unix & Linux Stack Exchange", /\b(?:unix|linux|ubuntu|bash|systemd)\b/i],
+  ["superuser", "superuser.com", "Super User", /\b(?:windows|macos|computer hardware|wifi|wi-fi|microsoft office)\b/i],
+  ["stackoverflow", "stackoverflow.com", "Stack Overflow", /\b(?:javascript|python|typescript|java|programming|rust|sql|css|html|node\.js|regex|swift)\b/i]
+];
+function communityFor(scope, topic) {
+  return COMMUNITY_SITES.find(([, host, , intent]) =>
+    allowsSiteUrl(scope, `https://${host}/`) && (scope.include.length || intent.test(topic)));
+}
+function validDoi(value) {
+  return typeof value === "string" && /^10\.\d{4,9}\/[^\s?#%]{1,500}$/i.test(value) ? value.toLowerCase() : "";
+}
 
 function safeUrl(value) {
   try {
@@ -94,6 +114,7 @@ function row(type, provider, item) {
     type, provider, url, title, source: plain(item.source, 120) || new URL(url).hostname.replace(/^www\./, ""),
     snippet: plain(item.snippet, 500), thumbnail: thumbnail(item.thumbnail),
     ...(type === "images" ? { imageUrl: safeUrl(item.imageUrl) || "", sourcePageUrl: safeUrl(item.sourcePageUrl) || "" } : {}),
+    ...(type === "research" && validDoi(item.doi) ? { doi: validDoi(item.doi) } : {}),
     publishedAt: isoDate(item.publishedAt), duration: plain(item.duration, 32), license: plain(item.license, 48),
     condition: plain(item.condition, 60), price
   };
@@ -117,6 +138,8 @@ function waitForToken(promise, signal) {
 function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexedImages, indexedVideos, indexedProducts, env = process.env, providerTimeoutMs = TIMEOUT }) {
   const cache = new Map(), cooldown = new Map();
   const indiaCatalog = fetchIndiaCatalog && createIndiaCatalog({ fetchCatalog: fetchIndiaCatalog, allowsSiteUrl, limit: PAGE_SIZE });
+  const communityBackoff = new Map();
+  let communityQuotaUntil = 0;
   let ebayToken, ebayTokenPromise;
   const braveKey = String(env.BRAVE_SEARCH_API_KEY || "").trim();
   const market = /^[A-Z]{2}$/.test(String(env.VEYRA_EBAY_MARKET || "")) ? env.VEYRA_EBAY_MARKET : "GB";
@@ -195,6 +218,23 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
     });
     return { provider: "openverse", results, more: Number(json.page_count) > page + 1 };
   }
+  async function nasaLibrary(type, q, { page, signal }) {
+    const json = await get(queryUrl("https://images-api.nasa.gov/search", { q, media_type: "image", page: page + 1, page_size: PAGE_SIZE }), signal);
+    if (!Array.isArray(json.collection?.items)) throw new Error("Invalid NASA library response");
+    const results = json.collection.items.slice(0, PAGE_SIZE).flatMap(item => {
+      const data = item?.data?.[0], id = data?.nasa_id;
+      if (data?.media_type !== "image" || typeof id !== "string" || !/^[\w.-]{1,100}$/.test(id)) return [];
+      const preview = (Array.isArray(item.links) ? item.links : []).find(link => link.rel === "preview")?.href;
+      if (!thumbnail(preview) || new URL(preview).hostname !== "images-assets.nasa.gov") return [];
+      const url = `https://images.nasa.gov/details/${encodeURIComponent(id)}`;
+      return [row(type, "nasa-library", { url, sourcePageUrl: url, title: data.title, snippet: data.description,
+        thumbnail: preview, imageUrl: preview, source: "NASA Image and Video Library", publishedAt: data.date_created })];
+    });
+    return { provider: "nasa-library", results, more: Number(json.collection.metadata?.total_hits) > (page + 1) * PAGE_SIZE };
+  }
+  async function spaceImages(type, q, opts) {
+    return mixed("space-images", [["wikimedia", commons], ["nasa-library", nasaLibrary]], type, q, opts);
+  }
   async function newsFeed(type, q, { lang, region, signal }) {
     lang = lang.split("-")[0];
     if (region === "IN") lang = lang === "hi" ? "hi" : "en";
@@ -217,9 +257,26 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
       const parts = item.published?.["date-parts"]?.[0];
       const authors = (item.author || []).slice(0, 3).map(a => [a.given, a.family].filter(Boolean).join(" ")).filter(Boolean);
       const publishedAt = parts?.length === 3 ? parts.map((n, i) => String(n).padStart(i ? 2 : 4, "0")).join("-") : "";
-      return row(type, "crossref", { title: item.title?.[0], url: `https://doi.org/${item.DOI.split("/").map(encodeURIComponent).join("/")}`, source: item["container-title"]?.[0] || item.publisher, snippet: [authors.join(", "), !publishedAt && parts?.[0]].filter(Boolean).join(" · "), publishedAt });
+      return row(type, "crossref", { title: item.title?.[0], url: `https://doi.org/${item.DOI.split("/").map(encodeURIComponent).join("/")}`, doi: item.DOI, source: item["container-title"]?.[0] || item.publisher, snippet: [authors.join(", "), !publishedAt && parts?.[0]].filter(Boolean).join(" · "), publishedAt });
     });
     return { provider: "crossref", results, more: Number(json.message["total-results"]) > (page + 1) * PAGE_SIZE };
+  }
+  async function europePmc(type, q, { page, signal }) {
+    // Europe PMC uses an opaque cursor (not an offset) for search pagination.
+    // Supply its independently ranked first page without manufacturing a cursor.
+    if (page) return { provider: "europe-pmc", results: [], more: false };
+    const json = await get(queryUrl("https://www.ebi.ac.uk/europepmc/webservices/rest/search", {
+      query: q, pageSize: PAGE_SIZE, format: "json", resultType: "lite"
+    }), signal);
+    if (!Array.isArray(json.resultList?.result)) throw new Error("Invalid Europe PMC response");
+    const results = json.resultList.result.slice(0, PAGE_SIZE).flatMap(item => {
+      const source = item?.source, id = item?.id;
+      if (typeof source !== "string" || typeof id !== "string" || !/^[A-Z]{2,12}$/.test(source) || !/^[\w.-]{1,80}$/.test(id)) return [];
+      return [row(type, "europe-pmc", { url: `https://europepmc.org/article/${source}/${id}`,
+        title: item.title, source: item.journalTitle || "Europe PMC", snippet: item.authorString,
+        publishedAt: item.firstPublicationDate, doi: item.doi })];
+    });
+    return { provider: "europe-pmc", results, more: false };
   }
   async function discussions(type, q, { page, signal }) {
     const json = await get(queryUrl("https://hn.algolia.com/api/v1/search", { query: q, tags: "story", page, hitsPerPage: PAGE_SIZE }), signal);
@@ -227,6 +284,48 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
     const results = json.hits.filter(item => /^\d+$/.test(item.objectID)).map(item => row(type, "hacker-news", { url: `https://news.ycombinator.com/item?id=${item.objectID}`, title: item.title, snippet: item.story_text, source: "Hacker News", publishedAt: item.created_at }));
     return { provider: "hacker-news", results, more: json.nbPages > page + 1 };
   }
+  async function stackExchange(type, q, { page, signal, scope }) {
+    const site = communityFor(scope, q);
+    if (!site) return { provider: "stack-exchange", results: [], more: false };
+    const [id, host, name] = site;
+    if (Math.max(communityQuotaUntil, communityBackoff.get(id) || 0) > Date.now()) {
+      throw new Error("Stack Exchange is in cooldown");
+    }
+    const json = await get(queryUrl("https://api.stackexchange.com/2.3/search/advanced", {
+      q, site: id, sort: "relevance", page: page + 1, pagesize: PAGE_SIZE
+    }), signal);
+    if (Number(json.backoff) > 0) communityBackoff.set(id, Date.now() + Number(json.backoff) * 1000);
+    if (json.quota_remaining === 0) communityQuotaUntil = Date.now() + 60 * 60_000;
+    if (!Array.isArray(json.items)) throw new Error("Invalid Stack Exchange response");
+    const results = json.items.slice(0, PAGE_SIZE).flatMap(item => {
+      const url = safeUrl(item?.link);
+      if (!url || new URL(url).origin !== `https://${host}` || !/^\/questions\/\d+(?:\/|$)/.test(new URL(url).pathname)) return [];
+      return [row(type, "stack-exchange", { url, title: item.title, source: name,
+        snippet: Array.isArray(item.tags) ? item.tags.slice(0, 8).join(" · ") : "",
+        publishedAt: Number(item.creation_date) > 0 ? new Date(Number(item.creation_date) * 1000) : "" })];
+    });
+    return { provider: "stack-exchange", results, more: json.has_more === true };
+  }
+  async function mixed(id, lanes, type, q, opts) {
+    const active = lanes.filter(([name]) => !(cooldown.get(`${name}:`) > Date.now()));
+    const settled = await Promise.allSettled(active.map(([, run]) => run(type, q, opts)));
+    opts.signal?.throwIfAborted();
+    const feeds = [];
+    for (const [i, item] of settled.entries()) {
+      if (item.status === "fulfilled") { feeds.push(item.value); continue; }
+      const error = item.reason;
+      if ([401, 403, 429].includes(error?.status) || error?.retryAfterMs > 0) {
+        cooldown.set(`${active[i][0]}:`, Date.now() + Math.max(30_000, error.retryAfterMs || 0));
+      }
+    }
+    if (!feeds.length) throw new Error("No matching providers reached");
+    return { provider: id, results: feeds.flatMap(feed => feed.results),
+      more: feeds.some(feed => feed.more), partial: feeds.length < lanes.length };
+  }
+  const researchMix = (type, q, opts) => mixed("research-mix",
+    [["crossref", crossref], ...(!opts.page ? [["europe-pmc", europePmc]] : [])], type, q, opts);
+  const discussionMix = (type, q, opts) => mixed("discussion-mix",
+    [["hacker-news", discussions], ["stack-exchange", stackExchange]], type, q, opts);
   async function youtube(type, q, { signal, lang, region }) {
     // search.list is expensive; the optional adapter is only used after Brave.
     const json = await get(queryUrl("https://www.googleapis.com/youtube/v3/search", { part: "snippet", q, type: "video", maxResults: PAGE_SIZE, safeSearch: "strict", relevanceLanguage: lang.split("-")[0], regionCode: region, key: env.YOUTUBE_DATA_API_KEY }), signal);
@@ -291,14 +390,14 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
     }));
     return { provider: "ebay", results, more: !!json.next };
   }
-  async function webCategory(type, q, { page, signal, lang, region, noCache }) {
+  async function webCategory(type, q, { page, signal, lang, region, noCache, privateSearch, fullQuery }) {
     // The discovery hint goes to upstreams, but never counts as a match.
     const shopping = type === "shopping" && india(region);
     const topic = type === "videos" ? videoTopic(q) : q;
     const deadline = AbortSignal.timeout(providerTimeoutMs);
-    const packed = await webSearch(`${q} ${type === "videos" ? "YouTube video" : shopping ? "buy online India" : "buy online"}`, {
+    const packed = await webSearch(`${fullQuery || q} ${type === "videos" ? "YouTube video" : shopping ? "buy online India" : "buy online"}`, {
       offset: page * WEB_FEED_STEP, limit: PAGE_SIZE * 2, lang, region, shopping, topic,
-      signal: signal ? AbortSignal.any([signal, deadline]) : deadline, noCache, feed: true });
+      signal: signal ? AbortSignal.any([signal, deadline]) : deadline, noCache, feed: true, privateSearch });
     if (packed.attempts?.length && packed.attempts.every(attempt => attempt.error || attempt.skipped)) throw new Error("No provider reached");
     const results = (packed.results || []).filter(item => testLink(type, item.url, region) &&
       isTopicalResult(topic, { ...item, snippet: item.snippet || item.description }, { requireTitle: true })).map(item => {
@@ -319,10 +418,14 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
     return { provider: "veyra-crawler", results: data.results.filter(item => testLink(type, item.url, region))
       .map(item => row(type, "veyra-crawler", { title: item.title, url: item.url })), more: (page + 1) * PAGE_SIZE < data.total };
   }
-  function adapters(type, page, preview, provider, region, privateSearch) {
+  function adapters(type, page, preview, provider, region, privateSearch, scope, topic) {
     const list = [];
     if (type === "videos" && !page) list.push(["verified-videos", verifiedVideos]);
     if (type === "shopping" && india(region) && indiaCatalog && !privateSearch) list.push(["india-storefronts", storefronts]);
+    if (type === "images" && !privateSearch && (provider === "nasa-library" || (scope.include.length && allowsSiteUrl(scope, "https://images.nasa.gov/")))) {
+      list.push(["nasa-library", nasaLibrary]);
+    }
+    if (type === "images" && !privateSearch && !scope.active && NASA_INTENT.test(topic)) list.push(["space-images", spaceImages]);
     if (type === "images" && !preview && typeof indexedImages === "function" && (!provider || provider === "image-mix")) list.push(["image-mix", imageMix]);
     else {
       if (braveKey && ["images", "videos", "news"].includes(type)) list.push(["brave", brave]);
@@ -336,8 +439,22 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
     if (type === "videos" && !preview && typeof indexedVideos === "function") list.push(["veyra-crawler", crawlerVideoFeed]);
     if (type === "shopping" && !preview && india(region) && typeof indexedProducts === "function") list.push(["veyra-crawler", crawlerProductFeed]);
     if (type === "videos" || type === "shopping") list.push(["web-discovery", webCategory]);
-    if (type === "research") list.push(["crossref", crossref]);
-    if (type === "discussions") list.push(["hacker-news", discussions]);
+    if (type === "research") {
+      if (!privateSearch && !scope.active && (!provider || provider === "research-mix")) list.push(["research-mix", researchMix]);
+      else {
+        if (allowsSiteUrl(scope, "https://doi.org/")) list.push(["crossref", crossref]);
+        if (!privateSearch && allowsSiteUrl(scope, "https://europepmc.org/")) list.push(["europe-pmc", europePmc]);
+      }
+    }
+    if (type === "discussions") {
+      const hasCommunity = !privateSearch && communityFor(scope, topic);
+      const hasHn = allowsSiteUrl(scope, "https://news.ycombinator.com/");
+      if (hasHn && hasCommunity && (!provider || provider === "discussion-mix")) list.push(["discussion-mix", discussionMix]);
+      else {
+        if (hasHn) list.push(["hacker-news", discussions]);
+        if (hasCommunity) list.push(["stack-exchange", stackExchange]);
+      }
+    }
     return list;
   }
   async function search(type, rawQuery, { page = 0, lang = "en", region = "", signal, noCache = true, provider = "", preview = false, privateSearch = false } = {}) {
@@ -357,7 +474,7 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
       const age = (started - Date.parse(item.publishedAt)) / 86400000;
       return type === "news" && age >= 0 ? 1.8 / (1 + age / 30) : 0;
     };
-    for (const [name, run] of adapters(type, page, preview, provider, region, privateSearch)) {
+    for (const [name, run] of adapters(type, page, preview, provider, region, privateSearch, scope, topic)) {
       if (signal?.aborted) return sparseImages || empty("cancelled");
       if (provider && provider !== name) continue;
       if (name === "openverse" && scope.include.length) continue;
@@ -368,23 +485,27 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
       const saved = noCache || name === "veyra-crawler" ? null : cache.get(key);
       try {
         const providerQuery = name === "brave" ? q : (scope.text || q).slice(0, 400);
-        const packed = saved?.until > Date.now() ? saved.packed : await run(type, providerQuery, { page, lang: language, region, signal, noCache, fullQuery: q, scope, preview });
+        const packed = saved?.until > Date.now() ? saved.packed : await run(type, providerQuery, { page, lang: language, region, signal, noCache, fullQuery: q, scope, preview, privateSearch });
         if (signal?.aborted) return sparseImages || empty("cancelled");
         const seen = new Set();
         const known = packed.results.filter(item => {
           if (!item || !allowsSiteUrl(scope, item.sourcePageUrl || item.url)) return false;
           const topicalMedia = (type === "videos" && name !== "verified-videos") || (type === "images" && unicodeWords(topic).length > 1 && !/[^\u0000-\u007f]/.test(topic));
-          if (topicalMedia && !isTopicalResult(mediaTopic, item, { requireTitle: true })) return false;
+          const topicalNative = ["europe-pmc", "stack-exchange", "nasa-library"].includes(item.provider);
+          if ((topicalMedia || topicalNative) && !isTopicalResult(mediaTopic, item, { requireTitle: true })) return false;
           const key = type === "images" ? imageIdentity(item.imageUrl || item.thumbnail || item.url)
             : type === "videos" ? youtubeWatch(new URL(item.url)) || item.url
-            : type === "news" ? unicodeWords(item.title).join(" ") || item.url : item.url;
+            : type === "news" ? unicodeWords(item.title).join(" ") || item.url
+            : type === "research" ? item.doi || item.url : item.url;
           return !seen.has(key) && seen.add(key);
         });
         const ranked = rankVertical(topic, known, item => (region ? indiaAffinity(item) * 0.35 : 0) + ageScore(item));
         const results = packed.whole ? ranked.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE) : ranked;
         const hasNext = packed.whole ? ranked.length > (page + 1) * PAGE_SIZE : packed.more;
-        if (!results.length && !provider) { attempts.push("empty"); continue; }
-        if (!noCache && name !== "veyra-crawler" && results.length && !(saved?.until > Date.now())) {
+        if (!results.length && !provider && !(hasNext && ["research-mix", "discussion-mix", "space-images", "nasa-library", "stack-exchange"].includes(name))) {
+          attempts.push("empty"); continue;
+        }
+        if (!noCache && name !== "veyra-crawler" && results.length && !packed.partial && !(saved?.until > Date.now())) {
           cache.set(key, { packed, until: Date.now() + 45_000 });
           if (cache.size > 100) cache.delete(cache.keys().next().value);
         }

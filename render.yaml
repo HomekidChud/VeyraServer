@@ -115,7 +115,7 @@ services:
       - key: GOOGLE_SEARCH_CX
         sync: false
       - key: WEB_SEARCH_ORDER
-        value: brave,bing,duckduckgo,google,mojeek,ecosia,yahoo,startpage
+        value: searxng,brave,bing,duckduckgo,google,mojeek,ecosia,yahoo,startpage
       - key: WEB_SEARCH_MAX_PROVIDERS
         value: "6"
       - key: WEB_SEARCH_CONCURRENCY

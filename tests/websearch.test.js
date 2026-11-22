@@ -153,5 +153,62 @@ const { parseSiteScope, allowsSiteUrl } = require("../src/services/search-site-s
   assert.equal(badPayload.attempts[0].error, "malformed-response");
   assert.equal(badPayload.attempts[0].classification, "malformed-response");
 
+  const nativeCalls = [];
+  const native = createWebSearch({ env: { WEB_SEARCH_ORDER: "brave" }, fetchText: async (url, opts) => {
+    const u = new URL(url);
+    nativeCalls.push(u);
+    assert.equal(opts.maxRedirects, 0);
+    assert.ok(opts.signal);
+    assert.equal(u.hostname, "developer.mozilla.org");
+    assert.equal(u.searchParams.get("q"), "CSS grid");
+    const page = u.searchParams.get("page");
+    return { ok: true, text: JSON.stringify({ documents: [
+      { mdn_url: `/en-US/docs/Web/CSS/Grid-${page}`, title: `CSS grid ${page}`, summary: "Grid <b>layout</b><script>discard()</script>" },
+      { mdn_url: "//wrong.example", title: "CSS grid unwanted result" },
+      { mdn_url: "/en-US/docs/Web/CSS/other", title: "Unrelated result" }
+    ], metadata: { total: { value: 19 } } }) };
+  } });
+  const nativeOptions = { feed: true, reference: true };
+  const mdn = await native.search("site:developer.mozilla.org CSS grid", nativeOptions);
+  assert.deepEqual(mdn.providersUsed, ["mdn"]);
+  assert.equal(mdn.results.length, 1);
+  assert.equal(mdn.results[0].snippet, "Grid layout");
+  assert.equal(mdn.nextOffset, 10);
+  const mdn2 = await native.search("site:developer.mozilla.org CSS grid", { ...nativeOptions, offset: 10 });
+  assert.equal(mdn2.results[0].title, "CSS grid 2");
+  assert.equal(mdn2.nextOffset, null);
+  await native.search("site:developer.mozilla.org CSS grid", { ...nativeOptions, privateSearch: true });
+  await native.search("site:lookalike.mozilla.org CSS grid", nativeOptions);
+  assert.equal(nativeCalls.length, 2, "only a compatible scope in non-incognito search reaches the native API");
+
+  const metaCalls = [];
+  const meta = createWebSearch({ env: { WEB_SEARCH_ORDER: "searxng,brave", VEYRA_SEARXNG_ORIGIN: "https://engine.example",
+    VEYRA_SEARXNG_ENGINES: "engine one,engine-two", BRAVE_SEARCH_API_KEY: "fixture" }, fetchText: async (url, opts) => {
+    const u = new URL(url);
+    metaCalls.push(u);
+    if (u.hostname === "api.search.brave.com") return { ok: true, text: JSON.stringify({ web: { results: [
+      { url: "https://guide.example/grid", title: "CSS grid", description: "Better grid reference" }
+    ] } }) };
+    assert.equal(u.origin, "https://engine.example");
+    assert.equal(u.pathname, "/search");
+    assert.equal(opts.maxRedirects, 0);
+    assert.equal(u.searchParams.get("engines"), "engine one,engine-two");
+    assert.equal(u.searchParams.get("safesearch"), "2");
+    assert.equal(u.searchParams.get("format"), "json");
+    assert.equal(u.searchParams.get("q"), "site:guide.example CSS grid");
+    return { ok: true, text: JSON.stringify({ results: [
+      { url: "https://guide.example/grid?utm_source=searx", title: "CSS grid", content: "Grid", engines: ["engine one", "engine-two", "<unsafe>"] },
+      { url: "https://other.example/grid", title: "CSS grid" },
+      { url: "https://127.0.0.1/grid", title: "CSS grid" }
+    ] }) };
+  } });
+  const aggregated = await meta.search("site:guide.example CSS grid", nativeOptions);
+  assert.equal(aggregated.results.length, 1);
+  assert.deepEqual(aggregated.results[0].providers, ["searxng", "brave"]);
+  assert.deepEqual(aggregated.results[0].upstreamEngines, ["engine one", "engine-two"]);
+  assert.equal(aggregated.results[0].snippet, "Better grid reference");
+  await meta.search("site:guide.example CSS grid", { ...nativeOptions, privateSearch: true });
+  assert.equal(metaCalls.filter(u => u.hostname === "engine.example").length, 1);
+
   console.log("Live web search regression tests passed (credentials, Google classification, bounded/adaptive parallelism, circuit cooldown, deadlines, cancellation, dedupe)");
 })().catch(error => { console.error(error); process.exit(1); });
