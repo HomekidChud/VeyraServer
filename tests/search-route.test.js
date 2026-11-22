@@ -49,6 +49,37 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
   };
   let crawlCalls = 0, crawlArgs = null;
   app.locals.veyraNeuralRobotPool = { async startCrawl(seeds, query, options) { crawlCalls += 1; crawlArgs = { seeds, query, options }; return [{ status: "fulfilled" }]; } };
+  // All direct-source crawling is also fixture-backed, including the robots
+  // and redirect checks in the production Fast Proxy adapter.
+  const sourceCalls = [];
+  app.locals.veyraSourceSearchFetch = async (url, options) => {
+    sourceCalls.push(url);
+    assert.equal(options.sessionId, undefined);
+    assert.equal(options.headers, undefined);
+    const u = new URL(url);
+    assert.equal(u.search, "");
+    const html = (title, content, robotsTag = "") => ({ ok: true, status: 200, finalUrl: url, contentType: "text/html", body: Buffer.from(`<title>${title}</title><main><h1>${title}</h1>${content}</main>`), robotsTag });
+    if (u.pathname === "/robots.txt") {
+      return { ok: true, status: 200, finalUrl: url, contentType: "text/plain", body: Buffer.from(
+        u.hostname === "docs.python.org" ? "User-agent: *\nDisallow: /private/" :
+          u.hostname === "slow-source.example" ? "User-agent: *\nCrawl-delay: 15" : "User-agent: *\nAllow: /") };
+    }
+    if (url === "https://docs.python.org/3/library/index.html") {
+      return html("Python reference", '<a href="/python-frobnicator">Python frobnicator</a><a href="https://unrelated.example/python-frobnicator">Python frobnicator</a>');
+    }
+    if (url === "https://docs.python.org/python-frobnicator") {
+      await assert.rejects(options.beforeRedirect("https://docs.python.org/private/fixture"));
+      await assert.rejects(options.beforeRedirect("https://another.example/frobnicator"));
+      return html("Python frobnicator reference", "<p>The Python frobnicator fixture demonstrates how to read a public reference with a relevant excerpt and without Google.</p>");
+    }
+    if (url === "https://evidence-source.example/frobnicator") {
+      return html("Python frobnicator example", "<p>This Python frobnicator guide describes the fixture in enough detail to be used as a direct publisher excerpt.</p>");
+    }
+    if (url === "https://optout-source.example/frobnicator") {
+      return html("Python frobnicator opt-out", "<p>This Python frobnicator fixture must never turn into a published excerpt because the publisher opted out.</p>", "nosnippet");
+    }
+    return { ok: false, status: 404, contentType: "text/plain", body: Buffer.alloc(0) };
+  };
 
   const url = "https://fixture-search-route.test/veyra-local-answer";
   const article = `<!doctype html><html><head><title>Veyra local route fixture</title><meta name="description" content="Local route integration fixture"></head><body><main><h1>Veyra local route fixture</h1><p>The Veyra local route fixture confirms the answer endpoint can reuse indexed article text without another page fetch.</p><p>Stored source text retains its canonical URL, provider attribution, extraction status and exact passage offsets for citation checks.</p></main></body></html>`;
@@ -396,9 +427,43 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     assert(indexDocument("https://relevant.example/cobalt", article.replaceAll("fixture", "cobalt quarry")));
     const topical = await (await fetch(`${base}/api/search?q=cobalt+quarry&region=IN`)).json();
     assert.deepEqual(topical.results.map(row => row.url), ["https://relevant.example/cobalt"]);
+
+    const getSourceResults = async (q, opts = {}) => {
+      const r = await fetch(`${base}/api/search/web?${new URLSearchParams({ q, feed: "1", ...opts })}`);
+      assert.equal(r.status, 200);
+      assert.equal(r.headers.get("cache-control"), "no-store");
+      return r.json();
+    };
+    app.locals.veyraWebSearch = { async search() { throw new Error("All discovery providers unavailable"); } };
+    const independent = await getSourceResults("site:docs.python.org Python frobnicator");
+    assert.equal(independent.provider, "veyra-crawl");
+    assert.equal(independent.status, "ok");
+    assert.deepEqual(independent.results.map(row => [row.url, row.evidence.level]), [["https://docs.python.org/python-frobnicator", "strong"]]);
+    assert.match(independent.results[0].snippet, /without Google/);
+    assert(!sourceCalls.some(url => url.includes("unrelated.example")));
+    app.locals.veyraWebSearch = { async search(_q, opts) {
+      assert.equal(opts.noCache, true);
+      const results = ["evidence-source", "slow-source", "optout-source"].map(name =>
+        ({ url: `https://${name}.example/frobnicator`, title: "Python frobnicator", snippet: "Provider snippet.", source: "fixture" }));
+      return { provider: "fixture", nextOffset: opts.offset ? null : 10, results };
+    } };
+    const mixed = await getSourceResults("Python frobnicator");
+    assert.equal(mixed.nextOffset, 10);
+    assert.equal(mixed.results.find(row => row.url.includes("evidence-source")).evidence.basis, "page-passage");
+    assert.match(mixed.results.find(row => row.url.includes("evidence-source")).snippet, /direct publisher excerpt/);
+    assert.equal(mixed.results.find(row => row.url.includes("optout-source")).evidence.basis, "excerpt-restricted");
+    assert.equal(mixed.results.find(row => row.url.includes("optout-source")).snippet, "");
+    assert.equal(mixed.results.find(row => row.url.includes("slow-source")).evidence.basis, "not-checked");
+    assert(!sourceCalls.includes("https://slow-source.example/frobnicator"), "crawl-delay prevents a page fetch");
+    const callsBeforeSkip = sourceCalls.length;
+    assert((await getSourceResults("Python frobnicator", { incognito: "1" })).results.every(row => !row.evidence));
+    assert((await getSourceResults("Python frobnicator", { engine: "bing" })).results.every(row => !row.evidence));
+    assert((await getSourceResults("Python frobnicator", { offset: "10" })).results.every(row => row.evidence.basis === "not-checked"));
+    assert.equal(sourceCalls.length, callsBeforeSkip, "incognito, explicit engines and pagination do not crawl");
     console.log("Search, answer and YouTube Express routes passed controlled local integration tests");
   } finally {
     delete app.locals.veyraWebSearch;
+    delete app.locals.veyraSourceSearchFetch;
     delete app.locals.veyraVerticalSearch;
     delete app.locals.veyraAnswerEngine;
     delete app.locals.veyraNeuralRobotPool;

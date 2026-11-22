@@ -123,14 +123,14 @@ function diceSimilarity(a, b) {
 const RANK_STOP = new Set("a an and are as at be but by for from how in is it of on or the to was were what when where which who why with does do did can could should would com www http https".split(" "));
 const relevanceTerms = query => [...new Set(rankTokens(query))].filter(token => !RANK_STOP.has(token)).slice(0, 40);
 const minimumMatches = count => Math.ceil(count * 2 / 3);
-function isTopicalResult(query, result, { requireTitle = false } = {}) {
+function isTopicalResult(query, result, { requireTitle = false, snippetOnly = false } = {}) {
   const terms = relevanceTerms(query);
   if (!terms.length) return true;
   const title = new Set(rankTokens(result.title));
   let path = "";
   try { const u = new URL(result.url); path = `${u.hostname} ${decodeURIComponent(u.pathname)}`; } catch {}
   const subject = new Set([...title, ...rankTokens(path)]);
-  const all = new Set([...subject, ...rankTokens(result.snippet)]);
+  const all = new Set([...(snippetOnly ? [] : subject), ...rankTokens(result.snippet)]);
   const matched = term => all.has(term) || (
     /^[a-z]{4,}$/.test(term) && [term.replace(/e$/, "") + "ing", term + "ed", term + "d"].some(word => all.has(word))
   );
