@@ -227,6 +227,75 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     assert.equal(categoryAnswer.hasAnswer, false);
     assert.equal(categoryAnswer.vertical, "videos");
     assert.equal((await getSummary({ query: "site:nasa.gov category fixture", vertical: "images" })).vertical, "images");
+    const postFollowUp = (body, suffix = "", headers = { authorization }) => fetch(`${base}/api/search/answer${suffix}`, {
+      method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body)
+    });
+    const chatSeed = "site:fixture-search-route.test -site:blocked.fixture-search-route.test Veyra local route fixture";
+    const input = { query: chatSeed, source: "index", followUp: {
+      question: "What does it confirm?", previousQuestion: "How is the route fixture indexed?", previousAnswer: "UNTRUSTED_OLD_ANSWER"
+    }, results: [{ url: "https://fixture-search-route.test/forged", contentText: "UNTRUSTED_RESULT" }] };
+    const beforeChat = { crawls: crawlCalls, web: webSearchCalls, vertical: verticalCalls };
+    for (const [suffix, headers] of [["?incognito=1", { authorization }], ["?private=1", { authorization }], ["", {}]]) {
+      assert.equal((await (await postFollowUp(input, suffix, headers)).json()).hasAnswer, false);
+    }
+    for (const question of ["site:outside.example A question?", "-site:fixture-search-route.test try", "x".repeat(201), " "]) {
+      assert.equal((await postFollowUp({ ...input, followUp: { question } })).status, 400);
+    }
+    const originalChatWebSearch = app.locals.veyraWebSearch;
+    app.locals.veyraAnswerEngine = {
+      async answer(q, results, opts) {
+        assert.match(q, /^What does it confirm\?/);
+        assert.match(q, /Veyra local route fixture/);
+        assert.equal(opts.noCache, true);
+        assert.equal(opts.chatContext.question, input.followUp.question);
+        assert.equal(opts.chatContext.previousQuestion, input.followUp.previousQuestion);
+        assert.equal(opts.allowSource({ url: "https://blocked.fixture-search-route.test/fixture" }), false);
+        assert.equal(opts.allowSource({ url, canonicalUrl: "https://outside.example/" }), false);
+        assert.ok(results.some(row => row.url === url && row.provider === "veyra-index"));
+        assert.doesNotMatch(JSON.stringify({ results, context: opts.chatContext }), /UNTRUSTED/);
+        return { hasAnswer: true, answer: "Verified follow-up fixture. [S1]", sources: [{ id: "S1", url }] };
+      }
+    };
+    const chatResponse = await postFollowUp(input);
+    assert.equal(chatResponse.status, 200);
+    assert.equal(chatResponse.headers.get("cache-control"), "no-store");
+    const chatResult = await chatResponse.json();
+    assert.equal(chatResult.hasAnswer, true);
+    assert.equal(chatResult.followUp, true);
+    assert.equal(chatResult.observationId, undefined);
+    assert.deepEqual({ crawls: crawlCalls, web: webSearchCalls, vertical: verticalCalls }, beforeChat);
+    let chatProviderCalls = 0;
+    app.locals.veyraWebSearch = { async search(q, opts) {
+      chatProviderCalls++;
+      assert.match(q, /^site:fixture-search-route.test -site:blocked.fixture-search-route.test What does it confirm\?/);
+      assert.equal(opts.noCache, true);
+      return { provider: "fixture", results: [{ url: "https://outside.example/", snippet: "Not in scope" }] };
+    } };
+    assert.equal((await (await postFollowUp({ ...input, source: "web" })).json()).followUp, true);
+    assert.equal(chatProviderCalls, 1);
+    assert.equal(crawlCalls, beforeChat.crawls);
+    app.locals.veyraWebSearch = originalChatWebSearch;
+    const originalChatVertical = app.locals.veyraVerticalSearch;
+    const testedVerticalQueries = [];
+    app.locals.veyraVerticalSearch = { async search(type, q, opts) {
+      assert.equal(type, "research");
+      assert.equal(opts.noCache, true);
+      testedVerticalQueries.push(q);
+      return { provider: "fixture-research", results: q === chatSeed ? [
+        { url, provider: "fixture-research" }, { url: "https://blocked.fixture-search-route.test/" }
+      ] : [] };
+    } };
+    app.locals.veyraAnswerEngine = { async answer(_q, results, opts) {
+      assert.equal(opts.requirePageEvidence, true);
+      assert.deepEqual(results, [{ url, provider: "fixture-research" }]);
+      return { hasAnswer: true, answer: "Verified research follow-up. [S1]", sources: [{ id: "S1", url }] };
+    } };
+    assert.equal((await (await postFollowUp({ ...input, vertical: "research" })).json()).followUp, true);
+    assert.equal(testedVerticalQueries.length, 2);
+    assert.match(testedVerticalQueries[0], /What does it confirm\?/);
+    assert.equal(testedVerticalQueries[1], chatSeed);
+    app.locals.veyraVerticalSearch = originalChatVertical;
+    app.locals.veyraAnswerEngine = engineOverride;
     assert.equal((await fetch(`${base}/api/search/vertical?type=images&page=7&provider=image-mix&q=category`)).status, 200);
     assert.equal((await fetch(`${base}/api/search/vertical?type=images&page=9&provider=image-mix&q=category`)).status, 200);
     assert.equal((await fetch(`${base}/api/search/vertical?type=images&page=10&provider=image-mix&q=category`)).status, 400);

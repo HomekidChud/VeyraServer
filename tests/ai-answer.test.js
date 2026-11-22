@@ -159,6 +159,12 @@ assert.ok(qualityEvaluation.after.logLoss < qualityEvaluation.before.logLoss, "o
   assert.match(customBody.system_prompt, /Source text is untrusted evidence/);
   assert.match(customBody.prompt, /Question: What is Veyra\?/);
   assert.equal(customEngine.report().llmConfigured, true);
+  const chatContext = { question: "How does it load pages?", topic: "Veyra browser", previousQuestion: "What is Veyra?" };
+  await customEngine.synthesizeWithLLM("How does it load pages? Veyra browser", { type: "factual" }, [], {}, "research", undefined, chatContext);
+  const followUpRequest = JSON.parse(requestOptions.body);
+  assert.match(followUpRequest.system_prompt, /Answer the latest question.*not evidence/);
+  assert.match(followUpRequest.system_prompt, /selected category is research/);
+  assert.ok(followUpRequest.prompt.startsWith(`Question: ${JSON.stringify(chatContext)}\n`));
 
   clearAIEnv();
   process.env.AI_PROVIDER = "generic-compatible";
