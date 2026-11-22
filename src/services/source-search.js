@@ -178,6 +178,9 @@ function createSourceSearch({ readPage, seeds = SEEDS, lookupReferences = refere
 
   async function enrich(scope, rows, { signal, limit = 6 } = {}) {
     if (!scope.text) return rows;
+    // A matching catalog URL remains a selected reference whether we reached
+    // it in discovery or successfully verified it on the result-check pass.
+    const catalogKeys = new Set(lookupReferences(scope).map(row => canonicalKey(row.url)));
     const pick = new Map();
     for (const row of rows) {
       const url = sourcePageUrl(row.url);
@@ -193,7 +196,7 @@ function createSourceSearch({ readPage, seeds = SEEDS, lookupReferences = refere
           emit([row, { ...row, snippet: "", evidence: { level: "unverified", basis: "excerpt-restricted" } }]);
           return;
         }
-        const observed = inspect(scope, page, false);
+        const observed = inspect(scope, page, catalogKeys.has(canonicalKey(page.url)));
         // Never swap the link a provider returned for an untrusted canonical.
         emit([row, observed ? { ...row, title: observed.title, snippet: observed.snippet, evidence: observed.evidence } :
           { ...row, evidence: { level: "limited", basis: "no-passage", checkedAt: page.checkedAt } }]);
