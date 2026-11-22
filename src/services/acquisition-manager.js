@@ -464,7 +464,7 @@ class AcquisitionManager {
     const candidates = rankSearchCandidates(query, rows, opts.fetchLimit || opts.limit || 8).map(row => [row.url, row]);
     const settled = await Promise.allSettled(candidates.map(async ([url, source]) => {
       const fetchStartedAt = Date.now();
-      const page = await this.fetch(url, { engine: "search-first", signal: controller.signal });
+      const page = await this.fetch(url, { engine: "search-first", signal: controller.signal, noCache: opts.noCache });
       const document = this.parseDocument(page.body, page.finalUrl || url);
       if (timeToFirstPageMs == null) timeToFirstPageMs = Date.now() - startedAt;
       return { ...document, source: { url: source.url, provider: source.source || source.provider || result.provider || null, providers: source.providers || [], rank: source.rank || null }, engine: page.engine, fetchDurationMs: Date.now() - fetchStartedAt, fetchedAt: new Date().toISOString() };

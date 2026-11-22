@@ -6586,7 +6586,7 @@ async function persistAIObservation(id, query, results, answer) {
 }
 app.post('/api/search/answer', async (req, res) => {
   const user = authStore.userFromRequest(req);
-  if (req.query.private === "1" || !user) {
+  if (req.query.private === "1" || req.query.incognito === "1" || !user) {
     req.veyraPrivateTraffic = true;
     return res.set("Cache-Control", "no-store").json({ hasAnswer: false, reason: "AI answers are off in private browsing." });
   }
@@ -6595,30 +6595,60 @@ app.post('/api/search/answer', async (req, res) => {
   try {
     const query = typeof req.body?.query === "string" ? req.body.query.trim().slice(0, 600) : "";
     const vertical = req.body?.vertical;
+    const followUp = req.body?.followUp != null;
     let { results } = req.body || {};
     let retrievalDiagnostics = null;
     if (!query) return res.json({ hasAnswer: false, reason: 'No query provided' });
     if (vertical != null && !SEARCH_VERTICALS.includes(vertical)) return respondError(res, 400, "Invalid answer category.", "INVALID_SEARCH_CATEGORY");
     const scope = parseSiteScope(String(query).trim());
     if (scope.invalid) return res.json({ hasAnswer: false, reason: "Use a valid hostname with site:." });
+    let chatContext, answerQuery = scope.text, discoveryQuery = query;
+    if (followUp) {
+      req.veyraPrivateTraffic = true;
+      const { question, previousQuestion } = req.body.followUp;
+      const valid = (value, max) => typeof value === "string" && value.trim().length > 0 && value.length <= max;
+      if (!scope.text || !valid(question, 200) || (previousQuestion != null && !valid(previousQuestion, 200)) ||
+          parseSiteScope(question).active || (previousQuestion && parseSiteScope(previousQuestion).active)) {
+        return respondError(res, 400, "Ask a question of up to 200 characters. Use the main search bar to change the site filter.", "INVALID_ANSWER_FOLLOWUP");
+      }
+      chatContext = { question: question.trim(), topic: scope.text.slice(0, 120), previousQuestion: previousQuestion?.trim().slice(0, 80) || "" };
+      // Only use the original search to establish scope. Leading operators
+      // survive discovery's provider-specific length limits.
+      const operators = [...scope.include.map(h => `site:${h}`), ...scope.exclude.map(h => `-site:${h}`)].join(" ");
+      answerQuery = [chatContext.question, chatContext.topic, chatContext.previousQuestion].filter(Boolean).join(" ");
+      discoveryQuery = [operators, chatContext.question, chatContext.topic, chatContext.previousQuestion].filter(Boolean).join(" ");
+      results = null; // Follow-ups discover their own evidence, not client-provided results.
+    }
     const inScope = row => row && allowsSiteUrl(scope, row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl));
     if (scope.active && Array.isArray(results)) results = results.filter(inScope);
     if (vertical) {
-      const section = await (app.locals.veyraVerticalSearch || verticalSearch).search(vertical, query, {
-        signal: AbortSignal.any([request.signal, AbortSignal.timeout(7500)]), lang: req.body.lang, region: req.body.region, noCache: !CFG.globalCacheEnabled
-      });
+      const service = app.locals.veyraVerticalSearch || verticalSearch;
+      const options = {
+        signal: AbortSignal.any([request.signal, AbortSignal.timeout(7500)]), lang: req.body.lang, region: req.body.region,
+        noCache: followUp || !CFG.globalCacheEnabled
+      };
       // Use server-discovered source links only. A product price, image,
       // video description, or research listing is not verified page evidence.
       const distinctSources = new Map();
-      for (const row of section.results) {
-        const url = verticalResultUrl(row?.sourcePageUrl || row?.url);
-        if (!url || !inScope({ url }) || distinctSources.has(url)) continue;
-        distinctSources.set(url, { url, provider: row.provider });
-        if (distinctSources.size === 6) break;
+      const addCategorySources = section => {
+        for (const row of section.results) {
+          const url = verticalResultUrl(row?.sourcePageUrl || row?.url);
+          if (!url || !inScope({ url }) || distinctSources.has(url)) continue;
+          distinctSources.set(url, { url, provider: row.provider });
+          if (distinctSources.size === 6) break;
+        }
+      };
+      let section = await service.search(vertical, discoveryQuery, options);
+      addCategorySources(section);
+      // A conversational question may be phrased differently from indexed
+      // listing titles. If it finds nothing, read pages for the original topic.
+      if (followUp && !distinctSources.size && !options.signal.aborted) {
+        section = await service.search(vertical, query, options);
+        addCategorySources(section);
       }
       results = [...distinctSources.values()];
       retrievalDiagnostics = { vertical, provider: section.provider, candidates: results.length };
-      if (!results.length) return res.json({ hasAnswer: false, reason: "No source pages are available in this category to support a summary.", vertical });
+      if (!results.length) return res.json({ hasAnswer: false, reason: "No source pages are available in this category to support an answer.", vertical, ...(followUp ? { followUp: true } : {}) });
     } else if (Array.isArray(results) && results.length) {
       // Client results are URL hints only. Read the server's indexed copy or
       // the source page itself rather than citing client-supplied prose.
@@ -6632,19 +6662,20 @@ app.post('/api/search/answer', async (req, res) => {
       }
       results = [...trusted.values()];
     } else {
-      const normalizedQuery = String(query).slice(0, CFG.maxSearchQueryChars);
+      const normalizedQuery = discoveryQuery.slice(0, CFG.maxSearchQueryChars);
       const localSearchStartedAt = Date.now();
-      const local = localSearch(query, 0, Math.min(4, CFG.maxSearchResults), { includeText: true, maxTextChars: 30000 });
+      const local = localSearch(discoveryQuery, 0, Math.min(4, CFG.maxSearchResults), { includeText: true, maxTextChars: 30000 });
       const localSearchMs = Date.now() - localSearchStartedAt;
       const externalDiscoveryStartedAt = Date.now();
       let discovered = { pages: [], metrics: { candidates: 0, fetched: 0, extracted: 0, failed: 0 }, provider: "none", attempts: [] };
-      try { discovered = await acquisitionManager.searchFirst(normalizedQuery, async (q, opts) => {
-        const result = await (app.locals.veyraWebSearch || webSearch).search(q, opts);
+      try { if (!(followUp && req.body.source === "index")) discovered = await acquisitionManager.searchFirst(normalizedQuery, async (q, opts) => {
+        const result = await (app.locals.veyraWebSearch || webSearch).search(q, followUp ? { ...opts, noCache: true, region: req.body.region } : opts);
         return scope.active ? { ...result, results: (result.results || []).filter(inScope) } : result;
-      }, { limit: CFG.maxSearchResults, fetchLimit: Math.min(8, CFG.maxSearchResults), signal: request.signal, deadlineMs: 8000 }); }
-      catch { serverLog("warn", "SEARCH", "Search-to-answer external discovery failed; continuing with local-index candidates."); }
+      }, { limit: CFG.maxSearchResults, fetchLimit: Math.min(8, CFG.maxSearchResults), signal: request.signal, deadlineMs: 8000,
+        noCache: followUp, lang: followUp && typeof req.body.lang === "string" ? req.body.lang.slice(0, 35) : "en" }); }
+      catch { if (!followUp) serverLog("warn", "SEARCH", "Search-to-answer external discovery failed; continuing with local-index candidates."); }
       const externalDiscoveries = (discovered.candidates || []).filter(inScope);
-      queueNeuralIndexFindings(normalizedQuery, externalDiscoveries);
+      if (!followUp) queueNeuralIndexFindings(normalizedQuery, externalDiscoveries);
       const combined = new Map();
       const add = candidate => {
         const key = normalizeUrl(candidate.canonicalUrl || candidate.url); if (!key) return;
@@ -6661,8 +6692,8 @@ app.post('/api/search/answer', async (req, res) => {
       results = [...combined.values()].filter(inScope);
       retrievalDiagnostics = { localCandidates: local.results.length, localSearchMs, externalDiscoveryMs: Date.now() - externalDiscoveryStartedAt, external: discovered.metrics, providers: discovered.attempts || [], mergedCandidates: results.length, webSearchResults: externalDiscoveries.slice(0, CFG.maxSearchResults).map(row => ({ url: row.url, title: row.title || "", snippet: String(row.snippet || row.description || "").slice(0, 700), provider: row.provider || "", providers: row.providers || [] })).filter(row => row.url) };
     }
-    const answer = await (app.locals.veyraAnswerEngine || aiAnswerEngine).answer(scope.active ? scope.text : query, results || [], {
-      signal: request.signal, retrievalDiagnostics, requirePageEvidence: !!vertical, vertical,
+    const answer = await (app.locals.veyraAnswerEngine || aiAnswerEngine).answer(answerQuery, results || [], {
+      signal: request.signal, retrievalDiagnostics, requirePageEvidence: !!vertical, vertical, chatContext, noCache: followUp,
       ...(scope.active ? { allowSource: inScope } : {})
     });
     if (vertical) answer.vertical = vertical;
@@ -6671,7 +6702,8 @@ app.post('/api/search/answer', async (req, res) => {
     const routeResponseTimeMs = Date.now() - routeStartedAt;
     answer.responseTimeMs = routeResponseTimeMs;
     answer.pipeline = { ...(answer.pipeline || {}), answerGenerationMs: answer.pipeline?.latencyMs ?? null, responseTimeMs: routeResponseTimeMs };
-    if (answer.hasAnswer) {
+    if (followUp) answer.followUp = true;
+    if (answer.hasAnswer && !followUp) {
       const observationId = `obs_${crypto.randomBytes(18).toString("base64url")}`;
       answer.observationId = observationId;
       rememberAIAnswerForFeedback(observationId, answer, user.id);

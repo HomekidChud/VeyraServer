@@ -36,7 +36,7 @@ test("image fallback validates artwork, license, provenance, cache and scoped pa
     assert.equal(url.searchParams.get("gsrnamespace"), "6");
     return {
       query: { pages: [{ title: "File:Welsh lake.jpg", imageinfo: [{ mime: "image/jpeg", descriptionurl: "https://commons.wikimedia.org/wiki/File:Lake.jpg", thumburl: "https://thumb.wikimedia.org/fixture.jpg", extmetadata: { LicenseShortName: { value: "CC BY 4.0" } } }] }] },
-      continue: { gsroffset: 12 }
+      continue: { gsroffset: 24 }
     };
   };
   const service = mock({ "api.search.brave.com": { status: 429 }, "commons.wikimedia.org": commons,
@@ -52,7 +52,7 @@ test("image fallback validates artwork, license, provenance, cache and scoped pa
   await service.search("images", "Welsh lake", { noCache: true });
   assert.equal(service.calls.length, 3);
   await service.search("images", "Welsh lake", { page: 1, provider: first.provider });
-  assert.equal(service.calls.at(-1).url.searchParams.get("gsroffset"), "12");
+  assert.equal(service.calls.at(-1).url.searchParams.get("gsroffset"), "24");
   const scope = await service.search("images", "site:elsewhere.example Welsh lake");
   assert.equal(scope.status, "empty");
   assert.equal(service.calls.at(-1).url.searchParams.get("gsrsearch"), "Welsh lake");
@@ -71,6 +71,7 @@ test("sparse Commons results can switch to relevant, credited Openverse photos",
     "api.openverse.org": url => {
       assert.equal(url.searchParams.has("mature"), false, "Openverse rejects the legacy parameter alongside the sensitivity switch");
       assert.equal(url.searchParams.get("unstable__include_sensitive_results"), "false");
+      assert.equal(url.searchParams.get("page_size"), "20");
       return { page_count: 2, results: [photo, { ...photo, mature: true }, { ...photo, unstable__sensitivity: ["fixture"], url: "https://live.staticflickr.com/sensitive.jpg" },
         { ...photo, title: "Someone at a press conference", url: "https://live.staticflickr.com/other.jpg" }] };
     }
@@ -160,11 +161,11 @@ test("deduplicates and paginates images from both providers and the local crawle
   const service = mock({
     "api.search.brave.com": url => {
       assert.equal(url.searchParams.get("safesearch"), "strict");
-      return { results: Array.from({ length: 48 }, (_, i) => ({ title: `Planet Brave ${i}`, url: `${nasa}/${i}`, properties: { url: asset(i) } })) };
+      return { results: Array.from({ length: 48 }, (_, i) => ({ title: `Planet Brave ${i}`, url: `${nasa}/${i}`, properties: { url: asset(i) }, thumbnail: { src: `https://imgs.search.brave.com/preview-${i}.jpg` } })) };
     },
     "commons.wikimedia.org": url => {
       const size = Number(url.searchParams.get("gsrlimit")), offset = Number(url.searchParams.get("gsroffset"));
-      assert.equal(size, offset ? 12 : 48);
+      assert.equal(size, offset ? 24 : 48);
       return { ...(!offset ? { continue: { gsroffset: 48 } } : {}), query: { pages: Array.from({ length: size }, (_, index) => {
         const i = index + offset;
         return { index, title: `File:Planet Commons ${i}.jpg`,
@@ -178,16 +179,18 @@ test("deduplicates and paginates images from both providers and the local crawle
   const rows = [];
   let page = await service.search("images", "Planet", { noCache: false });
   assert.equal(page.provider, "image-mix");
+  assert.equal(page.results.length, 24);
+  assert.ok(page.results.every(row => row.thumbnail));
   let pages = 0;
   while (++pages <= 11) {
     rows.push(...page.results);
     if (page.nextPage == null) break;
     page = await service.search("images", "Planet", { page: page.nextPage, provider: page.nextProvider || page.provider, noCache: false });
   }
-  assert.equal(pages, 10);
+  assert.equal(pages, 6);
   assert.equal(page.nextPage, null, "the feed stops when Commons has no continuation");
-  assert.equal(rows.length, 109);
-  assert.equal(new Set(rows.map(row => row.imageUrl)).size, 109);
+  assert.equal(rows.length, 121);
+  assert.equal(new Set(rows.map(row => row.imageUrl)).size, 121);
   assert.deepEqual(new Set(rows.map(row => row.provider)), new Set(["brave", "wikimedia", "veyra-crawler"]));
   assert.equal(service.calls.length, 3, "cached hybrid pages reuse their feeds, then Commons continues at offset 48");
   assert.equal(service.calls.at(-1).url.searchParams.get("gsroffset"), "48");
@@ -371,7 +374,7 @@ test("searches an eligible Stack Exchange community alongside HN, except in inco
 
 test("NASA Images results cite the item page and use only NASA-hosted image previews", async () => {
   const service = mock({
-    "images-api.nasa.gov": { collection: { metadata: { total_hits: 20 }, items: [
+    "images-api.nasa.gov": { collection: { metadata: { total_hits: 30 }, items: [
       { data: [{ nasa_id: "PIA00001", media_type: "image", title: "Jupiter plume" }], links: [{ href: "https://images-assets.nasa.gov/image/PIA00001/preview.jpg", rel: "preview" }] },
       { data: [{ nasa_id: "TEST", media_type: "image", title: "Jupiter lookalike" }], links: [{ href: "https://images-assets.nasa.gov.invalid/image/test.jpg", rel: "preview" }] },
       { data: [{ nasa_id: "TEST", media_type: "video", title: "Jupiter video" }], links: [{ href: "https://images-assets.nasa.gov/image/test.jpg", rel: "preview" }] }

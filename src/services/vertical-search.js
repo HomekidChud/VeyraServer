@@ -14,6 +14,8 @@ const { createIndiaCatalog } = require("./india-storefronts");
 
 const TYPES = Object.freeze(["images", "videos", "news", "shopping", "research", "discussions"]);
 const PAGE_SIZE = 12;
+const IMAGE_PAGE_SIZE = 24;
+const IMAGE_FEED_SIZE = 48;
 const LAST_IMAGE_PAGE = 9;
 function lastVerticalPage(type, provider) {
   if (provider === "image-mix") return LAST_IMAGE_PAGE;
@@ -157,7 +159,7 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
   }
   async function brave(type, q, { page, lang, region, signal }) {
     const offset = type === "images" ? null : page;
-    const json = await get(queryUrl(`${ENDPOINT}/${type}/search`, { q, count: type === "images" ? PAGE_SIZE * 4 : PAGE_SIZE, offset, country: region, search_lang: region ? braveLanguage(lang) : lang, safesearch: "strict" }), signal, { headers: { "X-Subscription-Token": braveKey } });
+    const json = await get(queryUrl(`${ENDPOINT}/${type}/search`, { q, count: type === "images" ? IMAGE_FEED_SIZE : PAGE_SIZE, offset, country: region, search_lang: region ? braveLanguage(lang) : lang, safesearch: "strict" }), signal, { headers: { "X-Subscription-Token": braveKey } });
     if (!Array.isArray(json.results)) throw new Error("Invalid results");
     const results = json.results.map(item => row(type, "brave", {
       ...item, source: item.source || item.video?.creator || item.meta_url?.hostname,
@@ -167,7 +169,7 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
     }));
     return { provider: "brave", results, whole: type === "images", more: type !== "images" && (json.query?.more_results_available ?? results.length === PAGE_SIZE) };
   }
-  async function commons(type, q, { page, signal, count = PAGE_SIZE }) {
+  async function commons(type, q, { page, signal, count = IMAGE_PAGE_SIZE }) {
     const json = await get(queryUrl("https://commons.wikimedia.org/w/api.php", {
       action: "query", format: "json", formatversion: 2, generator: "search", gsrnamespace: 6, gsrsearch: q,
       gsrlimit: count, gsroffset: page * count, prop: "imageinfo", iiprop: "url|mime|extmetadata",
@@ -182,7 +184,7 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
     return { provider: "wikimedia", results, more: json.continue?.gsroffset === (page + 1) * count };
   }
   async function imageMix(type, q, { signal, lang, region, fullQuery }) {
-    const lanes = [["wikimedia", () => commons(type, q, { page: 0, signal, count: 48 })]];
+    const lanes = [["wikimedia", () => commons(type, q, { page: 0, signal, count: IMAGE_FEED_SIZE })]];
     if (braveKey) lanes.unshift(["brave", () => brave(type, fullQuery, { page: 0, signal, lang, region })]);
     const active = lanes.filter(([name]) => (cooldown.get(`${name}:images`) || 0) <= Date.now());
     const settled = await Promise.allSettled(active.map(([, run]) => run()));
@@ -190,23 +192,24 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
       if ([401, 403, 429].includes(settled[i].reason?.status)) cooldown.set(`${active[i][0]}:images`, Date.now() + 30_000);
     }
     signal?.throwIfAborted();
-    const feeds = settled.flatMap(item => item.status === "fulfilled" ? [item.value.results.slice(0, 48)] : []);
+    const feeds = settled.flatMap(item => item.status === "fulfilled" ? [item.value.results.slice(0, IMAGE_FEED_SIZE)] : []);
     const commonsMore = settled.some(item => item.status === "fulfilled" && item.value.provider === "wikimedia" && item.value.more);
     let local = [];
     try { local = indexedImages(fullQuery, region).slice(0, 24).map(item => row(type, "veyra-crawler", item)); } catch {}
     if (local.some(Boolean)) feeds.push(local);
     if (!feeds.length) throw new Error("No image providers available");
     const results = [];
-    for (let i = 0; i < 48; i++) for (const feed of feeds) if (feed[i]) results.push(feed[i]);
+    for (let i = 0; i < IMAGE_FEED_SIZE; i++) for (const feed of feeds) if (feed[i]) results.push(feed[i]);
     return { provider: "image-mix", results, whole: true, commonsMore };
   }
   async function openverse(type, q, { page, signal }) {
     // Openverse treats its legacy mature parameter and the sensitivity
     // parameter as mutually exclusive. Validate the returned rows as well.
-    const json = await get(queryUrl("https://api.openverse.org/v1/images/", { q, page: page + 1, page_size: PAGE_SIZE,
+    const pageSize = 20; // Anonymous Openverse limit.
+    const json = await get(queryUrl("https://api.openverse.org/v1/images/", { q: q.slice(0, 200), page: page + 1, page_size: pageSize,
       filter_dead: true, unstable__include_sensitive_results: false }), signal);
     if (!Array.isArray(json.results)) throw new Error("Invalid Openverse response");
-    const results = json.results.slice(0, PAGE_SIZE).flatMap(item => {
+    const results = json.results.slice(0, pageSize).flatMap(item => {
       const url = safeUrl(item.foreign_landing_url), imageUrl = safeUrl(item.url);
       if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(item.id || "") || item.mature !== false ||
           (Array.isArray(item.unstable__sensitivity) && item.unstable__sensitivity.length) || !url || !imageUrl) return [];
@@ -219,12 +222,12 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
     });
     return { provider: "openverse", results, more: Number(json.page_count) > page + 1 };
   }
-  async function nasaLibrary(type, q, { page, signal }) {
+  async function nasaLibrary(type, q, { page, signal, count = type === "images" ? IMAGE_PAGE_SIZE : PAGE_SIZE }) {
     const media = type === "videos" ? "video" : "image";
     const topic = q.replace(/\bnasa\b/gi, " ").replace(/\s+/g, " ").trim() || q;
-    const json = await get(queryUrl("https://images-api.nasa.gov/search", { q: topic, media_type: media, page: page + 1, page_size: PAGE_SIZE }), signal);
+    const json = await get(queryUrl("https://images-api.nasa.gov/search", { q: topic, media_type: media, page: page + 1, page_size: count }), signal);
     if (!Array.isArray(json.collection?.items)) throw new Error("Invalid NASA library response");
-    const results = json.collection.items.slice(0, PAGE_SIZE).flatMap(item => {
+    const results = json.collection.items.slice(0, count).flatMap(item => {
       const data = item?.data?.[0], id = data?.nasa_id;
       if (data?.media_type !== media || typeof id !== "string" || !/^[\w][\w. -]{0,119}$/.test(id)) return [];
       const preview = (Array.isArray(item.links) ? item.links : []).find(link => link?.rel === "preview")?.href;
@@ -236,10 +239,10 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
         thumbnail: poster && new URL(poster).hostname === "images-assets.nasa.gov" ? poster : "", imageUrl: poster,
         source: "NASA Image and Video Library", publishedAt: data.date_created })];
     });
-    return { provider: "nasa-library", results, more: Number(json.collection.metadata?.total_hits) > (page + 1) * PAGE_SIZE };
+    return { provider: "nasa-library", results, more: Number(json.collection.metadata?.total_hits) > (page + 1) * count };
   }
   async function spaceImages(type, q, opts) {
-    return mixed("space-images", [["wikimedia", commons], ["nasa-library", nasaLibrary]], type, q, opts);
+    return mixed("space-images", [["wikimedia", commons], ["nasa-library", nasaLibrary]], type, q, { ...opts, count: PAGE_SIZE });
   }
   async function newsFeed(type, q, { lang, region, signal }) {
     lang = lang.split("-")[0];
@@ -509,8 +512,9 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
           return !seen.has(key) && seen.add(key);
         });
         const ranked = rankVertical(topic, known, item => (region ? indiaAffinity(item) * 0.35 : 0) + ageScore(item));
-        const results = packed.whole ? ranked.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE) : ranked;
-        const hasNext = packed.whole ? ranked.length > (page + 1) * PAGE_SIZE : packed.more;
+        const pageSize = type === "images" ? IMAGE_PAGE_SIZE : PAGE_SIZE;
+        const results = packed.whole ? ranked.slice(page * pageSize, (page + 1) * pageSize) : ranked;
+        const hasNext = packed.whole ? ranked.length > (page + 1) * pageSize : packed.more;
         if (!results.length && !provider && !(hasNext && ["research-mix", "discussion-mix", "space-images", "nasa-library", "stack-exchange"].includes(name))) {
           attempts.push("empty"); continue;
         }
@@ -521,7 +525,7 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
         let nextPage = hasNext && page < lastVerticalPage(type, name) ? packed.nextPage ?? page + 1 : null;
         let nextProvider;
         if (nextPage === null && packed.commonsMore) {
-          nextPage = 4; nextProvider = "wikimedia"; // First mix already fetched 48 Commons entries.
+          nextPage = IMAGE_FEED_SIZE / IMAGE_PAGE_SIZE; nextProvider = "wikimedia";
         }
         if (nextPage === null && type === "videos" && !preview && name !== "veyra-crawler" &&
             typeof indexedVideos === "function" && indexedVideos(q, 0, 1, region).total) {
