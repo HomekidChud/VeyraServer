@@ -2,6 +2,8 @@
 const assert = require("assert");
 const { AIAnswerEngine, AnswerQualityModel, ANSWER_QUALITY_FEATURES, extractReadable, evidenceText, normalizeUrl, normalizeAnswerFormat } = require("../src/services/ai-answer");
 const { MongoStore } = require("../src/core/mongo-store");
+const { discoverAnswerSources, discoveryPlan } = require("../src/services/answer-discovery");
+const { parseSiteScope, allowsSiteUrl } = require("../src/services/search-site-scope");
 
 const noisy = `<!doctype html><html><head><title>Hi - Dictionary</title><script>alert(1)</script></head><body>
 <header>Navigation menu Sign in</header><main><h1>hi</h1><button>Add to word list</button><p>Hi is an informal greeting used to say hello.</p><p>Hi is an informal greeting used to say hello.</p><div>Audio player Play pronunciation</div></main><footer>Related words Social media</footer></body></html>`;
@@ -374,6 +376,119 @@ assert.ok(qualityEvaluation.after.logLoss < qualityEvaluation.before.logLoss, "o
     restoreAIEnv();
   }
 
+  const topic = "SQLite versus PostgreSQL", scope = parseSiteScope(topic);
+  const primary = Array.from({ length: 12 }, (_, i) => ({ url: `https://same.example/item/${i}`, title: `Listing ${i}` }));
+  const sourcesFor = branch => Array.from({ length: 15 }, (_, i) => ({
+    url: `https://${branch}-${i}.example/guide`, provider: branch, snippet: "Not readable page evidence"
+  }));
+  const calls = [];
+  const broad = await discoverAnswerSources({ query: topic, scope, allowSource: () => true,
+    seeds: primary, indexed: [{ url: "https://index.example/guide", contentText: articleFixture("index") }],
+    references: [{ url: "https://reference.example/manual" }],
+    async search(q) {
+      calls.push(q);
+      return { results: q === topic ? primary.map(r => ({ ...r, url: `${r.url}?utm_source=duplicate#section` })) : sourcesFor(q.toLowerCase()) };
+    }
+  });
+  function articleFixture(name) {
+    return `The Veyra ${name} publication records ${name} procedures and ${name} observations for the laboratory. Its ${name} chapter documents baseline measurements, publishes ${name} instrument notes, and describes the follow-up procedure.`;
+  }
+  assert.deepEqual(calls, [topic, "SQLite", "PostgreSQL"]);
+  assert.equal(broad.diagnostics.candidates, 44);
+  assert.equal(broad.diagnostics.candidateHosts, 33);
+  assert.equal(broad.results.length, 24);
+  assert.equal(broad.diagnostics.shortlistedHosts, 24);
+  assert.equal(broad.results.filter(r => r.url.startsWith("https://same.example/")).length, 1);
+  assert.ok(broad.results.some(r => r.url === "https://index.example/guide" && r.contentText.length > 120));
+  assert.ok(broad.results.every(r => !r.snippet && !r.url.includes("utm_source")));
+  console.log(`Wide discovery fixture: ${primary.length} seed links / 1 host → ${broad.diagnostics.candidates} unique candidates / ${broad.diagnostics.candidateHosts} hosts → ${broad.results.length} shortlisted / ${broad.diagnostics.shortlistedHosts} hosts`);
+
+  const scoped = parseSiteScope("site:sqlite.org -site:old.sqlite.org SQLite versus PostgreSQL");
+  assert.deepEqual(discoveryPlan(scoped).variants, [
+    "site:sqlite.org -site:old.sqlite.org SQLite", "site:sqlite.org -site:old.sqlite.org PostgreSQL"
+  ]);
+  assert.deepEqual(discoveryPlan(parseSiteScope('Compare "SQLite JSON" versus PostgreSQL')).variants, []);
+  assert.deepEqual(discoveryPlan(parseSiteScope("SQLite versus PostgreSQL latest 2026")).variants, []);
+  assert.deepEqual(discoveryPlan(parseSiteScope("SQLite vs PostgreSQL -extension")).variants, []);
+  const partial = await discoverAnswerSources({ query: `site:sqlite.org What is SQLite?`, scope: scoped,
+    allowSource: row => allowsSiteUrl(scoped, row.url) && (!row.canonicalUrl || allowsSiteUrl(scoped, row.canonicalUrl)),
+    async search(q) {
+      if (q.endsWith("SQLite?")) throw new Error("provider down");
+      return { results: [{ url: "https://sqlite.org/doc" }, { url: "https://old.sqlite.org/doc" },
+        { url: "https://sqlite.org/redirect", canonicalUrl: "https://outside.example/" }] };
+    } });
+  assert.equal(partial.diagnostics.batches[0].status, "unavailable");
+  assert.deepEqual(partial.results.map(r => r.url), ["https://sqlite.org/doc"]);
+  const aliases = await discoverAnswerSources({ query: "geothermal", scope: parseSiteScope("geothermal"), allowSource: () => true,
+    seeds: [{ url: "https://doi.org/10.1234/article", doi: "10.1234/article" }, { url: "https://publisher.example/article" }],
+    async search() { return { results: [{ url: "https://publisher.example/article", doi: "10.1234/ARTICLE" }] }; }
+  });
+  assert.deepEqual(aliases.results.map(row => row.url), ["https://publisher.example/article"]);
+  const abort = new AbortController();
+  const interrupted = discoverAnswerSources({ query: topic, scope, allowSource: () => true, signal: abort.signal,
+    search: () => new Promise(() => {}) });
+  abort.abort();
+  await assert.rejects(interrupted, { name: "AbortError" });
+  const holdLoop = setTimeout(() => {}, 250);
+  try {
+    const deadline = await discoverAnswerSources({ query: topic, scope, allowSource: () => true, seeds: primary, budgetMs: 10,
+      search: () => new Promise(() => {}) });
+    assert.equal(deadline.diagnostics.deadlineExceeded, true);
+    assert.equal(deadline.results.length, primary.length);
+    const late = await discoverAnswerSources({ query: "geothermal", scope: parseSiteScope("geothermal"), allowSource: () => true, budgetMs: 10,
+      search: (_q, signal) => new Promise(resolve => signal.addEventListener("abort", () => resolve({
+        status: "ok", results: [{ url: "https://partial.example/with-data" }]
+      }), { once: true })) });
+    assert.equal(late.diagnostics.deadlineExceeded, true);
+    assert.equal(late.results[0].url, "https://partial.example/with-data");
+  } finally { clearTimeout(holdLoop); }
+
+  const goodBody = articleFixture("reader");
+  const pageReads = [];
+  const read = new AIAnswerEngine({ allowExtractiveFallback: false, acquisitionManager: { async fetch(url, options) {
+    pageReads.push([url, options?.noCache]);
+    const type = url.split("/").pop(), blocked = type === "header";
+    if (type === "snippet") throw new Error("Unreadable page");
+    if (type === "old-cache" && !options.noCache) return { ok: true, finalUrl: url, mongoCacheHit: true, robotsTag: null, body: goodBody };
+    return { ok: true, finalUrl: url, contentType: type === "binary" ? "application/pdf" : "text/html",
+      headers: new Headers(blocked || type === "old-cache" ? { "x-robots-tag": "nosnippet" } : {}),
+      body: `<title>Veyra ${type === "gate" ? "Verify you are human" : type}</title>${type === "meta" ? '<meta name="robots" content="noai">' : ""}
+        <article><p>${goodBody}</p><p data-nosnippet>Veyra hidden content cannot be in the prompt.</p></article>` };
+  } } });
+  let packet;
+  read.synthesizeWithLLM = async (_q, _i, selected) => { packet = selected; return null; };
+  const passages = [
+    "Veyra records seismometer readings and microearthquake swarms underneath a basalt plateau during winter.",
+    "Veyra describes scalloped ceramic tiles and beveled grout patterns that conserve water inside a Japanese bathhouse.",
+    "Veyra catalogues deciduous saplings near the estuary where herons, sandpipers and other migrating birds breed.",
+    "Veyra analyses carbon electrodes, molten electrolytes, and current losses during an aluminium smelting demonstration.",
+    "Veyra outlines a chord progression for oboe, bassoon, and English horn in the traditional Dorian mode.",
+    "Veyra documents differential rotation and polar activity on the Sun from spectrographic observations made during an eclipse.",
+    "Veyra compares Roman inscriptions, Athenian pottery, and unlabelled fragments of amphorae recovered by archaeologists.",
+    "Veyra explains the longevity of a spiral staircase made from cast iron during a historic railway station restoration.",
+    "Veyra reviews rowing drills, pacing adjustments, and team synchronisation for a regatta held beside a sheltered island.",
+    "Veyra provides context for artisanal milling, sourdough fermentation, and variations in hydration across different wheat varieties.",
+    "Veyra tracks the logistics of cross-border rail shipments from intermodal terminals through customs inspections and bonded warehouses.",
+    "Veyra surveys shared tenancy agreements, housing affordability, deposit disputes, and the process for renewing a rental contract.",
+    "Veyra audits laboratory refrigerators, inventory labels, temperature logs, and allocation of secure storage for fragile instruments."
+  ];
+  const wideRead = await read.answer("Veyra", [
+    ...["header", "meta", "snippet", "binary", "gate", "old-cache", "reader"].map(slug => ({ url: `https://publisher.example/${slug}`, snippet: "Veyra unreadable evidence." })),
+    ...passages.map((text, i) => (
+      { url: `https://source-${i}.example/report`, contentText: `${text} The contributing author presented the results at the Veyra conference.` }
+    ))
+  ], { requireReadableEvidence: true, evidenceLimit: 12 });
+  assert.equal(wideRead.hasAnswer, false, "without a verified synthesis, a wider candidate pool must not produce an answer");
+  assert.equal(wideRead.pipeline.selected, 12);
+  assert.equal(packet.length, 12);
+  assert.ok(packet.some(e => e.url === "https://publisher.example/reader"));
+  assert.doesNotMatch(JSON.stringify(packet), /hidden content|unreadable evidence|publisher\.example\/(?:header|meta|snippet|binary|gate|old-cache)/i);
+  assert.deepEqual(pageReads.filter(([url]) => url.endsWith("/old-cache")).map(([, noCache]) => noCache), [false, true]);
+  const readsBeforeIndex = pageReads.length;
+  const tooShort = await read.answer("Veyra", [{ url: "https://local.example/short", contentText: "Veyra" }],
+    { requireReadableEvidence: true, indexOnly: true });
+  assert.equal(tooShort.hasAnswer, false);
+  assert.equal(pageReads.length, readsBeforeIndex);
   console.log("AI answer pipeline provenance and offline fallback tests passed");
   console.log("AI answer regression tests passed");
 })().catch(error => { console.error(error); process.exit(1); });

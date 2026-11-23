@@ -49,6 +49,7 @@ const { isChallengePage, detectChallengeType } = require("./browser/challenge-de
 const { CastServer, InternetConnectionManager } = require("./network/cast-server");
 const { WsRelay } = require("./network/ws-relay");
 const { AIAnswerEngine } = require("./services/ai-answer");
+const { discoverAnswerSources, STRATEGY: answerDiscoveryStrategy, SHORTLIST: answerDiscoveryShortlist } = require("./services/answer-discovery");
 const { AcquisitionManager, rankSearchCandidates } = require("./services/acquisition-manager");
 const { RenewingManager } = require("./services/renewing-system");
 const fullPage = require("./browser/full-page.js");
@@ -6794,7 +6795,21 @@ function queueNeuralIndexFindings(query, sources = []) {
   while (aiIndexRuns.size > 1000) aiIndexRuns.delete(aiIndexRuns.keys().next().value);
 }
 const aiAnswerEngine = new AIAnswerEngine({ acquisitionManager });
+const wideAnswerDiscovery = boolEnv("AI_ANSWER_WIDE_DISCOVERY", true);
+const wideOverviewUsers = new Set();
+const maxWideOverviews = 4;
 const aiAnswerFeedbackObservations = new Map();
+function trustedAnswerHints(rows, inScope) {
+  const trusted = new Map();
+  for (const row of (Array.isArray(rows) ? rows : []).slice(0, 12)) {
+    const url = verticalResultUrl(row?.url);
+    if (!url || !inScope(row) || trusted.has(url)) continue;
+    const indexed = searchIndex.get(normalizeUrl(url));
+    trusted.set(url, indexed && inScope(indexed) ? { url: indexed.url, title: indexed.title, contentText: indexed.text,
+      provider: "veyra-index", retrievedAt: indexed.indexedAt } : { url });
+  }
+  return [...trusted.values()];
+}
 function rememberAIAnswerForFeedback(id, answer, userId) {
   const now = Date.now();
   for (const [key, value] of aiAnswerFeedbackObservations) if (now - value.createdAt > 24 * 60 * 60 * 1000) aiAnswerFeedbackObservations.delete(key);
@@ -6817,8 +6832,9 @@ app.post('/api/search/answer', async (req, res) => {
   }
   const routeStartedAt = Date.now();
   const request = requestAbortSignal(req, res);
+  let wideSlot = false;
   try {
-    const { query } = searchEntry(typeof req.body?.query === "string" ? req.body.query.trim().slice(0, 600) : "");
+    const { query, preferGoogle } = searchEntry(typeof req.body?.query === "string" ? req.body.query.trim().slice(0, 600) : "");
     const vertical = req.body?.vertical;
     const followUp = req.body?.followUp != null;
     let { results } = req.body || {};
@@ -6853,8 +6869,59 @@ app.post('/api/search/answer', async (req, res) => {
       results = null; // Follow-ups discover their own evidence, not client-provided results.
     }
     const inScope = row => allowsSearchResult(privacy, row) && allowsSiteUrl(scope, row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl));
-    if (Array.isArray(results)) results = results.filter(inScope);
-    if (vertical) {
+    // The overview identifies its search category. Leave unversioned/legacy
+    // summary callers and the retired conversation UI on their existing path.
+    const source = req.body?.source;
+    const wide = wideAnswerDiscovery && !followUp && !!scope.text &&
+      (vertical ? source === vertical : source === "web" || source === "index");
+    if (wide) {
+      if (wideOverviewUsers.has(user.id) || wideOverviewUsers.size >= maxWideOverviews) {
+        return res.set({ "Retry-After": "2", "Cache-Control": "no-store" }).status(429)
+          .json({ hasAnswer: false, reason: "Veyra AI is busy. Try again in a moment.", diagnosticCode: "http_429" });
+      }
+      wideOverviewUsers.add(user.id);
+      wideSlot = true;
+      const lang = typeof req.body.lang === "string" ? req.body.lang.slice(0, 35) : "en";
+      const region = req.body.region;
+      const options = { lang, region, noCache: !CFG.globalCacheEnabled };
+      const categorySearch = async (category, topic, signal, next) => {
+        const service = app.locals.veyraVerticalSearch || verticalSearch;
+        const section = await service.search(category, topic, { ...options, ...next, signal });
+        const nextProvider = section.nextProvider || section.provider;
+        const continuation = !next && Number.isSafeInteger(section.nextPage) && section.nextPage >= 1 &&
+          section.nextPage <= lastVerticalPage(category, nextProvider) && /^[a-z-]{1,24}$/.test(nextProvider || "")
+          ? { page: section.nextPage, provider: nextProvider } : null;
+        // A media URL or a listing's metadata is not page evidence. Discover
+        // source pages from the selected category and re-check all URL fields.
+        return { status: section.status, continuation, results: (section.results || []).flatMap(row => {
+          const url = verticalResultUrl(row?.sourcePageUrl || row?.url);
+          return url && allowsSearchResult(privacy, row) && inScope({ ...row, url }) ? [{ ...row, url }] : [];
+        }) };
+      };
+      const webLookup = async (topic, signal, next) => {
+        const found = await (app.locals.veyraWebSearch || webSearch).search(topic, {
+          ...options, ...next, signal, limit: Math.min(CFG.maxSearchResults, 20), feed: true, reference: true, preferGoogle
+        });
+        return { ...found, continuation: !next && found.nextOffset === WEB_FEED_STEP ? { offset: WEB_FEED_STEP } : null };
+      };
+      const guarded = lookup => (topic, signal, next) => masksSearchScope(privacy, topic, parseSiteScope(topic))
+        ? { status: "filtered", results: [] } : lookup(topic, signal, next);
+      const { results: discovered, diagnostics } = await discoverAnswerSources({
+        query, scope, vertical, allowSource: inScope, signal: request.signal,
+        seeds: vertical ? [] : trustedAnswerHints(results, inScope).filter(row => source !== "index" || row.provider === "veyra-index"),
+        indexed: vertical ? [] : localSearch(query, 0, answerDiscoveryShortlist, { includeText: true, maxTextChars: 30000,
+          privacy, region, topical: true, requireTerms: true }).results,
+        references: !vertical && source === "web" ? referenceResults(scope, 3) : [],
+        search: vertical ? guarded((q, signal, next) => categorySearch(vertical, q, signal, next)) : source === "web" ? guarded(webLookup) : null,
+        research: !vertical && source === "web" ? guarded((q, signal) => categorySearch("research", q, signal)) : null
+      });
+      results = discovered;
+      retrievalDiagnostics = { ...diagnostics, ...(vertical ? { vertical } : {}) };
+      if (!results.length && diagnostics.batches.some(batch => ["unavailable", "cancelled"].includes(batch.status))) {
+        return res.json({ hasAnswer: false, reason: "Source discovery is temporarily unavailable.", diagnosticCode: "provider_error",
+          ...(vertical ? { vertical } : {}), pipeline: { sourceRetrieval: retrievalDiagnostics } });
+      }
+    } else if (vertical) {
       const service = app.locals.veyraVerticalSearch || verticalSearch;
       const options = {
         signal: AbortSignal.any([request.signal, AbortSignal.timeout(7500)]), lang: req.body.lang, region: req.body.region,
@@ -6885,15 +6952,7 @@ app.post('/api/search/answer', async (req, res) => {
     } else if (Array.isArray(results) && results.length) {
       // Client results are URL hints only. Read the server's indexed copy or
       // the source page itself rather than citing client-supplied prose.
-      const trusted = new Map();
-      for (const row of results.slice(0, 12)) {
-        const url = verticalResultUrl(row?.url);
-        if (!url || !inScope({ url }) || trusted.has(url)) continue;
-        const indexed = searchIndex.get(normalizeUrl(url));
-        trusted.set(url, indexed ? { url: indexed.url, title: indexed.title, contentText: indexed.text,
-          provider: "veyra-index", retrievedAt: indexed.indexedAt } : { url });
-      }
-      results = [...trusted.values()];
+      results = trustedAnswerHints(results, inScope);
     } else {
       const normalizedQuery = discoveryQuery.slice(0, CFG.maxSearchQueryChars);
       const localSearchStartedAt = Date.now();
@@ -6928,6 +6987,7 @@ app.post('/api/search/answer', async (req, res) => {
     }
     const answer = await (app.locals.veyraAnswerEngine || aiAnswerEngine).answer(answerQuery, results || [], {
       signal: request.signal, retrievalDiagnostics, requirePageEvidence: !!vertical, vertical, chatContext, noCache: followUp,
+      ...(wide ? { requireReadableEvidence: true, indexOnly: source === "index", evidenceLimit: 12 } : {}),
       ...(scope.active || privacy !== "unfiltered" ? { allowSource: inScope } : {})
     });
     if (vertical) answer.vertical = vertical;
@@ -6941,11 +7001,20 @@ app.post('/api/search/answer', async (req, res) => {
       const observationId = `obs_${crypto.randomBytes(18).toString("base64url")}`;
       answer.observationId = observationId;
       rememberAIAnswerForFeedback(observationId, answer, user.id);
-      if (!vertical) void persistAIObservation(observationId, query, results || [], answer).catch(e => serverLog("warn", "AI", `AI observation persistence failed: ${e.message}`));
+      if (!vertical) {
+        // Persist discovery metadata and cited passages, not copies of all the
+        // index text sent to synthesis for this overview.
+        const observationResults = wide ? results.map(({ contentText, ...metadata }) => metadata) : results || [];
+        void persistAIObservation(observationId, query, observationResults, answer).catch(e => serverLog("warn", "AI", `AI observation persistence failed: ${e.message}`));
+      }
     }
     res.json(answer);
-  } catch (e) { res.json({ hasAnswer: false, reason: "Answer retrieval or synthesis failed.", code: /^[A-Z0-9_:-]{1,64}$/i.test(String(e?.code || "")) ? String(e.code) : "ANSWER_PIPELINE_ERROR" }); }
-  finally { request.dispose(); }
+  } catch (e) {
+    if (!request.signal.aborted) res.json({ hasAnswer: false, reason: "Answer retrieval or synthesis failed.", code: /^[A-Z0-9_:-]{1,64}$/i.test(String(e?.code || "")) ? String(e.code) : "ANSWER_PIPELINE_ERROR" });
+  } finally {
+    if (wideSlot) wideOverviewUsers.delete(user.id);
+    request.dispose();
+  }
 });
 app.post("/api/search/answer/feedback", async (req, res) => {
   const user = authStore.userFromRequest(req);
@@ -6963,7 +7032,9 @@ app.post("/api/search/answer/feedback", async (req, res) => {
   void mongoStore.saveAINeuralModel("answer-quality-v1", aiAnswerEngine.qualityModel.serialize()).catch(error => serverLog("warn", "AI", `Answer-quality model persistence failed: ${error.message}`));
   res.json({ ok: true, trained: true, rating, scoreBefore: Math.round(training.before * 1000) / 1000, scoreAfter: Math.round(training.after * 1000) / 1000, optimizer: "AdamW", trainingExamples: aiAnswerEngine.qualityModel.examples, calibrated: false });
 });
-app.get('/api/answer/status', (req, res) => res.json(aiAnswerEngine.report()));
+app.get('/api/answer/status', (req, res) => res.json({ ...aiAnswerEngine.report(),
+  sourceDiscovery: { strategy: wideAnswerDiscovery ? answerDiscoveryStrategy : "legacy", shortlistLimit: wideAnswerDiscovery ? answerDiscoveryShortlist : null }
+}));
 
 
 

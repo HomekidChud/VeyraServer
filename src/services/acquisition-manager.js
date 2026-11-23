@@ -311,7 +311,7 @@ class AcquisitionManager {
             if (!opts.allowBinary && type && !/(html|xhtml|text\/|json|xml|rss|atom|javascript|css|svg)/i.test(type)) throw Object.assign(new Error(`Unsupported content type: ${type}`), { code: "CONTENT_TYPE_UNSUPPORTED", status: response.status });
             const chunks = []; let bytes = 0; for await (const chunk of response.body) { bytes += chunk.length; if (bytes > (opts.maxBytes || this.maxBytes)) throw Object.assign(new Error("Response exceeds the configured size limit."), { code: "RESPONSE_TOO_LARGE" }); chunks.push(Buffer.from(chunk)); }
             const body = Buffer.concat(chunks); this.stats.bytes += body.length;
-            return { ok: true, status: response.status, url, finalUrl: url, redirectChain, body, contentType: type, etag: response.headers.get("etag") || "", lastModified: response.headers.get("last-modified") || "", cacheControl: response.headers.get("cache-control") || "", headers: response.headers, engine: opts.engine || "direct-http" };
+            return { ok: true, status: response.status, url, finalUrl: url, redirectChain, body, contentType: type, robotsTag: response.headers.get("x-robots-tag") || "", etag: response.headers.get("etag") || "", lastModified: response.headers.get("last-modified") || "", cacheControl: response.headers.get("cache-control") || "", headers: response.headers, engine: opts.engine || "direct-http" };
           } catch (error) {
             clearTimeout(timer); if (opts.signal) opts.signal.removeEventListener("abort", onAbort);
             if (opts.signal?.aborted || controller.signal.aborted && error?.name === "AbortError") { const code = opts.signal?.aborted ? "OPERATION_CANCELLED" : "FETCH_TIMEOUT"; this.stats[code === "FETCH_TIMEOUT" ? "timeouts" : "cancellations"] += 1; throw Object.assign(new Error("Operation cancelled or timed out."), { code, cause: error }); }
@@ -357,7 +357,11 @@ class AcquisitionManager {
       let result;
       try { result = await this._request(key, { ...opts, headers }); }
       catch (e) { this._error(e, key); this.records.set(key, { url: key, lastAttempted: Date.now(), status: "failed", error: e.code || e.message }); throw e; }
-      if (result.status === 304 && cached) { this.stats.conditionalHits += 1; result = { ...cached.result, cacheHit: true, revalidated: true }; }
+      if (result.status === 304 && cached) {
+        this.stats.conditionalHits += 1;
+        const robotsTag = result.headers?.get("x-robots-tag") ?? cached.result.robotsTag;
+        result = { ...cached.result, robotsTag, cacheHit: true, revalidated: true };
+      }
       const cacheControl = String(result.cacheControl || "").toLowerCase();
       const vary = String(result.headers?.get?.("vary") || "").trim();
       const hasSetCookie = !!result.headers?.get?.("set-cookie");
