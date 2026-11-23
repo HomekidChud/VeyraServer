@@ -3,19 +3,21 @@
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const { runSandboxCase } = require("../scripts/yoti-sandbox-smoke");
+const { createYotiSandboxAdapter } = require("../scripts/lib/yoti-sandbox-adapter");
+const fixtures = require("./fixtures/yoti-sandbox-results.json");
 
 const SDK = "198c5cb8-d8d1-4070-97c2-301720fe0ab1";
 const SESSION = "813b9f67-de9a-464e-bb46-40b4465c691f";
 const BASE = "https://age.yoti.com/sandbox/api/v1/sessions";
 const NOW = Date.parse("2026-07-25T20:12:00Z");
 
-function harness({ scenario = "pass", alterSession, alterResult, rejectAt, now } = {}) {
+function harness({ scenario = "pass", alterSession, alterResult, rejectAt, now, initialState = scenario } = {}) {
   let reference;
+  let state = initialState;
   const calls = [];
-  const run = () => runSandboxCase({
+  const options = {
     sdkId: SDK,
     token: "synthetic-test-token",
-    scenario,
     now: now || (() => NOW),
     async transport(url, options) {
       calls.push([url, options]);
@@ -25,13 +27,15 @@ function harness({ scenario = "pass", alterSession, alterResult, rejectAt, now }
         const session = { id: SESSION, status: "PENDING", expires_at: new Date(NOW + 900000).toISOString() };
         return Response.json(alterSession ? alterSession(session) : session);
       }
-      if (options.method === "PUT") return Response.json({ message: "Response config set successfully" });
-      const result = { id: SESSION, reference_id: reference, type: "OVER", status: "FAIL" };
-      if (scenario === "pass") Object.assign(result, { status: "COMPLETE", method: "AGE_ESTIMATION", age: 21 });
+      if (options.method === "PUT") {
+        state = JSON.parse(options.body).status === "FAIL" ? "fail" : "pass";
+        return Response.json({ message: "Response config set successfully" });
+      }
+      const result = { ...fixtures[state], id: SESSION, reference_id: reference };
       return Response.json(alterResult ? alterResult(result) : result);
     },
-  });
-  return { calls, run };
+  };
+  return { calls, run: () => runSandboxCase({ ...options, scenario }), options };
 }
 
 test("sandbox smoke only uses fixed sandbox paths, passive liveness, and dummy ages", async () => {
@@ -61,6 +65,35 @@ test("a synthetic threshold failure has no success fields or access decision", a
   assert.deepEqual(JSON.parse(calls[1][1].body), { status: "FAIL", age: 16, method: "AGE_ESTIMATION" });
 });
 
+test("a fresh pending session is only created and read, never mutated or polled automatically", async () => {
+  const { calls, run } = harness({ scenario: "pending" });
+  assert.equal(await run(), undefined);
+  assert.deepEqual(calls.map(([url, { method }]) => [url, method]), [
+    [BASE, "POST"], [`${BASE}/${SESSION}/result`, "GET"],
+  ]);
+});
+
+test("adapter emits only explicit synthetic outcomes, including pending before a later result", async () => {
+  for (const scenario of ["pass", "fail"]) {
+    const { options } = harness({ initialState: "pending" });
+    const session = await createYotiSandboxAdapter(options).createSession();
+    assert.deepEqual(await session.readResult(), { sandboxOutcome: "pending" });
+    await session.setSyntheticResult(scenario);
+    assert.deepEqual(await session.readResult(), { sandboxOutcome: scenario });
+  }
+});
+
+test("in-progress stays pending even when success fields are present", async () => {
+  const { options } = harness({ alterResult: (r) => ({ ...r, status: "IN_PROGRESS" }) });
+  const session = await createYotiSandboxAdapter(options).createSession();
+  assert.deepEqual(await session.readResult(), { sandboxOutcome: "pending" });
+});
+
+test("a pending read still requires the original reference", async () => {
+  const { run } = harness({ scenario: "pending", alterResult: (r) => ({ ...r, reference_id: SESSION }) });
+  await assert.rejects(run(), /mismatched session/);
+});
+
 for (const [label, patch] of Object.entries({
   pending: { status: "PENDING" },
   "in progress": { status: "IN_PROGRESS" },
@@ -76,7 +109,7 @@ for (const [label, patch] of Object.entries({
   "exact age instead of threshold": { type: "AGE", age: 25 },
 })) {
   test(`rejects ${label} as a synchronous synthetic pass`, async () => {
-    await assert.rejects(harness({ alterResult: (r) => ({ ...r, ...patch }) }).run(), /unexpected outcome/);
+    await assert.rejects(harness({ alterResult: (r) => ({ ...r, ...patch }) }).run(), /unexpected outcome|mismatched session/);
   });
 }
 
@@ -88,7 +121,19 @@ test("refuses a malformed session ID before sending any further requests", async
 
 test("rejects an otherwise matching result after local expiry", async () => {
   let clockReads = 0;
-  await assert.rejects(harness({ now: () => NOW + clockReads++ * 900000 }).run(), /expired/);
+  const { calls, run } = harness({ now: () => NOW + (clockReads++ >= 3 ? 900000 : 0) });
+  await assert.rejects(run(), /expired/);
+  assert.equal(calls.at(-1)[1].method, "GET");
+});
+
+test("does not make a read or mock request once the session has expired", async () => {
+  let elapsed = 0;
+  const { calls, options } = harness({ now: () => NOW + elapsed });
+  const session = await createYotiSandboxAdapter(options).createSession();
+  elapsed = 900000;
+  await assert.rejects(session.readResult(), /expired/);
+  await assert.rejects(session.setSyntheticResult("pass"), /expired/);
+  assert.equal(calls.length, 1);
 });
 
 test("rejects a provider outage without logging its details", async () => {

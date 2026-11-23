@@ -4,11 +4,11 @@ Recommendation: evaluate [Yoti hosted facial age estimation](https://developers.
 
 ## Smoke test
 
-Run `npm run test:yoti-sandbox` for mocked transport tests. They make no network calls and do not require an account, camera or image.
+Run `npm run test:yoti-sandbox` for mocked transport tests and synthetic `pass`, `fail`, and `pending` result fixtures. They make no network calls and do not require an account, camera or image.
 
 Run `npm run smoke:yoti-sandbox` only from a developer environment with an authorized Yoti sandbox SDK ID in `YOTI_SANDBOX_SDK_ID` and a short-lived Central Authentication bearer in `YOTI_SANDBOX_ACCESS_TOKEN`. Obtain the token with the `avs` scope per the [Yoti sandbox integration guide](https://developers.yoti.com/age-verification/sandbox-integration-guide) using the organization’s approved credential workflow. Inject credentials through a secret manager. Do not put credentials in a command line, tracked file, browser, or Render.
 
-The command creates two disposable `OVER` sessions against the fixed `age.yoti.com/sandbox` API path, simulates the two outcomes with the [mock endpoint](https://developers.yoti.com/age-verification/mock-the-sandbox-response) and retrieves each [sandbox result](https://developers.yoti.com/age-verification/sandbox-results). It checks session ID, random reference, expiry, status, and the documented successful method and threshold from [Yoti's result fields](https://developers.yoti.com/age-verification/results). If a live sandbox response differs from the published contract, the smoke test fails; confirm the schema with Yoti before changing those checks. No login, camera, selfie upload, callback URL, access grant, or catalog query is involved.
+The command creates three disposable `OVER` sessions against the fixed `age.yoti.com/sandbox` API path. It reads the fresh `pending` session without modifying it, and configures `pass` and `fail` with the [mock endpoint](https://developers.yoti.com/age-verification/mock-the-sandbox-response) before retrieving each [sandbox result](https://developers.yoti.com/age-verification/sandbox-results). The adapter checks session ID, random reference, expiry, status, and the documented successful method and threshold from [Yoti's result fields](https://developers.yoti.com/age-verification/results). It returns only `{ sandboxOutcome: "pass" | "fail" | "pending" }`, with `IN_PROGRESS` treated as pending and no automatic polling. If the live sandbox response differs from the documented contract, the smoke test fails; confirm the schema with Yoti before changing those checks. No login, camera, selfie upload, callback URL, access grant, or catalog query is involved.
 
 ## Before a production bridge
 

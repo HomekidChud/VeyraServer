@@ -1,0 +1,5 @@
+{
+  "pass": { "type": "OVER", "status": "COMPLETE", "method": "AGE_ESTIMATION", "age": 21 },
+  "fail": { "type": "OVER", "status": "FAIL" },
+  "pending": { "type": "OVER", "status": "PENDING" }
+}
