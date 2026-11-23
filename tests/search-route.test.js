@@ -206,6 +206,7 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
       async search(type, query, options) {
         verticalCalls++;
         if (type === "images" && query === "preview fixture") {
+          assert.equal(options.requireThumbnail, true);
           return { type, status: "ok", provider: "wikimedia", nextPage: 1, results: Array.from({ length: 10 }, (_, i) => ({
             url: `https://commons.wikimedia.org/wiki/${i}`, title: "Preview fixture",
             thumbnail: i ? `https://upload.wikimedia.org/photo-${i}.jpg` : ""
@@ -520,9 +521,11 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
       assert.equal(type, "videos");
       assert.equal(q, "site:example.com");
       assert.equal(options.domainBrowse, true);
+      assert.equal(options.requireThumbnail, true);
       return { provider: "fixture", status: "ok", nextPage: 1, results: [
-        { title: "Watch", url: "https://media.example.com/watch?a=1" },
-        { title: "Offsite", url: "https://other.test/watch", sourcePageUrl: "https://example.com/story" }
+        ...Array.from({ length: 7 }, (_, i) => ({ title: "No preview", url: `https://media.example.com/watch?id=${i}` })),
+        { title: "Watch", url: "https://media.example.com/watch?a=1", thumbnail: "https://imgs.search.brave.com/watch.jpg" },
+        { title: "Offsite", url: "https://other.test/watch", sourcePageUrl: "https://example.com/story", thumbnail: "https://imgs.search.brave.com/offsite.jpg" }
       ] };
     } };
     const videoPreview = await (await fetch(`${base}/api/search/vertical?${new URLSearchParams({
