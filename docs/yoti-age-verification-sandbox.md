@@ -1,0 +1,20 @@
+# Veyra age verification: Yoti sandbox
+
+Recommendation: evaluate [Yoti hosted facial age estimation](https://developers.yoti.com/age-verification/age-estimation) with passive liveness and a separate, policy-approved non-camera option. A facial estimate is not documentary proof of age. The test threshold of 21 below comes from the [sandbox example](https://developers.yoti.com/age-verification/create-sandbox-session), not a Veyra production rule.
+
+## Smoke test
+
+Run `npm run test:yoti-sandbox` for mocked transport tests. They make no network calls and do not require an account, camera or image.
+
+Run `npm run smoke:yoti-sandbox` only from a developer environment with an authorized Yoti sandbox SDK ID in `YOTI_SANDBOX_SDK_ID` and a short-lived Central Authentication bearer in `YOTI_SANDBOX_ACCESS_TOKEN`. Obtain the token with the `avs` scope per the [Yoti sandbox integration guide](https://developers.yoti.com/age-verification/sandbox-integration-guide) using the organization’s approved credential workflow. Inject credentials through a secret manager. Do not put credentials in a command line, tracked file, browser, or Render.
+
+The command creates two disposable `OVER` sessions against the fixed `age.yoti.com/sandbox` API path, simulates the two outcomes with the [mock endpoint](https://developers.yoti.com/age-verification/mock-the-sandbox-response) and retrieves each [sandbox result](https://developers.yoti.com/age-verification/sandbox-results). It checks session ID, random reference, expiry, status, and the documented successful method and threshold from [Yoti's result fields](https://developers.yoti.com/age-verification/results). If a live sandbox response differs from the published contract, the smoke test fails; confirm the schema with Yoti before changing those checks. No login, camera, selfie upload, callback URL, access grant, or catalog query is involved.
+
+## Before a production bridge
+
+- **Approval:** Privacy and Safety must approve the vendor, legal basis, DPIA, DPA, data handling and retention, jurisdictions, accessibility and non-camera fallback. Determine the threshold from evidence for false accepts, false rejects, subgroup outcomes and liveness, not from the sandbox example. Rights must separately approve both the publisher and the specific media and surfaces covered by its grant.
+- **Capture and evidence:** Open approved provider-hosted capture in a separate browsing context, isolated from the trusted opener. Do not send Veyra account IDs, search history or query terms to the vendor. Veyra should neither receive nor retain selfies, templates, identity documents, or exact ages. Provider redirects and client claims must never count as verification.
+- **Binding:** Keep a short-lived, one-time server record linking the opaque provider reference to the existing Veyra account, browser session and challenge. Fetch results from the authenticated provider server and validate the exact method, result, policy, binding and expiry before consuming the record atomically. Only after review should the production bridge mint the existing signed Veyra claim. Never grant access on incomplete, uncertain, mismatched, replayed, expired, canceled or unavailable checks.
+- **Exposure:** Licensed unblurred media can appear only in Restricted after the server has accepted a valid age decision and the matching catalog grant, never as a consequence of choosing Unfiltered. Test that no protected bytes, metadata or third-party media requests leave Veyra before verification. Keep default-off controls, withdrawals, a rollback owner and a kill switch. See [the publisher search contract](publisher-media-search.md).
+
+No server route or deploy configuration imports this harness. It cannot issue a Veyra proof or enable either publisher. Sandbox results must never authorize access to real content.
