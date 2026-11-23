@@ -132,7 +132,7 @@ test("Express route serves synthetic publisher rows only after sign-in and signe
   try {
     await new Promise((resolve, reject) => server.once("listening", resolve).once("error", reject));
     const base = `http://127.0.0.1:${server.address().port}`;
-    const post = (to, json = {}, token) => fetch(`${base}/api/${to}`, {
+    const post = (to, json = {}, token, privacy = "restricted") => fetch(`${base}/api/${to}${to.includes("?") ? "&" : "?"}privacy=${privacy}`, {
       method: "POST", headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       body: JSON.stringify(json)
     });
@@ -142,12 +142,16 @@ test("Express route serves synthetic publisher rows only after sign-in and signe
     const signup = await post("auth/signup", { email: "publisher-fixture@example.test", name: "Publisher fixture", password: "Fixture-pass-123!" });
     assert.equal(signup.status, 201);
     const { token } = await signup.json();
-    const status = (query, bearer = token) => fetch(`${base}/api/search/publisher/status?${query}`,
+    const status = (query, bearer = token, privacy = "restricted") => fetch(`${base}/api/search/publisher/status?${query}&privacy=${privacy}`,
       { headers: bearer ? { Authorization: `Bearer ${bearer}` } : {} });
     assert.equal((await status("domain=pornhub.com", "")).status, 401);
     assert.equal((await status("domain=pornhub.com&private=1")).status, 404);
     assert.equal((await status("domain=pornhub.com&incognito=1")).status, 404);
     assert.equal((await status("domain=pornhub.com.evil.test")).status, 404);
+    for (const mode of ["filtered", "unfiltered", "blocked", "invalid", ""]) {
+      assert.equal((await status("domain=pornhub.com", token, mode)).status, 404);
+      assert.equal((await post("search/publisher/challenge", {}, token, mode)).status, 404);
+    }
     const available = await status("domain=pornhub.com");
     assert.equal(available.headers.get("cache-control"), "private, no-store");
     assert.deepEqual(await available.json(), { ok: true });
@@ -159,6 +163,7 @@ test("Express route serves synthetic publisher rows only after sign-in and signe
     const assertion = proof(nonce, Date.now());
     assert.equal((await post("search/publisher/verify", { assertion })).status, 401);
     assert.equal((await post("search/publisher/verify", { assertion }, token)).status, 200);
+    assert.equal((await post("search/publisher", { nonce, q: "search:xvideos.com" }, token, "unfiltered")).status, 404);
     for (const [n, domain] of domains.entries()) {
       const response = await post("search/publisher", { nonce, q: `search:${domain}` }, token);
       assert.equal(response.status, 200);
