@@ -492,7 +492,7 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
     }
     return list;
   }
-  async function search(type, rawQuery, { page = 0, lang = "en", region = "", signal, noCache = true, provider = "", preview = false, domainBrowse = false, privateSearch = false } = {}) {
+  async function search(type, rawQuery, { page = 0, lang = "en", region = "", signal, noCache = true, provider = "", preview = false, requireThumbnail = false, domainBrowse = false, privateSearch = false } = {}) {
     if (!TYPES.includes(type)) throw new Error("Unknown vertical");
     const started = Date.now(), scope = parseSiteScope(rawQuery), q = String(rawQuery).trim().slice(0, 400);
     region = india(region) ? "IN" : "";
@@ -527,7 +527,9 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
         if (signal?.aborted) return sparseImages || empty("cancelled");
         const seen = new Set();
         const known = packed.results.filter(item => {
-          if (!item || !allowsSiteUrl(scope, item.sourcePageUrl || item.url)) return false;
+          // The Web strip renders previews, not placeholder cards. Exclude
+          // thumbnail-free rows before ranking, paging and choosing a provider.
+          if (!item || (requireThumbnail && !item.thumbnail) || !allowsSiteUrl(scope, item.sourcePageUrl || item.url)) return false;
           const topicalMedia = (type === "videos" && name !== "verified-videos") || (type === "images" && unicodeWords(topic).length > 1 && !/[^\u0000-\u007f]/.test(topic));
           const topicalNative = ["europe-pmc", "stack-exchange", "nasa-library"].includes(item.provider);
           const intendedTopic = item.provider === "nasa-library" ? mediaTopic.replace(/\bnasa\b/gi, "").trim() || mediaTopic : mediaTopic;

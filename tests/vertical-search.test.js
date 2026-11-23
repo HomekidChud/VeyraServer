@@ -61,6 +61,25 @@ test("bare domain video discovery does not treat upstream hints as required titl
   assert.equal(service.calls[0].options.topic, null);
 });
 
+test("Web video previews can fall back to a provider with safe, in-scope thumbnails", async () => {
+  const found = { url: "https://www.youtube.com/watch?v=abcDEF12345", title: "Aurora from orbit" };
+  const previewable = { url: "https://www.youtube.com/watch?v=efgDEF12345", title: "Looking down at Earth" };
+  const service = mock({
+    "api.search.brave.com": url => {
+      assert.equal(url.searchParams.get("safesearch"), "strict");
+      return { results: [{ ...found, thumbnail: { src: "https://unknown.example/unsafe.jpg" } }] };
+    },
+    "sepiasearch.org": { total: 0, data: [] }
+  }, { env: { BRAVE_SEARCH_API_KEY: "fixture" }, results: [previewable, { ...previewable, url: "https://youtu.be/efgDEF12345" }] });
+  const ordinary = await service.search("videos", "site:youtube.com", { domainBrowse: true, noCache: false });
+  assert.equal(ordinary.provider, "brave");
+  assert.deepEqual(ordinary.results.map(({ url, thumbnail }) => [url, thumbnail]), [[found.url, ""]]);
+  const preview = await service.search("videos", "site:youtube.com", { domainBrowse: true, noCache: false, requireThumbnail: true });
+  assert.equal(preview.provider, "web-discovery");
+  assert.deepEqual(preview.results.map(({ url, thumbnail }) => [url, thumbnail]), [[previewable.url, "https://i.ytimg.com/vi/efgDEF12345/hqdefault.jpg"]]);
+  assert.equal(service.calls.filter(call => call.url?.host === "api.search.brave.com").length, 1, "cached rows are still checked for thumbnails");
+});
+
 test("image fallback validates artwork, license, provenance, cache and scoped pagination", async () => {
   const commons = (url) => {
     assert.equal(url.searchParams.get("gsrnamespace"), "6");

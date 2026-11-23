@@ -6649,7 +6649,7 @@ app.get("/api/search/vertical", async (req, res) => {
   try {
     const signal = AbortSignal.any([request.signal, AbortSignal.timeout(type === "all" ? 12000 : 9000)]);
     const service = app.locals.veyraVerticalSearch || verticalSearch;
-    const options = { page, provider, lang: req.query.lang, region: req.query.region, signal, noCache: req.veyraPrivateTraffic || req.query.incognito === "1" || !CFG.globalCacheEnabled, preview: type === "all", domainBrowse: !!domain, privateSearch: req.query.incognito === "1" };
+    const options = { page, provider, lang: req.query.lang, region: req.query.region, signal, noCache: req.veyraPrivateTraffic || req.query.incognito === "1" || !CFG.globalCacheEnabled, preview: type === "all", requireThumbnail: thumbnailPreview, domainBrowse: !!domain, privateSearch: req.query.incognito === "1" };
     const scope = parseSiteScope(q);
     const withMatches = (section, category) => ({ ...section, results: rankMatchBatch(q, section.results.filter(row =>
       row && allowsSiteUrl(scope, row.sourcePageUrl || row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl)) &&
@@ -6659,7 +6659,7 @@ app.get("/api/search/vertical", async (req, res) => {
       const result = withMatches(await service.search(type, q, options), type);
       if (!thumbnailPreview) return res.json({ ok: true, ...result });
       return res.json({ ok: true, type, provider: result.provider, status: result.status,
-        results: (type === "images" ? result.results.filter(row => row.thumbnail) : result.results).slice(0, 6), nextPage: null });
+        results: result.results.filter(row => row.thumbnail).slice(0, 6), nextPage: null });
     }
     let cursor = 0;
     const sections = Array(SEARCH_VERTICALS.length);
