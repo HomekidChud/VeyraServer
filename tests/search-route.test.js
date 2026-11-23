@@ -14,6 +14,8 @@ process.env.VEYRA_ALLOW_SIGNUP = "1";
 process.env.VEYRA_SIGNUP_KEY = "";
 process.env.VEYRA_TEST_MODE = "0";
 process.env.VEYRA_DEV_CONFIG_API = "0";
+// This fixture exercises many serial API routes in under one production burst.
+process.env.SHIELD_API_BURST = "300";
 process.env.WEB_SEARCH_ORDER = "google";
 process.env.VEYRA_CHROMIUM_ENABLED = "false";
 process.env.INDEX_AI_FINDINGS = "true";
