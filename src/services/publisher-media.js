@@ -178,7 +178,8 @@ function createPublisherMedia({ env = process.env, now = Date.now, log = () => {
   }
   function search(account, token, { nonce, q, page = 0 } = {}) {
     const time = now();
-    if (!activeChallenge(nonce, account, token, time)?.verified) return { status: "age-required" };
+    const grant = activeChallenge(nonce, account, token, time);
+    if (!grant?.verified) return { status: "age-required" };
     const match = typeof q === "string" && q.length <= 240 && /^(?:search|site):([a-z0-9.-]+)(?:\s+(.+))?$/i.exec(q.trim());
     if (!match || !Number.isSafeInteger(page) || page < 0 || page >= Math.ceil(MAX_ROWS / PAGE_SIZE) ||
         /(?:^|\s)-?site:/i.test(match[2] || "")) return { status: "invalid-query" };
@@ -188,9 +189,14 @@ function createPublisherMedia({ env = process.env, now = Date.now, log = () => {
     const hits = catalog.records.filter(entry => terms.every(term => entry.keywords.has(term)));
     const start = page * PAGE_SIZE;
     return { status: "ok", domain, total: hits.length, page, nextPage: start + PAGE_SIZE < hits.length ? page + 1 : null,
+      expiresInMs: Math.min(grant.until, catalog.expiresAtMs) - time,
       results: hits.slice(start, start + PAGE_SIZE).map(entry => entry.row) };
   }
-  return { issue, accept, search };
+  function browserAvailable(domain) {
+    const catalog = catalogs.get(domain);
+    return env.VEYRA_PUBLISHER_BROWSER === "1" && Boolean(catalog?.expiresAtMs > now() && catalog.records.length);
+  }
+  return { issue, accept, search, browserAvailable };
 }
 
 module.exports = { createPublisherMedia };

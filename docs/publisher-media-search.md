@@ -2,7 +2,7 @@
 
 Fast Proxy navigates a site in a visitor's own browsing session. It is not a feed, a grant to reuse publisher artwork, or evidence of the visitor's verified age. The public video fallback recognizes a limited set of watch URL formats and its image provider uses strict filtering. Neither a Fast Proxy session nor the Veyra invite gate unlocks this catalog.
 
-This implementation is disabled by default. It stages an approved operator-supplied snapshot and exposes it through a separate age-gated API. It does not crawl either site, fetch or cache thumbnail bytes, add records to public search, or enable a Browser UI. Do not activate the route for real data until the publisher rights, restricted-display controls, verifier integration and target deployment have been approved and tested.
+This implementation is disabled by default. It stages an approved operator-supplied snapshot and exposes it through a separate age-gated API. It does not crawl either site, fetch or cache thumbnail bytes, or add records to public search. Do not activate the route for real data until the publisher rights, restricted-display controls, verifier integration and target deployment have been approved and tested.
 
 ## Approval and input snapshot
 
@@ -51,9 +51,15 @@ Configuration variables: `VEYRA_PUBLISHER_SEARCH=1`, `VEYRA_PUBLISHER_CATALOG_PA
 
 1. `POST /api/search/publisher/challenge` with a Veyra account bearer token starts an expiring challenge and returns its nonce and the verifier URL. Starting again invalidates that account's old challenge.
 2. The verifier bridge delivers the signed decision back to the original client through a confidential, session-bound integration. Do not put the assertion in a URL or rely on a manually shared link or token. The original client calls `POST /api/search/publisher/verify` with the same Veyra bearer token and `{ "assertion": "<compact signed JWS>" }`. The JWS has `alg: EdDSA`, `typ: JWT`, and claims `iss` (canonical issuer URL), `aud: "veyra:publisher-search"`, `nonce`, boolean `over18`, and integer `iat`/`exp` Unix seconds. Only a current, positive, signed decision redeemed in the initiating session unlocks the challenge.
-3. `POST /api/search/publisher` with the original account bearer and `{ "nonce": "...", "q": "search:xvideos.com lunar atlas", "page": 0 }` returns authorized, publisher-scoped rows and the matched count. There is no query-string form and no incognito mode. The client needs to keep the challenge and results in memory and clear them on sign-out and expiration.
+3. `POST /api/search/publisher` with the original account bearer and `{ "nonce": "...", "q": "search:xvideos.com lunar atlas", "page": 0 }` returns authorized, publisher-scoped rows, the matched count and `expiresInMs` for the earlier of grant expiry and snapshot expiry. There is no query-string form and no incognito mode. Clients should subtract request time from this lifetime, keep data in memory and clear it on sign-out or expiration.
 
-Use a single instance for this version: challenges live only in memory and a restart invalidates them. The age check must be completed before any client access to titles, thumbnails, or embeds. A future client still needs a reviewed thumbnail delivery strategy and release testing; this API does not alter public Browser content security policy. Setting a flag does not establish media rights, prove age assurance works, or authorize publication.
+### Optional VeyraBrowser client
+
+`GET /api/search/publisher/status?domain=pornhub.com` requires a signed-in session and only returns `{ "ok": true }` when `VEYRA_PUBLISHER_BROWSER=1` and that domain has an approved, unexpired, non-empty catalog. Leave this separate option off until the Browser handoff is tested against a real, reviewed provider.
+
+The Browser opens the configured first-party verifier bridge in a popup only on user action. The bridge must retain the opener only on trusted pages, not forward it to untrusted or vendor pages, and have a compatible cross-origin opener policy. After the bridge confirms a decision belongs to the initiating browser, it sends `window.opener.postMessage({ type: "veyra:publisher-age-decision", nonce, assertion }, configuredBrowserOrigin)` using the exact Browser origin, never `*`. The client only accepts the message from that popup and bridge origin with its current nonce. The assertion is only passed to `/verify` in a POST, not stored or placed in a URL. The bridge must not trust age, nonce ownership, or return origins supplied by the browser without independently verifying the flow.
+
+Use a single instance for this version: challenges live only in memory and a restart invalidates them. The age check must be completed before any client access to titles, thumbnails, or embeds. The Browser renders only titles and outbound links in this version. Thumbnails require a separately reviewed delivery strategy and release testing; do not add publisher CDNs to public Browser content security policy. Setting either flag does not establish media rights, prove age assurance works, or authorize publication.
 
 ## Verification and logs
 
