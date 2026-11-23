@@ -1,7 +1,7 @@
 "use strict";
 
 const MODES = new Set(["unfiltered", "filtered", "blocked", "restricted"]);
-const ADULT_HOSTS = ["pornhub.com", "xvideos.com", "xnxx.com", "xhamster.com", "youporn.com", "redtube.com",
+const ADULT_HOSTS = ["porn.com", "pornhub.com", "xvideos.com", "xnxx.com", "xhamster.com", "youporn.com", "redtube.com",
   "tube8.com", "spankbang.com", "phncdn.com", "others-cdn.com"];
 const URL_FIELDS = ["url", "canonical", "canonicalUrl", "sourcePageUrl", "imageUrl", "thumbnail", "thumbnailUrl", "posterUrl", "embedUrl", "favicon"];
 

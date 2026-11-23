@@ -58,6 +58,8 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
   const privacyRows = [
     { url: "https://public.example.test/privacy-fixture", title: "Public privacy fixture" },
     { url: "https://mirror.pornhub.com/fixture", title: "Known host fixture" },
+    { url: "https://www.porn.com/fixture", title: "Known publisher fixture" },
+    { url: "https://porn.com.lookalike.example/fixture", title: "Unrelated lookalike host fixture" },
     { url: "https://mirror.example.test/privacy-fixture", title: "Known source fixture", sourcePageUrl: "https://xvideos.com/fixture" },
     { url: "https://flagged.example.test/privacy-fixture", title: "Labelled fixture", nsfw: true },
     { url: "https://poster.example.test/privacy-fixture", title: "Known media fixture", thumbnail: "https://cdn.phncdn.com/fixture.jpg" }
@@ -147,13 +149,16 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     } };
     for (const mode of ["filtered", "blocked", "restricted", "invalid", "unfiltered"]) {
       const web = await search("/web", "public privacy fixture", mode, { engine: "bing" });
-      assert.equal(web.results.length, mode === "unfiltered" ? 5 : 1);
+      assert.equal(web.results.length, mode === "unfiltered" ? 7 : 2);
+      assert.ok(web.results.some(row => row.title === "Unrelated lookalike host fixture"));
       assert.equal(web.candidates, undefined, "unfiltered internal candidate arrays must never be serialized");
       const vertical = await search("/vertical", "public privacy fixture", mode, { type: "images", preview: "1" });
-      assert.equal(vertical.results.length, mode === "unfiltered" ? 5 : 1);
+      assert.equal(vertical.results.length, mode === "unfiltered" ? 7 : 2);
     }
     const providerCalls = webSearchCalls, imageCalls = privacyVerticalCalls;
-    for (const [q, mode] of [["search:pornhub.com", "filtered"], ["site:xvideos.com", "restricted"], ["(https://www.xvideos.com/fixture), clip", "blocked"]]) {
+    for (const [q, mode] of [["search:pornhub.com", "filtered"], ["site:xvideos.com", "restricted"], ["site:xhamster.com", "filtered"],
+      ["(https://www.xvideos.com/fixture), clip", "blocked"], ["search:porn.com", "filtered"], ["site:www.porn.com", "restricted"],
+      ["(https://www.porn.com/fixture), clip", "blocked"]]) {
       for (const [route, extra] of [["/web", {}], ["/vertical", { type: "images", preview: "1" }], ["", {}]]) {
         const result = await search(route, q, mode, extra);
         assert.equal(result.status, "filtered");
