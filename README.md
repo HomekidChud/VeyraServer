@@ -387,3 +387,7 @@ Render's filesystem is ephemeral. Without a persistent disk mounted at `VEYRA_DA
 ## YouTube playback eligibility
 
 Set `YOUTUBE_DATA_API_KEY` in the deployment environment to enable `GET /api/media/youtube/:id`. Restrict the key to the YouTube Data API v3; never put it in a client bundle or browser query string. The endpoint uses Google's [Made for Kids status lookup](https://developers.google.com/youtube/data/guides/made_for_kids_status) and returns `ready` only for an explicitly embeddable video that is not Made for Kids. Without a key, or on upstream failure, it returns `unavailable`; ineligible videos return `external`.
+
+## Protected publisher-media catalog
+
+Publisher-feed integration is disabled by default and kept separate from public Search and Fast Proxy. See the [protected catalog setup and release requirements](docs/publisher-media-search.md).
