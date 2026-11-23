@@ -152,8 +152,12 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
       assert.equal(web.results.length, mode === "unfiltered" ? 7 : 2);
       assert.ok(web.results.some(row => row.title === "Unrelated lookalike host fixture"));
       assert.equal(web.candidates, undefined, "unfiltered internal candidate arrays must never be serialized");
-      const vertical = await search("/vertical", "public privacy fixture", mode, { type: "images", preview: "1" });
+      const vertical = await search("/vertical", "public privacy fixture", mode, { type: "images" });
       assert.equal(vertical.results.length, mode === "unfiltered" ? 7 : 2);
+      assert.equal(vertical.results.some(row => row.title === "Known publisher fixture"), mode === "unfiltered");
+      const preview = await search("/vertical", "public privacy fixture", mode, { type: "images", preview: "1" });
+      assert.equal(preview.results.length, mode === "unfiltered" ? 6 : 2);
+      if (mode !== "unfiltered") assert.ok(!preview.results.some(row => row.title === "Known publisher fixture"));
     }
     const providerCalls = webSearchCalls, imageCalls = privacyVerticalCalls;
     for (const [q, mode] of [["search:pornhub.com", "filtered"], ["site:xvideos.com", "restricted"], ["site:xhamster.com", "filtered"],
