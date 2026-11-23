@@ -26,7 +26,14 @@ function lastVerticalPage(type, provider) {
 }
 const ENDPOINT = "https://api.search.brave.com/res/v1";
 const TIMEOUT = 4400;
-const VIDEO_INTENT = new Set("fix repair make install tutorial guide review recipe video watch".split(" "));
+const VIDEO_INTENT = new Set("fix repair make install build replace cook bake grow tutorial guide review recipe video watch".split(" "));
+const VIDEO_TASK = /^(?:how\s+to\s+)?(?:make|fix|repair|install|build|replace|cook|bake|grow)\s+\S/i;
+const COMPARISON_CONNECTOR = /\s+(?:vs\.?|versus|compared (?:with|to))\s+/gi;
+function discussionTopic(query) {
+  // Forum search engines may require the connector verbatim, even when a
+  // relevant thread uses a different one (e.g. “X or Y”).
+  return /["“”]/.test(query) ? query : query.replace(COMPARISON_CONNECTOR, " ");
+}
 function videoTopic(query) {
   const subject = unicodeWords(query).filter(word => !VIDEO_INTENT.has(word));
   return subject.length ? subject.join(" ") : query;
@@ -51,6 +58,7 @@ const COMMUNITY_SITES = [
   ["electronics", "electronics.stackexchange.com", "Electrical Engineering Stack Exchange", /\b(?:electronics|arduino|transistor|microcontroller|oscilloscope)\b/i],
   ["unix", "unix.stackexchange.com", "Unix & Linux Stack Exchange", /\b(?:unix|linux|ubuntu|bash|systemd)\b/i],
   ["superuser", "superuser.com", "Super User", /\b(?:windows|macos|computer hardware|wifi|wi-fi|microsoft office)\b/i],
+  ["dba", "dba.stackexchange.com", "Database Administrators", /\b(?:sqlite|postgres(?:ql)?|mysql|mariadb|sql server|database administration)\b/i],
   ["stackoverflow", "stackoverflow.com", "Stack Overflow", /\b(?:javascript|python|typescript|java|programming|rust|sql|css|html|node\.js|regex|swift)\b/i]
 ];
 function communityFor(scope, topic) {
@@ -504,7 +512,9 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
     if (!q || (scope.active && !scope.text && !domainOnly)) return empty("empty");
     const attempts = [];
     let sparseImages;
-    const topic = scope.text || (domainOnly ? "" : q);
+    const rawTopic = scope.text || (domainOnly ? "" : q);
+    const topic = type === "discussions" ? discussionTopic(rawTopic) : rawTopic;
+    const videoTask = type === "videos" && VIDEO_TASK.test(topic);
     const domainHint = domainOnly ? scope.include[0] : "";
     const mediaTopic = type === "videos" ? videoTopic(topic) : topic;
     const ageScore = item => {
@@ -522,7 +532,7 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
       const saved = noCache || name === "veyra-crawler" ? null : cache.get(key);
       try {
         const fullQuery = domainHint ? `${q} ${domainHint}` : q;
-        const providerQuery = name === "brave" ? fullQuery : (scope.text || domainHint || q).slice(0, 400);
+        const providerQuery = name === "brave" ? fullQuery : (topic || domainHint || q).slice(0, 400);
         const packed = saved?.until > Date.now() ? saved.packed : await run(type, providerQuery, { page, lang: language, region, signal, noCache, fullQuery, indexQuery: q, scope, preview, domainBrowse, privateSearch });
         if (signal?.aborted) return sparseImages || empty("cancelled");
         const seen = new Set();
@@ -533,7 +543,10 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
           const topicalMedia = (type === "videos" && name !== "verified-videos") || (type === "images" && unicodeWords(topic).length > 1 && !/[^\u0000-\u007f]/.test(topic));
           const topicalNative = ["europe-pmc", "stack-exchange", "nasa-library"].includes(item.provider);
           const intendedTopic = item.provider === "nasa-library" ? mediaTopic.replace(/\bnasa\b/gi, "").trim() || mediaTopic : mediaTopic;
-          if ((topicalMedia || topicalNative) && !isTopicalResult(intendedTopic, item, { requireTitle: item.provider !== "nasa-library" })) return false;
+          // A recipe's ingredient list (or a video's description of what it
+          // uses) is not evidence that the video teaches the requested task.
+          const topicalItem = videoTask ? { ...item, snippet: "" } : item;
+          if ((topicalMedia || topicalNative) && !isTopicalResult(intendedTopic, topicalItem, { requireTitle: item.provider !== "nasa-library" })) return false;
           const key = type === "images" ? imageIdentity(item.imageUrl || item.thumbnail || item.url)
             : type === "videos" ? youtubeWatch(new URL(item.url)) || item.url
             : type === "news" ? unicodeWords(item.title).join(" ") || item.url
