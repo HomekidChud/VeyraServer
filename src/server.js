@@ -3793,6 +3793,9 @@ function localSearch(query, offset, limit, options = {}) {
   const parsed = parseSearchQuery(query);
   const N = searchIndex.size;
   if (!N || (options.requireTerms && !parsed.terms.length)) return { total: 0, results: [], indexSize: N, terms: parsed.terms, filters: parsed.filters };
+  // Day buckets keep millisecond timing from reordering otherwise tied pages
+  // between feed requests; the final URL comparison breaks exact ties.
+  const dayMs = 86_400_000, rankingDay = Math.floor(Date.now() / dayMs);
   const candidateScores = new Map();
   const k1 = 1.35, b = 0.75;
   let avgLen = 0;
@@ -3840,7 +3843,8 @@ function localSearch(query, offset, limit, options = {}) {
       if (phraseText.includes(phrase)) score += 7;
     }
     if (!parsed.terms.length && (doc.title || doc.description)) score += 0.05;
-    const ageDays = Math.max(0, (Date.now() - Date.parse(doc.indexedAt || now())) / 86400000);
+    const indexedAt = Date.parse(doc.indexedAt);
+    const ageDays = Number.isFinite(indexedAt) ? Math.max(0, rankingDay - Math.floor(indexedAt / dayMs)) : 0;
     score += 0.25 / (1 + ageDays);
     if (score > 0) candidateScores.set(doc.url, score);
   }
