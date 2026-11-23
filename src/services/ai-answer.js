@@ -67,15 +67,22 @@ function evidenceText(value) {
   if (/\b(?:jump to content|tools tools|read edit view history|what links here|sign in|navigation menu|add to word list|audio player|play pronunciation|listen to pronunciation|related words|social media)\b/i.test(text)) return "";
   return text;
 }
+const noAnswerExcerpt = /(?:^|[\s,:])(?:none|noindex|nosnippet|noai|max-snippet\s*:\s*0)(?=$|[\s,;])/i;
+function canReadAnswerResponse(contentType, robots) {
+  return !noAnswerExcerpt.test(robots || "") &&
+    (!contentType || /^(?:text\/html|application\/xhtml\+xml|text\/plain)(?:\s*;|$)/i.test(contentType));
+}
 
 /** DOM-aware extraction: removes structural chrome, then keeps meaningful text blocks. */
 function extractReadable(html, url = "") {
   const raw = String(html || "");
   const $ = cheerio.load(raw, { decodeEntities: true });
   const meta = name => cleanText($(`meta[name='${name}'],meta[property='${name}']`).first().attr("content"), 1000);
+  const answerExcerptAllowed = !$("meta[name]").toArray().some(el => /^(?:robots|veyracrawler|veyraaibot)$/i.test($(el).attr("name") || "") &&
+    noAnswerExcerpt.test($(el).attr("content") || ""));
   const jsonLd = [];
   $("script[type='application/ld+json']").each((i, el) => { if (i < 8) try { jsonLd.push(JSON.parse($(el).text())); } catch {} });
-  $("script,style,noscript,svg,template,canvas,iframe,object,embed,nav,header,footer,form,aside,[role='navigation'],[aria-hidden='true'],[class*='cookie'],[id*='cookie'],[class*='advert'],[id*='advert'],[class*='social'],[class*='share']").remove();
+  $("script,style,noscript,svg,template,canvas,iframe,object,embed,nav,header,footer,form,aside,[role='navigation'],[aria-hidden='true'],[data-nosnippet],[class*='cookie'],[id*='cookie'],[class*='advert'],[id*='advert'],[class*='social'],[class*='share']").remove();
   const title = cleanText($("title").first().text(), 240);
   let canonical = url;
   try { const href = $(`link[rel='canonical']`).first().attr("href"); if (href) canonical = safeUrl(new URL(href, url).href) || url; } catch {}
@@ -96,7 +103,7 @@ function extractReadable(html, url = "") {
     seen.add(key); unique.push(block);
   }
   const text = unique.join(" ").slice(0, 90000);
-  return { url, canonicalUrl: canonical || url, title, ...metadata, headings, text, sentences: sentences(text), originalLength: raw.length, extractedLength: text.length, extractionStatus: text.length ? (text.length < 120 ? "low-information" : "extracted") : "empty", duplicateRatio: blocks.length ? Math.max(0, 1 - unique.length / blocks.length) : 0, extractionQuality: text ? Math.min(1, text.length / 900) : 0 };
+  return { url, canonicalUrl: canonical || url, title, ...metadata, headings, text, answerExcerptAllowed, sentences: sentences(text), originalLength: raw.length, extractedLength: text.length, extractionStatus: text.length ? (text.length < 120 ? "low-information" : "extracted") : "empty", duplicateRatio: blocks.length ? Math.max(0, 1 - unique.length / blocks.length) : 0, extractionQuality: text ? Math.min(1, text.length / 900) : 0 };
 }
 function htmlToText(html) { return extractReadable(html).text; }
 function normalizeUrl(raw) {
@@ -401,20 +408,24 @@ class AIAnswerEngine {
     this.acquisitionManager = opts.acquisitionManager || null;
     this.qualityModel = opts.qualityModel || new AnswerQualityModel();
   }
-  async answer(query, searchResults = [], { signal, retrievalDiagnostics = null, allowSource = () => true, requirePageEvidence = false, vertical = "", chatContext, noCache = false } = {}) {
+  async answer(query, searchResults = [], { signal, retrievalDiagnostics = null, allowSource = () => true, requirePageEvidence = false,
+    requireReadableEvidence = false, indexOnly = false, evidenceLimit = 6, vertical = "", chatContext, noCache = false } = {}) {
     const started = Date.now(), q = cleanText(query, 600);
     const intent = this.detectIntent(q);
     if (chatContext) intent.type = this.detectIntent(chatContext.question).type;
     if (!q) return { hasAnswer: false, reason: "No query provided" };
     const results = this.normalizeResults(searchResults).filter(allowSource).slice(0, this.maxPagesToRead);
     const readDeadline = AbortSignal.timeout(6500);
-    const contents = await this.fetchContents(results, signal ? AbortSignal.any([signal, readDeadline]) : readDeadline, allowSource, noCache);
+    const contents = await this.fetchContents(results, signal ? AbortSignal.any([signal, readDeadline]) : readDeadline,
+      allowSource, noCache, requireReadableEvidence, indexOnly);
     signal?.throwIfAborted();
     const verifiedPages = requirePageEvidence
       ? contents.filter(content => content.extractionStatus === "extracted" && content.text.length >= 160)
         .map(content => ({ ...content, title: content.pageTitle || content.url, snippet: "" }))
-      : contents;
-    const evidence = this.buildEvidence(q, intent, verifiedPages, requirePageEvidence ? [] : results);
+      : requireReadableEvidence
+        ? contents.filter(content => ["extracted", "local-index"].includes(content.extractionStatus) && content.text.length >= 120)
+        : contents;
+    const evidence = this.buildEvidence(q, intent, verifiedPages, requirePageEvidence || requireReadableEvidence ? [] : results, evidenceLimit);
     if (!evidence.length) return { hasAnswer: false, reason: "No readable source evidence found", query: q, intent, pipeline: { retrieved: results.length, fetched: contents.length, selected: 0, sourceRetrieval: retrievalDiagnostics } };
     const synthesisDiagnostics = {};
     const synthDeadline = AbortSignal.timeout(Math.min(this.llmTimeoutMs, 11500));
@@ -486,7 +497,7 @@ class AIAnswerEngine {
     return { type: "explore", subject: q };
   }
   extractSubject(q) { return String(q).replace(/^what\s+(is|are|was|were)\s+/i, "").replace(/^what\s+does\s+/i, "").replace(/\s+mean\??$/i, "").replace(/^what's\s+/i, "").replace(/^define\s+/i, "").replace(/^meaning\s+of\s+/i, "").replace(/\s+(meaning|definition)\??$/i, "").trim() || q; }
-  async fetchContents(results, signal, allowSource = () => true, noCache = false) {
+  async fetchContents(results, signal, allowSource = () => true, noCache = false, requireReadableEvidence = false, indexOnly = false) {
     // Read many candidate pages with bounded concurrency so the answer is built
     // from broad evidence, not just the first handful of search hits.
     const out = [];
@@ -497,8 +508,12 @@ class AIAnswerEngine {
         const r = results[cursor++];
         try {
           const indexed = String(r.contentText || "");
-          const content = indexed.length >= 80 ? { ...this.parseContent(indexed, r.canonicalUrl || r.url), extractionStatus: "local-index", extractionQuality: 0.7 } : await this.fetchPageContent(r.url, { signal, noCache });
-          if (content?.text?.length >= 80 && allowSource(content)) out.push({ ...content, url: r.url, canonicalUrl: content.canonicalUrl || r.canonicalUrl || r.url, pageTitle: content.title, title: content.title || (r.title !== r.url ? r.title : "") || r.url, snippet: r.snippet, rank: r.rank, sourceIdentity: host(content.url || r.url), provider: r.provider || r.source?.provider || r.source, retrievedAt: r.retrievedAt || new Date().toISOString(), extractionStatus: content.extractionStatus || "extracted" });
+          const content = indexed.length >= (requireReadableEvidence ? 120 : 80)
+            ? { ...this.parseContent(indexed, r.canonicalUrl || r.url), extractionStatus: "local-index", extractionQuality: 0.7 }
+            : indexOnly ? null : await this.fetchPageContent(r.url, { signal, noCache, requireReadableEvidence });
+          if (requireReadableEvidence && content?.answerExcerptAllowed === false) continue;
+          if (requireReadableEvidence && content && /\b(?:before you continue to|verify (?:that )?you are human|checking your browser|cloudflare ray id|unusual traffic)\b/i.test(`${content.title} ${content.text.slice(0, 500)}`)) continue;
+          if (content?.text?.length >= 80 && allowSource(content)) out.push({ ...content, url: r.url, canonicalUrl: content.canonicalUrl || r.canonicalUrl || r.url, pageTitle: content.title, title: content.title || ((!requireReadableEvidence || content.extractionStatus === "local-index") && r.title !== r.url ? r.title : "") || r.url, snippet: requireReadableEvidence ? "" : r.snippet, rank: r.rank, sourceIdentity: host(content.url || r.url), provider: r.provider || r.source?.provider || r.source, retrievedAt: r.retrievedAt || new Date().toISOString(), publishedAt: content.publishedAt || r.publishedAt || null, extractionStatus: content.extractionStatus || "extracted" });
         } catch {}
       }
     });
@@ -506,18 +521,50 @@ class AIAnswerEngine {
     out.sort((a, b) => (a.rank || 999) - (b.rank || 999));
     return out;
   }
-  fetchPageContent(url, { signal, noCache } = {}) {
+  async fetchPageContent(url, { signal, noCache, requireReadableEvidence } = {}) {
     if (this.acquisitionManager) {
-      return this.acquisitionManager.fetch(url, { engine: "answer", maxBytes: this.maxContentBytes, timeoutMs: this.timeoutMs, retries: 0, signal, noCache })
-        .then(result => result.ok && this.parseContent(result.body, result.finalUrl || url));
+      const options = { engine: "answer", maxBytes: this.maxContentBytes, timeoutMs: this.timeoutMs, retries: 0, signal, noCache };
+      let result = await this.acquisitionManager.fetch(url, options);
+      // Older durable entries did not retain X-Robots-Tag. Do not use one
+      // for a new overview without checking the page's opt-out first.
+      if (requireReadableEvidence && result.mongoCacheHit && result.robotsTag == null) {
+        result = await this.acquisitionManager.fetch(url, { ...options, noCache: true });
+      }
+      const robots = result.robotsTag ?? result.headers?.get?.("x-robots-tag") ?? result.headers?.["x-robots-tag"];
+      if (!result.ok || (requireReadableEvidence && !canReadAnswerResponse(result.contentType, robots))) return null;
+      return this.parseContent(result.body, result.finalUrl || url);
     }
-    return new Promise((resolve, reject) => { const u = new URL(url), lib = u.protocol === "https:" ? https : http; if (signal?.aborted) return reject(Object.assign(new Error("Operation cancelled"), { code: "OPERATION_CANCELLED" })); const req = lib.get(url, { headers: { "User-Agent": this.userAgent, Accept: "text/html,application/xhtml+xml,text/plain;q=0.8", "Accept-Encoding": "identity" }, timeout: this.timeoutMs }, res => { if (res.statusCode < 200 || res.statusCode >= 300) { res.resume(); reject(new Error(`HTTP ${res.statusCode}`)); return; } let data = "", done = false; res.setEncoding("utf8"); res.on("data", chunk => { if (done) return; data += chunk; if (data.length >= this.maxContentBytes) { done = true; res.destroy(); resolve(this.parseContent(data, url)); } }); res.on("end", () => { if (!done) resolve(this.parseContent(data, url)); }); res.on("error", reject); }); const abort = () => req.destroy(Object.assign(new Error("Operation cancelled"), { code: "OPERATION_CANCELLED" })); signal?.addEventListener("abort", abort, { once: true }); req.on("close", () => signal?.removeEventListener("abort", abort)); req.on("error", reject); req.on("timeout", () => req.destroy(new Error("Timeout"))); });
+    return new Promise((resolve, reject) => {
+      const lib = new URL(url).protocol === "https:" ? https : http;
+      const cancelled = () => Object.assign(new Error("Operation cancelled"), { code: "OPERATION_CANCELLED" });
+      if (signal?.aborted) return reject(cancelled());
+      const req = lib.get(url, { headers: { "User-Agent": this.userAgent, Accept: "text/html,application/xhtml+xml,text/plain;q=0.8", "Accept-Encoding": "identity" }, timeout: this.timeoutMs }, res => {
+        if (res.statusCode < 200 || res.statusCode >= 300) { res.resume(); reject(new Error(`HTTP ${res.statusCode}`)); return; }
+        if (requireReadableEvidence && !canReadAnswerResponse(res.headers["content-type"], res.headers["x-robots-tag"])) {
+          res.destroy(); resolve(null); return;
+        }
+        let data = "", done = false;
+        res.setEncoding("utf8");
+        res.on("data", chunk => {
+          if (done) return;
+          data += chunk;
+          if (data.length >= this.maxContentBytes) { done = true; res.destroy(); resolve(this.parseContent(data, url)); }
+        });
+        res.on("end", () => { if (!done) resolve(this.parseContent(data, url)); });
+        res.on("error", reject);
+      });
+      const abort = () => req.destroy(cancelled());
+      signal?.addEventListener("abort", abort, { once: true });
+      req.on("close", () => signal?.removeEventListener("abort", abort));
+      req.on("error", reject);
+      req.on("timeout", () => req.destroy(new Error("Timeout")));
+    });
   }
   parseContent(html, url) { return extractReadable(html, url); }
-  buildEvidence(query, intent, contents, results) {
+  buildEvidence(query, intent, contents, results, limit = 6) {
     const qTerms = groundingTerms(intent.subject || query).filter(term => !/^(?:compare|difference|versu|vs|fix|make|use)$/.test(term));
     const candidates = [...contents, ...results.filter(r => !contents.some(c => c.url === r.url) && r.snippet).map(r => ({ ...r, sentences: sentences(r.snippet), text: r.snippet, extractionQuality: 0.35, extractionStatus: "search-snippet" }))];
-    const out = [], contentSeen = [];
+    const out = [], contentSeen = [], canonicalSeen = new Set();
     for (const c of candidates) {
       const sourceSentences = [...new Set((c.sentences || sentences(c.text || "")).map(evidenceText).filter(Boolean))].slice(0, 240);
       const hits = text => {
@@ -537,19 +584,21 @@ class AIAnswerEngine {
       }).filter(Boolean).sort((a, b) => b.score - a.score).slice(0, 8);
       if (!matched.length) continue;
       const body = String(c.text || "");
+      const canonical = normalizeUrl(c.canonicalUrl || c.url);
+      if (!canonical || canonicalSeen.has(canonical)) continue;
       const contentHash = hash((body || matched.map(x => x.text).join(" ")).toLowerCase());
       const comparisonText = cleanText(body || matched.map(x => x.text).join(" "), 16000);
       if (contentSeen.some(x => x.hash === contentHash || similarity(x.text, comparisonText) >= 0.94)) continue;
+      canonicalSeen.add(canonical);
       contentSeen.push({ hash: contentHash, text: comparisonText });
       const passages = matched.map((item, index) => { const start = body.indexOf(item.text); return { id: `${hash(`${normalizeUrl(c.canonicalUrl || c.url)}|${contentHash}`).slice(0, 16)}:P${index + 1}`, text: item.text, start: start < 0 ? null : start, end: start < 0 ? null : start + item.text.length, offsetsRepresentation: c.extractionStatus === "search-snippet" ? "searchSnippet" : "extractedText" }; });
-      const canonical = normalizeUrl(c.canonicalUrl || c.url);
       out.push({ id: `S${out.length + 1}`, url: c.url, canonicalUrl: canonical, documentId: hash(`${canonical}|${contentHash}`), title: c.title || c.url, rank: c.rank, provider: c.provider || null, sourceIdentity: c.sourceIdentity || host(c.url), retrievedAt: c.retrievedAt || new Date().toISOString(), publishedAt: c.publishedAt || null, extractionStatus: c.extractionStatus || (body ? "extracted" : "search-snippet"), evidenceType: c.extractionStatus === "local-index" ? "local-index-text" : c.extractionStatus === "search-snippet" ? "search-snippet" : "extracted-document", matched: matched.map(x => x.text), verificationSentences: sourceSentences.slice(0, 240), documentText: cleanText(body, 90000), passages, score: matched[0].score, extractionQuality: c.extractionQuality ?? 0.5, contentHash });
     }
     const ranked = out.sort((a, b) => b.score - a.score || (a.rank || 999) - (b.rank || 999));
     const domains = new Set();
     const first = ranked.filter(row => !domains.has(row.sourceIdentity) && domains.add(row.sourceIdentity));
     const rest = ranked.filter(row => !first.includes(row));
-    return [...first, ...rest].slice(0, 6).map((x, i) => ({ ...x, id: `S${i + 1}` }));
+    return [...first, ...rest].slice(0, Math.max(1, Math.min(12, limit))).map((x, i) => ({ ...x, id: `S${i + 1}` }));
   }
   detectConflicts(evidence) {
     const pairs = [[/\b(?:increase|increased|increases|rise|rose|rises|higher|more)\b/i, /\b(?:decrease|decreased|decreases|fall|fell|falls|lower|less)\b/i], [/\b(?:safe|effective|works|benefit|beneficial)\b/i, /\b(?:unsafe|ineffective|fails?|harm|harmful)\b/i], [/\b(?:approved|supports?|confirms?|true)\b/i, /\b(?:rejected|refutes?|contradicts?|false)\b/i]];
@@ -617,7 +666,8 @@ class AIAnswerEngine {
     const perDocument = Math.floor(26_000 / Math.max(1, evidence.length));
     const packet = evidence.map(e => {
       const documentText = cleanText(e.documentText || e.matched.join(" "), perDocument);
-      return `[${e.id}] ${e.title}\nURL: ${e.url}\nRELEVANT PASSAGES:\n- ${e.matched.slice(0, 8).join("\n- ")}\n\nDOCUMENT TEXT (may be clipped to fit the context budget):\n${documentText}`;
+      const passages = evidence.length > 6 ? e.matched.slice(0, 4).join("\n- ") : e.matched.slice(0, 8).join("\n- ");
+      return `[${e.id}] ${e.title}\nURL: ${e.url}\nRELEVANT PASSAGES:\n- ${passages}\n\nDOCUMENT TEXT (may be clipped to fit the context budget):\n${documentText}`;
     }).join("\n\n");
     const sourceWordCounts = evidence.map(e => String(e.documentText || e.matched?.join(" ") || "").split(/\s+/).filter(Boolean).length);
     const richSourceCount = sourceWordCounts.filter(count => count >= 80).length;

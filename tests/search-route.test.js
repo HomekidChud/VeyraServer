@@ -17,6 +17,7 @@ process.env.WEB_SEARCH_ORDER = "google";
 process.env.VEYRA_CHROMIUM_ENABLED = "false";
 process.env.INDEX_AI_FINDINGS = "true";
 process.env.AI_ANSWER_ALLOW_EXTRACTIVE_FALLBACK = "true";
+process.env.AI_ANSWER_WIDE_DISCOVERY = "true";
 
 const { app, indexDocument, mongoStore, CFG } = require("../src/server");
 (async () => {
@@ -593,6 +594,107 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
       assert.deepEqual(page.results.map(row => new URL(row.url).pathname), [`/${slug}-preferred`, `/${slug}-badge`]);
       assert.ok(page.results[1].matchPercent > page.results[0].matchPercent, "Web preserves provider rank despite a higher later badge");
     }
+
+    assert.deepEqual(aiStatus.sourceDiscovery, { strategy: "wide-v1", shortlistLimit: 24 });
+    const wideCalls = [];
+    const readShortlist = [];
+    app.locals.veyraWebSearch = { async search(q, options) {
+      wideCalls.push({ lane: "web", q, offset: options.offset });
+      assert.equal(options.feed, true);
+      assert.equal(options.reference, true);
+      assert.ok(options.signal instanceof AbortSignal);
+      if (q.includes("peer-reviewed")) throw new Error("Web provider unavailable");
+      if (q.includes("PostgreSQL") && !q.includes("SQLite")) throw new Error("Partial provider failure");
+      const site = q.startsWith("site:fixture-search-route.test");
+      if (!site) return { status: "ok", nextOffset: options.offset ? null : 10, results: [
+        { url: `https://docs.example.test/geothermal-${options.offset || 0}` }
+      ] };
+      return { status: "ok", results: [
+        { url: `https://fixture-search-route.test/${q.endsWith("SQLite") ? "sqlite-docs" : "comparison"}`, snippet: "UNTRUSTED" },
+        { url: "https://outside.example/", snippet: "UNTRUSTED" },
+        { url: "https://blocked.fixture-search-route.test/" },
+        { url: "https://fixture-search-route.test/redirect", canonicalUrl: "https://outside.example/" }
+      ] };
+    } };
+    app.locals.veyraVerticalSearch = { async search(type, q, options) {
+      wideCalls.push({ lane: type, q, page: options.page, provider: options.provider });
+      if (type === "research") return { provider: "research-mix", status: "ok", results: [
+        { url: "https://europepmc.org/article/MED/101", doi: "10.1234/shared", provider: "europe-pmc", snippet: "UNTRUSTED" },
+        { url: "https://doi.org/10.1234/shared", doi: "10.1234/SHARED", provider: "crossref", snippet: "UNTRUSTED" }
+      ] };
+      assert.equal(type, "images");
+      return { provider: options.page ? "wikimedia" : "image-mix", status: "ok",
+        ...(options.page ? { nextPage: null } : { nextPage: 2, nextProvider: "wikimedia" }), results: [
+        { url: "https://asset.example.test/file.jpg", sourcePageUrl: `https://fixture-search-route.test/gallery-${options.page || 0}`, title: "A discovery link", snippet: "UNTRUSTED" },
+        { url: "https://asset.example.test/unrelated.jpg", sourcePageUrl: "https://outside.example/gallery" },
+        { url: "https://asset.example.test/blocked.jpg", sourcePageUrl: "https://fixture-search-route.test/blocked-gallery", thumbnail: "https://phncdn.com/preview.jpg" }
+      ] };
+    } };
+    app.locals.veyraAnswerEngine = { async answer(q, results, options) {
+      assert.equal(options.requireReadableEvidence, true);
+      assert.equal(options.evidenceLimit, 12);
+      assert.doesNotMatch(JSON.stringify(results), /UNTRUSTED|outside\.example|blocked\.fixture|ignored-gallery|blocked-gallery/);
+      readShortlist.push({ q, results, options });
+      return { hasAnswer: false, pipeline: { sourceRetrieval: options.retrievalDiagnostics } };
+    } };
+    const scopedCompare = "site:fixture-search-route.test -site:blocked.fixture-search-route.test SQLite versus PostgreSQL";
+    const scopedInput = { query: scopedCompare, source: "web", results: [
+      { url, contentText: "UNTRUSTED", title: "UNTRUSTED" },
+      { url: "https://fixture-search-route.test/unsafe", canonicalUrl: "https://outside.example/" }
+    ] };
+    for (const [suffix, headers] of [["?incognito=1", { authorization }], ["?private=1", { authorization }], ["", {}]]) {
+      assert.equal((await getSummary(scopedInput, { suffix, headers })).hasAnswer, false);
+    }
+    assert.equal(wideCalls.length, 0, "discovery never calls providers for guest or incognito answers");
+    const wideScoped = await getSummary(scopedInput);
+    assert.deepEqual(wideCalls.map(call => call.q), [
+      scopedCompare,
+      "site:fixture-search-route.test -site:blocked.fixture-search-route.test SQLite",
+      "site:fixture-search-route.test -site:blocked.fixture-search-route.test PostgreSQL"
+    ]);
+    assert.equal(wideScoped.pipeline.sourceRetrieval.batches[2].status, "unavailable");
+    assert.equal(readShortlist[0].q, "SQLite versus PostgreSQL", "alternate searches cannot change the question sent for synthesis");
+    assert.deepEqual(readShortlist[0].results.map(r => r.url).sort(),
+      [url, "https://fixture-search-route.test/comparison", "https://fixture-search-route.test/sqlite-docs"].sort());
+    assert.equal(readShortlist[0].options.allowSource({ url, canonicalUrl: "https://outside.example/" }), false);
+    assert.equal((await getSummary({ query: "geothermal", source: "web" })).pipeline.sourceRetrieval.shortlisted, 2);
+    assert.deepEqual(wideCalls.slice(-2).map(call => call.offset), [undefined, 10]);
+    const academic = await getSummary({ query: "peer-reviewed geothermal research papers", source: "web" });
+    assert.equal(academic.pipeline.sourceRetrieval.batches[0].status, "unavailable");
+    assert.equal(academic.pipeline.sourceRetrieval.batches[1].lane, "research");
+    assert.equal(readShortlist.at(-1).results.length, 1, "mirrors with one DOI should count as one candidate");
+
+    const image = await getSummary({ query: "site:fixture-search-route.test gallery", source: "images", vertical: "images",
+      results: [{ url: "https://fixture-search-route.test/ignored-gallery" }] });
+    assert.equal(image.vertical, "images");
+    assert.deepEqual(wideCalls.slice(-2).map(call => [call.lane, call.page, call.provider]),
+      [["images", undefined, undefined], ["images", 2, "wikimedia"]]);
+    assert.deepEqual(readShortlist.at(-1).results.map(r => r.url), [0, 2].map(i => `https://fixture-search-route.test/gallery-${i}`));
+    assert.equal(readShortlist.at(-1).options.requirePageEvidence, true);
+    const countBeforeIndex = wideCalls.length;
+    app.locals.veyraAnswerEngine = engineOverride;
+    const indexedOverview = await getSummary({ query: "What does the Veyra local route fixture confirm?", source: "index",
+      results: [{ url }, { url: "https://untrusted.example/ignored" }] });
+    assert.equal(indexedOverview.hasAnswer, true);
+    assert.equal(indexedOverview.pipeline.sourceRetrieval.strategy, "wide-v1");
+    assert.ok(indexedOverview.sources.every(row => row.provider === "veyra-index"));
+    assert.equal(wideCalls.length, countBeforeIndex, "Index overviews must not query external providers");
+    let enter, release;
+    const entered = new Promise(resolve => { enter = resolve; });
+    const heldSlot = new Promise(resolve => { release = resolve; });
+    app.locals.veyraAnswerEngine = { async answer() { enter(); await heldSlot; return { hasAnswer: false }; } };
+    const held = getSummary({ query: "Veyra", source: "index" });
+    await entered;
+    try {
+      const busy = await fetch(`${base}/api/search/answer`, {
+        method: "POST", headers: { "Content-Type": "application/json", authorization },
+        body: JSON.stringify({ query: "Veyra", source: "index" })
+      });
+      assert.equal(busy.status, 429);
+      assert.equal(busy.headers.get("Retry-After"), "2");
+      assert.equal((await busy.json()).diagnosticCode, "http_429");
+    } finally { release(); await held; }
+    assert.equal((await getSummary({ query: "Veyra", source: "index" })).diagnosticCode, undefined, "a finished request releases its account slot");
     console.log("Search, answer and YouTube Express routes passed controlled local integration tests");
   } finally {
     delete app.locals.veyraWebSearch;
