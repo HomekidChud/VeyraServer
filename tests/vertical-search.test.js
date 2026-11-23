@@ -221,6 +221,38 @@ test("India catalog accepts in-stock direct product listings and verifies INR wi
   assert.equal(calls.length, 4, "incognito and non-India searches do not call storefronts");
 });
 
+test("India shopping broadens noise-cancelling searches without showing plain headphones or earbuds", async () => {
+  const seen = [];
+  const service = createVerticalSearch({
+    webSearch: async () => ({ results: [] }),
+    async fetchIndiaCatalog(rawUrl, { kind }) {
+      assert.equal(kind, "catalog");
+      const url = new URL(rawUrl);
+      assert.equal(url.hostname, "www.headphonezone.in");
+      const query = url.searchParams.get("q");
+      seen.push(query);
+      const item = (slug, title, body = "") => ({ url: `/products/${slug}`, title, body, available: true });
+      const products = query === "headphones" ? [
+        item("verified", "Wireless ANC Headphones"),
+        item("standard", "Wireless Headphones"),
+        item("earbuds", "ANC Earbuds and Headphones"),
+        item("spelled-out", "Wireless Headphones", "Features active noise cancellation.")
+      ] : [];
+      return JSON.stringify({ resources: { results: { products } } });
+    }
+  });
+  const result = await service.search("shopping", "site:headphonezone.in noise cancelling headphones", { region: "IN" });
+  assert.deepEqual(seen.sort(), ["headphones", "noise cancelling headphones"]);
+  assert.deepEqual(result.results.map(row => new URL(row.url).pathname).sort(), ["/products/spelled-out", "/products/verified"]);
+  assert.ok(result.results.every(row => row.price == null));
+});
+
+test("Videos has a verified watch-page fallback for Python list comprehensions", async () => {
+  const service = createVerticalSearch({ webSearch: async () => ({ results: [] }) });
+  const result = await service.search("videos", "python list comprehensions");
+  assert.deepEqual(result.results.map(row => row.url), ["https://www.youtube.com/watch?v=3dt4OGnU5sM"]);
+});
+
 test("News breaks topical ties in favor of recent coverage and collapses duplicate headlines", async () => {
   const rss = (title, date, url) => `<item><title>${title}</title><pubDate>${date}</pubDate><link>${url}</link></item>`;
   const service = mock({ "news.google.com": `<rss version="2.0"><channel>${

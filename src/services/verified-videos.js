@@ -13,7 +13,8 @@ const COLLECTION = [
   ["0XsNCe0nd_0", "4 must try crispy dosa recipes for morning breakfast | easy & tasty dosa recipes | healthy dosa", "Hebbars Kitchen", "Crispy dosa recipes for breakfast, including instant and rava dosa."],
   ["uT5Y38EcXJ8", "2 instant crispy dosa recipe - aloo dosa, besan dosa & red chutney | instant south indian breakfast", "Hebbars Kitchen", "Two instant crispy dosa recipes with potato or gram flour."],
   ["Xbl7XjFYsN4", "import asyncio: Learn Python's AsyncIO #1 - The Async Ecosystem", "EdgeDB", "A Python asyncio tutorial series linked from the official Python documentation, starting with async programming.", "asyncio"],
-  ["l4Nn-y9ktd4", "Łukasz Langa - Thinking In Coroutines - PyCon 2016", "PyCon 2016", "A PyCon talk on Python asyncio, its event loop, coroutines, futures, and async/await.", "asyncio"]
+  ["l4Nn-y9ktd4", "Łukasz Langa - Thinking In Coroutines - PyCon 2016", "PyCon 2016", "A PyCon talk on Python asyncio, its event loop, coroutines, futures, and async/await.", "asyncio"],
+  ["3dt4OGnU5sM", "Python Tutorial: Comprehensions - How they work and why you should be using them", "Corey Schafer", "An introduction to Python list comprehensions with examples of transforming lists, dictionaries and sets.", "comprehensions"]
 ];
 
 const catalog = COLLECTION.map(([id, title, source, snippet, topic], index) => Object.freeze({
@@ -25,11 +26,13 @@ const catalog = COLLECTION.map(([id, title, source, snippet, topic], index) => O
 function videoMatches(value) {
   const words = unicodeWords(value);
   const aliases = { faucets: "tap", faucet: "tap", taps: "tap", dripping: "leak", drips: "leak", leaks: "leak", leaky: "leak", leaking: "leak",
-    dosai: "dosa", dosas: "dosa", dose: "dosa", "डोसा": "dosa", "ದೋಸೆ": "dosa", "தோசை": "dosa", crisp: "crispy", crispier: "crispy" };
+    dosai: "dosa", dosas: "dosa", dose: "dosa", "डोसा": "dosa", "ದೋಸೆ": "dosa", "தோசை": "dosa", crisp: "crispy", crispier: "crispy",
+    comprehension: "comprehensions", lists: "list" };
   const normalize = list => list.map(word => Object.hasOwn(aliases, word) ? aliases[word] : word);
   const query = normalize(words);
   const group = query.includes("dosa") ? "dosa" : query.includes("tap") && query.includes("leak") ? "tap" :
-    query.includes("asyncio") ? "asyncio" : "";
+    query.includes("asyncio") ? "asyncio" :
+    query.includes("comprehensions") && (query.includes("list") || query.includes("python")) ? "comprehensions" : "";
   if (!group) return [];
   const generic = new Set((group === "tap"
     ? "how to do i fix repair repairing fixing replacement replace change stop the a my of for leaking leak tap diy video videos watch guide tutorial in"

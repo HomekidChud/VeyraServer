@@ -556,7 +556,7 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     const wiki = { url: "https://en.wikipedia.org/wiki/TikTok", title: "TikTok", source: "fixture" };
     const homeLike = { url: "https://tiktok.com/?utm_source=fixture", title: "TikTok Login", source: "fixture" };
     app.locals.veyraWebSearch = { async search(q, options) {
-      if (q === "Tik Tok") throw new Error("provider offline");
+      if (q === "Tik Tok" || q === "TikTok history") throw new Error("provider offline");
       return { status: "ok", provider: "fixture", results: [wiki, ...(options.limit > 1 ? [homeLike] : [])] };
     } };
     const direct = await getSourceResults("TikTok", { incognito: "1", limit: "2" });
@@ -567,6 +567,10 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     const offlineAlias = await getSourceResults("Tik Tok", { incognito: "1" });
     assert.equal(offlineAlias.status, "ok");
     assert.deepEqual(offlineAlias.results.map(row => row.url), ["https://www.tiktok.com/"]);
+    const historical = await getSourceResults("TikTok history", { incognito: "1" });
+    assert.equal(historical.status, "ok");
+    assert.ok(historical.results.some(row => row.url === "https://www.britannica.com/topic/TikTok"));
+    assert.ok(historical.results.every(row => row.navigation !== "official-site"));
     for (const [q, options] of [["TikTok history", {}], ["TikTokk", {}], ["TikTok -site:example.com", {}],
       ["TikTok site:tiktok.com", {}], ["TikTok", { engine: "bing" }], ["TikTok", { offset: "10" }]]) {
       assert.ok(!(await getSourceResults(q, { incognito: "1", ...options })).results.some(row => row.navigation));

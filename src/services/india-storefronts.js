@@ -29,7 +29,8 @@ function merchandiseText(value, limit = 4000) {
 }
 
 function specText(value) {
-  return value.toLowerCase().replace(/\btype[\s-]*c\b|\busb[\s-]*c\b/g, "usb c").replace(/\b(\d+)\s*w(?:atts?)?\b/g, "$1w");
+  return value.toLowerCase().replace(/\btype[\s-]*c\b|\busb[\s-]*c\b/g, "usb c").replace(/\b(\d+)\s*w(?:atts?)?\b/g, "$1w")
+    .replace(/\b(?:active\s+)?noise[\s-]+cancell?(?:ing|ation|ed)\b/g, "anc");
 }
 
 function productMatch(q, item, category) {
@@ -51,6 +52,7 @@ function productMatch(q, item, category) {
   if (/\bheadphones?\b/.test(subject) && (!/\bheadphones?\b/.test(title) ||
       (/\bwireless\b/.test(subject) && !/\b(?:wireless|bluetooth)\b/.test(title)) ||
       (!/\b(?:buds|earbuds|earphones)\b/.test(subject) && /\b(?:earbuds?|earphones|tws)\b/.test(title)))) return false;
+  if (/\banc\b/.test(subject) && !/\banc\b/.test(`${title} ${description}`)) return false;
   return isTopicalResult(subject.replace(/\badapters?\b/g, "charger"), {
     url: item.url, title: title.replace(/\b(?:adapter|adaptor|adapto)\b/g, "charger"),
     snippet: description.replace(/\b(?:adapter|adaptor)\b/g, "charger").replace(/\bbluetooth\b/g, "wireless")
@@ -84,20 +86,28 @@ function createIndiaCatalog({ fetchCatalog, allowsSiteUrl, limit = 12 }) {
   return async (q, { page, scope, signal, preview }) => {
     const hosts = Object.keys(STORES).filter(host => allowsSiteUrl(scope, `https://${host}/`));
     if (!hosts.length) return { results: [], more: false };
-    const settled = await Promise.allSettled(hosts.map(async host => {
-      const endpoint = new URL(`https://${host}/search/suggest.json`);
-      endpoint.search = new URLSearchParams({ q, "resources[type]": "product", "resources[limit]": "10", "resources[options][unavailable_products]": "hide" });
-      const packed = JSON.parse(await fetchCatalog(endpoint.href, { signal, kind: "catalog" }));
-      const products = packed.resources?.results?.products;
-      if (!Array.isArray(products)) throw new Error("Invalid India storefront response");
-      return products.slice(0, 10).flatMap(product => {
-        const url = merchantProductUrl(product?.url, host);
-        const title = merchandiseText(product?.title, 260), snippet = merchandiseText(product?.body);
-        if (!url || !title || product.available !== true || !productMatch(q, { url, title, snippet }, merchandiseText(product.type, 80))) return [];
-        return [{ url, title, source: STORES[host], advertised: product.price }];
-      });
-    }));
-    const lanes = settled.flatMap(item => item.status === "fulfilled" ? [item.value] : []);
+    async function discover(terms, requestSignal) {
+      return Promise.allSettled(hosts.map(async host => {
+        const endpoint = new URL(`https://${host}/search/suggest.json`);
+        endpoint.search = new URLSearchParams({ q: terms, "resources[type]": "product", "resources[limit]": "10", "resources[options][unavailable_products]": "hide" });
+        const packed = JSON.parse(await fetchCatalog(endpoint.href, { signal: requestSignal, kind: "catalog" }));
+        const products = packed.resources?.results?.products;
+        if (!Array.isArray(products)) throw new Error("Invalid India storefront response");
+        return products.slice(0, 10).flatMap(product => {
+          const url = merchantProductUrl(product?.url, host);
+          const title = merchandiseText(product?.title, 260), snippet = merchandiseText(product?.body);
+          if (!url || !title || product.available !== true || !productMatch(q, { url, title, snippet }, merchandiseText(product.type, 80))) return [];
+          return [{ url, title, source: STORES[host], advertised: product.price }];
+        });
+      }));
+    }
+    const budget = AbortSignal.timeout(5100);
+    const total = signal ? AbortSignal.any([signal, budget]) : budget;
+    const headphones = /\banc\b/.test(specText(q)) && /\bheadphones?\b/i.test(q) && !/["“”]|(?:^|\s)-\S/.test(q);
+    // Merchant suggestions need not understand synonyms. Fetch a wider
+    // category in parallel, but validate every result against the full query.
+    const batches = await Promise.all([discover(q, total), ...(headphones ? [discover("headphones", total)] : [])]);
+    const lanes = batches.flat().flatMap(item => item.status === "fulfilled" ? [item.value] : []);
     if (!lanes.length) throw new Error("India storefronts are temporarily unavailable");
     const seen = new Set(), matches = [];
     for (let i = 0; i < 10; i++) for (const lane of lanes) {
@@ -106,9 +116,9 @@ function createIndiaCatalog({ fetchCatalog, allowsSiteUrl, limit = 12 }) {
     }
     const selected = matches.slice(page * limit, (page + 1) * limit);
     const results = await Promise.all(selected.map(async ({ advertised, ...item }, i) => {
-      if (preview || i >= 4 || !advertised || signal?.aborted) return item;
+      if (preview || i >= 4 || !advertised || total.aborted) return item;
       try {
-        const html = await fetchCatalog(item.url, { signal, kind: "product" });
+        const html = await fetchCatalog(item.url, { signal: total, kind: "product" });
         return { ...item, price: productPrice(html, advertised) };
       } catch { return item; }
     }));

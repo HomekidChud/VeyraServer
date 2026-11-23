@@ -1692,7 +1692,7 @@ async function fetchIndiaCatalog(url, { signal, kind }) {
   let policy = merchantRobotsCache.get(u.origin);
   if (!policy || policy.expiresAt <= Date.now()) {
     const r = await fetchBuffer(`${u.origin}/robots.txt`, {
-      timeout: 1250, signal: requestSignal, limit: 512 * 1024, maxRedirects: 0,
+      timeout: 1250, bodyTimeoutMs: 1000, signal: requestSignal, limit: 512 * 1024, maxRedirects: 0,
       accept: "text/plain,*/*;q=0.1", retries: 0, userAgent: merchantUserAgent
     });
     const text = r.body.toString("utf8");
@@ -1703,7 +1703,7 @@ async function fetchIndiaCatalog(url, { signal, kind }) {
   }
   if (!robotsAllowed(url, policy) || policy.group?.crawlDelayMs) throw new Error("Storefront requests not permitted at search speed");
   requestSignal.throwIfAborted();
-  const r = await fetchBuffer(url, { timeout: kind === "catalog" ? 2250 : 1450, signal: requestSignal, retries: 0,
+  const r = await fetchBuffer(url, { timeout: kind === "catalog" ? 2250 : 1450, bodyTimeoutMs: 1250, signal: requestSignal, retries: 0,
     limit: kind === "catalog" ? 512 * 1024 : PRODUCT_BYTES, maxRedirects: 0, preserveQuery: true,
     accept: kind === "catalog" ? "application/json" : "text/html", userAgent: merchantUserAgent });
   requestSignal.throwIfAborted();

@@ -22,6 +22,7 @@ function navigationResult(scope) {
 // Editorial link metadata only. None of these match terms or titles are sent
 // to publishers as search queries, and no previous user searches are used.
 const PAGES = [
+  ["https://www.britannica.com/topic/TikTok", "TikTok: app and history", "tiktok history origins bytedance douyin musical ly acquisition launch"],
   ["https://docs.python.org/3/library/asyncio.html", "asyncio: Asynchronous I/O", "python async await concurrency coroutine"],
   ["https://docs.python.org/3/library/asyncio-task.html", "asyncio coroutines and tasks", "python asyncio task group taskgroup gather create task cancellation"],
   ["https://docs.python.org/3/library/asyncio-eventloop.html", "asyncio event loop", "python asyncio event loop asyncio run callback scheduling"],
