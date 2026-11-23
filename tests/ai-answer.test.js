@@ -18,7 +18,8 @@ assert.equal(structured.jsonLd[0].headline, "Hi");
 assert.equal(normalizeUrl("https://example.com/a/?utm_source=x#part"), "https://example.com/a/");
 assert.equal(evidenceText("window.__CONFIG__ = {}; Add to word list"), "");
 assert.equal(normalizeAnswerFormat("## Answer\n- **A useful result** [S1].\n\n2. More detail [S2]."), "A useful result [S1]. More detail [S2].");
-  assert.equal(normalizeAnswerFormat("Answering questions [S1]."), "Answering questions [S1].");
+assert.equal(normalizeAnswerFormat("Answering questions [S1]."), "Answering questions [S1].");
+assert.equal(normalizeAnswerFormat("One fact. [S1, S2] Another fact. [S3]"), "One fact. [S1] [S2] Another fact. [S3]");
 const engine = new AIAnswerEngine();
 assert.equal(engine.allowExtractiveFallback, false, "verbatim source excerpts must not silently be presented as the default AI answer");
 const evidence = engine.buildEvidence("What is hi?", engine.detectIntent("What is hi?"), [
@@ -472,6 +473,9 @@ assert.ok(qualityEvaluation.after.logLoss < qualityEvaluation.before.logLoss, "o
   });
   assert.deepEqual(discoveryPlan(parseSiteScope('site:publisher.example "Game VII" release date')).variants, []);
   assert.deepEqual(discoveryPlan(parseSiteScope("Game VII release date -rumor")).variants, []);
+  assert.deepEqual(discoveryPlan(parseSiteScope("site:publisher.example App X history")).variants,
+    ["site:publisher.example App X history timeline", "site:publisher.example App X origin and launch"]);
+  assert.deepEqual(discoveryPlan(parseSiteScope('"App X" history')).variants, []);
   const releaseQuery = "Game VII release date";
   const releaseLookups = [];
   const release = await discoverAnswerSources({ query: releaseQuery, scope: parseSiteScope(releaseQuery), allowSource: () => true,
@@ -563,6 +567,29 @@ assert.ok(qualityEvaluation.after.logLoss < qualityEvaluation.before.logLoss, "o
     { requireReadableEvidence: true, indexOnly: true });
   assert.equal(tooShort.hasAnswer, false);
   assert.equal(pageReads.length, readsBeforeIndex);
+
+  const temporalText = [
+    "The Neon Atlas won several awards for its music and art direction.",
+    "NEW YORK, Nov. 19, 2026, Prism Software, Inc. (PSI) announces that The Neon Atlas is now available for all supported consoles.",
+    "The studio published a separate booklet detailing the original design and scoring process used by the team."
+  ];
+  const paddedArticle = `<script>${" ".repeat(140000)}</script><article><h1>Press release headline that must not appear in the quoted claim</h1>${temporalText.map(p => `<p>${p}</p>`).join("")}</article>`;
+  const temporal = new AIAnswerEngine({ allowNeuralFallback: true, fallbackRanker: { scoreUrl: () => 0.5 },
+    acquisitionManager: { async fetch(url, options) {
+      assert.ok(options.maxBytes > 90000 && options.maxBytes <= 1024 * 1024);
+      const body = url.endsWith("/oversize") ? `${paddedArticle}${" ".repeat(options.maxBytes)}` : paddedArticle;
+      return { ok: true, finalUrl: url, contentType: "text/html", body };
+    } }
+  });
+  temporal.synthesizeWithLLM = async () => null;
+  assert.ok(temporal.parseContent(paddedArticle).sentences.includes(temporalText[1]), "a dated press-release sentence should stay intact");
+  const launch = await temporal.answer("The Neon Atlas release date", [{ url: "https://example.test/oversize" },
+    { url: "https://example.test/launch" }], { requireReadableEvidence: true });
+  assert.equal(launch.hasAnswer, true);
+  assert.equal(launch.pipeline.fetched, 1);
+  assert.match(launch.answer, /Nov\. 19, 2026.*now available/);
+  assert.doesNotMatch(launch.answer, /awards|headline/);
+  assert.equal(launch.sources[0].url, "https://example.test/launch");
 
   const opts = { requireReadableEvidence: true, requirePageEvidence: true, vertical: "news" };
   const rankCalls = [];

@@ -22,7 +22,11 @@ function navigationResult(scope) {
 // Editorial link metadata only. None of these match terms or titles are sent
 // to publishers as search queries, and no previous user searches are used.
 const PAGES = [
+  ["https://newsroom.tiktok.com/musical-ly-and?lang=en", "TikTok history: Musical.ly and TikTok unite", "tiktok history origins merger musical ly 2018"],
+  ["https://www.bbc.com/news/technology-53640724", "TikTok history: from Musical.ly to a global app", "tiktok history origins launch bytedance douyin musical ly"],
+  ["https://techcrunch.com/2018/08/02/musically-tiktok/", "TikTok history: the Musical.ly merger", "tiktok history origins bytedance merger musical ly acquisition launch"],
   ["https://www.britannica.com/topic/TikTok", "TikTok: app and history", "tiktok history origins bytedance douyin musical ly acquisition launch"],
+  ["https://www.take2games.com/ir/news/grand-theft-auto-vi-now-available", "GTA 6 release date and availability: Take-Two launch announcement", "gta 6 grand theft auto vi release date launch availability rockstar take two"],
   ["https://docs.python.org/3/library/asyncio.html", "asyncio: Asynchronous I/O", "python async await concurrency coroutine"],
   ["https://docs.python.org/3/library/asyncio-task.html", "asyncio coroutines and tasks", "python asyncio task group taskgroup gather create task cancellation"],
   ["https://docs.python.org/3/library/asyncio-eventloop.html", "asyncio event loop", "python asyncio event loop asyncio run callback scheduling"],
@@ -42,7 +46,7 @@ function referenceResults(scope, limit = 3) {
   // A bare publisher name should not return every entry in its catalog.
   const broad = /^(?:python|javascript|js|css|mdn|node(?:\.?js)?|nasa|uk|gov|usgs)$/i;
   const topic = scope.text.trim();
-  if (!topic || broad.test(topic) || !/[\p{L}\p{N}]/u.test(topic)) return [];
+  if (!topic || broad.test(topic) || navigationResult(scope) || !/[\p{L}\p{N}]/u.test(topic)) return [];
   const rows = PAGES.filter(([url]) => allowsSiteUrl(scope, url)).flatMap(([url, title, terms]) => {
     const candidate = { url, title, snippet: terms };
     return isTopicalResult(topic, candidate, { requireTitle: true }) ? [candidate] : [];

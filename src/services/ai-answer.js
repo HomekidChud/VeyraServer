@@ -18,6 +18,8 @@ const GROQ_API_BASE = "https://api.groq.com/openai/v1";
 const GROQ_MODELS_URL = `${GROQ_API_BASE}/models`;
 const GROQ_DEFAULT_MODEL = "openai/gpt-oss-120b";
 const GROQ_PREFERRED_MODELS = [GROQ_DEFAULT_MODEL, "openai/gpt-oss-20b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"];
+const DEFAULT_ANSWER_PAGE_BYTES = 512 * 1024;
+const MAX_ANSWER_PAGE_BYTES = 1024 * 1024;
 let groqModelCache = null;
 
 function cleanText(value, max = 10000) {
@@ -32,7 +34,10 @@ function normalizeAnswerFormat(value, max = 2200) {
     .replace(/\*(.*?)\*/g, "$1").replace(/_(.*?)_/g, "$1")
     .replace(/`([^`]+)`/g, "$1")
     .replace(/^\s*(?:answer|summary)\b\s*(?::|-)?\s*/i, "");
-  return cleanText(plain, max);
+  // Groq occasionally groups already-present IDs. Normalize the syntax without
+  // guessing where a citation belongs or introducing a new source.
+  return cleanText(plain.replace(/\[((?:S\d+\s*,\s*)+S\d+)\]/g,
+    (_, ids) => ids.split(/\s*,\s*/).map(id => `[${id}]`).join(" ")), max);
 }
 function terms(text) {
   return [...new Set(unicodeWords(text).filter(x => !STOP.has(x)))];
@@ -50,8 +55,32 @@ function safeUrl(raw) {
 }
 function host(url) { try { return new URL(url).hostname.replace(/^www\./, ""); } catch { return ""; } }
 function hash(text) { return crypto.createHash("sha1").update(String(text || "")).digest("hex"); }
+const inlinePeriod = String.raw`\.(?:(?=[\p{L}\p{N}])|(?<=\b(?:Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.)(?=\s+\d)|(?<=\bInc\.)(?=\s*(?:,|\()))`;
+const sentencePattern = new RegExp(String.raw`(?:[^.!?。！？।]|${inlinePeriod})+(?:[.!?。！？।]+|$)`, "giu");
+const statementPattern = new RegExp(String.raw`(?:[^.!?。！？।\n]|${inlinePeriod})+(?:[.!?。！？।]+["'”’)]*(?:[ \t]*\[S\d+\])*|$|(?=\n))`, "gu");
 function sentences(text) {
-  return cleanText(text, 30000).match(/(?:[^.!?。！？।]|\.(?=[\p{L}\p{N}]))+(?:[.!?。！？।]+|$)/gu)?.map(x => x.trim()).filter(x => x.length >= 25 && x.length <= 600) || [];
+  return cleanText(text, 30000).match(sentencePattern)?.map(x => x.trim()).filter(x => x.length >= 25 && x.length <= 600) || [];
+}
+const releaseQuestion = /(?:\b(?:release|launch) date[?？]?$|^when (?:does|did|will) .{2,90} (?:come out|launch|release|(?:get |be )?released)[?？]?$)/i;
+const historyQuestion = /^.{2,90} (?:history|origins?)[?？]?$/i;
+const calendarDate = /\b(?:\d{4}-\d{2}-\d{2}|(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+\d{1,2},?\s+\d{4}|\d{1,2}\s+(?:january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{4})\b/i;
+function evidenceFocus(query) {
+  if (releaseQuestion.test(query)) return {
+    drop: /^(?:release|released|launch|date|come|out)$/,
+    score: text => /\b(?:available|launched|launches|launch|released|releases|release|come out)\b/i.test(text) && calendarDate.test(text) ? 0.65 : 0
+  };
+  if (historyQuestion.test(query)) return {
+    drop: /^(?:history|origin)$/,
+    score: text => /\b(?:origin(?:s|ated)?|began|founded|launched|acquired|bought|merged|merger|unite(?:d)?|combined)\b/i.test(text)
+      ? 0.3 + (/\b(?:19|20)\d{2}\b/.test(text) ? 0.3 : 0) : 0
+  };
+  return null;
+}
+function evidenceTopic(query, intent, focus) {
+  // Match the publisher's title rather than scoring an unrelated review
+  // higher just because it spells out the same shorthand as the query.
+  const subject = String(intent.subject || query).replace(/\bgta\s*6\b/gi, "Grand Theft Auto VI");
+  return groundingTerms(subject).filter(term => !/^(?:compare|difference|versu|vs|fix|make|use)$/.test(term) && !focus?.drop.test(term));
 }
 function evidenceText(value) {
   const text = cleanText(value, 1800)
@@ -104,7 +133,15 @@ function extractReadable(html, url = "") {
     seen.add(key); unique.push(block);
   }
   const text = unique.join(" ").slice(0, 90000);
-  return { url, canonicalUrl: canonical || url, title, ...metadata, headings, text, answerExcerptAllowed, sentences: sentences(text), originalLength: raw.length, extractedLength: text.length, extractionStatus: text.length ? (text.length < 120 ? "low-information" : "extracted") : "empty", duplicateRatio: blocks.length ? Math.max(0, 1 - unique.length / blocks.length) : 0, extractionQuality: text ? Math.min(1, text.length / 900) : 0 };
+  // Never turn a heading or date label into part of a neighboring claim.
+  let remaining = 30000;
+  const sourceSentences = [];
+  for (const block of unique) {
+    if (remaining < block.length) break;
+    sourceSentences.push(...sentences(block));
+    remaining -= block.length + 1;
+  }
+  return { url, canonicalUrl: canonical || url, title, ...metadata, headings, text, answerExcerptAllowed, sentences: sourceSentences, originalLength: raw.length, extractedLength: text.length, extractionStatus: text.length ? (text.length < 120 ? "low-information" : "extracted") : "empty", duplicateRatio: blocks.length ? Math.max(0, 1 - unique.length / blocks.length) : 0, extractionQuality: text ? Math.min(1, text.length / 900) : 0 };
 }
 function htmlToText(html) { return extractReadable(html).text; }
 function normalizeUrl(raw) {
@@ -397,7 +434,9 @@ class AnswerQualityModel {
 class AIAnswerEngine {
   constructor(opts = {}) {
     this.maxPagesToRead = opts.maxPagesToRead || Number(process.env.AI_ANSWER_MAX_PAGES || 24);
-    this.maxContentBytes = opts.maxContentBytes || Number(process.env.AI_ANSWER_MAX_CONTENT_BYTES || 90000);
+    const pageBytes = Number(opts.maxContentBytes ?? process.env.AI_ANSWER_MAX_CONTENT_BYTES);
+    this.maxContentBytes = Number.isSafeInteger(pageBytes) && pageBytes > 0
+      ? Math.min(pageBytes, MAX_ANSWER_PAGE_BYTES) : DEFAULT_ANSWER_PAGE_BYTES;
     this.timeoutMs = opts.timeoutMs || Number(process.env.AI_ANSWER_TIMEOUT_MS || 10000);
     this.fetchConcurrency = Math.max(2, Math.min(12, Number(process.env.AI_ANSWER_FETCH_CONCURRENCY) || 8));
     this.userAgent = opts.userAgent || "VeyraAIBot/2.0 (+https://veyra.app/bot)";
@@ -543,7 +582,8 @@ class AIAnswerEngine {
         result = await this.acquisitionManager.fetch(url, { ...options, noCache: true });
       }
       const robots = result.robotsTag ?? result.headers?.get?.("x-robots-tag") ?? result.headers?.["x-robots-tag"];
-      if (!result.ok || (requireReadableEvidence && !canReadAnswerResponse(result.contentType, robots))) return null;
+      if (!result.ok || Buffer.byteLength(result.body || "") > this.maxContentBytes ||
+          (requireReadableEvidence && !canReadAnswerResponse(result.contentType, robots))) return null;
       return this.parseContent(result.body, result.finalUrl || url);
     }
     return new Promise((resolve, reject) => {
@@ -574,7 +614,8 @@ class AIAnswerEngine {
   }
   parseContent(html, url) { return extractReadable(html, url); }
   buildEvidence(query, intent, contents, results, limit = 6) {
-    const qTerms = groundingTerms(intent.subject || query).filter(term => !/^(?:compare|difference|versu|vs|fix|make|use)$/.test(term));
+    const focus = evidenceFocus(query);
+    const qTerms = evidenceTopic(query, intent, focus);
     const candidates = [...contents, ...results.filter(r => !contents.some(c => c.url === r.url) && r.snippet).map(r => ({ ...r, sentences: sentences(r.snippet), text: r.snippet, extractionQuality: 0.35, extractionStatus: "search-snippet" }))];
     const out = [], contentSeen = [], canonicalSeen = new Set();
     for (const c of candidates) {
@@ -590,6 +631,7 @@ class AIAnswerEngine {
         const nearby = scored[i - 1]?.hits || scored[i + 1]?.hits;
         if (!row.hits && !nearby && !titleRelevant) return null;
         let score = row.hits / Math.max(1, qTerms.length) * 0.85 + (!row.hits && nearby ? 0.12 : 0.04);
+        if (row.hits || titleRelevant) score += focus?.score(row.text) || 0;
         if (row.hits && intent.type === "definition" && /\b(is|are|means|refers to|defined as)\b/i.test(row.text)) score += 0.16;
         if ((row.hits || nearby) && intent.type === "howto" && /\b(step|first|then|next|finally|install|configure|use)\b/i.test(row.text)) score += 0.16;
         return { text: row.text, score };
@@ -629,7 +671,8 @@ class AIAnswerEngine {
   }
   localSynthesis(query, intent, evidence) { const simple = terms(query).length <= 5 && !["howto", "why"].includes(intent.type); const picks = evidence.flatMap(e => e.matched.slice(0, 3).map(text => ({ text, id: e.id, score: e.score }))).sort((a, b) => b.score - a.score); const selected = picks.filter((p, i, a) => i === a.findIndex(x => similarity(x.text, p.text) >= 0.82)).slice(0, simple ? 2 : 4); return { answer: normalizeAnswerFormat(selected.map(p => `${p.text} [${p.id}]`).join(" "), simple ? 620 : 1000), sourceIds: [...new Set(selected.map(p => p.id))], keyPoints: [], caveats: evidence.length < 2 ? ["Only one independent source was available; verify important details."] : [] }; }
   neuralFallback(query, intent, evidence) {
-    const topic = groundingTerms(intent.subject || query).filter(term => !/^(?:compare|difference|versu|vs|fix|make|use)$/.test(term));
+    const focus = evidenceFocus(query);
+    const topic = evidenceTopic(query, intent, focus);
     if (!topic.length) return null;
     const sources = evidence.filter(e => ["extracted", "local-index"].includes(e.extractionStatus));
     const clauses = new Map(sources.map(source => [source.id, verificationPassages(source).flatMap(polarityClauses)]));
@@ -637,12 +680,15 @@ class AIAnswerEngine {
       let rank = 0;
       try { rank = Math.max(0, Math.min(1, Number(this.fallbackRanker.scoreUrl(source.url,
         { type: "html", discoveredAt: Date.parse(source.retrievedAt) || undefined })) || 0)); } catch {}
+      const titleWords = focus ? new Set(groundingTerms(source.title)) : null;
+      const onTopicTitle = titleWords && topic.filter(term => tokenSetHas(titleWords, term)).length >= Math.ceil(topic.length / 2);
       return source.matched.slice(0, 4).flatMap(text => {
         const words = new Set(groundingTerms(text));
         const hits = topic.filter(term => tokenSetHas(words, term)).length;
-        if (hits < Math.max(1, Math.ceil(topic.length / (intent.type === "compare" ? 3 : 2))) ||
-            text.length > 300 || /\[S\d+\]|\b(?:ignore (?:all |any )?(?:previous|prior) instructions|system prompt)\b/i.test(text)) return [];
-        return [{ source, text, score: hits / topic.length + 0.2 * rank }];
+        const focused = focus?.score(text) || 0;
+        if ((focus && !focused) || (!onTopicTitle && hits < Math.max(1, Math.ceil(topic.length / (intent.type === "compare" ? 3 : 2)))) ||
+            text.length > (focus ? 420 : 300) || /\[S\d+\]|\b(?:ignore (?:all |any )?(?:previous|prior) instructions|system prompt)\b/i.test(text)) return [];
+        return [{ source, text, score: focused + hits / topic.length + 0.2 * rank }];
       });
     }).sort((a, b) => b.score - a.score);
     const selected = [];
@@ -663,7 +709,6 @@ class AIAnswerEngine {
     const citations = [...String(answer || "").matchAll(/\[(S\d+)\]/g)].map(match => match[1]);
     const invalid = citations.filter(id => !byId.has(id));
     const clean = String(answer || "").replace(/\[(S\d+)\]/g, (all, id) => byId.has(id) ? all : "");
-    const statementPattern = /(?:[^.!?。！？।\n]|\.(?=[\p{L}\p{N}]))+(?:[.!?。！？।]+["'”’)]*(?:[ \t]*\[S\d+\])*|$|(?=\n))/gu;
     const statements = String(answer || "").match(statementPattern)?.map(value => value.trim()).filter(value =>
       /[\p{L}\p{N}]/u.test(value.replace(/\[S\d+\]/g, "")) && (strict || value.length >= 25)) || [];
     const polarityBySource = new Map();
@@ -780,7 +825,7 @@ class AIAnswerEngine {
       if (!parsed?.answer || typeof parsed.answer !== "string") return fail("missing_answer");
       parsed.answer = normalizeAnswerFormat(parsed.answer, 5000);
       const allowed = new Set(evidence.map(e => e.id));
-      const cited = [...new Set([...String(parsed.answer).matchAll(/\[(S\d+)\]/g)].map(m => m[1]))];
+      const cited = [...new Set([...String(parsed.answer).matchAll(/\[(S\d+)\]/g)].map(m => m[1]).filter(id => allowed.has(id)))];
       if (!cited.length) return fail("missing_citations");
       parsed.keyPoints = Array.isArray(parsed.keyPoints) ? parsed.keyPoints : [];
       parsed.caveats = Array.isArray(parsed.caveats) ? parsed.caveats : [];

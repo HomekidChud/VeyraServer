@@ -582,8 +582,12 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     assert.deepEqual(offlineAlias.results.map(row => row.url), ["https://www.tiktok.com/"]);
     const historical = await getSourceResults("TikTok history", { incognito: "1" });
     assert.equal(historical.status, "ok");
-    assert.ok(historical.results.some(row => row.url === "https://www.britannica.com/topic/TikTok"));
+    assert.ok(historical.results.some(row => new URL(row.url).hostname === "newsroom.tiktok.com"));
+    assert.ok(historical.results.some(row => new URL(row.url).hostname === "techcrunch.com"));
+    assert.ok(historical.results.filter(row => row.source === "veyra-reference").every(row => !row.snippet && !row.contentText));
     assert.ok(historical.results.every(row => row.navigation !== "official-site"));
+    const scopedHistory = await getSourceResults("TikTok history site:techcrunch.com", { incognito: "1" });
+    assert.deepEqual(scopedHistory.results.map(row => row.url), ["https://techcrunch.com/2018/08/02/musically-tiktok/"]);
     for (const [q, options] of [["TikTok history", {}], ["TikTokk", {}], ["TikTok -site:example.com", {}],
       ["TikTok site:tiktok.com", {}], ["TikTok", { engine: "bing" }], ["TikTok", { offset: "10" }]]) {
       assert.ok(!(await getSourceResults(q, { incognito: "1", ...options })).results.some(row => row.navigation));
