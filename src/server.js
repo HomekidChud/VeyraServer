@@ -20,6 +20,7 @@ const { languageTag, normalizeSearchText, unicodeWords } = require("./services/s
 const { walkSitemap, hasRel } = require("./services/crawl-sitemap");
 const { india, indiaAffinity, isIndianProductUrl } = require("./services/search-region");
 const { createVerticalSearch, TYPES: SEARCH_VERTICALS, lastVerticalPage, indexedWatchPage, safeUrl: verticalResultUrl } = require("./services/vertical-search");
+const { createPublisherMedia } = require("./services/publisher-media");
 const { merchantProductUrl, PRODUCT_BYTES } = require("./services/india-storefronts");
 const { publicImageUrl, imageIdentity } = require("./services/crawl-page-data");
 const { parseSiteScope, allowsSiteUrl } = require("./services/search-site-scope");
@@ -510,6 +511,9 @@ const authStore = new AuthStore({
   adminEmails: CFG.adminEmails, allowSignup: CFG.authAllowSignup, signupKey: CFG.authSignupKey, persistence: mongoStore, testMode: CFG.testMode,
   
   log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
+});
+const publisherMedia = createPublisherMedia({
+  log: (level, message) => setImmediate(() => serverLog(level, "PUBLISHER_MEDIA", message))
 });
 
 // Access gate — invite-only front door for the whole service.
@@ -6633,6 +6637,36 @@ app.get('/api/search/web', async (req, res) => {
   } catch (e) {
     respondError(res, 502, "Veyra web search is temporarily unavailable.", "SEARCH_WEB_ERROR");
   } finally { request.dispose(); }
+});
+
+// Separate from the public search providers, crawler, general media cache and
+// Fast Proxy. Nothing from a configured catalog enters those pipelines.
+function publisherMediaRequired(req, res, next) {
+  res.set("Cache-Control", "private, no-store");
+  res.set("Referrer-Policy", "no-referrer");
+  if (!publisherMedia || req.query.incognito === "1" || req.query.private === "1") {
+    return respondError(res, 404, "Publisher search is unavailable.", "PUBLISHER_UNAVAILABLE");
+  }
+  next();
+}
+const publisherToken = req => /^Bearer\s+(\S+)$/i.exec(req.get("authorization") || "")?.[1] || "";
+app.post("/api/search/publisher/challenge", publisherMediaRequired, requireUser, (req, res) => {
+  const grant = publisherMedia.issue(req.veyraUser.id, publisherToken(req));
+  if (!grant) return respondError(res, 503, "Publisher search is temporarily unavailable.", "PUBLISHER_UNAVAILABLE");
+  res.json({ ok: true, ...grant });
+});
+app.post("/api/search/publisher/verify", publisherMediaRequired, requireUser, (req, res) => {
+  if (!publisherMedia.accept(req.veyraUser.id, publisherToken(req), req.body?.assertion)) {
+    return respondError(res, 403, "Age verification was not accepted.", "PUBLISHER_AGE_REQUIRED");
+  }
+  res.json({ ok: true });
+});
+app.post("/api/search/publisher", publisherMediaRequired, requireUser, (req, res) => {
+  const result = publisherMedia.search(req.veyraUser.id, publisherToken(req), req.body || {});
+  if (result.status === "age-required") return respondError(res, 403, "Verified adult access is required.", "PUBLISHER_AGE_REQUIRED");
+  if (result.status === "invalid-query") return respondError(res, 400, "Use search:<approved-domain> and optional keywords.", "PUBLISHER_QUERY_INVALID");
+  if (result.status !== "ok") return respondError(res, 404, "Publisher search is unavailable.", "PUBLISHER_UNAVAILABLE");
+  res.json({ ok: true, ...result });
 });
 
 app.get("/api/search/vertical", async (req, res) => {
