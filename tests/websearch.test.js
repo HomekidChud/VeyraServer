@@ -1,7 +1,8 @@
 "use strict";
 const assert = require("assert");
-const { createWebSearch, classifyGoogleResponse } = require("../src/services/websearch");
+const { createWebSearch, classifyGoogleResponse, parseBraveApi } = require("../src/services/websearch");
 const { parseSiteScope, allowsSiteUrl } = require("../src/services/search-site-scope");
+const { searchEntry, googleProxySearchQuery } = require("../src/services/search-entry");
 
 (async () => {
   const unconfigured = createWebSearch({ env: {}, fetchText: async () => ({ ok: true, status: 200, text: "" }) });
@@ -9,6 +10,47 @@ const { parseSiteScope, allowsSiteUrl } = require("../src/services/search-site-s
   assert.equal(google.provider, "none");
   assert.equal(google.results.length, 0);
   assert.deepEqual(google.attempts[0], { provider: "google", skipped: "not-configured" });
+  assert.deepEqual(searchEntry("search:google.com"), { query: "google.com", preferGoogle: false });
+  assert.deepEqual(searchEntry("SEARCH: WWW.GOOGLE.COM 日本語 site:example.org"), { query: "日本語 site:example.org", preferGoogle: true });
+  assert.deepEqual(searchEntry("search:Example.com"), { query: "site:example.com", domain: "example.com", preferGoogle: false });
+  assert.deepEqual(searchEntry("search:example.com ice cores"), { query: "site:example.com ice cores", domain: "example.com", preferGoogle: false });
+  assert.equal(searchEntry("search:192.168.0.1").domain, undefined);
+  assert.equal(searchEntry("search:example.com@other.test").domain, undefined);
+  const brave = { url: "https://publisher.example/clip", title: "Fixture", family_friendly: true,
+    thumbnail: { src: "https://imgs.search.brave.com/example" }, video: { duration: "3:35" } };
+  assert.deepEqual(parseBraveApi({ web: { results: [brave] } })[0].media,
+    { type: "videos", thumbnail: brave.thumbnail.src, duration: "3:35" });
+  assert.deepEqual(parseBraveApi({ web: { results: [{ ...brave, video: undefined }] } })[0].media,
+    { type: "images", thumbnail: brave.thumbnail.src, duration: "" });
+  for (const unsafe of [
+    { ...brave, family_friendly: false },
+    { ...brave, family_friendly: undefined },
+    { ...brave, thumbnail: { src: "http://imgs.search.brave.com/cover" } },
+    { ...brave, thumbnail: { src: "https://imgs.search.brave.com.other.test/cover" } }
+  ]) {
+    assert.equal(parseBraveApi({ web: { results: [unsafe] } })[0].media, undefined);
+  }
+  assert.equal(googleProxySearchQuery("https://www.google.com/search?q=a%26b"), "a&b");
+  assert.equal(googleProxySearchQuery("https://www.google.com.evil.test/search?q=bad"), "");
+  assert.equal(googleProxySearchQuery("https://accounts.google.com/search?q=bad"), "");
+  for (const code of [null, 200, 429]) {
+    const seen = [];
+    const preferred = createWebSearch({ env: {
+      WEB_SEARCH_ORDER: "duckduckgo", WEB_SEARCH_MAX_PROVIDERS: "1",
+      ...(code ? { GOOGLE_SEARCH_API_KEY: "fixture", GOOGLE_SEARCH_CX: "fixture" } : {})
+    }, fetchText: async href => {
+      const url = new URL(href);
+      seen.push(url.hostname);
+      assert.equal(url.searchParams.get("q"), "aurora borealis");
+      return url.hostname === "www.googleapis.com"
+        ? { ok: code === 200, status: code, text: JSON.stringify({ items: [{ link: "https://google-result.example/aurora", title: "Aurora borealis" }] }) }
+        : { ok: true, status: 200, text: '<div class="result"><a class="result__a" href="https://other-result.example/aurora">Aurora borealis</a></div>' };
+    } });
+    const answer = await preferred.search("aurora borealis", { feed: true, preferGoogle: true });
+    assert.ok(answer.results.some(row => row.source === "duckduckgo"), "preferred Google never displaces the only fallback");
+    assert.equal(answer.results.some(row => row.source === "google"), code === 200);
+    assert.equal(seen[0], code ? "www.googleapis.com" : "html.duckduckgo.com");
+  }
 
   assert.equal(classifyGoogleResponse({ status: 429 }), "rate-limited");
   assert.equal(classifyGoogleResponse({ status: 403 }), "forbidden");

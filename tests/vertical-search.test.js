@@ -31,6 +31,36 @@ function mock(routes, { env = {}, results = [], indexedImages, indexedVideos } =
   return { calls, ...service };
 }
 
+test("domain-only media uses scoped provider requests and does not weaken SafeSearch", async () => {
+  const service = mock({ "api.search.brave.com": url => {
+    assert.equal(url.searchParams.get("q"), "site:publisher.example publisher.example");
+    assert.equal(url.searchParams.get("safesearch"), "strict");
+    return { results: [
+      { url: "https://media.publisher.example/story", title: "A publisher result", thumbnail: { src: "https://imgs.search.brave.com/thumb" } },
+      { url: "https://publisher.example.other.test/story", title: "Another site", thumbnail: { src: "https://imgs.search.brave.com/other" } }
+    ] };
+  } }, { env: { BRAVE_SEARCH_API_KEY: "fixture" }, indexedImages: () => [] });
+  for (const type of ["images", "videos"]) {
+    const batch = await service.search(type, "site:publisher.example", { domainBrowse: true });
+    assert.equal(batch.status, "ok");
+    assert.deepEqual(batch.results.map(row => row.url), ["https://media.publisher.example/story"]);
+    assert.equal(batch.results[0].thumbnail, "https://imgs.search.brave.com/thumb");
+  }
+  assert.equal(service.calls.length, 2);
+  assert.equal((await service.search("images", "site:publisher.example")).status, "empty");
+  assert.equal(service.calls.length, 2);
+});
+
+test("bare domain video discovery does not treat upstream hints as required title terms", async () => {
+  const video = { url: "https://www.youtube.com/watch?v=abcDEF12345", title: "Aurora from orbit" };
+  const service = mock({ "sepiasearch.org": { data: [] }, "api.joinpeertube.org": { data: [] } },
+    { results: [video, { ...video, url: "https://vimeo.com/12345678" }] });
+  const batch = await service.search("videos", "site:youtube.com", { domainBrowse: true, preview: true, provider: "web-discovery" });
+  assert.deepEqual(batch.results.map(row => row.url), [video.url]);
+  assert.equal(service.calls[0].query, "site:youtube.com youtube.com video");
+  assert.equal(service.calls[0].options.topic, null);
+});
+
 test("image fallback validates artwork, license, provenance, cache and scoped pagination", async () => {
   const commons = (url) => {
     assert.equal(url.searchParams.get("gsrnamespace"), "6");
