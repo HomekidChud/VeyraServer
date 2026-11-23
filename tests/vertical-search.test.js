@@ -372,6 +372,38 @@ test("a stalled provider body times out and leaves time for a fallback", async (
   assert.equal(result.results[0].title, "Fallback report");
 });
 
+test("UK economy overviews can discover fresh direct articles without sending the topic to publishers", async () => {
+  const now = new Date(Date.now() - 60_000).toUTCString();
+  const stale = new Date(Date.now() - 20 * 86400000).toUTCString();
+  const article = "https://www.theguardian.com/business/2026/nov/18/uk-inflation";
+  const calls = [];
+  const service = createVerticalSearch({ env: {}, async fetchText(rawUrl) {
+    const url = new URL(rawUrl);
+    calls.push(url);
+    const entry = (title, link, date) => `<item><title>${title}</title><link>${link}</link><pubDate>${date}</pubDate><description>Discovery metadata only</description></item>`;
+    if (url.hostname === "www.theguardian.com") {
+      assert.equal(url.pathname, "/business/economics/rss"); assert.equal(url.search, "");
+      return { ok: true, text: `<rss><channel>${entry("UK inflation rises", article, now)}
+        ${entry("UK economy update", "https://outside.example/business/2026/spoof", now)}
+        ${entry("UK economy report", `${article}-stale`, stale)}
+        ${entry("French election heats up", `${article}-offtopic`, now)}
+      </channel></rss>` };
+    }
+    if (url.hostname === "feeds.bbci.co.uk") return { ok: true, text: "<rss><channel></channel></rss>" };
+    return { ok: true, text: "<rss><channel></channel></rss>" };
+  } });
+  const overview = await service.search("news", "UK economy", { overview: true });
+  assert.equal(overview.provider, "publisher-news");
+  assert.deepEqual(overview.results.map(row => [row.url, row.snippet]), [[article, ""]]);
+  assert.equal(calls.length, 2);
+  calls.length = 0;
+  for (const [query, options] of [["UK economy", {}], ["UK economy site:outside.example", { overview: true }],
+    ["UK economy", { overview: true, privateSearch: true }], ["UK economy grain tariffs", { overview: true }]]) {
+    await service.search("news", query, options);
+  }
+  assert.ok(calls.every(url => url.hostname === "news.google.com"), "publisher feeds should only serve eligible overview lookups");
+});
+
 test("eBay supplies real listing fields; discovery fallback never invents prices", async () => {
   const service = mock({
     "api.ebay.com": (url, options) => {

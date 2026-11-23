@@ -26,6 +26,11 @@ function lastVerticalPage(type, provider) {
 }
 const ENDPOINT = "https://api.search.brave.com/res/v1";
 const TIMEOUT = 4400;
+const PUBLISHER_NEWS_FEEDS = [
+  { url: "https://feeds.bbci.co.uk/news/business/rss.xml?edition=uk", origin: "https://www.bbc.co.uk", path: /^\/news\/articles\//, source: "BBC News" },
+  { url: "https://www.theguardian.com/business/economics/rss", origin: "https://www.theguardian.com", path: /^\/business\/\d{4}\//, source: "The Guardian" }
+];
+const UK_ECONOMY = /^(?:the\s+)?(?:uk|british|united kingdom)(?:'s)?\s+(?:economy|economic news|economic outlook)[?？]?$/i;
 const VIDEO_INTENT = new Set("fix repair make install build replace cook bake grow tutorial guide review recipe video watch".split(" "));
 const VIDEO_TASK = /^(?:how\s+to\s+)?(?:make|fix|repair|install|build|replace|cook|bake|grow)\s+\S/i;
 const COMPARISON_CONNECTOR = /\s+(?:vs\.?|versus|compared (?:with|to))\s+/gi;
@@ -288,6 +293,33 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
     });
     return { provider: "google-news-rss", results, whole: true };
   }
+  async function publisherNews(type, q, { scope, signal }) {
+    // Fetch two public feeds in parallel, without forwarding the user's
+    // query. Feed headlines and descriptions only select URLs, not evidence.
+    const feeds = PUBLISHER_NEWS_FEEDS.filter(feed => allowsSiteUrl(scope, feed.origin));
+    const deadline = AbortSignal.timeout(1600);
+    const feedSignal = signal ? AbortSignal.any([deadline, signal]) : deadline;
+    const responses = await Promise.allSettled(feeds.map(async feed => {
+      const xml = await get(feed.url, feedSignal, { raw: true, accept: "application/rss+xml,application/xml" });
+      const $ = cheerio.load(xml, { xml: true });
+      if (!$("rss > channel").length) throw new Error("Invalid publisher RSS feed");
+      return $("channel > item").slice(0, 60).toArray().flatMap(node => {
+        const item = $(node), url = safeUrl(item.children("link").text());
+        const publishedAt = isoDate(item.children("pubDate").text());
+        const age = Date.now() - Date.parse(publishedAt);
+        if (!url || new URL(url).origin !== feed.origin || !feed.path.test(new URL(url).pathname) ||
+            !allowsSiteUrl(scope, url) || !(age >= 0 && age <= 14 * 86400000)) return [];
+        const title = plain(item.children("title").text()), description = plain(item.children("description").text(), 500);
+        const topical = [q, "UK inflation", "UK GDP", "UK economic growth", "UK interest rates", "UK unemployment"].some(
+          topic => isTopicalResult(topic, { url, title, snippet: description }, { requireTitle: true }));
+        if (!topical || !/\b(?:UK|British|Britain|Bank of England)\b/i.test(`${title} ${description}`)) return [];
+        return [row(type, "publisher-news", { url, title, source: feed.source, publishedAt })];
+      });
+    }));
+    signal?.throwIfAborted();
+    if (responses.length && responses.every(result => result.status === "rejected")) throw new Error("Publisher news feeds unavailable");
+    return { provider: "publisher-news", results: responses.flatMap(result => result.status === "fulfilled" ? result.value : []), whole: true };
+  }
   async function crossref(type, q, { page, signal }) {
     const json = await get(queryUrl("https://api.crossref.org/works", { "query.bibliographic": q, rows: PAGE_SIZE, offset: page * PAGE_SIZE, select: "DOI,title,container-title,publisher,published,type,author", filter: "type:journal-article" }), signal);
     if (!Array.isArray(json.message?.items)) throw new Error("Invalid Crossref response");
@@ -458,7 +490,7 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
     return { provider: "veyra-crawler", results: data.results.filter(item => testLink(type, item.url, region))
       .map(item => row(type, "veyra-crawler", { title: item.title, url: item.url })), more: (page + 1) * PAGE_SIZE < data.total };
   }
-  function adapters(type, page, preview, provider, region, privateSearch, scope, topic, domainBrowse) {
+  function adapters(type, page, preview, provider, region, privateSearch, scope, topic, domainBrowse, overview, language) {
     const list = [];
     if (type === "videos" && !page) list.push(["verified-videos", verifiedVideos]);
     if (type === "shopping" && india(region) && indiaCatalog && !privateSearch) list.push(["india-storefronts", storefronts]);
@@ -477,6 +509,8 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
     if (type === "images" && !preview && !scope.include.length) list.push(["openverse", openverse]);
     if (type === "videos" && !page && !preview && env.YOUTUBE_DATA_API_KEY && env.VEYRA_YOUTUBE_SEARCH === "1") list.push(["youtube", youtube]);
     if (type === "videos") list.push(["peertube", peertube]);
+    if (type === "news" && overview && !privateSearch && language === "en" && UK_ECONOMY.test(topic) &&
+        PUBLISHER_NEWS_FEEDS.some(feed => allowsSiteUrl(scope, feed.origin))) list.push(["publisher-news", publisherNews]);
     if (type === "news") list.push(["google-news-rss", newsFeed]);
     if (type === "shopping" && !india(region) && env.EBAY_CLIENT_ID && env.EBAY_CLIENT_SECRET) list.push(["ebay", ebay]);
     if (type === "videos" && !preview && typeof indexedVideos === "function") list.push(["veyra-crawler", crawlerVideoFeed]);
@@ -500,7 +534,7 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
     }
     return list;
   }
-  async function search(type, rawQuery, { page = 0, lang = "en", region = "", signal, noCache = true, provider = "", preview = false, requireThumbnail = false, domainBrowse = false, privateSearch = false } = {}) {
+  async function search(type, rawQuery, { page = 0, lang = "en", region = "", signal, noCache = true, provider = "", preview = false, requireThumbnail = false, domainBrowse = false, privateSearch = false, overview = false } = {}) {
     if (!TYPES.includes(type)) throw new Error("Unknown vertical");
     const started = Date.now(), scope = parseSiteScope(rawQuery), q = String(rawQuery).trim().slice(0, 400);
     region = india(region) ? "IN" : "";
@@ -521,13 +555,13 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
       const age = (started - Date.parse(item.publishedAt)) / 86400000;
       return type === "news" && age >= 0 ? 1.8 / (1 + age / 30) : 0;
     };
-    for (const [name, run] of adapters(type, page, preview, provider, region, privateSearch, scope, topic, domainBrowse)) {
+    for (const [name, run] of adapters(type, page, preview, provider, region, privateSearch, scope, topic, domainBrowse, overview, language)) {
       if (signal?.aborted) return sparseImages || empty("cancelled");
       if (provider && provider !== name) continue;
       if (name === "openverse" && scope.include.length) continue;
       const breaker = `${name}:${name === "brave" ? type : ""}`;
       if ((cooldown.get(breaker) || 0) > Date.now()) { attempts.push("unavailable"); continue; }
-      const singleFeed = name === "image-mix" || name === "google-news-rss" || (name === "brave" && type === "images");
+      const singleFeed = name === "image-mix" || ["google-news-rss", "publisher-news"].includes(name) || (name === "brave" && type === "images");
       const key = JSON.stringify([name, type, q, domainBrowse, language, region, singleFeed ? 0 : page, name === "india-storefronts" && preview]);
       const saved = noCache || name === "veyra-crawler" ? null : cache.get(key);
       try {

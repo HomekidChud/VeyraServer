@@ -6900,7 +6900,7 @@ app.post('/api/search/answer', async (req, res) => {
       const options = { lang, region, noCache: !CFG.globalCacheEnabled };
       const categorySearch = async (category, topic, signal, next) => {
         const service = app.locals.veyraVerticalSearch || verticalSearch;
-        const section = await service.search(category, topic, { ...options, ...next, signal });
+        const section = await service.search(category, topic, { ...options, ...next, signal, overview: true });
         const nextProvider = section.nextProvider || section.provider;
         const continuation = !next && Number.isSafeInteger(section.nextPage) && section.nextPage >= 1 &&
           section.nextPage <= lastVerticalPage(category, nextProvider) && /^[a-z-]{1,24}$/.test(nextProvider || "")

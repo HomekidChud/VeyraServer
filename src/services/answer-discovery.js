@@ -15,6 +15,7 @@ const COMPLEX = /\b(?:compare|versus|vs\.?|difference between|trade[- ]?offs?|pr
 const FRESH = /\b(?:latest|recent|today|yesterday|tomorrow|current(?:ly)?|newest|20\d{2})\b/i;
 const RELEASE_DATE = /^([\p{L}\p{N}][\p{L}\p{M}\p{N} .’'-]{1,85}?) (?:release date|launch date)[?？]?$/iu;
 const WHEN_RELEASED = /^when (?:does|did|will) ([\p{L}\p{N}][\p{L}\p{M}\p{N} .’'-]{1,85}?) (?:(?:get |be )?released|come out|launch|release)[?？]?$/iu;
+const ORIGINS = /^([\p{L}\p{N}][\p{L}\p{M}\p{N} .’'-]{1,85}?) (?:history|origins?)[?？]?$/iu;
 
 function discoveryPlan(scope, maxLength = 600) {
   const topic = scope.text.trim();
@@ -27,8 +28,10 @@ function discoveryPlan(scope, maxLength = 600) {
   const compare = !FRESH.test(topic) && /^(?:compare\s+)?(.+?)\s+(?:vs\.?|versus)\s+(.+)$/i.exec(keyword);
   // Availability evidence can be newer than any scheduled launch date.
   const release = (topic.match(WHEN_RELEASED) || topic.match(RELEASE_DATE))?.[1];
+  const origins = topic.match(ORIGINS)?.[1];
   const alternatives = compare ? compare.slice(1) : release
-    ? [`${release} official release date announcement`, `${release} launch availability`] : [keyword];
+    ? [`${release} official release date announcement`, `${release} launch availability`] : origins
+      ? [`${origins} history timeline`, `${origins} origin and launch`] : [keyword];
   const key = text => text.toLowerCase().replace(/[?？]+$/u, "").trim();
   const seen = new Set([key(topic)]);
   const variants = [];
