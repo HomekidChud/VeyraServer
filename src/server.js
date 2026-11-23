@@ -27,7 +27,7 @@ const { parseSiteScope, allowsSiteUrl } = require("./services/search-site-scope"
 const { searchPrivacy, masksSearchScope, allowsSearchResult } = require("./services/search-privacy");
 const { annotateMatchBatch, matchModelVersion } = require("./services/search-match");
 const { createSourceSearch, defaultEvidence, sourcePageUrl } = require("./services/source-search");
-const { referenceResults } = require("./services/reference-catalog");
+const { referenceResults, navigationResult } = require("./services/reference-catalog");
 const { installBrandRoutes, isReservedOriginPath, brandNotFoundHtml } = require("./services/brand");
 const VEYRA_VERSION = require("../package.json").version;
 const { SessionManager } = require("./core/session-manager");
@@ -6581,22 +6581,24 @@ app.get('/api/search/web', async (req, res) => {
     };
     const sourceLane = sourceSearchEnabled && !selected && req.query.incognito !== "1";
     const wantsGoogle = !selected && (preferGoogle || req.query.prefer === "google");
-    const googleHome = !selected && !offset && /^(?:www\.)?google\.com$/i.test(q) ? "https://www.google.com/" : "";
+    const homepage = !selected && !offset && !wantsGoogle ? navigationResult(scope) : null;
     const reply = result => {
       // Candidate rows are used internally for ranking, not a second public feed.
       const { candidates: _candidates, ...publicResult } = result;
       const eligible = result.results.filter(row => allowsSearchResult(privacy, row));
+      const direct = homepage && allowsSearchResult(privacy, homepage) ? homepage : null;
+      const sameHome = row => direct && [row.url, row.canonicalUrl].some(url => {
+        const key = canonicalKey(url);
+        if (!key) return false;
+        const target = new URL(key);
+        return target.pathname === "/" && !target.search && !target.port &&
+          target.hostname.replace(/^www\./, "") === new URL(direct.url).hostname.replace(/^www\./, "");
+      });
+      const ordered = direct ? [direct, ...eligible.filter(row => !sameHome(row))].slice(0, limit) : eligible;
       let results = annotateMatchBatch(q, sourceLane
-        ? eligible.map(row => ({ ...row, evidence: row.evidence || defaultEvidence(row) })) : eligible, "web");
+        ? ordered.map(row => ({ ...row, evidence: row.evidence || defaultEvidence(row) })) : ordered, "web");
       if (!domain || req.query.incognito === "1") results = results.map(({ media, ...row }) => row);
-      if (googleHome) {
-        const key = canonicalKey(googleHome);
-        const found = results.find(row => canonicalKey(row.url) === key);
-        const [home] = annotateMatchBatch(q, [{ url: googleHome, title: "Google", displayUrl: "google.com", source: "veyra-navigation" }], "web");
-        results = [{ ...(found || home), url: googleHome, canonicalUrl: key, title: "Google" },
-          ...results.filter(row => canonicalKey(row.url) !== key)].slice(0, limit);
-      }
-      return res.json({ ok: true, ...publicResult, results, ...(googleHome ? { status: "ok", provider: result.provider === "none" ? "veyra-navigation" : result.provider } : {}),
+      return res.json({ ok: true, ...publicResult, results, ...(direct ? { status: "ok", provider: !result.provider || result.provider === "none" ? "veyra-navigation" : result.provider } : {}),
         ...(wantsGoogle ? { preferredEngine: "google", googleIncluded: results.some(row => row.source === "google" || row.providers?.includes("google")) } : {}),
         matchModel: matchModelVersion, ...(scope.active ? { total: null, siteFilter: { include: scope.include, exclude: scope.exclude } } : {}), source: "web", responseTimeMs: Date.now() - started });
     };
@@ -6611,7 +6613,7 @@ app.get('/api/search/web', async (req, res) => {
       (app.locals.veyraWebSearch || webSearch).search(q, { offset, limit, engine: selected, preferGoogle: wantsGoogle, domainBrowse: !!domain, lang, region: req.query.region,
         signal: request.signal, noCache: isPrivate || !CFG.globalCacheEnabled, feed, reference: true,
         privateSearch: req.query.incognito === "1" }).catch(error => {
-        if (!firstSourcePage && !references.length && !googleHome) throw error;
+        if (!firstSourcePage && !references.length && !homepage) throw error;
         return { provider: "none", results: [], status: "unavailable" };
       }),
       firstSourcePage ? evidenceService.discover(scope, { signal: request.signal }).catch(() => []) : []
@@ -6794,7 +6796,8 @@ function queueNeuralIndexFindings(query, sources = []) {
     .catch(e => { aiIndexRuns.delete(key); serverLog("warn", "SEARCH", `Search-result index crawl failed: ${e.message}`); });
   while (aiIndexRuns.size > 1000) aiIndexRuns.delete(aiIndexRuns.keys().next().value);
 }
-const aiAnswerEngine = new AIAnswerEngine({ acquisitionManager });
+const aiAnswerEngine = new AIAnswerEngine({ acquisitionManager, fallbackRanker: neuralModel,
+  allowNeuralFallback: boolEnv("AI_ANSWER_NEURAL_FALLBACK", true) });
 const wideAnswerDiscovery = boolEnv("AI_ANSWER_WIDE_DISCOVERY", true);
 const wideOverviewUsers = new Set();
 const maxWideOverviews = 4;
@@ -6906,6 +6909,11 @@ app.post('/api/search/answer', async (req, res) => {
       };
       const guarded = lookup => (topic, signal, next) => masksSearchScope(privacy, topic, parseSiteScope(topic))
         ? { status: "filtered", results: [] } : lookup(topic, signal, next);
+      const crawl = sourceSearchEnabled && !vertical && source === "web" ? guarded(async (topic, signal) => ({
+        results: await (app.locals.veyraSourceSearch || sourceSearch).discover(parseSiteScope(topic), {
+          signal, allowUrl: url => inScope({ url })
+        })
+      })) : null;
       const { results: discovered, diagnostics } = await discoverAnswerSources({
         query, scope, vertical, allowSource: inScope, signal: request.signal,
         seeds: vertical ? [] : trustedAnswerHints(results, inScope).filter(row => source !== "index" || row.provider === "veyra-index"),
@@ -6913,7 +6921,8 @@ app.post('/api/search/answer', async (req, res) => {
           privacy, region, topical: true, requireTerms: true }).results,
         references: !vertical && source === "web" ? referenceResults(scope, 3) : [],
         search: vertical ? guarded((q, signal, next) => categorySearch(vertical, q, signal, next)) : source === "web" ? guarded(webLookup) : null,
-        research: !vertical && source === "web" ? guarded((q, signal) => categorySearch("research", q, signal)) : null
+        research: !vertical && source === "web" ? guarded((q, signal) => categorySearch("research", q, signal)) : null,
+        crawl
       });
       results = discovered;
       retrievalDiagnostics = { ...diagnostics, ...(vertical ? { vertical } : {}) };

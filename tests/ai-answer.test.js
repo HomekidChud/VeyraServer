@@ -403,6 +403,40 @@ assert.ok(qualityEvaluation.after.logLoss < qualityEvaluation.before.logLoss, "o
   assert.ok(broad.results.every(r => !r.snippet && !r.url.includes("utm_source")));
   console.log(`Wide discovery fixture: ${primary.length} seed links / 1 host → ${broad.diagnostics.candidates} unique candidates / ${broad.diagnostics.candidateHosts} hosts → ${broad.results.length} shortlisted / ${broad.diagnostics.shortlistedHosts} hosts`);
 
+  const crowded = lane => Array.from({ length: 80 }, (_, i) => ({ url: `https://${lane}-${i}.example/public` }));
+  const simple = "geothermal research papers", tracked = [];
+  const capped = await discoverAnswerSources({
+    query: simple, scope: parseSiteScope(simple), allowSource: () => true,
+    seeds: crowded("hint"), indexed: crowded("index"), references: crowded("reference"),
+    search: async (q, _signal, next) => {
+      tracked.push([q, next]); return { results: crowded("search"), continuation: { page: 2 } };
+    },
+    research: async () => ({ results: crowded("papers") }),
+    crawl: async () => ({ results: crowded("crawler") })
+  });
+  assert.deepEqual(tracked, [[simple, undefined]], "a rich, simple query does not use a second pass");
+  assert.equal(capped.diagnostics.candidates, 6 * 24);
+  assert.equal(capped.diagnostics.shortlistedHosts, 24);
+  assert.equal(capped.results.length, 24);
+  assert.deepEqual(capped.diagnostics.batches.map(row => row.returned), [24, 24, 24]);
+  for (const [query, vertical, expected] of [
+    [topic, "", [[topic, undefined], ["SQLite", undefined], ["PostgreSQL", undefined]]],
+    [topic, "videos", [[topic, undefined], ["SQLite", undefined]]],
+    ["geothermal", "", [["geothermal", undefined], ["geothermal", 2]]],
+    ["geothermal", "news", [["geothermal", undefined], ["geothermal", 2]]],
+  ]) {
+    const attempts = [];
+    let crawlerCalled = false;
+    await discoverAnswerSources({ query, scope: parseSiteScope(query), vertical, allowSource: () => true,
+      crawl: vertical ? () => { crawlerCalled = true; } : undefined,
+      search: async (q, _signal, next) => {
+        attempts.push([q, next]);
+        return { results: [], continuation: next ? 3 : 2 };
+      } });
+    assert.deepEqual(attempts, expected, "variants take precedence and continuations never recurse");
+    assert.equal(crawlerCalled, false);
+  }
+
   const scoped = parseSiteScope("site:sqlite.org -site:old.sqlite.org SQLite versus PostgreSQL");
   assert.deepEqual(discoveryPlan(scoped).variants, [
     "site:sqlite.org -site:old.sqlite.org SQLite", "site:sqlite.org -site:old.sqlite.org PostgreSQL"
@@ -456,6 +490,8 @@ assert.ok(qualityEvaluation.after.logLoss < qualityEvaluation.before.logLoss, "o
         <article><p>${goodBody}</p><p data-nosnippet>Veyra hidden content cannot be in the prompt.</p></article>` };
   } } });
   let packet;
+  const explanatoryProse = "TikTok is a social media service with short videos, and this article provides background information about how creators display captions.";
+  assert.equal(read.parseContent(`<article><p>${explanatoryProse}</p></article>`).text, explanatoryProse);
   read.synthesizeWithLLM = async (_q, _i, selected) => { packet = selected; return null; };
   const passages = [
     "Veyra records seismometer readings and microearthquake swarms underneath a basalt plateau during winter.",
@@ -489,6 +525,41 @@ assert.ok(qualityEvaluation.after.logLoss < qualityEvaluation.before.logLoss, "o
     { requireReadableEvidence: true, indexOnly: true });
   assert.equal(tooShort.hasAnswer, false);
   assert.equal(pageReads.length, readsBeforeIndex);
+
+  const opts = { requireReadableEvidence: true, requirePageEvidence: true, vertical: "news" };
+  const rankCalls = [];
+  const localModel = new AIAnswerEngine({ allowNeuralFallback: true, fallbackRanker: { scoreUrl(url) {
+    rankCalls.push(url); return url.includes("preferred") ? 0.99 : 0.1;
+  } }, acquisitionManager: { async fetch(url) {
+    if (url.includes("unreadable")) return { ok: false, status: 403 };
+    const opposite = url.includes("opposite");
+    const text = `Veyra Market does ${opposite ? "not " : ""}provide Sunday delivery. ${url.includes("preferred") ?
+      "The March dispatch handbook contains independent notes about warehouse procedures during public holidays." :
+      "The autumn merchant bulletin lists loading bay opening times, locker policies and bicycle access for staff."}`;
+    return { ok: true, finalUrl: url, contentType: "text/html", body: `<article><p>${text}
+      The independent transport logs include extensive background documentation for this report.</p></article>` };
+  } } });
+  const preferred = { url: "https://preferred.example/delivery" }, regular = { url: "https://regular.example/delivery" };
+  localModel.synthesizeWithLLM = async () => ({ answer: "At Veyra Market, delivery is available on Sundays. [S1]" });
+  const hosted = await localModel.answer("Veyra Market Sunday delivery", [preferred], opts);
+  assert.match(hosted.generatedBy || "", /^llm:/, JSON.stringify(hosted));
+  assert.equal(rankCalls.length, 0);
+  localModel.synthesizeWithLLM = async (_q, _intent, _e, diagnostics) => { diagnostics.failureCode = "timeout"; return null; };
+  const localRecovery = await localModel.answer("Veyra Market Sunday delivery", [regular, preferred], opts);
+  assert.equal(localRecovery.generatedBy, "neural-grounded-fallback");
+  assert.equal(localRecovery.pipeline.hostedFailure, "timeout");
+  assert.equal(localRecovery.sources[0].url, preferred.url);
+  assert.equal(localRecovery.grounding.unsupportedClaims, 0);
+  assert.equal(rankCalls.length, 2);
+  localModel.synthesizeWithLLM = async () => { throw new Error("fixture provider down"); };
+  assert.equal((await localModel.answer("Veyra Market Sunday delivery", [preferred], opts)).pipeline.hostedFailure, "provider_error");
+  localModel.synthesizeWithLLM = async () => ({ answer: "Veyra Market does not provide Sunday delivery. [S1]" });
+  assert.equal((await localModel.answer("Veyra Market Sunday delivery", [preferred], opts)).pipeline.hostedFailure, "grounding_rejected");
+  localModel.synthesizeWithLLM = async () => null;
+  assert.equal((await localModel.answer("Veyra Market Sunday delivery",
+    [preferred, { url: "https://opposite.example/delivery" }], opts)).hasAnswer, false);
+  assert.equal((await localModel.answer("Veyra Market Sunday delivery",
+    [{ url: "https://unreadable.example/delivery", snippet: "Veyra Market provides Sunday delivery." }], opts)).hasAnswer, false);
   console.log("AI answer pipeline provenance and offline fallback tests passed");
   console.log("AI answer regression tests passed");
 })().catch(error => { console.error(error); process.exit(1); });

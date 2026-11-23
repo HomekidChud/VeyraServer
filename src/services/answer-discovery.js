@@ -8,6 +8,8 @@ const BUDGET_MS = 6000;
 const FIRST_PASS_MS = 3400;
 const SHORTLIST = 24;
 const MAX_PER_BATCH = 24;
+const WEB_SECOND_PASS = 2;
+const VERTICAL_SECOND_PASS = 1;
 const SCHOLARLY = /\b(?:scholarly|peer[- ]reviewed|clinical trials?|systematic reviews?|meta[- ]analys(?:is|es)|research papers?|arxiv|crossref|pubmed|europe pmc)\b/i;
 const COMPLEX = /\b(?:compare|versus|vs\.?|difference between|trade[- ]?offs?|pros and cons)\b/i;
 const FRESH = /\b(?:latest|recent|today|yesterday|tomorrow|current(?:ly)?|newest|20\d{2})\b/i;
@@ -35,7 +37,7 @@ function discoveryPlan(scope, maxLength = 600) {
 }
 
 const publisherKey = url => new URL(url).hostname.toLowerCase().replace(/^www\./, "").replace(/\.$/, "");
-const WEIGHTS = { original: 1.15, reference: 1.15, hints: 1, index: 1, research: 0.9, alternate: 0.8, next: 0.75 };
+const WEIGHTS = { original: 1.15, reference: 1.15, hints: 1, index: 1, crawler: 0.95, research: 0.9, alternate: 0.8, next: 0.75 };
 
 function fuse(batches, allowSource) {
   const parent = new Map();
@@ -98,7 +100,7 @@ function fuse(batches, allowSource) {
 }
 
 async function discoverAnswerSources({ query, scope, seeds = [], indexed = [], references = [],
-  search, research, vertical = "", allowSource, signal, budgetMs = BUDGET_MS }) {
+  search, research, crawl, vertical = "", allowSource, signal, budgetMs = BUDGET_MS }) {
   signal?.throwIfAborted();
   const start = Date.now(), deadline = AbortSignal.timeout(budgetMs);
   const budget = signal ? AbortSignal.any([signal, deadline]) : deadline;
@@ -145,6 +147,7 @@ async function discoverAnswerSources({ query, scope, seeds = [], indexed = [], r
   }
   const original = search ? [{ lane: "original", lookup: search, topic: query }] : [];
   if (research && SCHOLARLY.test(scope.text)) original.push({ lane: "research", lookup: research, topic: query });
+  if (crawl && !vertical) original.push({ lane: "crawler", lookup: crawl, topic: query });
   const initial = search
     ? AbortSignal.any([budget, AbortSignal.timeout(Math.min(FIRST_PASS_MS, budgetMs))]) : budget;
   const [first] = await run(original, initial);
@@ -153,7 +156,7 @@ async function discoverAnswerSources({ query, scope, seeds = [], indexed = [], r
   // reformulate within their own vertical, never fall over to generic Web.
   const thin = (scope.include.length || vertical) ? merged.unique < (vertical ? 10 : 8) : merged.hosts < 8;
   if (!budget.aborted && search && (thin || plan.complex)) {
-    const followups = plan.variants.slice(0, vertical ? 1 : 2).map(topic => ({ lane: "alternate", lookup: search, topic }));
+    const followups = plan.variants.slice(0, vertical ? VERTICAL_SECOND_PASS : WEB_SECOND_PASS).map(topic => ({ lane: "alternate", lookup: search, topic }));
     if (!followups.length && thin && first?.continuation) followups.push({ lane: "next", lookup: search, topic: query, continuation: first.continuation });
     await run(followups, budget);
     merged = fuse(batches, allowSource);

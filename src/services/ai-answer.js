@@ -63,11 +63,12 @@ function evidenceText(value) {
   if (/\b(?:casino|gambling|betting|jackpot|wager)\b/i.test(text)) return "";
   if (/[{}[\];]{3,}/.test(text) && text.length > 120) return "";
   if (/CLIENT_CANARY_STATE|USER_DEFINED|(?:\\u[0-9a-f]{4}){2,}|(?:window|globalThis|self)\s*[.(]|\b(?:set\s*\(|document\.cookie|webpackJsonp)\b/i.test(text)) return "";
-  if (/(?:^|\s)[.#]?[\w-]+\s*\{[^}]+\}/.test(text) || /(?:font-family|margin|padding|line-height|display|background(?:-color)?|ssrcss-)/i.test(text)) return "";
-  if (/\b(?:jump to content|tools tools|read edit view history|what links here|sign in|navigation menu|add to word list|audio player|play pronunciation|listen to pronunciation|related words|social media)\b/i.test(text)) return "";
+  if (/(?:^|\s)[.#]?[\w-]+\s*\{[^}]+\}/.test(text) ||
+      /(?:\b(?:font-family|margin|padding|line-height|display|background(?:-color)?)\s*:|ssrcss-)/i.test(text)) return "";
+  if (/\b(?:jump to content|tools tools|read edit view history|what links here|sign in|navigation menu|add to word list|audio player|play pronunciation|listen to pronunciation|related words)\b/i.test(text)) return "";
   return text;
 }
-const noAnswerExcerpt = /(?:^|[\s,:])(?:none|noindex|nosnippet|noai|max-snippet\s*:\s*0)(?=$|[\s,;])/i;
+const noAnswerExcerpt = /(?:^|[\s,:])(?:none|noindex|nosnippet|noai|max-snippet\s*:\s*\d+)(?=$|[\s,;])/i;
 function canReadAnswerResponse(contentType, robots) {
   return !noAnswerExcerpt.test(robots || "") &&
     (!contentType || /^(?:text\/html|application\/xhtml\+xml|text\/plain)(?:\s*;|$)/i.test(contentType));
@@ -407,6 +408,8 @@ class AIAnswerEngine {
     this.allowExtractiveFallback = opts.allowExtractiveFallback ?? /^(1|true|yes)$/i.test(extractiveSetting);
     this.acquisitionManager = opts.acquisitionManager || null;
     this.qualityModel = opts.qualityModel || new AnswerQualityModel();
+    this.fallbackRanker = opts.fallbackRanker || null;
+    this.allowNeuralFallback = !!opts.allowNeuralFallback && typeof this.fallbackRanker?.scoreUrl === "function";
   }
   async answer(query, searchResults = [], { signal, retrievalDiagnostics = null, allowSource = () => true, requirePageEvidence = false,
     requireReadableEvidence = false, indexOnly = false, evidenceLimit = 6, vertical = "", chatContext, noCache = false } = {}) {
@@ -438,7 +441,9 @@ class AIAnswerEngine {
     const recoverable = !!draftVerification && supported.length >= 2 && supported.length > draftVerification.unsupported;
     const llmVerified = complete || recoverable;
     let local = null;
-    if (!llmVerified && this.allowExtractiveFallback && !requirePageEvidence) {
+    if (!llmVerified && this.allowNeuralFallback && requireReadableEvidence && !chatContext) {
+      local = this.neuralFallback(q, intent, evidence);
+    } else if (!llmVerified && this.allowExtractiveFallback && !requirePageEvidence && !requireReadableEvidence) {
       const extracts = this.localSynthesis(q, intent, evidence);
       const checked = this.verifyAnswer(extracts.answer, evidence, { strict: true });
       if (checked.supported) {
@@ -450,7 +455,10 @@ class AIAnswerEngine {
       const configured = providerConfig(process.env, this.model).configured;
       const diagnosticCode = llm ? "grounding_rejected" : synthesisDiagnostics.failureCode || "provider_error";
       const groundingDiagnostic = llm ? { supportedClaims: draftVerification.supported, unsupportedClaims: draftVerification.unsupported, claims: draftVerification.claims.map(({ id, sourceIds, status }) => ({ id, sourceIds, status })) } : undefined;
-      return { hasAnswer: false, reason: configured ? synthesisFailureMessage(diagnosticCode) : "AI summary generation is not configured on this server. Configure a compatible model API key, endpoint, and model; copied excerpts remain disabled.", code: configured ? "SYNTHESIS_UNVERIFIED" : "AI_MODEL_NOT_CONFIGURED", ...(configured ? { diagnosticCode } : {}), ...(groundingDiagnostic ? { groundingDiagnostic } : {}), llmConfigured: configured, query: q, intent: intent.type, sourcesAvailable: evidence.length, pipeline: { retrieved: results.length, fetched: contents.length, selected: evidence.length, independent: new Set(evidence.map(e => e.sourceIdentity)).size, sourceRetrieval: retrievalDiagnostics, responseTimeMs: Date.now() - started } };
+      return { hasAnswer: false, reason: this.allowNeuralFallback && requireReadableEvidence && !chatContext
+        ? "No verified answer or suitable cited excerpts were available."
+        : configured ? synthesisFailureMessage(diagnosticCode) : "AI summary generation is not configured on this server. Configure a compatible model API key, endpoint, and model; copied excerpts remain disabled.",
+      code: configured ? "SYNTHESIS_UNVERIFIED" : "AI_MODEL_NOT_CONFIGURED", ...(configured ? { diagnosticCode } : {}), ...(groundingDiagnostic ? { groundingDiagnostic } : {}), llmConfigured: configured, query: q, intent: intent.type, sourcesAvailable: evidence.length, pipeline: { retrieved: results.length, fetched: contents.length, selected: evidence.length, independent: new Set(evidence.map(e => e.sourceIdentity)).size, sourceRetrieval: retrievalDiagnostics, responseTimeMs: Date.now() - started } };
     }
     const partial = llmVerified && !complete;
     const paragraphs = [];
@@ -460,7 +468,7 @@ class AIAnswerEngine {
       for (let i = 0; i < distinct.length; i += chunkSize) paragraphs.push(distinct.slice(i, i + chunkSize).map(claim => claim.statement).join(" "));
     } else paragraphs.push(local.answer);
     const answer = paragraphs.join("\n\n");
-    const verified = this.verifyAnswer(answer, evidence, { strict: llmVerified });
+    const verified = this.verifyAnswer(answer, evidence, { strict: llmVerified || !!local?.neural });
     const conflicts = this.detectConflicts(evidence);
     const citedIds = new Set([...String(answer).matchAll(/\[(S\d+)\]/g)].map(m => m[1]));
     const used = evidence.filter(e => citedIds.has(e.id));
@@ -472,12 +480,12 @@ class AIAnswerEngine {
       hasAnswer: !!answer, answer, keyPoints: [], caveats: [...new Set([...(partial ? ["Only the parts that matched the retrieved evidence are shown."] : []), ...(!llmVerified ? local.caveats : []), ...verified.caveats, ...(conflicts.length ? ["Independent sources contain potentially conflicting statements; review the cited excerpts before relying on a single conclusion."] : [])])],
       confidence: quality.score, confidenceLabel: quality.label, confidenceBasis: quality.basis,
       sources: used.map(e => ({ id: e.id, url: e.url, canonicalUrl: e.canonicalUrl, documentId: e.documentId, title: e.title, provider: e.provider, retrievedAt: e.retrievedAt, publishedAt: e.publishedAt, extractionStatus: e.extractionStatus, relevance: e.score, passages: e.passages.slice(0, 3), matched: e.matched.slice(0, 3) })), sourceCount: used.length,
-      intent: intent.type, query: q, generatedBy: llmVerified ? `llm:${this.model}` : "local-grounded-fallback",
+      intent: intent.type, query: q, generatedBy: llmVerified ? `llm:${this.model}` : local.neural ? "neural-grounded-fallback" : "local-grounded-fallback",
       relatedQueries: chatContext ? [] : this.followUps(q, intent),
       readingTimeMinutes: Math.max(1, Math.ceil(answer.split(/\s+/).filter(Boolean).length / 220)),
       grounding: { mode: "multi-source", sourceIds: used.map(e => e.id), citationRequired: true, verifiedClaims: verified.supported, unsupportedClaims: verified.unsupported, removedClaims: partial ? draftVerification.claims.length - supported.length : 0, claims: verified.claims.map(({ statement, ...claim }) => claim), conflicts },
       qualityLearning: { score: Math.round(learnedQuality * 1000) / 1000, trainingExamples: this.qualityModel.examples, calibrated: false },
-      pipeline: { retrieved: results.length, fetched: contents.length, selected: evidence.length, independent: new Set(evidence.map(e => e.sourceIdentity)).size, sourceRetrieval: retrievalDiagnostics, extractionOutcomes: { extracted: contents.filter(c => c.extractionStatus === "extracted" || c.extractionStatus === "local-index").length, lowInformation: contents.filter(c => c.extractionStatus === "low-information").length, empty: contents.filter(c => c.extractionStatus === "empty").length }, latencyMs: Date.now() - started },
+      pipeline: { retrieved: results.length, fetched: contents.length, selected: evidence.length, independent: new Set(evidence.map(e => e.sourceIdentity)).size, sourceRetrieval: retrievalDiagnostics, ...(local?.neural ? { hostedFailure: llm ? "grounding_rejected" : synthesisDiagnostics.failureCode || "provider_error" } : {}), extractionOutcomes: { extracted: contents.filter(c => c.extractionStatus === "extracted" || c.extractionStatus === "local-index").length, lowInformation: contents.filter(c => c.extractionStatus === "low-information").length, empty: contents.filter(c => c.extractionStatus === "empty").length }, latencyMs: Date.now() - started },
       responseTimeMs: Date.now() - started
     };
   }
@@ -616,6 +624,36 @@ class AIAnswerEngine {
     return conflicts.slice(0, 5);
   }
   localSynthesis(query, intent, evidence) { const simple = terms(query).length <= 5 && !["howto", "why"].includes(intent.type); const picks = evidence.flatMap(e => e.matched.slice(0, 3).map(text => ({ text, id: e.id, score: e.score }))).sort((a, b) => b.score - a.score); const selected = picks.filter((p, i, a) => i === a.findIndex(x => similarity(x.text, p.text) >= 0.82)).slice(0, simple ? 2 : 4); return { answer: normalizeAnswerFormat(selected.map(p => `${p.text} [${p.id}]`).join(" "), simple ? 620 : 1000), sourceIds: [...new Set(selected.map(p => p.id))], keyPoints: [], caveats: evidence.length < 2 ? ["Only one independent source was available; verify important details."] : [] }; }
+  neuralFallback(query, intent, evidence) {
+    const topic = groundingTerms(intent.subject || query).filter(term => !/^(?:compare|difference|versu|vs|fix|make|use)$/.test(term));
+    if (!topic.length) return null;
+    const sources = evidence.filter(e => ["extracted", "local-index"].includes(e.extractionStatus));
+    const clauses = new Map(sources.map(source => [source.id, verificationPassages(source).flatMap(polarityClauses)]));
+    const picks = sources.flatMap(source => {
+      let rank = 0;
+      try { rank = Math.max(0, Math.min(1, Number(this.fallbackRanker.scoreUrl(source.url,
+        { type: "html", discoveredAt: Date.parse(source.retrievedAt) || undefined })) || 0)); } catch {}
+      return source.matched.slice(0, 4).flatMap(text => {
+        const words = new Set(groundingTerms(text));
+        const hits = topic.filter(term => tokenSetHas(words, term)).length;
+        if (hits < Math.max(1, Math.ceil(topic.length / (intent.type === "compare" ? 3 : 2))) ||
+            text.length > 300 || /\[S\d+\]|\b(?:ignore (?:all |any )?(?:previous|prior) instructions|system prompt)\b/i.test(text)) return [];
+        return [{ source, text, score: hits / topic.length + 0.2 * rank }];
+      });
+    }).sort((a, b) => b.score - a.score);
+    const selected = [];
+    for (const { source, text } of picks) {
+      if (selected.some(item => item.source.sourceIdentity === source.sourceIdentity || similarity(item.text, text) >= 0.82)) continue;
+      const polarity = polarityClauses(text);
+      if (sources.some(other => other.id !== source.id && claimContradicted(polarity, clauses.get(other.id)))) continue;
+      const checked = this.verifyAnswer(`${text} [${source.id}]`, [source], { strict: true });
+      if (!checked.supported || checked.unsupported) continue;
+      selected.push({ source, text, answer: checked.claims.map(claim => claim.statement).join(" ") });
+      if (selected.length >= 2) break;
+    }
+    return selected.length ? { neural: true, answer: selected.map(item => item.answer).join(" "),
+      caveats: ["The hosted model did not provide a verified answer. These are locally selected, cited excerpts."] } : null;
+  }
   verifyAnswer(answer, evidence, { strict = false } = {}) {
     const byId = new Map(evidence.map(source => [source.id, source]));
     const citations = [...String(answer || "").matchAll(/\[(S\d+)\]/g)].map(match => match[1]);
@@ -729,6 +767,6 @@ class AIAnswerEngine {
       return evidence.some(source => (source.verificationSentences || source.matched || []).some(line => similarity(claim, line) >= 0.88));
     });
   }
-  report() { const settings = providerConfig(process.env, this.model); return { maxPages: this.maxPagesToRead, provider: settings.providerName, model: settings.model || (settings.autoModelDiscovery ? "Auto-detect (Groq)" : ""), llmConfigured: settings.configured, extractiveFallback: this.allowExtractiveFallback, mode: "multi-source-grounded-synthesis", revision: "claim-filtered-v2", confidence: "evidence-quality score, not calibrated probability", qualityLearning: this.qualityModel.report() }; }
+  report() { const settings = providerConfig(process.env, this.model); return { maxPages: this.maxPagesToRead, provider: settings.providerName, model: settings.model || (settings.autoModelDiscovery ? "Auto-detect (Groq)" : ""), llmConfigured: settings.configured, extractiveFallback: this.allowExtractiveFallback, neuralFallback: this.allowNeuralFallback ? { enabled: true, method: "neural-ranked-verified-excerpts" } : { enabled: false }, mode: "multi-source-grounded-synthesis", revision: "claim-filtered-v2", confidence: "evidence-quality score, not calibrated probability", qualityLearning: this.qualityModel.report() }; }
 }
 module.exports = { AIAnswerEngine, AnswerQualityModel, ANSWER_QUALITY_FEATURES, cleanText, normalizeAnswerFormat, evidenceText, extractReadable, normalizeUrl, similarity };
