@@ -24,6 +24,7 @@ const { createPublisherMedia } = require("./services/publisher-media");
 const { merchantProductUrl, PRODUCT_BYTES } = require("./services/india-storefronts");
 const { publicImageUrl, imageIdentity } = require("./services/crawl-page-data");
 const { parseSiteScope, allowsSiteUrl } = require("./services/search-site-scope");
+const { searchPrivacy, masksSearchScope, allowsSearchResult } = require("./services/search-privacy");
 const { rankMatchBatch, matchModelVersion } = require("./services/search-match");
 const { createSourceSearch, defaultEvidence, sourcePageUrl } = require("./services/source-search");
 const { referenceResults } = require("./services/reference-catalog");
@@ -3811,6 +3812,7 @@ function localSearch(query, offset, limit, options = {}) {
   }
   for (const url of candidateUrls) {
     const doc = searchIndex.get(url); if (!doc) continue;
+    if (options.privacy && !allowsSearchResult(options.privacy, doc)) continue;
     if (options.onlyWithImages && !doc.searchImages?.length) continue;
     if (options.onlyWatchPages && !indexedWatchPage(doc.url)) continue;
     if (options.onlyIndianProducts && !isIndianProductUrl(doc.url)) continue;
@@ -6505,10 +6507,12 @@ app.get('/api/browser/session/:sid/frames', async (req, res) => {
 app.get('/api/search', (req, res) => {
   try {
     const query = String(req.query.q || "").trim();
+    const privacy = searchPrivacy(req.query.privacy), scoped = searchEntry(query).query;
+    if (masksSearchScope(privacy, scoped, parseSiteScope(scoped))) return res.json({ ok: true, status: "filtered", results: [], total: 0 });
     const offset = Math.max(0, Number(req.query.offset || 0) || 0);
     const limit = Math.min(CFG.maxSearchResults, Math.max(1, Number(req.query.limit || 20) || 20));
     const started = Date.now();
-    const result = localSearch(query, offset, limit, { region: req.query.region, topical: true });
+    const result = localSearch(scoped, offset, limit, { region: req.query.region, topical: true, privacy });
     res.json({ ok: true, ...result, results: rankMatchBatch(query, result.results, "index"), matchModel: matchModelVersion, provider: "veyra-index", responseTimeMs: Date.now() - started });
   } catch (e) { respondError(res, 500, e.message, "SEARCH_ERROR"); }
 });
@@ -6525,9 +6529,16 @@ app.get('/api/search/suggest', (req, res) => {
   // The shell marks every guest search as private=1 to prevent retention, not
   // to disable transient reads. Incognito disables autocomplete separately.
   req.veyraPrivateTraffic = true;
-  res.json({ ok: true, suggestions: req.query.incognito === "1" ? [] : localSearchSuggestions(q, limit) });
+  const privacy = searchPrivacy(req.query.privacy);
+  const hidden = input => { const { query } = searchEntry(input); return masksSearchScope(privacy === "unfiltered" ? privacy : "blocked", query, parseSiteScope(query)); };
+  res.json({ ok: true, suggestions: req.query.incognito === "1" || hidden(q) ? [] : localSearchSuggestions(q, limit).filter(s => !hidden(s)) });
 });
-app.get('/api/search/correct', (req, res) => res.json({ ok: true, ...correctSearchQuery(req.query.q || "") }));
+app.get('/api/search/correct', (req, res) => {
+  const q = String(req.query.q || "").slice(0, 600), privacy = searchPrivacy(req.query.privacy);
+  const hidden = input => { const { query } = searchEntry(input); return masksSearchScope(privacy === "unfiltered" ? privacy : "blocked", query, parseSiteScope(query)); };
+  const correction = hidden(q) ? {} : correctSearchQuery(q);
+  res.json({ ok: true, ...(hidden(correction.corrected || "") ? { changed: false } : correction) });
+});
 function requestAbortSignal(req, res) {
   const controller = new AbortController();
   const abort = () => { if (!res.writableEnded) controller.abort(); };
@@ -6556,8 +6567,10 @@ app.get('/api/search/web', async (req, res) => {
     const limit = Math.min(CFG.maxSearchResults, Math.max(1, Math.floor(Number(req.query.limit || 20)) || 20));
     const started = Date.now();
     const scope = parseSiteScope(q);
+    const privacy = searchPrivacy(req.query.privacy);
     if (scope.invalid) return res.json({ ok: true, results: [], provider: "none", siteFilter: { invalid: true }, more: false, source: "web", responseTimeMs: Date.now() - started });
-    const indexOptions = { region: req.query.region, requireTerms: !scope.active, topical: true };
+    if (masksSearchScope(privacy, q, scope)) return res.json({ ok: true, status: "filtered", results: [], more: false });
+    const indexOptions = { region: req.query.region, requireTerms: !scope.active, topical: true, privacy };
     const fromIndex = indexOffset => {
       const local = localSearch(q, indexOffset, limit, indexOptions);
       const next = indexOffset + local.results.length;
@@ -6569,8 +6582,11 @@ app.get('/api/search/web', async (req, res) => {
     const wantsGoogle = !selected && (preferGoogle || req.query.prefer === "google");
     const googleHome = !selected && !offset && /^(?:www\.)?google\.com$/i.test(q) ? "https://www.google.com/" : "";
     const reply = result => {
+      // Candidate rows are used internally for ranking, not a second public feed.
+      const { candidates: _candidates, ...publicResult } = result;
+      const eligible = result.results.filter(row => allowsSearchResult(privacy, row));
       let results = rankMatchBatch(q, sourceLane
-        ? result.results.map(row => ({ ...row, evidence: row.evidence || defaultEvidence(row) })) : result.results, "web");
+        ? eligible.map(row => ({ ...row, evidence: row.evidence || defaultEvidence(row) })) : eligible, "web");
       if (!domain || req.query.incognito === "1") results = results.map(({ media, ...row }) => row);
       if (googleHome) {
         const key = canonicalKey(googleHome);
@@ -6579,7 +6595,7 @@ app.get('/api/search/web', async (req, res) => {
         results = [{ ...(found || home), url: googleHome, canonicalUrl: key, title: "Google" },
           ...results.filter(row => canonicalKey(row.url) !== key)].slice(0, limit);
       }
-      return res.json({ ok: true, ...result, results, ...(googleHome ? { status: "ok", provider: result.provider === "none" ? "veyra-navigation" : result.provider } : {}),
+      return res.json({ ok: true, ...publicResult, results, ...(googleHome ? { status: "ok", provider: result.provider === "none" ? "veyra-navigation" : result.provider } : {}),
         ...(wantsGoogle ? { preferredEngine: "google", googleIncluded: results.some(row => row.source === "google" || row.providers?.includes("google")) } : {}),
         matchModel: matchModelVersion, ...(scope.active ? { total: null, siteFilter: { include: scope.include, exclude: scope.exclude } } : {}), source: "web", responseTimeMs: Date.now() - started });
     };
@@ -6589,7 +6605,7 @@ app.get('/api/search/web', async (req, res) => {
     const evidenceService = app.locals.veyraSourceSearch || sourceSearch;
     const firstSourcePage = sourceLane && !offset;
     const references = !selected && !offset ? referenceResults(scope, Math.min(3, limit)) : [];
-    const inScope = row => row && canonicalKey(row.url) && allowsSiteUrl(scope, row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl));
+    const inScope = row => allowsSearchResult(privacy, row) && canonicalKey(row.url) && allowsSiteUrl(scope, row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl));
     const [result, discovered] = await Promise.all([
       (app.locals.veyraWebSearch || webSearch).search(q, { offset, limit, engine: selected, preferGoogle: wantsGoogle, domainBrowse: !!domain, lang, region: req.query.region,
         signal: request.signal, noCache: isPrivate || !CFG.globalCacheEnabled, feed, reference: true,
@@ -6648,7 +6664,7 @@ app.get('/api/search/web', async (req, res) => {
 function publisherMediaRequired(req, res, next) {
   res.set("Cache-Control", "private, no-store");
   res.set("Referrer-Policy", "no-referrer");
-  if (!publisherMedia || req.query.incognito === "1" || req.query.private === "1") {
+  if (!publisherMedia || req.query.privacy !== "restricted" || req.query.incognito === "1" || req.query.private === "1") {
     return respondError(res, 404, "Publisher search is unavailable.", "PUBLISHER_UNAVAILABLE");
   }
   next();
@@ -6695,8 +6711,13 @@ app.get("/api/search/vertical", async (req, res) => {
     const service = app.locals.veyraVerticalSearch || verticalSearch;
     const options = { page, provider, lang: req.query.lang, region: req.query.region, signal, noCache: req.veyraPrivateTraffic || req.query.incognito === "1" || !CFG.globalCacheEnabled, preview: type === "all", requireThumbnail: thumbnailPreview, domainBrowse: !!domain, privateSearch: req.query.incognito === "1" };
     const scope = parseSiteScope(q);
+    const privacy = searchPrivacy(req.query.privacy);
+    if (masksSearchScope(privacy, q, scope)) {
+      const section = category => ({ type: category, provider: "none", status: "filtered", results: [], nextPage: null });
+      return res.json(type === "all" ? { ok: true, type, sections: SEARCH_VERTICALS.map(section) } : { ok: true, ...section(type) });
+    }
     const withMatches = (section, category) => ({ ...section, results: rankMatchBatch(q, section.results.filter(row =>
-      row && allowsSiteUrl(scope, row.sourcePageUrl || row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl)) &&
+      allowsSearchResult(privacy, row) && allowsSiteUrl(scope, row.sourcePageUrl || row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl)) &&
       (category === "images" || allowsSiteUrl(scope, row.url))), category), matchModel: matchModelVersion });
     if (thumbnailPreview && options.privateSearch) return res.json({ ok: true, type, provider: "none", status: "empty", results: [], nextPage: null });
     if (type !== "all") {
@@ -6797,7 +6818,7 @@ app.post('/api/search/answer', async (req, res) => {
   const routeStartedAt = Date.now();
   const request = requestAbortSignal(req, res);
   try {
-    const query = typeof req.body?.query === "string" ? req.body.query.trim().slice(0, 600) : "";
+    const { query } = searchEntry(typeof req.body?.query === "string" ? req.body.query.trim().slice(0, 600) : "");
     const vertical = req.body?.vertical;
     const followUp = req.body?.followUp != null;
     let { results } = req.body || {};
@@ -6805,7 +6826,9 @@ app.post('/api/search/answer', async (req, res) => {
     if (!query) return res.json({ hasAnswer: false, reason: 'No query provided' });
     if (vertical != null && !SEARCH_VERTICALS.includes(vertical)) return respondError(res, 400, "Invalid answer category.", "INVALID_SEARCH_CATEGORY");
     const scope = parseSiteScope(String(query).trim());
+    const privacy = searchPrivacy(req.body?.privacy);
     if (scope.invalid) return res.json({ hasAnswer: false, reason: "Use a valid hostname with site:." });
+    if (masksSearchScope(privacy, query, scope)) return res.json({ hasAnswer: false, reason: "The current search filter excludes that scope." });
     let chatContext, answerQuery = scope.text, discoveryQuery = query;
     if (followUp) {
       req.veyraPrivateTraffic = true;
@@ -6816,6 +6839,12 @@ app.post('/api/search/answer', async (req, res) => {
         return respondError(res, 400, "Ask a question of up to 200 characters. Use the main search bar to change the site filter.", "INVALID_ANSWER_FOLLOWUP");
       }
       chatContext = { question: question.trim(), topic: scope.text.slice(0, 120), previousQuestion: previousQuestion?.trim().slice(0, 80) || "" };
+      if ([chatContext.question, chatContext.previousQuestion].some(input => {
+        const { query: q } = searchEntry(input);
+        return masksSearchScope(privacy, q, parseSiteScope(q));
+      })) {
+        return res.json({ hasAnswer: false, reason: "The current search filter excludes that destination.", followUp: true });
+      }
       // Only use the original search to establish scope. Leading operators
       // survive discovery's provider-specific length limits.
       const operators = [...scope.include.map(h => `site:${h}`), ...scope.exclude.map(h => `-site:${h}`)].join(" ");
@@ -6823,8 +6852,8 @@ app.post('/api/search/answer', async (req, res) => {
       discoveryQuery = [operators, chatContext.question, chatContext.topic, chatContext.previousQuestion].filter(Boolean).join(" ");
       results = null; // Follow-ups discover their own evidence, not client-provided results.
     }
-    const inScope = row => row && allowsSiteUrl(scope, row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl));
-    if (scope.active && Array.isArray(results)) results = results.filter(inScope);
+    const inScope = row => allowsSearchResult(privacy, row) && allowsSiteUrl(scope, row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl));
+    if (Array.isArray(results)) results = results.filter(inScope);
     if (vertical) {
       const service = app.locals.veyraVerticalSearch || verticalSearch;
       const options = {
@@ -6837,7 +6866,7 @@ app.post('/api/search/answer', async (req, res) => {
       const addCategorySources = section => {
         for (const row of section.results) {
           const url = verticalResultUrl(row?.sourcePageUrl || row?.url);
-          if (!url || !inScope({ url }) || distinctSources.has(url)) continue;
+          if (!url || !inScope({ ...row, url }) || distinctSources.has(url)) continue;
           distinctSources.set(url, { url, provider: row.provider });
           if (distinctSources.size === 6) break;
         }
@@ -6868,13 +6897,14 @@ app.post('/api/search/answer', async (req, res) => {
     } else {
       const normalizedQuery = discoveryQuery.slice(0, CFG.maxSearchQueryChars);
       const localSearchStartedAt = Date.now();
-      const local = localSearch(discoveryQuery, 0, Math.min(4, CFG.maxSearchResults), { includeText: true, maxTextChars: 30000 });
+      const local = localSearch(discoveryQuery, 0, Math.min(4, CFG.maxSearchResults), { includeText: true, maxTextChars: 30000, privacy });
       const localSearchMs = Date.now() - localSearchStartedAt;
       const externalDiscoveryStartedAt = Date.now();
       let discovered = { pages: [], metrics: { candidates: 0, fetched: 0, extracted: 0, failed: 0 }, provider: "none", attempts: [] };
       try { if (!(followUp && req.body.source === "index")) discovered = await acquisitionManager.searchFirst(normalizedQuery, async (q, opts) => {
         const result = await (app.locals.veyraWebSearch || webSearch).search(q, followUp ? { ...opts, noCache: true, region: req.body.region } : opts);
-        return scope.active ? { ...result, results: (result.results || []).filter(inScope) } : result;
+        return { ...result, results: (result.results || []).filter(inScope),
+          ...(Array.isArray(result.candidates) ? { candidates: result.candidates.filter(inScope) } : {}) };
       }, { limit: CFG.maxSearchResults, fetchLimit: Math.min(8, CFG.maxSearchResults), signal: request.signal, deadlineMs: 8000,
         noCache: followUp, lang: followUp && typeof req.body.lang === "string" ? req.body.lang.slice(0, 35) : "en" }); }
       catch { if (!followUp) serverLog("warn", "SEARCH", "Search-to-answer external discovery failed; continuing with local-index candidates."); }
@@ -6898,10 +6928,10 @@ app.post('/api/search/answer', async (req, res) => {
     }
     const answer = await (app.locals.veyraAnswerEngine || aiAnswerEngine).answer(answerQuery, results || [], {
       signal: request.signal, retrievalDiagnostics, requirePageEvidence: !!vertical, vertical, chatContext, noCache: followUp,
-      ...(scope.active ? { allowSource: inScope } : {})
+      ...(scope.active || privacy !== "unfiltered" ? { allowSource: inScope } : {})
     });
     if (vertical) answer.vertical = vertical;
-    if (scope.active && (answer.sources || []).some(row => !inScope(row))) return res.json({ hasAnswer: false, reason: "An answer could not be grounded within the requested site." });
+    if ((scope.active || privacy !== "unfiltered") && (answer.sources || []).some(row => !inScope(row))) return res.json({ hasAnswer: false, reason: "An answer could not be grounded within the requested site." });
     if (retrievalDiagnostics?.webSearchResults) answer.searchResults = retrievalDiagnostics.webSearchResults;
     const routeResponseTimeMs = Date.now() - routeStartedAt;
     answer.responseTimeMs = routeResponseTimeMs;

@@ -37,6 +37,9 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
         assert.equal(options.noCache, true);
         return { results: [{ url: "https://search-fixture.example/private", title: "Private fixture" }] };
       }
+      if (query === "public privacy fixture") {
+        return { provider: "mock-provider", results: privacyRows, candidates: privacyRows };
+      }
       assert.equal(options.limit, 20, "answer discovery should request 20 provider results");
       return { provider: "mock-provider", results: [
         { url: "https://search-fixture.example/result", title: "Mock web result", snippet: "Controlled external discovery result", provider: "mock-provider" },
@@ -47,6 +50,13 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
       ], attempts: [{ provider: "mock-provider", count: 2 }] };
     }
   };
+  const privacyRows = [
+    { url: "https://public.example.test/privacy-fixture", title: "Public privacy fixture" },
+    { url: "https://mirror.pornhub.com/fixture", title: "Known host fixture" },
+    { url: "https://mirror.example.test/privacy-fixture", title: "Known source fixture", sourcePageUrl: "https://xvideos.com/fixture" },
+    { url: "https://flagged.example.test/privacy-fixture", title: "Labelled fixture", nsfw: true },
+    { url: "https://poster.example.test/privacy-fixture", title: "Known media fixture", thumbnail: "https://cdn.phncdn.com/fixture.jpg" }
+  ];
   let crawlCalls = 0, crawlArgs = null;
   app.locals.veyraNeuralRobotPool = { async startCrawl(seeds, query, options) { crawlCalls += 1; crawlArgs = { seeds, query, options }; return [{ status: "fulfilled" }]; } };
   // All direct-source crawling is also fixture-backed, including the robots
@@ -111,6 +121,39 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     assert.equal(signup.status, 201, JSON.stringify(login));
     assert.ok(login.token, "the regular fixture account can sign in");
     const authorization = `Bearer ${login.token}`;
+    const search = (path, q, privacy, extra = {}) => fetch(`${base}/api/search${path}?${new URLSearchParams({ q, privacy, private: "1", ...extra })}`,
+      { headers: { authorization } }).then(r => r.json());
+    const callsBeforePrivacyFixtures = webSearchCalls;
+    const oldVertical = app.locals.veyraVerticalSearch;
+    let privacyVerticalCalls = 0;
+    app.locals.veyraVerticalSearch = { search: async () => {
+      privacyVerticalCalls++;
+      return { results: privacyRows.map(row => ({ thumbnail: "https://upload.wikimedia.org/fixture.jpg", ...row })), status: "ok" };
+    } };
+    for (const mode of ["filtered", "blocked", "restricted", "invalid", "unfiltered"]) {
+      const web = await search("/web", "public privacy fixture", mode, { engine: "bing" });
+      assert.equal(web.results.length, mode === "unfiltered" ? 5 : 1);
+      assert.equal(web.candidates, undefined, "unfiltered internal candidate arrays must never be serialized");
+      const vertical = await search("/vertical", "public privacy fixture", mode, { type: "images", preview: "1" });
+      assert.equal(vertical.results.length, mode === "unfiltered" ? 5 : 1);
+    }
+    const providerCalls = webSearchCalls, imageCalls = privacyVerticalCalls;
+    for (const [q, mode] of [["search:pornhub.com", "filtered"], ["site:xvideos.com", "restricted"], ["(https://www.xvideos.com/fixture), clip", "blocked"]]) {
+      for (const [route, extra] of [["/web", {}], ["/vertical", { type: "images", preview: "1" }], ["", {}]]) {
+        const result = await search(route, q, mode, extra);
+        assert.equal(result.status, "filtered");
+        assert.deepEqual(result.results, []);
+      }
+      assert.deepEqual((await search("/suggest", q, mode)).suggestions, []);
+      const answer = await fetch(`${base}/api/search/answer`, {
+        method: "POST", headers: { authorization, "content-type": "application/json" }, body: JSON.stringify({ query: q, privacy: mode })
+      }).then(r => r.json());
+      assert.equal(answer.hasAnswer, false);
+    }
+    assert.equal(webSearchCalls, providerCalls, "filtered scopes must not leave the server");
+    assert.equal(privacyVerticalCalls, imageCalls, "filtered scopes must not reach vertical providers");
+    webSearchCalls = callsBeforePrivacyFixtures;
+    app.locals.veyraVerticalSearch = oldVertical;
     const webResponse = await fetch(`${base}/api/search/web?q=mock%20web%20route%20query&engine=bing&region=IN`, { headers: { authorization } });
     const webPayload = await webResponse.json();
     assert.equal(webResponse.status, 200);
