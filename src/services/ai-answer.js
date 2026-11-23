@@ -246,9 +246,59 @@ function tokenSetHas(set, token) {
   return false;
 }
 const numericFacts = text => String(text).normalize("NFKC").match(/(?:[₹£$€]\s*)?\p{Nd}+(?:[.,]\p{Nd}+)*(?:\s*%)?/gu)?.map(value => value.replace(/\s/g, "")) || [];
+const OPPOSITE_PREDICATES = {
+  unavailable: "available", prohibited: "allowed", forbidden: "allowed",
+  disabled: "enabled", rejected: "approved", ineffective: "effective", unsafe: "safe"
+};
+const TIME_QUALIFIER = /^(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|weekday|weekend|holiday|morning|afternoon|evening|overnight)$/;
+function polarityClauses(text) {
+  const normalized = text.normalize("NFKC").toLowerCase().replace(/[’‘]/g, "'")
+    .replace(/\bcan't\b/g, "can not").replace(/\bcannot\b/g, "can not").replace(/\bwon't\b/g, "will not")
+    .replace(/\bshan't\b/g, "shall not").replace(/n't\b/g, " not")
+    .replace(/\bthere (?:is|are|was|were) no\b/g, "no")
+    .replace(/\bnot\s+(?:only|just|merely)\b/g, " ")
+    // "Available on Saturday, but not on Sunday" shares its predicate.
+    // Only expand this common ellipsis when both halves repeat the preposition.
+    .replace(/(^|[.!?;])([^.!?;,]+?)\s+(on|in|at|for|during)\s+([^.!?;,]+?)\s*,?\s+but\s+not\s+\3\s+([^.!?;,]+)/g,
+      "$1$2 $3 $4; $2 not $3 $5");
+  return normalized.split(/[;!?。！？।]|[.](?![\p{L}\p{N}])|,\s*|\b(?:but|whereas|although|however)\b/gu)
+    .filter(clause => clause.trim()).map(clause => {
+      const negative = [...clause.matchAll(/\b(?:not|no|never)\b/g)].length;
+      let opposite = 0;
+      const unsigned = clause.replace(/\b[a-z]+\b/g, word => {
+        if (!Object.hasOwn(OPPOSITE_PREDICATES, word)) return word;
+        opposite += 1;
+        return OPPOSITE_PREDICATES[word];
+      });
+      const tokens = groundingTerms(unsigned);
+      return { tokens, set: new Set(tokens), negative: negative + opposite === 1,
+        ambiguous: negative + opposite > 1 || (negative && /\bonly\b/.test(clause)),
+        numbers: numericFacts(unsigned), time: tokens.filter(token => TIME_QUALIFIER.test(token)).sort().join(" ") };
+    });
+}
+function verificationPassages(source) {
+  return [...new Set([...(source.verificationSentences || []), ...(source.matched || [])])];
+}
+// This is a conservative polarity check, not entailment. Require close
+// agreement on the content of a clause before treating negation as a veto.
+function claimContradicted(clauses, passageClauses) {
+  return clauses.some(claim => !claim.ambiguous && claim.tokens.length >= 2 &&
+    passageClauses.some(passage => {
+      if (passage.ambiguous || passage.negative === claim.negative || passage.time !== claim.time) return false;
+      if (claim.numbers.length !== passage.numbers.length ||
+        claim.numbers.some((value, i) => value !== passage.numbers[i])) return false;
+      // The smaller wording can be contained by a more specific paraphrase.
+      // Do not conflate two different scopes when both have unmatched terms.
+      const shared = claim.tokens.filter(token => tokenSetHas(passage.set, token)).length;
+      const reverse = passage.tokens.filter(token => tokenSetHas(claim.set, token)).length;
+      return Math.min(shared, reverse) >= Math.min(3, claim.tokens.length) &&
+        shared >= claim.tokens.length * 0.8 && reverse >= passage.tokens.length * 0.8 &&
+        (shared === claim.tokens.length || reverse === passage.tokens.length);
+    }));
+}
 function claimSupported(claimTokens, source, numbers) {
   if (!claimTokens?.length || !source) return false;
-  const candidates = [...new Set([...(source.verificationSentences || []), ...(source.matched || [])])];
+  const candidates = verificationPassages(source);
   const minAnchors = claimTokens.length < 5 ? 2 : claimTokens.length < 12 ? 3 : 4;
   const minRatio = claimTokens.length < 5 ? 0.5 : claimTokens.length < 12 ? 0.35 : 0.28;
   return candidates.some(sentence => {
@@ -366,7 +416,6 @@ class AIAnswerEngine {
       : contents;
     const evidence = this.buildEvidence(q, intent, verifiedPages, requirePageEvidence ? [] : results);
     if (!evidence.length) return { hasAnswer: false, reason: "No readable source evidence found", query: q, intent, pipeline: { retrieved: results.length, fetched: contents.length, selected: 0, sourceRetrieval: retrievalDiagnostics } };
-    const local = this.allowExtractiveFallback && !requirePageEvidence ? this.localSynthesis(q, intent, evidence) : null;
     const synthesisDiagnostics = {};
     const synthDeadline = AbortSignal.timeout(Math.min(this.llmTimeoutMs, 11500));
     const llm = await this.synthesizeWithLLM(q, intent, evidence, synthesisDiagnostics, vertical, signal ? AbortSignal.any([signal, synthDeadline]) : synthDeadline, chatContext)
@@ -377,6 +426,15 @@ class AIAnswerEngine {
     const complete = !!draftVerification && supported.length > 0 && draftVerification.unsupported === 0 && supported.length === draftVerification.claims.length;
     const recoverable = !!draftVerification && supported.length >= 2 && supported.length > draftVerification.unsupported;
     const llmVerified = complete || recoverable;
+    let local = null;
+    if (!llmVerified && this.allowExtractiveFallback && !requirePageEvidence) {
+      const extracts = this.localSynthesis(q, intent, evidence);
+      const checked = this.verifyAnswer(extracts.answer, evidence, { strict: true });
+      if (checked.supported) {
+        local = { answer: checked.claims.map(claim => claim.statement).filter(Boolean).join(" "),
+          caveats: [...extracts.caveats, ...checked.caveats] };
+      }
+    }
     if (!llmVerified && !local) {
       const configured = providerConfig(process.env, this.model).configured;
       const diagnosticCode = llm ? "grounding_rejected" : synthesisDiagnostics.failureCode || "provider_error";
@@ -517,15 +575,23 @@ class AIAnswerEngine {
     const statementPattern = /(?:[^.!?。！？।\n]|\.(?=[\p{L}\p{N}]))+(?:[.!?。！？।]+["'”’)]*(?:[ \t]*\[S\d+\])*|$|(?=\n))/gu;
     const statements = String(answer || "").match(statementPattern)?.map(value => value.trim()).filter(value =>
       /[\p{L}\p{N}]/u.test(value.replace(/\[S\d+\]/g, "")) && (strict || value.length >= 25)) || [];
+    const polarityBySource = new Map();
     const claims = statements.map((statement, index) => {
       const ids = [...new Set([...statement.matchAll(/\[(S\d+)\]/g)].map(match => match[1]))];
       const sourceIds = ids.filter(id => byId.has(id));
       const body = statement.replace(/\[(S\d+)\]/g, " ").replace(/\s+([.!?。！？।])/g, "$1").trim();
       const tokens = groundingTerms(body), numbers = numericFacts(body);
       const citedSources = sourceIds.map(id => byId.get(id));
-      const matching = citedSources.filter(source => claimSupported(tokens, source, numbers));
+      const polarity = polarityClauses(body);
+      const eligible = citedSources.filter(source => {
+        if (!polarityBySource.has(source.id)) {
+          polarityBySource.set(source.id, verificationPassages(source).flatMap(polarityClauses));
+        }
+        return !claimContradicted(polarity, polarityBySource.get(source.id));
+      });
+      const matching = eligible.filter(source => claimSupported(tokens, source, numbers));
       const supportedIds = matching.length ? matching.map(source => source.id) :
-        claimSupportedAcrossSources(tokens, citedSources, numbers) ? sourceIds : [];
+        eligible.length === citedSources.length && claimSupportedAcrossSources(tokens, eligible, numbers) ? sourceIds : [];
       const isSupported = ids.length === sourceIds.length && supportedIds.length > 0;
       return { id: `C${index + 1}`, text: body, sourceIds: isSupported ? supportedIds : sourceIds,
         statement: isSupported ? `${/[.!?。！？।]["'”’)]*$/.test(body) ? body : `${body}.`} ${supportedIds.map(id => `[${id}]`).join(" ")}` : "",

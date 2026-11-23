@@ -251,7 +251,7 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
         if (type === "images" && query === "preview fixture") {
           assert.equal(options.requireThumbnail, true);
           return { type, status: "ok", provider: "wikimedia", nextPage: 1, results: Array.from({ length: 10 }, (_, i) => ({
-            url: `https://commons.wikimedia.org/wiki/${i}`, title: "Preview fixture",
+            url: `https://commons.wikimedia.org/wiki/${i}`, title: i === 8 ? "Preview fixture" : "Gallery",
             thumbnail: i ? `https://upload.wikimedia.org/photo-${i}.jpg` : ""
           })) };
         }
@@ -553,6 +553,7 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     const previewUrl = `${base}/api/search/vertical?type=images&q=preview+fixture&preview=1`;
     const preview = await (await fetch(previewUrl)).json();
     assert.equal(preview.results.length, 6);
+    assert.deepEqual(preview.results.map(row => row.url), Array.from({ length: 6 }, (_, i) => `https://commons.wikimedia.org/wiki/${i + 1}`), "preview cuts the already-ranked list before any badge can change membership");
     assert(preview.results.every(row => row.thumbnail));
     assert.equal(preview.nextPage, null);
     const beforeIncognito = verticalCalls;
@@ -576,6 +577,22 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     })}`)).json();
     assert.deepEqual(videoPreview.results.map(row => row.url), ["https://media.example.com/watch?a=1"]);
     assert.equal(videoPreview.nextPage, null);
+    app.locals.veyraWebSearch = { async search(query, { offset, engine }) {
+      assert.equal(query, "transit timetable");
+      assert.equal(engine, "bing");
+      const slug = offset ? "later" : "first";
+      return { provider: "mock-provider", status: "ok", nextOffset: offset ? null : 10, more: !offset, results: [
+        { url: `https://search-fixture.example/${slug}-preferred`, title: "City transit agency", provider: "mock-provider" },
+        { url: `https://search-fixture.example/${slug}-badge`, title: "Transit timetable", snippet: "Transit timetable", provider: "mock-provider" }
+      ] };
+    } };
+    const orderedPage = offset => search("/web", "transit timetable", "filtered", { engine: "bing", feed: "1", offset });
+    const firstOrdered = await orderedPage("0");
+    assert.equal(firstOrdered.nextOffset, 10);
+    for (const [slug, page] of [["first", firstOrdered], ["later", await orderedPage(String(firstOrdered.nextOffset))]]) {
+      assert.deepEqual(page.results.map(row => new URL(row.url).pathname), [`/${slug}-preferred`, `/${slug}-badge`]);
+      assert.ok(page.results[1].matchPercent > page.results[0].matchPercent, "Web preserves provider rank despite a higher later badge");
+    }
     console.log("Search, answer and YouTube Express routes passed controlled local integration tests");
   } finally {
     delete app.locals.veyraWebSearch;

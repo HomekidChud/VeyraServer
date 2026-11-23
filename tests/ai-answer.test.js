@@ -43,6 +43,27 @@ const invented = engine.verifyAnswer("Hi is a greeting that cures migraines in e
 assert.equal(invented.supported, 0);
 assert.equal(invented.unsupported, 1, "valid citation ID alone must not make an unsupported claim pass");
 assert.equal(engine.verifyAnswer(`${local.answer} Costs £100`, evidence, { strict: true }).unsupported, 1, "category summaries must not ignore a short or unpunctuated claim");
+const groundingFixture = (id, ...text) => ({ id, url: `https://${id.toLowerCase()}.example/`, verificationSentences: text, matched: text });
+const sunday = "The express delivery service is available on Sundays.";
+const notSunday = "The express delivery service is not available on Sundays.";
+const verifyGrounding = (claim, fixtures, citations = "[S1]") => engine.verifyAnswer(`${claim} ${citations}`, fixtures, { strict: true });
+for (const denial of [notSunday, "The express delivery service isn’t available on Sundays.", "The express delivery service is unavailable on Sundays."]) {
+  assert.equal(verifyGrounding(sunday, [groundingFixture("S1", denial)]).unsupported, 1);
+  assert.equal(verifyGrounding(denial, [groundingFixture("S1", sunday)]).unsupported, 1);
+}
+assert.equal(verifyGrounding(notSunday, [groundingFixture("S1", "The express delivery service isn't available on Sundays.")]).supported, 1);
+assert.equal(verifyGrounding(sunday, [groundingFixture("S1", "There is no express delivery service on Sundays.")]).unsupported, 1);
+assert.equal(verifyGrounding("The carrier can ship refrigerated parcels on Sundays.", [groundingFixture("S1", "The carrier cannot ship refrigerated parcels on Sundays.")]).unsupported, 1);
+assert.equal(verifyGrounding(sunday, [groundingFixture("S1", "The express delivery service is not only available on Sundays but also on holidays.")]).supported, 1);
+assert.equal(verifyGrounding(sunday, [groundingFixture("S1", "The express delivery service is not available on Mondays.", "The express delivery service is available on Sundays, but the ticket office is not open.")]).supported, 1);
+const disagreeing = groundingFixture("S1", notSunday);
+assert.equal(verifyGrounding(sunday, [groundingFixture("S1", "The express delivery service is available on Saturdays, but not on Sundays.")]).unsupported, 1, "an elliptical denial should not pass as support");
+const complementaryPassages = [groundingFixture("S2", "The express delivery timetable is published weekly."), groundingFixture("S3", "The service lists Sunday hours.")];
+assert.equal(verifyGrounding(sunday, complementaryPassages, "[S2] [S3]").supported, 1);
+assert.equal(verifyGrounding(sunday, [disagreeing, ...complementaryPassages], "[S1] [S2] [S3]").unsupported, 1, "pooling cannot rescue a contradicted claim");
+const independentSupport = verifyGrounding(sunday, [disagreeing, groundingFixture("S2", sunday)], "[S1] [S2]");
+assert.deepEqual(independentSupport.claims[0].sourceIds, ["S2"], "a contradicted citation must not survive alongside independent support");
+assert.doesNotMatch(independentSupport.claims[0].statement, /\[S1\]/);
 const quality = engine.evidenceQuality(evidence, evidence.slice(0, 1), verified, engine.detectIntent("What is hi?"));
 assert.ok(quality.score >= 0 && quality.score <= 1);
 assert.match(quality.label, /evidence|verify/i);
@@ -81,6 +102,16 @@ assert.equal(qualityEvaluation.after.byCase["invented-citation"].overlapPassed, 
 assert.ok(qualityEvaluation.after.logLoss < qualityEvaluation.before.logLoss, "offline scorer should improve fixture loss");
 
 (async () => {
+  const contradictionEngine = new AIAnswerEngine({ allowExtractiveFallback: false });
+  const deliveryUrl = "https://delivery.example/schedule";
+  contradictionEngine.fetchContents = async () => [{
+    url: deliveryUrl, text: notSunday, sentences: [notSunday], extractionStatus: "extracted"
+  }];
+  contradictionEngine.synthesizeWithLLM = async () => ({ answer: `${sunday} [S1]` });
+  const contradictedAnswer = await contradictionEngine.answer("Is express delivery available on Sundays?", [{ url: deliveryUrl }]);
+  assert.equal(contradictedAnswer.hasAnswer, false);
+  assert.equal(contradictedAnswer.groundingDiagnostic.unsupportedClaims, 1);
+
   const classifier = new AIAnswerEngine({ allowExtractiveFallback: true });
   classifier.fetchContents = async () => [];
   classifier.synthesizeWithLLM = async () => assert.fail("Provider should not be called without source-page evidence");

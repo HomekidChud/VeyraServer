@@ -28,8 +28,6 @@ function sigmoid(x) { return 1 / (1 + Math.exp(-Math.max(-50, Math.min(50, x))))
 function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, n)); }
 function now() { return Date.now(); }
 function safeHost(url) { try { return new URL(url).hostname.replace(/^www\./, ""); } catch { return ""; } }
-function safePath(url) { try { return new URL(url).pathname; } catch { return ""; } }
-function safeScheme(url) { try { return new URL(url).protocol.replace(":", ""); } catch { return ""; } }
 
 
 
@@ -48,6 +46,14 @@ const FEATURE_NAMES = [
 
 const NUM_FEATURES = FEATURE_NAMES.length;
 
+const LINK_CONTEXT_SCORES = new Map(Object.entries({
+  html: 0.7, css: 0.3, js: 0.4, data: 0.5,
+  image: 0.2, media: 0.2, font: 0.1, asset: 0.15,
+  sitemap: 0.6, "broad-scan": 0.3, "attribute-scan": 0.25,
+  "lazy-attribute": 0.35, "preload-runtime": 0.4,
+  "css-url": 0.2, "css-import": 0.25, "json-discovered": 0.45,
+  "media-manifest": 0.3, "link-header": 0.4,
+}));
 
 const HIGH_AUTHORITY_DOMAINS = new Set([
   "wikipedia.org", "github.com", "stackoverflow.com", "developer.mozilla.org",
@@ -87,7 +93,7 @@ class NeuralCrawlerModel {
     this.saveIntervalMs = opts.saveIntervalMs || 60000; 
     this.domainClickCounts = new Map(); 
     this.domainVisitCounts = new Map(); 
-    this.urlFeatures = new Map(); 
+    this.staticUrlFeatures = new Map();
     this.maxUrlCache = opts.maxUrlCache || 50000;
     this.stats = {
       scored: 0, trained: 0, positiveFeedback: 0, negativeFeedback: 0,
@@ -97,48 +103,51 @@ class NeuralCrawlerModel {
 
   
   baseAuthority(url) {
-    const host = safeHost(url);
+    return this.getStaticUrlFeatures(url).authority;
+  }
+
+  getStaticUrlFeatures(url) {
+    const cached = this.staticUrlFeatures.get(url);
+    if (cached) return cached;
+    let host = "", urlPath = "";
+    try {
+      const parsed = new URL(url);
+      host = parsed.hostname.replace(/^www\./, "");
+      urlPath = parsed.pathname;
+    } catch {}
     const baseHost = host.split(".").slice(-2).join(".");
-    return HIGH_AUTHORITY_DOMAINS.has(host) || HIGH_AUTHORITY_DOMAINS.has(baseHost) ? 0.9 : 0.1;
+    const authority = HIGH_AUTHORITY_DOMAINS.has(host) || HIGH_AUTHORITY_DOMAINS.has(baseHost) ? 0.9 : 0.1;
+    const depthScore = clamp(1 - urlPath.split("/").filter(Boolean).length * 0.15, 0.1, 1);
+    const urlText = (host + " " + urlPath).toLowerCase();
+    const commonTerms = ["api", "docs", "guide", "tutorial", "reference", "example",
+      "blog", "news", "article", "wiki", "learn", "course", "book", "manual"];
+    const relevanceScore = clamp(commonTerms.filter(t => urlText.includes(t)).length / 3, 0, 1);
+    const features = { host, authority, depthScore, relevanceScore };
+    this.staticUrlFeatures.set(url, features);
+    if (this.staticUrlFeatures.size > this.maxUrlCache) {
+      this.staticUrlFeatures.delete(this.staticUrlFeatures.keys().next().value);
+    }
+    return features;
   }
 
   extractFeatures(url, context = {}) {
-    const host = safeHost(url);
-    const urlPath = safePath(url);
-    const scheme = safeScheme(url);
-
-    
-    let domainAuthority = this.baseAuthority(url);
+    // Only URL properties are cached. The current context, visit/click
+    // history and model weights can differ on the very next call.
+    const { host, authority, depthScore, relevanceScore } = this.getStaticUrlFeatures(url);
+    let domainAuthority = authority;
     
     const clickCount = this.domainClickCounts.get(host) || 0;
     if (clickCount > 0) domainAuthority = Math.min(1, domainAuthority + 0.1 * Math.log(1 + clickCount));
 
     
-    const linkContextScore = clamp({
-      "html": 0.7, "css": 0.3, "js": 0.4, "data": 0.5,
-      "image": 0.2, "media": 0.2, "font": 0.1, "asset": 0.15,
-      "sitemap": 0.6, "broad-scan": 0.3, "attribute-scan": 0.25,
-      "lazy-attribute": 0.35, "preload-runtime": 0.4,
-      "css-url": 0.2, "css-import": 0.25, "json-discovered": 0.45,
-      "media-manifest": 0.3, "link-header": 0.4,
-    }[context.type] || 0.3, 0, 1);
+    const linkContextScore = LINK_CONTEXT_SCORES.get(context.type) ?? 0.3;
 
     
     const contentTypeScore = context.type === "html" ? 0.85 : 0.3;
 
     
-    const pathSegments = urlPath.split("/").filter(Boolean);
-    const depthScore = clamp(1 - pathSegments.length * 0.15, 0.1, 1);
-
-    
     const ageMs = context.discoveredAt ? now() - context.discoveredAt : 0;
     const freshnessScore = clamp(1 - ageMs / (30 * 60 * 1000), 0.3, 1);
-
-    
-    const urlText = (host + " " + urlPath).toLowerCase();
-    const commonTerms = ["api", "docs", "guide", "tutorial", "reference", "example",
-      "blog", "news", "article", "wiki", "learn", "course", "book", "manual"];
-    const relevanceScore = clamp(commonTerms.filter(t => urlText.includes(t)).length / 3, 0, 1);
 
     
     const internalLinkScore = context.internal ? 0.7 : 0.4;
@@ -177,17 +186,7 @@ class NeuralCrawlerModel {
   
   scoreUrl(url, context = {}) {
     this.stats.scored++;
-    let features = this.urlFeatures.get(url);
-    if (!features) {
-      features = this.extractFeatures(url, context);
-      this.urlFeatures.set(url, features);
-      if (this.urlFeatures.size > this.maxUrlCache) {
-        
-        const firstKey = this.urlFeatures.keys().next().value;
-        this.urlFeatures.delete(firstKey);
-      }
-    }
-    const s = this.score(features);
+    const s = this.score(this.extractFeatures(url, context));
     this.stats.avgScore = (this.stats.avgScore * 0.99) + (s * 0.01);
     return s;
   }
@@ -197,7 +196,7 @@ class NeuralCrawlerModel {
   train(feedback) {
     const url = feedback.url;
     const features = Array.isArray(feedback.features) ? feedback.features :
-      url ? this.urlFeatures.get(url) || this.extractFeatures(url, feedback.context || {}) : null;
+      url ? this.extractFeatures(url, feedback.context || {}) : null;
     if (!features || features.length !== NUM_FEATURES || !features.every(n => Number.isFinite(n) && n >= 0 && n <= 1)) return false;
     const target = feedback.positive ? 1 : 0;
     const weight = feedback.weight || 1.0;
@@ -341,7 +340,7 @@ class NeuralCrawlerModel {
       stats: { ...this.stats },
       topDomains,
       feedbackCount: this.feedbackHistory.length,
-      urlCacheSize: this.urlFeatures.size,
+      urlCacheSize: this.staticUrlFeatures.size,
       domainCount: this.domainClickCounts.size,
     };
   }
@@ -355,7 +354,7 @@ class NeuralCrawlerModel {
     this.feedbackHistory = [];
     this.domainClickCounts.clear();
     this.domainVisitCounts.clear();
-    this.urlFeatures.clear();
+    this.staticUrlFeatures.clear();
     this.stats = { scored: 0, trained: 0, positiveFeedback: 0, negativeFeedback: 0, avgScore: 0, domainDiversityScore: 0 };
   }
 }

@@ -43,11 +43,12 @@ function matchPercent(vector, model = artifact) {
   if (!vector[3]) return 1;
   return Math.max(1, Math.min(100, Math.round(100 * (.75 * heuristic(vector) + .25 * predict(vector, model)))));
 }
-function rankMatchBatch(query, rows, category) {
+// The search engine has already ordered and paginated these rows. A badge
+// describes lexical match; it must not replace the engine's ranking.
+function annotateMatchBatch(query, rows, category) {
   const terms = prepareQuery(query);
   return (Array.isArray(rows) ? rows : []).filter(row => row && typeof row === "object" && !Array.isArray(row))
-    .map(row => ({ ...row, matchPercent: matchPercent(features(terms, row, category)) }))
-    .sort((a, b) => b.matchPercent - a.matchPercent);
+    .map(row => ({ ...row, matchPercent: matchPercent(features(terms, row, category)) }));
 }
 
-module.exports = { prepareQuery, features, heuristic, predict, matchPercent, rankMatchBatch, matchModelVersion: artifact.version };
+module.exports = { prepareQuery, features, heuristic, predict, matchPercent, annotateMatchBatch, matchModelVersion: artifact.version };

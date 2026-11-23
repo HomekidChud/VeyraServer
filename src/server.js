@@ -25,7 +25,7 @@ const { merchantProductUrl, PRODUCT_BYTES } = require("./services/india-storefro
 const { publicImageUrl, imageIdentity } = require("./services/crawl-page-data");
 const { parseSiteScope, allowsSiteUrl } = require("./services/search-site-scope");
 const { searchPrivacy, masksSearchScope, allowsSearchResult } = require("./services/search-privacy");
-const { rankMatchBatch, matchModelVersion } = require("./services/search-match");
+const { annotateMatchBatch, matchModelVersion } = require("./services/search-match");
 const { createSourceSearch, defaultEvidence, sourcePageUrl } = require("./services/source-search");
 const { referenceResults } = require("./services/reference-catalog");
 const { installBrandRoutes, isReservedOriginPath, brandNotFoundHtml } = require("./services/brand");
@@ -6513,7 +6513,7 @@ app.get('/api/search', (req, res) => {
     const limit = Math.min(CFG.maxSearchResults, Math.max(1, Number(req.query.limit || 20) || 20));
     const started = Date.now();
     const result = localSearch(scoped, offset, limit, { region: req.query.region, topical: true, privacy });
-    res.json({ ok: true, ...result, results: rankMatchBatch(query, result.results, "index"), matchModel: matchModelVersion, provider: "veyra-index", responseTimeMs: Date.now() - started });
+    res.json({ ok: true, ...result, results: annotateMatchBatch(query, result.results, "index"), matchModel: matchModelVersion, provider: "veyra-index", responseTimeMs: Date.now() - started });
   } catch (e) { respondError(res, 500, e.message, "SEARCH_ERROR"); }
 });
 app.get('/api/search/stats', (req, res) => res.json({ ok: true, ...searchIndexStats() }));
@@ -6585,13 +6585,13 @@ app.get('/api/search/web', async (req, res) => {
       // Candidate rows are used internally for ranking, not a second public feed.
       const { candidates: _candidates, ...publicResult } = result;
       const eligible = result.results.filter(row => allowsSearchResult(privacy, row));
-      let results = rankMatchBatch(q, sourceLane
+      let results = annotateMatchBatch(q, sourceLane
         ? eligible.map(row => ({ ...row, evidence: row.evidence || defaultEvidence(row) })) : eligible, "web");
       if (!domain || req.query.incognito === "1") results = results.map(({ media, ...row }) => row);
       if (googleHome) {
         const key = canonicalKey(googleHome);
         const found = results.find(row => canonicalKey(row.url) === key);
-        const [home] = rankMatchBatch(q, [{ url: googleHome, title: "Google", displayUrl: "google.com", source: "veyra-navigation" }], "web");
+        const [home] = annotateMatchBatch(q, [{ url: googleHome, title: "Google", displayUrl: "google.com", source: "veyra-navigation" }], "web");
         results = [{ ...(found || home), url: googleHome, canonicalUrl: key, title: "Google" },
           ...results.filter(row => canonicalKey(row.url) !== key)].slice(0, limit);
       }
@@ -6716,7 +6716,7 @@ app.get("/api/search/vertical", async (req, res) => {
       const section = category => ({ type: category, provider: "none", status: "filtered", results: [], nextPage: null });
       return res.json(type === "all" ? { ok: true, type, sections: SEARCH_VERTICALS.map(section) } : { ok: true, ...section(type) });
     }
-    const withMatches = (section, category) => ({ ...section, results: rankMatchBatch(q, section.results.filter(row =>
+    const withMatches = (section, category) => ({ ...section, results: annotateMatchBatch(q, section.results.filter(row =>
       allowsSearchResult(privacy, row) && allowsSiteUrl(scope, row.sourcePageUrl || row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl)) &&
       (category === "images" || allowsSiteUrl(scope, row.url))), category), matchModel: matchModelVersion });
     if (thumbnailPreview && options.privateSearch) return res.json({ ok: true, type, provider: "none", status: "empty", results: [], nextPage: null });
