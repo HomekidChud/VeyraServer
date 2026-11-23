@@ -22,6 +22,19 @@ const DEFAULT_ANSWER_PAGE_BYTES = 512 * 1024;
 const MAX_ANSWER_PAGE_BYTES = 1024 * 1024;
 let groqModelCache = null;
 
+async function untilAbort(work, signal, onAbort) {
+  if (!signal) return work;
+  if (signal.aborted) return onAbort();
+  let cancel;
+  try {
+    return await Promise.race([work, new Promise(resolve => {
+      cancel = () => resolve(onAbort());
+      signal.addEventListener("abort", cancel, { once: true });
+    })]);
+  } finally {
+    signal.removeEventListener("abort", cancel);
+  }
+}
 function cleanText(value, max = 10000) {
   return String(value || "").replace(/\u00a0/g, " ").replace(/[ \t\r\n]+/g, " ").trim().slice(0, max);
 }
@@ -438,6 +451,7 @@ class AIAnswerEngine {
     this.maxContentBytes = Number.isSafeInteger(pageBytes) && pageBytes > 0
       ? Math.min(pageBytes, MAX_ANSWER_PAGE_BYTES) : DEFAULT_ANSWER_PAGE_BYTES;
     this.timeoutMs = opts.timeoutMs || Number(process.env.AI_ANSWER_TIMEOUT_MS || 10000);
+    this.readBudgetMs = opts.readBudgetMs || 6500;
     this.fetchConcurrency = Math.max(2, Math.min(12, Number(process.env.AI_ANSWER_FETCH_CONCURRENCY) || 8));
     this.userAgent = opts.userAgent || "VeyraAIBot/2.0 (+https://veyra.app/bot)";
     this.providerSettings = providerConfig(process.env, opts.model || "");
@@ -457,7 +471,7 @@ class AIAnswerEngine {
     if (chatContext) intent.type = this.detectIntent(chatContext.question).type;
     if (!q) return { hasAnswer: false, reason: "No query provided" };
     const results = this.normalizeResults(searchResults).filter(allowSource).slice(0, this.maxPagesToRead);
-    const readDeadline = AbortSignal.timeout(6500);
+    const readDeadline = AbortSignal.timeout(this.readBudgetMs);
     const contents = await this.fetchContents(results, signal ? AbortSignal.any([signal, readDeadline]) : readDeadline,
       allowSource, noCache, requireReadableEvidence, indexOnly);
     signal?.throwIfAborted();
@@ -471,9 +485,10 @@ class AIAnswerEngine {
     if (!evidence.length) return { hasAnswer: false, reason: "No readable source evidence found", query: q, intent, pipeline: { retrieved: results.length, fetched: contents.length, selected: 0, sourceRetrieval: retrievalDiagnostics } };
     const synthesisDiagnostics = {};
     const synthDeadline = AbortSignal.timeout(Math.min(this.llmTimeoutMs, 11500));
-    const llm = await this.synthesizeWithLLM(q, intent, evidence, synthesisDiagnostics, vertical, signal ? AbortSignal.any([signal, synthDeadline]) : synthDeadline, chatContext,
-      requireReadableEvidence && !chatContext)
+    const synthesisSignal = signal ? AbortSignal.any([signal, synthDeadline]) : synthDeadline;
+    const work = this.synthesizeWithLLM(q, intent, evidence, synthesisDiagnostics, vertical, synthesisSignal, chatContext, requireReadableEvidence && !chatContext)
       .catch(() => { synthesisDiagnostics.failureCode = "provider_error"; return null; });
+    const llm = await untilAbort(work, synthesisSignal, () => { synthesisDiagnostics.failureCode = "timeout"; return null; });
     signal?.throwIfAborted();
     const draftVerification = llm ? this.verifyAnswer(llm.answer, evidence, { strict: true }) : null;
     const supported = draftVerification?.claims.filter(claim => claim.status === "supported-by-overlap" && !this.isVerbatimCopy(claim.text, evidence)) || [];
@@ -562,13 +577,16 @@ class AIAnswerEngine {
           const content = indexed.length >= (requireReadableEvidence ? 120 : 80)
             ? { ...this.parseContent(indexed, r.canonicalUrl || r.url), extractionStatus: "local-index", extractionQuality: 0.7 }
             : indexOnly ? null : await this.fetchPageContent(r.url, { signal, noCache, requireReadableEvidence });
+          if (signal?.aborted) return;
           if (requireReadableEvidence && content?.answerExcerptAllowed === false) continue;
           if (requireReadableEvidence && content && /\b(?:before you continue to|verify (?:that )?you are human|checking your browser|cloudflare ray id|unusual traffic)\b/i.test(`${content.title} ${content.text.slice(0, 500)}`)) continue;
           if (content?.text?.length >= 80 && allowSource(content)) out.push({ ...content, url: r.url, canonicalUrl: content.canonicalUrl || r.canonicalUrl || r.url, pageTitle: content.title, title: content.title || ((!requireReadableEvidence || content.extractionStatus === "local-index") && r.title !== r.url ? r.title : "") || r.url, snippet: requireReadableEvidence ? "" : r.snippet, rank: r.rank, sourceIdentity: host(content.url || r.url), provider: r.provider || r.source?.provider || r.source, retrievedAt: r.retrievedAt || new Date().toISOString(), publishedAt: content.publishedAt || r.publishedAt || null, extractionStatus: content.extractionStatus || "extracted" });
         } catch {}
       }
     });
-    await Promise.all(workers);
+    // A provider or cache can fail to settle on abort. Do not lose already
+    // completed sources or keep the signed-in overview slot waiting for it.
+    await untilAbort(Promise.all(workers), signal, () => null);
     out.sort((a, b) => (a.rank || 999) - (b.rank || 999));
     return out;
   }

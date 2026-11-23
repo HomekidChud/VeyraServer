@@ -591,6 +591,24 @@ assert.ok(qualityEvaluation.after.logLoss < qualityEvaluation.before.logLoss, "o
   assert.doesNotMatch(launch.answer, /awards|headline/);
   assert.equal(launch.sources[0].url, "https://example.test/launch");
 
+  const stalledReader = new AIAnswerEngine({ readBudgetMs: 30, llmTimeoutMs: 40 });
+  stalledReader.fetchPageContent = url => url.endsWith("/stalled") ? new Promise(() => {}) :
+    Promise.resolve(stalledReader.parseContent(paddedArticle, url));
+  stalledReader.synthesizeWithLLM = () => new Promise(() => {});
+  const holdForDeadline = setTimeout(() => {}, 1000);
+  try {
+    const finished = await stalledReader.answer("The Neon Atlas release date", [{ url: "https://example.test/stalled" },
+      { url: "https://example.test/ready" }], { requireReadableEvidence: true });
+    assert.equal(finished.hasAnswer, false);
+    assert.equal(finished.pipeline.fetched, 1, "keep completed source reads when another fetch never settles");
+    assert.equal(finished.pipeline.selected, 1);
+    const controller = new AbortController();
+    const cancelled = stalledReader.answer("The Neon Atlas release date", [{ url: "https://example.test/stalled" }],
+      { signal: controller.signal, requireReadableEvidence: true });
+    controller.abort();
+    await assert.rejects(cancelled, { name: "AbortError" });
+  } finally { clearTimeout(holdForDeadline); }
+
   const opts = { requireReadableEvidence: true, requirePageEvidence: true, vertical: "news" };
   const rankCalls = [];
   const localModel = new AIAnswerEngine({ allowNeuralFallback: true, fallbackRanker: { scoreUrl(url) {
