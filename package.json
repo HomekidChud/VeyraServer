@@ -16,7 +16,7 @@
     "train:vertical-ranker": "node scripts/train-vertical-ranker.js --write",
     "evaluate:search-match": "node scripts/train-search-match.js",
     "check:visual-rights": "node scripts/train-visual-ranker.js --check-rights",
-    "test:publisher-media": "node --test tests/publisher-media.test.js",
+    "test:publisher-media": "node --test tests/publisher-media.test.js tests/tiktok-share.test.js",
     "test:yoti-sandbox": "node --test tests/yoti-sandbox.test.js",
     "smoke:yoti-sandbox": "node scripts/yoti-sandbox-smoke.js",
     "test:visual-ranker": "node --test tests/media-rights-ledger.test.js tests/visual-ranker.test.js",
