@@ -6650,6 +6650,12 @@ function publisherMediaRequired(req, res, next) {
   next();
 }
 const publisherToken = req => /^Bearer\s+(\S+)$/i.exec(req.get("authorization") || "")?.[1] || "";
+app.get("/api/search/publisher/status", publisherMediaRequired, requireUser, (req, res) => {
+  if (!publisherMedia.browserAvailable(req.query.domain)) {
+    return respondError(res, 404, "Publisher search is unavailable.", "PUBLISHER_UNAVAILABLE");
+  }
+  res.json({ ok: true });
+});
 app.post("/api/search/publisher/challenge", publisherMediaRequired, requireUser, (req, res) => {
   const grant = publisherMedia.issue(req.veyraUser.id, publisherToken(req));
   if (!grant) return respondError(res, 503, "Publisher search is temporarily unavailable.", "PUBLISHER_UNAVAILABLE");

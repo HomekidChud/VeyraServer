@@ -74,6 +74,7 @@ test("counts 4,311 synthetic accepted records, filters unsafe URLs, and enforces
   let time = fixedTime;
   const catalog = createPublisherMedia({ env: config, now: () => time, log: (level, message) => lines.push({ level, message }) });
   assert.ok(catalog);
+  assert.equal(catalog.browserAvailable("pornhub.com"), false, "the Browser surface is separately opt-in");
   const counters = lines.map(line => JSON.parse(line.message.slice("Publisher catalog loaded ".length)));
   assert.deepEqual(counters.map(item => item.indexed), total);
   assert.ok(counters.every(item => item.received === item.indexed + 5 && item.missingThumbnail === 1 &&
@@ -103,6 +104,7 @@ test("counts 4,311 synthetic accepted records, filters unsafe URLs, and enforces
     assert.equal(initial.total, total[n]);
     assert.equal(initial.results.length, 24);
     assert.equal(initial.nextPage, 1);
+    assert.equal(initial.expiresInMs, (Math.floor(time / 1000) + 120) * 1000 - time);
     assert.equal(request(`search:${domain} lunar atlas`).total, Math.ceil(total[n] / 2));
     assert.equal(request(`search:${domain} lunar telescope`).total, 0);
     const second = catalog.search("adult-fixture", "fixture-session-token", { nonce, q: `search:${domain}`, page: 1 });
@@ -121,7 +123,8 @@ test("Express route serves synthetic publisher rows only after sign-in and signe
   persist(snapshot(Date.now(), [25, 26]));
   Object.assign(process.env, config, {
     VEYRA_DATA_DIR: join(catalogDir, "runtime"), ACCESS_GATE: "0",
-    VEYRA_ALLOW_SIGNUP: "1", VEYRA_SIGNUP_KEY: "", VEYRA_CHROMIUM_ENABLED: "false", VEYRA_TEST_MODE: "0"
+    VEYRA_ALLOW_SIGNUP: "1", VEYRA_SIGNUP_KEY: "", VEYRA_CHROMIUM_ENABLED: "false", VEYRA_TEST_MODE: "0",
+    VEYRA_PUBLISHER_BROWSER: "1"
   });
   delete process.env.MONGODB_URI;
   const { app } = require("../src/server");
@@ -139,6 +142,15 @@ test("Express route serves synthetic publisher rows only after sign-in and signe
     const signup = await post("auth/signup", { email: "publisher-fixture@example.test", name: "Publisher fixture", password: "Fixture-pass-123!" });
     assert.equal(signup.status, 201);
     const { token } = await signup.json();
+    const status = (query, bearer = token) => fetch(`${base}/api/search/publisher/status?${query}`,
+      { headers: bearer ? { Authorization: `Bearer ${bearer}` } : {} });
+    assert.equal((await status("domain=pornhub.com", "")).status, 401);
+    assert.equal((await status("domain=pornhub.com&private=1")).status, 404);
+    assert.equal((await status("domain=pornhub.com&incognito=1")).status, 404);
+    assert.equal((await status("domain=pornhub.com.evil.test")).status, 404);
+    const available = await status("domain=pornhub.com");
+    assert.equal(available.headers.get("cache-control"), "private, no-store");
+    assert.deepEqual(await available.json(), { ok: true });
     const challenge = await post("search/publisher/challenge", {}, token);
     assert.equal(challenge.status, 200);
     const { nonce } = await challenge.json();
@@ -155,6 +167,7 @@ test("Express route serves synthetic publisher rows only after sign-in and signe
       const result = await response.json();
       assert.equal(result.total, 25 + n);
       assert.equal(result.results.length, 24);
+      assert.ok(result.expiresInMs > 0 && result.expiresInMs <= 120_000);
       assert.ok(result.results.every(row => row.thumbnail));
     }
     assert.equal((await post("search/publisher?incognito=1", { nonce, q: "search:xvideos.com" }, token)).status, 404);
