@@ -59,6 +59,49 @@ const legacy = new NeuralCrawlerModel();
 assert.equal(legacy.loadData({ version: 1, weights: Array(NUM_FEATURES).fill(0.2), bias: 0.1 }), true, "legacy v1 checkpoints remain loadable");
 assert.equal(legacy.optimizerStep, 0);
 assert.equal(model.report().optimizer.name, "AdamW");
+
+const dynamicUrl = "https://crawler-fixture.example/docs/guide";
+const htmlContext = { type: "html", internal: true };
+const cssContext = { type: "css", internal: false };
+const dynamicModel = () => {
+  const m = new NeuralCrawlerModel({ maxUrlCache: 2 });
+  m.weights.set([1, 0.2, 0.6, 0.1, 0.8, 0.1, 0.5, 0.4, 1.5, 0.7]);
+  return m;
+};
+const htmlFirst = dynamicModel(), cssFirst = dynamicModel();
+const htmlScore = htmlFirst.scoreUrl(dynamicUrl, htmlContext);
+const cssScore = cssFirst.scoreUrl(dynamicUrl, cssContext);
+assert.ok(htmlScore > cssScore);
+assert.equal(htmlFirst.scoreUrl(dynamicUrl, cssContext), cssScore);
+assert.equal(cssFirst.scoreUrl(dynamicUrl, htmlContext), htmlScore);
+assert.ok(htmlFirst.scoreUrl(dynamicUrl, { ...htmlContext, discoveredAt: Date.now() - 60 * 60 * 1000 }) < htmlScore);
+htmlFirst.recordVisit("https://crawler-fixture.example/another-page");
+assert.ok(htmlFirst.scoreUrl(dynamicUrl, htmlContext) < htmlScore, "a cached URL must see new domain visits");
+const originalClock = Date.now;
+try {
+  let time = originalClock();
+  Date.now = () => time;
+  const fading = { ...htmlContext, discoveredAt: time };
+  const fresh = cssFirst.scoreUrl(dynamicUrl, fading);
+  time += 15 * 60 * 1000;
+  assert.ok(cssFirst.scoreUrl(dynamicUrl, fading) < fresh, "freshness decays even when the context is reused");
+} finally { Date.now = originalClock; }
+
+const hot = dynamicModel(), cold = dynamicModel();
+hot.scoreUrl(dynamicUrl, htmlContext);
+const beforeUpdate = hot.extractFeatures(dynamicUrl, cssContext);
+for (const m of [hot, cold]) assert.equal(m.train({ url: dynamicUrl, context: cssContext, positive: true }), true);
+assert.deepEqual(hot.serialize().weights, cold.serialize().weights, "URL-only feedback must use its own context even with a warm cache");
+const afterUpdate = hot.extractFeatures(dynamicUrl, cssContext);
+assert.ok(afterUpdate[0] > beforeUpdate[0], "authority must include new domain clicks");
+assert.notEqual(afterUpdate[8], beforeUpdate[8], "model-derived input must reflect updated weights");
+assert.equal(hot.scoreUrl(dynamicUrl, cssContext), hot.score(afterUpdate));
+hot.scoreUrl("https://crawler-fixture.example/second");
+hot.scoreUrl("https://crawler-fixture.example/third");
+assert.equal(hot.report().urlCacheSize, 2);
+hot.reset();
+assert.equal(hot.report().urlCacheSize, 0);
+
 (async () => {
   await assert.rejects(() => robot.fetchRaw("https://127.0.0.1/private"), error => error.code === "SAFE_FETCH_REQUIRED", "crawler workers without the socket-validated adapter must fail closed");
   const safeRobot = new NeuralRobot(1, { fetchPage: async url => ({

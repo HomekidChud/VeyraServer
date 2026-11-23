@@ -1,6 +1,9 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 const { setImmediate: flush } = require("node:timers/promises");
 const { NeuralCrawlerModel, NUM_FEATURES } = require("../src/services/neural-crawler");
 const { NeuralLearningWorker } = require("../src/services/neural-learning");
@@ -8,7 +11,7 @@ const { createPublicCrawlTrainer, responseTrainingPolicy, classifyCrawlObservati
 const { NeuralRobotPool } = require("../src/services/neural-robots");
 const { AcquisitionManager } = require("../src/services/acquisition-manager");
 const { MongoStore } = require("../src/core/mongo-store");
-const { TRAIN_TOPICS, HOLDOUT_TOPICS, run } = require("../scripts/evaluate-neural-training");
+const { TRAIN_TOPICS, HOLDOUT_TOPICS, run, runDataset, main } = require("../scripts/evaluate-neural-training");
 
 const url = "https://docs.python.org/3/library/overview.html";
 const dead = "https://docs.python.org/3/library/old-reference.html";
@@ -134,6 +137,41 @@ async function verify() {
   assert.equal(evaluation.holdoutExamples, 48);
   assert.ok(evaluation.after.logLoss < evaluation.before.logLoss);
   assert.ok(evaluation.after.pairAccuracy > evaluation.before.pairAccuracy);
+
+  const examplePair = (split, publisher, topic) => ({
+    split, publisher, topic, rights: "owned", rightsReference: "approval-internal-fixture",
+    useful: { url: `https://${publisher}.example.org/docs/tutorial/reference`, internal: true },
+    deadEnd: { url: `https://${publisher}.example.org/archive/legacy/old/missing`, internal: false }
+  });
+  const splitData = { schemaVersion: 1, datasetId: "synthetic-import-test", pairs: [
+    examplePair("train", "train-publisher", "transit"),
+    examplePair("holdout", "holdout-publisher", "weather")
+  ] };
+  const { checkpoint: candidate, report } = runDataset(splitData);
+  assert.equal(report.optimizerUpdates, 10);
+  assert.equal(report.holdoutExamples, 2);
+  assert.equal(new NeuralCrawlerModel().loadData(candidate), true);
+  assert.doesNotMatch(JSON.stringify(candidate), /example\.org|approval-internal-fixture|holdout-publisher/);
+  for (const change of [
+    { publisher: "train-publisher" }, { topic: "transit" }, { rights: "publicly-visible" }, { rightsReference: "" },
+    { deadEnd: { url: "https://train-publisher.example.org/a", internal: false } },
+    { deadEnd: { url: "https://holdout-publisher.example.org/?token=private", internal: false } },
+    { deadEnd: splitData.pairs[1].useful }
+  ]) assert.throws(() => runDataset({ ...splitData, pairs: [splitData.pairs[0], { ...splitData.pairs[1], ...change }] }));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "veyra-offline-training-"));
+  try {
+    const input = path.join(dir, "dataset.json"), output = path.join(dir, "v1.candidate.json");
+    fs.writeFileSync(input, JSON.stringify(splitData));
+    assert.equal(main(["--dataset", input]).candidateWritten, false);
+    assert.equal(fs.existsSync(output), false);
+    assert.equal(main(["--dataset", input, "--candidate-out", output]).candidateWritten, true);
+    assert.equal(JSON.parse(fs.readFileSync(output, "utf8")).offlineTraining.datasetId, splitData.datasetId);
+    assert.throws(() => main(["--dataset", input, "--candidate-out", output]), { code: "EEXIST" });
+    assert.throws(() => main(["--dataset", input, "--candidate-out", path.join(dir, "neural-model.json")]), /live checkpoint/);
+    assert.throws(() => main(["--candidate-out", output]), /requires a permissioned/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
   console.log("Neural training sources, private/noindex filtering, durable feature rows, concurrency budget and offline holdout passed");
 }
 
