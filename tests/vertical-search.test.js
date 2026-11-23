@@ -141,6 +141,16 @@ test("the requested subject, not generic action words, controls video results", 
   assert.deepEqual((await service.search("videos", "fix a leaking tap", { provider: "peertube" })).results.map(r => r.title), ["Repair a leaking tap"]);
 });
 
+test("a video tutorial does not match when the requested subject is only an ingredient", async () => {
+  const service = mock({ "sepiasearch.org": { total: 2, data: [
+    { name: "How to make a sourdough focaccia pizza!!", truncatedDescription: "Ingredients: 60 g sourdough starter",
+      url: "https://video.example/w/pizza", nsfw: false, privacy: { id: 1 } },
+    { name: "Make a sourdough starter from scratch", url: "https://video.example/w/starter", nsfw: false, privacy: { id: 1 } }
+  ] } });
+  assert.deepEqual((await service.search("videos", "how to make sourdough starter", { provider: "peertube" })).results.map(r => r.title),
+    ["Make a sourdough starter from scratch"]);
+});
+
 test("verified videos surface direct, scoped watch links without a paid provider", async () => {
   const service = mock({ "sepiasearch.org": { total: 0, data: [] } });
   for (const [q, count] of [["how to fix a leaking tap", 3], ["dripping faucet", 3], ["how to make crispy dosa", 4], ["डोसा", 4], ["Python asyncio", 2]]) {
@@ -437,6 +447,28 @@ test("searches an eligible Stack Exchange community alongside HN, except in inco
   const count = service.calls.filter(call => call.url?.hostname === "api.stackexchange.com").length;
   assert.equal((await service.search("discussions", "dosa batter", { privateSearch: true })).provider, "hacker-news");
   assert.equal(service.calls.filter(call => call.url?.hostname === "api.stackexchange.com").length, count);
+});
+
+test("Discussions searches both subjects of a comparison without requiring the comparison wording", async () => {
+  const query = "SQLite versus PostgreSQL";
+  const service = mock({
+    "api.stackexchange.com": url => {
+      assert.equal(url.searchParams.get("site"), "dba");
+      assert.equal(url.searchParams.get("q"), "SQLite PostgreSQL");
+      return { items: [{ title: "PostgreSQL vs SQLite", link: "https://dba.stackexchange.com/questions/7/databases" }] };
+    },
+    "hn.algolia.com": url => {
+      assert.equal(url.searchParams.get("query"), "SQLite PostgreSQL");
+      return { hits: [{ objectID: "24", title: "SQLite or PostgreSQL? It's Complicated" }] };
+    }
+  });
+  const both = await service.search("discussions", query);
+  assert.deepEqual(new Set(both.results.map(row => row.provider)), new Set(["stack-exchange", "hacker-news"]));
+  const scoped = await service.search("discussions", `site:dba.stackexchange.com ${query}`);
+  assert.deepEqual(scoped.results.map(row => row.provider), ["stack-exchange"]);
+  const incognito = await service.search("discussions", query, { privateSearch: true });
+  assert.deepEqual(incognito.results.map(row => row.provider), ["hacker-news"]);
+  assert.equal(service.calls.filter(call => call.url.host === "api.stackexchange.com").length, 2);
 });
 
 test("NASA Images results cite the item page and use only NASA-hosted image previews", async () => {
