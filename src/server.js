@@ -3866,11 +3866,11 @@ function isReferenceImageSource(url) {
     .some(domain => host === domain || host.endsWith(`.${domain}`));
 }
 function localVideoSearch(query, offset, limit, region) {
-  return localSearch(query, offset, limit, { region, onlyWatchPages: true, requireTerms: true, topical: true });
+  return localSearch(query, offset, limit, { region, onlyWatchPages: true, requireTerms: !parseSiteScope(query).include.length, topical: true });
 }
 function localImageSearch(query, region) {
   const parsed = parseSearchQuery(query);
-  if (!parsed.terms.length || parsed.siteScope.invalid) return [];
+  if ((!parsed.terms.length && !parsed.siteScope.include.length) || parsed.siteScope.invalid) return [];
   const { results } = localSearch(query, 0, 40, { region, onlyWithImages: true });
   const feeds = results.filter(page => isReferenceImageSource(page.url)).map(page => {
     const candidates = [];
@@ -3881,7 +3881,7 @@ function localImageSearch(query, region) {
       let path = new URL(url).pathname;
       try { path = decodeURIComponent(path); } catch {}
       const words = new Set(tokenizeSearch(`${item.title || (item.primary ? page.title : "")} ${path.replace(/[-_]/g, " ")}`));
-      if (!parsed.terms.some(term => words.has(term))) continue;
+      if (parsed.terms.length && !parsed.terms.some(term => words.has(term))) continue;
       candidates.push({ url, imageUrl: url, sourcePageUrl: page.url, source: hostOf(page.url), thumbnail: url, title, snippet: page.title });
     }
     return candidates;
@@ -6538,7 +6538,7 @@ app.get('/api/search/web', async (req, res) => {
   if (isPrivate) { req.veyraPrivateTraffic = true; res.set("Cache-Control", "no-store"); }
   try {
     const raw = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 600) : "";
-    const { query: q, preferGoogle } = searchEntry(raw);
+    const { query: q, preferGoogle, domain } = searchEntry(raw);
     if (!q) return res.json({ ok: true, provider: "none", results: [], attempts: [], responseTimeMs: 0 });
     const engine = String(req.query.engine || "").trim().toLowerCase();
     const selected = GENERAL_ENGINES.includes(engine) ? engine : "";
@@ -6563,6 +6563,7 @@ app.get('/api/search/web', async (req, res) => {
     const reply = result => {
       let results = rankMatchBatch(q, sourceLane
         ? result.results.map(row => ({ ...row, evidence: row.evidence || defaultEvidence(row) })) : result.results, "web");
+      if (!domain || req.query.incognito === "1") results = results.map(({ media, ...row }) => row);
       if (googleHome) {
         const key = canonicalKey(googleHome);
         const found = results.find(row => canonicalKey(row.url) === key);
@@ -6582,7 +6583,7 @@ app.get('/api/search/web', async (req, res) => {
     const references = !selected && !offset ? referenceResults(scope, Math.min(3, limit)) : [];
     const inScope = row => row && canonicalKey(row.url) && allowsSiteUrl(scope, row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl));
     const [result, discovered] = await Promise.all([
-      (app.locals.veyraWebSearch || webSearch).search(q, { offset, limit, engine: selected, preferGoogle: wantsGoogle, lang, region: req.query.region,
+      (app.locals.veyraWebSearch || webSearch).search(q, { offset, limit, engine: selected, preferGoogle: wantsGoogle, domainBrowse: !!domain, lang, region: req.query.region,
         signal: request.signal, noCache: isPrivate || !CFG.globalCacheEnabled, feed, reference: true,
         privateSearch: req.query.incognito === "1" }).catch(error => {
         if (!firstSourcePage && !references.length && !googleHome) throw error;
@@ -6636,25 +6637,29 @@ app.get('/api/search/web', async (req, res) => {
 
 app.get("/api/search/vertical", async (req, res) => {
   const type = typeof req.query.type === "string" ? req.query.type : "";
-  const q = searchEntry(typeof req.query.q === "string" ? req.query.q.trim().slice(0, 600) : "").query;
+  const { query: q, domain } = searchEntry(typeof req.query.q === "string" ? req.query.q.trim().slice(0, 600) : "");
   const page = Number(req.query.page ?? 0);
   const provider = typeof req.query.provider === "string" ? req.query.provider : "";
   const thumbnailPreview = req.query.preview === "1";
   const lastPage = lastVerticalPage(type, provider);
-  if ((type !== "all" && !SEARCH_VERTICALS.includes(type)) || !Number.isInteger(page) || page < 0 || page > lastPage || (page > 0 && !provider) || !/^[a-z-]{0,24}$/.test(provider) || (type === "all" && (page || provider)) || (thumbnailPreview && (type !== "images" || page || provider))) {
+  if ((type !== "all" && !SEARCH_VERTICALS.includes(type)) || !Number.isInteger(page) || page < 0 || page > lastPage || (page > 0 && !provider) || !/^[a-z-]{0,24}$/.test(provider) || (type === "all" && (page || provider)) || (thumbnailPreview && (!["images", "videos"].includes(type) || page || provider))) {
     return respondError(res, 400, "Invalid search category or page.", "INVALID_SEARCH_CATEGORY");
   }
   const request = requestAbortSignal(req, res);
   try {
     const signal = AbortSignal.any([request.signal, AbortSignal.timeout(type === "all" ? 12000 : 9000)]);
     const service = app.locals.veyraVerticalSearch || verticalSearch;
-    const options = { page, provider, lang: req.query.lang, region: req.query.region, signal, noCache: req.veyraPrivateTraffic || req.query.incognito === "1" || !CFG.globalCacheEnabled, preview: type === "all", privateSearch: req.query.incognito === "1" };
-    const withMatches = (section, category) => ({ ...section, results: rankMatchBatch(q, section.results, category), matchModel: matchModelVersion });
+    const options = { page, provider, lang: req.query.lang, region: req.query.region, signal, noCache: req.veyraPrivateTraffic || req.query.incognito === "1" || !CFG.globalCacheEnabled, preview: type === "all", domainBrowse: !!domain, privateSearch: req.query.incognito === "1" };
+    const scope = parseSiteScope(q);
+    const withMatches = (section, category) => ({ ...section, results: rankMatchBatch(q, section.results.filter(row =>
+      row && allowsSiteUrl(scope, row.sourcePageUrl || row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl)) &&
+      (category === "images" || allowsSiteUrl(scope, row.url))), category), matchModel: matchModelVersion });
     if (thumbnailPreview && options.privateSearch) return res.json({ ok: true, type, provider: "none", status: "empty", results: [], nextPage: null });
     if (type !== "all") {
       const result = withMatches(await service.search(type, q, options), type);
       if (!thumbnailPreview) return res.json({ ok: true, ...result });
-      return res.json({ ok: true, type, provider: result.provider, status: result.status, results: result.results.filter(row => row.thumbnail).slice(0, 6), nextPage: null });
+      return res.json({ ok: true, type, provider: result.provider, status: result.status,
+        results: (type === "images" ? result.results.filter(row => row.thumbnail) : result.results).slice(0, 6), nextPage: null });
     }
     let cursor = 0;
     const sections = Array(SEARCH_VERTICALS.length);

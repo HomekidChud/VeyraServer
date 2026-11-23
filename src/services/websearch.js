@@ -57,7 +57,20 @@ function parseGoogleApi(json, shopping = false) {
     return [{ ...result, ...(price ? { price } : {}) }];
   });
 }
-function parseBraveApi(json) { return (Array.isArray(json?.web?.results) ? json.web.results : []).map(x => row(x.url, x.title, x.description || x.snippet, "brave")).filter(Boolean); }
+function parseBraveApi(json) {
+  return (Array.isArray(json?.web?.results) ? json.web.results : []).flatMap(x => {
+    if (!x) return [];
+    const result = row(x.url, x.title, x.description || x.snippet, "brave");
+    if (!result) return [];
+    const poster = safeHttpUrl(x.thumbnail?.src);
+    const thumbnail = poster && new URL(poster).origin === "https://imgs.search.brave.com" ? poster : "";
+    if (x.family_friendly === true && thumbnail) {
+      result.media = { type: x.video && typeof x.video === "object" ? "videos" : "images", thumbnail,
+        duration: cleanText(x.video?.duration, 32) };
+    }
+    return [result];
+  });
+}
 function parseBingApi(json) { return (Array.isArray(json?.webPages?.value) ? json.webPages.value : []).map(x => row(x.url, x.name || x.title, x.snippet, "bing")).filter(Boolean); }
 function parseMojeekHtml(html) {
   const $ = cheerio.load(String(html || "")); const out = [];
@@ -400,12 +413,14 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       return { name, results: [], ms, error: info.code, classification: info.classification };
     } finally { clearTimeout(timer); if (abortListener) controller.signal.removeEventListener("abort", abortListener); params.signal?.removeEventListener("abort", abortUpstream); }
   }
-  async function search(query, { offset = 0, engine = "", preferGoogle = false, lang = "", signal, limit = 20, noCache = false, region = "", shopping = false, feed = false, reference = false, topic = "", privateSearch = false } = {}) {
+  async function search(query, { offset = 0, engine = "", preferGoogle = false, domainBrowse = false, lang = "", signal, limit = 20, noCache = false, region = "", shopping = false, feed = false, reference = false, topic = "", privateSearch = false } = {}) {
     const requestStartedAt = Date.now(); let firstResultAt = null;
     const requestedLimit = Math.max(1, Math.min(50, Number(limit) || 20));
     const q = cleanText(query, 600); if (!q) return { provider: "none", results: [], attempts: [], responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: null };
     const scope = parseSiteScope(q);
     if (scope.invalid) return { provider: "none", results: [], attempts: [], more: false, siteFilter: { invalid: true }, responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: null };
+    const domainOnly = domainBrowse && !scope.text && scope.include[0];
+    const providerQuery = domainOnly ? `${q} ${domainOnly}` : q;
     region = india(region) ? "IN" : "";
     shopping = Boolean(region && shopping);
     const regionalLanguage = region ? indiaLanguage(scope.text || q, lang) : "";
@@ -422,7 +437,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
     preferGoogle = !engine && preferGoogle;
     const requested = [...new Set(engine && GENERAL_ENGINES.includes(engine) ? [engine]
       : [...(preferGoogle ? ["google"] : []), ...order.filter(name => GENERAL_ENGINES.includes(name))])].filter(name => !(name === "searxng" && privateSearch));
-    const key = JSON.stringify([requested, preferGoogle, native, offset, region, shopping, feed, !!includeReference, !!includeStack, topic, requestedLimit, regionalLanguage || lang, q.toLowerCase()]);
+    const key = JSON.stringify([requested, preferGoogle, native, offset, region, shopping, feed, !!includeReference, !!includeStack, topic, requestedLimit, regionalLanguage || lang, providerQuery.toLowerCase()]);
     const hit = noCache ? null : cache.get(key);
     if (hit && Date.now() - hit.time < cacheTtlMs) return { ...hit.value, cached: true, responseTimeMs: Date.now() - requestStartedAt };
     const attempts = []; let eligible = [];
@@ -463,7 +478,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
           nextAllowed.set(name, Date.now() + interval);
         }
         const providerLang = regionalLanguage ? (name === "brave" ? braveLanguage(regionalLanguage) : regionalLanguage.split("-")[0]) : lang;
-        const item = await runProvider(name, specialist.has(name) || providers[name].native ? scope.text : q, { offset, limit: requestedLimit,
+        const item = await runProvider(name, specialist.has(name) || providers[name].native ? scope.text : providerQuery, { offset, limit: requestedLimit,
           lang: name === "wikipedia" ? referenceLang : providerLang, region, shopping, feed, filterRows: scopedRows,
           signal: requestController.signal, isCancelled: () => callerCancelled, isDeadlineExpired: () => deadlineExpired,
           isEarlyCancel: () => earlyCancelled, onResults: at => { if (firstResultAt == null) firstResultAt = at; } });
@@ -487,11 +502,12 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
         if (result.upstreamEngines) existing.upstreamEngines = [...new Set([...(existing.upstreamEngines || []), ...result.upstreamEngines])].slice(0, 12);
         if (result.snippet.length > existing.snippet.length) existing.snippet = result.snippet;
         if (result.price && !existing.price) existing.price = result.price;
+        if (result.media && !existing.media) existing.media = result.media;
       }
     }
     // Rank the merged provider results by token relevance to the query so the
     // most on-topic pages surface first instead of raw provider arrival order.
-    const rankQuery = topic || scope.text || q;
+    const rankQuery = domainOnly || topic === null ? "" : topic || scope.text || q;
     const ranked = rankResultsByRelevance(rankQuery, [...merged.values()], region);
     const relevant = feed ? ranked.filter(row => isTopicalResult(rankQuery, row, { requireTitle: !!topic || !scope.active })) : ranked;
     const results = feed ? diversifyWebResults(relevant, requestedLimit, scope.active || !!engine) : relevant.slice(0, requestedLimit);
