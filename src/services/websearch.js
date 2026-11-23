@@ -400,7 +400,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       return { name, results: [], ms, error: info.code, classification: info.classification };
     } finally { clearTimeout(timer); if (abortListener) controller.signal.removeEventListener("abort", abortListener); params.signal?.removeEventListener("abort", abortUpstream); }
   }
-  async function search(query, { offset = 0, engine = "", lang = "", signal, limit = 20, noCache = false, region = "", shopping = false, feed = false, reference = false, topic = "", privateSearch = false } = {}) {
+  async function search(query, { offset = 0, engine = "", preferGoogle = false, lang = "", signal, limit = 20, noCache = false, region = "", shopping = false, feed = false, reference = false, topic = "", privateSearch = false } = {}) {
     const requestStartedAt = Date.now(); let firstResultAt = null;
     const requestedLimit = Math.max(1, Math.min(50, Number(limit) || 20));
     const q = cleanText(query, 600); if (!q) return { provider: "none", results: [], attempts: [], responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: null };
@@ -419,9 +419,10 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       ? Object.entries(providers).filter(([, p]) => p.native && !(offset && p.firstPage) &&
         p.hosts.some(host => allowsSiteUrl(scope, `https://${host}/`)) && (scope.include.length || p.intent.test(scope.text)))
         .map(([name]) => name) : [];
+    preferGoogle = !engine && preferGoogle;
     const requested = [...new Set(engine && GENERAL_ENGINES.includes(engine) ? [engine]
-      : order.filter(name => GENERAL_ENGINES.includes(name)))].filter(name => !(name === "searxng" && privateSearch));
-    const key = JSON.stringify([requested, native, offset, region, shopping, feed, !!includeReference, !!includeStack, topic, requestedLimit, regionalLanguage || lang, q.toLowerCase()]);
+      : [...(preferGoogle ? ["google"] : []), ...order.filter(name => GENERAL_ENGINES.includes(name))])].filter(name => !(name === "searxng" && privateSearch));
+    const key = JSON.stringify([requested, preferGoogle, native, offset, region, shopping, feed, !!includeReference, !!includeStack, topic, requestedLimit, regionalLanguage || lang, q.toLowerCase()]);
     const hit = noCache ? null : cache.get(key);
     if (hit && Date.now() - hit.time < cacheTtlMs) return { ...hit.value, cached: true, responseTimeMs: Date.now() - requestStartedAt };
     const attempts = []; let eligible = [];
@@ -432,7 +433,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
       eligible.push(name);
     }
     if (!engine) {
-      eligible = eligible.slice(0, maxProviders);
+      eligible = eligible.slice(0, preferGoogle && eligible[0] === "google" ? Math.max(2, maxProviders) : maxProviders);
       if (eligible.some(name => healthRecord(name).attempted)) {
         const originalOrder = new Map(eligible.map((name, index) => [name, index]));
         eligible.sort((a, b) => providerUtility(b) - providerUtility(a) || originalOrder.get(a) - originalOrder.get(b));
@@ -441,6 +442,7 @@ function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
     eligible.unshift(...native.filter(name => !(cooldowns.get(name) > Date.now())).slice(0, 3));
     if (includeReference && !(cooldowns.get("wikipedia") > Date.now())) eligible.unshift("wikipedia");
     if (includeStack && !(Math.max(stackBackoffUntil, cooldowns.get("stackoverflow") || 0) > Date.now())) eligible.unshift("stackoverflow");
+    if (preferGoogle && eligible.includes("google")) eligible = ["google", ...eligible.filter(name => name !== "google")];
     const requestController = new AbortController();
     let callerCancelled = false, deadlineExpired = false, earlyCancelled = false;
     const observedResultKeys = new Set();

@@ -60,6 +60,7 @@ const https = require("node:https");
 const zlib = require("node:zlib");
 const { setTimeout: wait } = require("node:timers/promises");
 const { isGoogleAccountsUrl, requestGoogleAccounts } = require("./network/google-accounts-transport");
+const { searchEntry, googleProxySearchQuery } = require("./services/search-entry");
 const veyraConfigModule = require("./config");
 
 
@@ -2393,10 +2394,12 @@ function challengeFallbackHtml(url, info, sid = "", apiOrigin = "") {
   const safe = escapeHtml(url);
   let query = "";
   try { const u = new URL(url); const cont = u.searchParams.get("continue"); const src = cont ? new URL(cont) : u; query = src.searchParams.get("q") || src.searchParams.get("query") || ""; } catch {}
-  const google = info?.type === "unusual-traffic";
-  const title = google ? "Google is asking for a captcha" : "This site requires its own security verification";
+  const googleQuery = googleProxySearchQuery(url);
+  const google = info?.type === "unusual-traffic" || info?.type === "google-search-interstitial";
+  const title = info?.type === "google-search-interstitial" ? "Google did not return a results page" :
+    google ? "Google is asking for a captcha" : "This site requires its own security verification";
   const why = google
-    ? "Google blocks searches that come from cloud servers like the one Veyra runs on, and its captcha can't be completed through a proxy. This isn't something Veyra can bypass. Connecting Veyra VPN to a residential exit usually avoids it."
+    ? "Google did not serve search results through Fast Proxy. Continue with Veyra Search or open Google directly. Veyra will not bypass Google's checks."
     : `Veyra's server proxy detected a security or bot-verification page (${escapeHtml(info?.type || "verification")}). It was not indexed as site content and Veyra will not attempt to bypass the site's security controls.`;
   const alt = query ? [
     ["Bing", `https://www.bing.com/search?q=${encodeURIComponent(query)}`],
@@ -2408,7 +2411,7 @@ function challengeFallbackHtml(url, info, sid = "", apiOrigin = "") {
   // Chromium fully works. The retry + open-directly actions remain.
   const chromiumActions = CHROMIUM_VERIFY_DISABLED ? "" : `<a class="primary" href="#" id="veyraChromium">Verify in real Chromium</a>`;
   const chromiumNote = CHROMIUM_VERIFY_DISABLED
-    ? `<p style="font-size:13px;margin-top:18px">Veyra does not solve, evade, or weaken CAPTCHA/anti-bot checks. Connecting Veyra VPN to a residential exit often avoids these checks for sites like this.</p>`
+    ? ""
     : `<p style="font-size:13px;margin-top:18px">Chromium shows the site's own check so <b>you</b> can complete it. Veyra does not solve, evade, or weaken CAPTCHA/anti-bot checks. Once you finish the check, this tab returns to the fast proxy automatically.</p>`;
   const chromiumScript = CHROMIUM_VERIFY_DISABLED ? "" : `<script>(function(){var m={type:"veyra:challenge",url:${JSON.stringify(String(url)).replace(/</g, "\\u003c")},kind:${JSON.stringify(String(info?.type || "verification"))},auto:${process.env.CHALLENGE_AUTO_HANDOFF == null ? "true" : /^(1|true|yes|on)$/i.test(String(process.env.CHALLENGE_AUTO_HANDOFF)) ? "true" : "false"}};try{if(parent!==window)parent.postMessage(m,"*")}catch(e){}var b=document.getElementById("veyraChromium");if(b){if(parent===window){b.href=${JSON.stringify(String(url)).replace(/</g, "\\u003c")};b.target="_blank";b.textContent="Open Google directly to verify"}else b.onclick=function(e){e.preventDefault();m.auto=false;m.manual=true;try{parent.postMessage(m,"*")}catch(x){}}}})();</script>`;
   // The cross-session cookie handoff (open the real site in your own
@@ -2418,6 +2421,9 @@ function challengeFallbackHtml(url, info, sid = "", apiOrigin = "") {
   // remains as an escape hatch for the user's own browser, but no cookie
   // ever crosses back into the Veyra session.
   const directClass = CHROMIUM_VERIFY_DISABLED ? "primary" : "secondary";
+  const veyraSearch = googleQuery ? '<button class="primary" type="button" id="veyraSearchInstead">Search with Veyra</button>' : "";
+  const message = JSON.stringify({ type: "veyra:google-search-fallback", query: googleQuery, sessionId: sid }).replace(/</g, "\\u003c");
+  const searchFallbackScript = veyraSearch ? `<script>(function(){var b=document.getElementById('veyraSearchInstead');if(parent===window){b.hidden=true;return}b.addEventListener('click',function(){parent.postMessage(${message},'*')})})();</script>` : "";
   // Route every "open in a new tab" action through the app: a popup opened by
   // this sandboxed frame inherits the sandbox, and any site that sends
   // Cross-Origin-Opener-Policy (chess.com, Google, Twitter, …) then refuses to
@@ -2425,7 +2431,7 @@ function challengeFallbackHtml(url, info, sid = "", apiOrigin = "") {
   // a normal tab and always works. If the app does not answer the ping (very
   // old cached frontend), the plain link still runs as before.
   const handoffEscapeScript = `<script>(function(){if(parent===window)return;var haveParent=false;try{addEventListener('message',function(ev){try{var d=ev.data;if(d&&d.type==='veyra:open-direct-ack')haveParent=true}catch(e){}});parent.postMessage({type:'veyra:open-direct-ping'},'*')}catch(e){}var links=document.querySelectorAll('.actions a[target="_blank"]');for(var i=0;i<links.length;i++){(function(a){a.addEventListener('click',function(e){if(!haveParent)return;e.preventDefault();try{parent.postMessage({type:'veyra:open-direct',url:a.href},'*')}catch(err){}})})(links[i])}})();</${"script"}>`;
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#10151d;color:#eaf0f6;font:15px/1.5 system-ui,sans-serif}.card{max-width:650px;margin:24px;padding:32px;background:#171e28;border:1px solid #303a48;border-radius:18px;box-shadow:0 20px 60px #0008}.ey{font-size:11px;letter-spacing:.15em;text-transform:uppercase;color:#86a9d5}.card h1{font-size:26px;margin:10px 0}.card p{color:#aab5c4}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px}.actions a{display:inline-block;padding:10px 15px;border-radius:9px;text-decoration:none}.primary{background:#4b82c9;color:#fff}.secondary{border:1px solid #3a4657;color:#dce5ef}.secondary:hover{background:#1f2835}</style></head><body><main class="card"><div class="ey">Veyra Browser</div><h1>${escapeHtml(title)}</h1><p>${why}</p><div class="actions">${chromiumActions}${alt}<a class="${directClass}" href="${safe}" target="_blank" rel="noopener noreferrer">Open directly in a new tab</a><a class="secondary" href="${escapeHtml(makeViewUrl(url, sid))}">Retry through Veyra</a></div>${chromiumNote}</main>${chromiumScript}${handoffEscapeScript}</body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#10151d;color:#eaf0f6;font:15px/1.5 system-ui,sans-serif}.card{max-width:650px;margin:24px;padding:32px;background:#171e28;border:1px solid #303a48;border-radius:18px;box-shadow:0 20px 60px #0008}.ey{font-size:11px;letter-spacing:.15em;text-transform:uppercase;color:#86a9d5}.card h1{font-size:26px;margin:10px 0}.card p{color:#aab5c4}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px}.actions :is(a,button){padding:10px 15px;border-radius:9px;text-decoration:none;font:inherit;cursor:pointer}.primary{background:#4b82c9;color:#fff;border:0}.secondary{border:1px solid #3a4657;color:#dce5ef}.secondary:hover{background:#1f2835}</style></head><body><main class="card"><div class="ey">Veyra Browser</div><h1>${escapeHtml(title)}</h1><p>${why}</p><div class="actions">${veyraSearch}${chromiumActions}<a class="${veyraSearch ? "secondary" : directClass}" href="${safe}" target="_blank" rel="noopener noreferrer">Open directly in a new tab</a><a class="secondary" href="${escapeHtml(makeViewUrl(url, sid))}">Retry through Veyra</a>${alt}</div>${chromiumNote}</main>${chromiumScript}${handoffEscapeScript}${searchFallbackScript}</body></html>`;
 }
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m])); }
 
@@ -6531,8 +6537,8 @@ app.get('/api/search/web', async (req, res) => {
   const isPrivate = req.query.private === "1" || req.query.incognito === "1" || !authStore.userFromRequest(req);
   if (isPrivate) { req.veyraPrivateTraffic = true; res.set("Cache-Control", "no-store"); }
   try {
-    const input = String(req.query.q || "").trim();
-    const q = input.slice(0, 600);
+    const raw = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 600) : "";
+    const { query: q, preferGoogle } = searchEntry(raw);
     if (!q) return res.json({ ok: true, provider: "none", results: [], attempts: [], responseTimeMs: 0 });
     const engine = String(req.query.engine || "").trim().toLowerCase();
     const selected = GENERAL_ENGINES.includes(engine) ? engine : "";
@@ -6541,7 +6547,7 @@ app.get('/api/search/web', async (req, res) => {
     const lang = String(req.query.lang || "en").slice(0, 35);
     const limit = Math.min(CFG.maxSearchResults, Math.max(1, Math.floor(Number(req.query.limit || 20)) || 20));
     const started = Date.now();
-    const scope = parseSiteScope(input);
+    const scope = parseSiteScope(q);
     if (scope.invalid) return res.json({ ok: true, results: [], provider: "none", siteFilter: { invalid: true }, more: false, source: "web", responseTimeMs: Date.now() - started });
     const indexOptions = { region: req.query.region, requireTerms: !scope.active, topical: true };
     const fromIndex = indexOffset => {
@@ -6552,9 +6558,22 @@ app.get('/api/search/web', async (req, res) => {
         nextOffset: more ? WEB_FEED_INDEX_OFFSET + next : null, more };
     };
     const sourceLane = sourceSearchEnabled && !selected && req.query.incognito !== "1";
-    const reply = result => res.json({ ok: true, ...result, results: rankMatchBatch(q, sourceLane
-      ? result.results.map(row => ({ ...row, evidence: row.evidence || defaultEvidence(row) })) : result.results, "web"),
-      matchModel: matchModelVersion, ...(scope.active ? { total: null, siteFilter: { include: scope.include, exclude: scope.exclude } } : {}), source: "web", responseTimeMs: Date.now() - started });
+    const wantsGoogle = !selected && (preferGoogle || req.query.prefer === "google");
+    const googleHome = !selected && !offset && /^(?:www\.)?google\.com$/i.test(q) ? "https://www.google.com/" : "";
+    const reply = result => {
+      let results = rankMatchBatch(q, sourceLane
+        ? result.results.map(row => ({ ...row, evidence: row.evidence || defaultEvidence(row) })) : result.results, "web");
+      if (googleHome) {
+        const key = canonicalKey(googleHome);
+        const found = results.find(row => canonicalKey(row.url) === key);
+        const [home] = rankMatchBatch(q, [{ url: googleHome, title: "Google", displayUrl: "google.com", source: "veyra-navigation" }], "web");
+        results = [{ ...(found || home), url: googleHome, canonicalUrl: key, title: "Google" },
+          ...results.filter(row => canonicalKey(row.url) !== key)].slice(0, limit);
+      }
+      return res.json({ ok: true, ...result, results, ...(googleHome ? { status: "ok", provider: result.provider === "none" ? "veyra-navigation" : result.provider } : {}),
+        ...(wantsGoogle ? { preferredEngine: "google", googleIncluded: results.some(row => row.source === "google" || row.providers?.includes("google")) } : {}),
+        matchModel: matchModelVersion, ...(scope.active ? { total: null, siteFilter: { include: scope.include, exclude: scope.exclude } } : {}), source: "web", responseTimeMs: Date.now() - started });
+    };
     if (feed && (!Number.isSafeInteger(offset) || offset > WEB_FEED_INDEX_OFFSET + CFG.maxIndexDocs || (offset < WEB_FEED_INDEX_OFFSET && offset % WEB_FEED_STEP))) return respondError(res, 400, "Invalid search feed offset.", "INVALID_SEARCH_OFFSET");
     if (feed && selected && offset >= WEB_FEED_INDEX_OFFSET) return respondError(res, 400, "Index offsets are not available for an explicit engine.", "INVALID_SEARCH_OFFSET");
     if (feed && offset >= WEB_FEED_INDEX_OFFSET) return reply(fromIndex(offset - WEB_FEED_INDEX_OFFSET));
@@ -6563,10 +6582,10 @@ app.get('/api/search/web', async (req, res) => {
     const references = !selected && !offset ? referenceResults(scope, Math.min(3, limit)) : [];
     const inScope = row => row && canonicalKey(row.url) && allowsSiteUrl(scope, row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl));
     const [result, discovered] = await Promise.all([
-      (app.locals.veyraWebSearch || webSearch).search(q, { offset, limit, engine: selected, lang, region: req.query.region,
+      (app.locals.veyraWebSearch || webSearch).search(q, { offset, limit, engine: selected, preferGoogle: wantsGoogle, lang, region: req.query.region,
         signal: request.signal, noCache: isPrivate || !CFG.globalCacheEnabled, feed, reference: true,
         privateSearch: req.query.incognito === "1" }).catch(error => {
-        if (!firstSourcePage && !references.length) throw error;
+        if (!firstSourcePage && !references.length && !googleHome) throw error;
         return { provider: "none", results: [], status: "unavailable" };
       }),
       firstSourcePage ? evidenceService.discover(scope, { signal: request.signal }).catch(() => []) : []
@@ -6617,11 +6636,12 @@ app.get('/api/search/web', async (req, res) => {
 
 app.get("/api/search/vertical", async (req, res) => {
   const type = typeof req.query.type === "string" ? req.query.type : "";
-  const q = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 600) : "";
+  const q = searchEntry(typeof req.query.q === "string" ? req.query.q.trim().slice(0, 600) : "").query;
   const page = Number(req.query.page ?? 0);
   const provider = typeof req.query.provider === "string" ? req.query.provider : "";
+  const thumbnailPreview = req.query.preview === "1";
   const lastPage = lastVerticalPage(type, provider);
-  if ((type !== "all" && !SEARCH_VERTICALS.includes(type)) || !Number.isInteger(page) || page < 0 || page > lastPage || (page > 0 && !provider) || !/^[a-z-]{0,24}$/.test(provider) || (type === "all" && (page || provider))) {
+  if ((type !== "all" && !SEARCH_VERTICALS.includes(type)) || !Number.isInteger(page) || page < 0 || page > lastPage || (page > 0 && !provider) || !/^[a-z-]{0,24}$/.test(provider) || (type === "all" && (page || provider)) || (thumbnailPreview && (type !== "images" || page || provider))) {
     return respondError(res, 400, "Invalid search category or page.", "INVALID_SEARCH_CATEGORY");
   }
   const request = requestAbortSignal(req, res);
@@ -6630,7 +6650,12 @@ app.get("/api/search/vertical", async (req, res) => {
     const service = app.locals.veyraVerticalSearch || verticalSearch;
     const options = { page, provider, lang: req.query.lang, region: req.query.region, signal, noCache: req.veyraPrivateTraffic || req.query.incognito === "1" || !CFG.globalCacheEnabled, preview: type === "all", privateSearch: req.query.incognito === "1" };
     const withMatches = (section, category) => ({ ...section, results: rankMatchBatch(q, section.results, category), matchModel: matchModelVersion });
-    if (type !== "all") return res.json({ ok: true, ...withMatches(await service.search(type, q, options), type) });
+    if (thumbnailPreview && options.privateSearch) return res.json({ ok: true, type, provider: "none", status: "empty", results: [], nextPage: null });
+    if (type !== "all") {
+      const result = withMatches(await service.search(type, q, options), type);
+      if (!thumbnailPreview) return res.json({ ok: true, ...result });
+      return res.json({ ok: true, type, provider: result.provider, status: result.status, results: result.results.filter(row => row.thumbnail).slice(0, 6), nextPage: null });
+    }
     let cursor = 0;
     const sections = Array(SEARCH_VERTICALS.length);
     await Promise.all(Array.from({ length: 3 }, async () => {
@@ -7641,6 +7666,13 @@ async function proxyRequest(req, res, mode, { formRouting, download: downloadOpt
       return res.status(200).type("html").send(challengeFallbackHtml(canonical, challenge, sid, requestOrigin(req)));
     }
     res.setHeader("X-Veyra-Challenge", String(challenge.type || "security-verification"));
+  }
+  if (mode === "view" && mayTransform && /html/i.test(result.contentType) && googleProxySearchQuery(canonical) &&
+      googleProxySearchQuery(result.finalUrl || canonical) &&
+      /<a\b[^>]*href=["'](?:https:\/\/(?:www\.)?google\.(?:com|co\.uk|co\.in))?\/httpservice\/retry\/enablejs(?:[?"'])/i.test(result.body.toString("utf8", 0, 30000))) {
+    res.setHeader("X-Veyra-Challenge", "google-search-interstitial");
+    res.setHeader("X-Veyra-Canonical-URL", canonical);
+    return res.status(200).type("html").send(challengeFallbackHtml(canonical, { type: "google-search-interstitial" }, sid, requestOrigin(req)));
   }
   // Same safety fix as the early 302: only redirect when the Referer origin
   // matches YouTube itself (native tab). Fast-proxy iframes must receive the

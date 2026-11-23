@@ -173,7 +173,7 @@ function createVerticalSearch({ fetchText, fetchIndiaCatalog, webSearch, indexed
     const results = json.results.map(item => row(type, "brave", {
       ...item, source: item.source || item.video?.creator || item.meta_url?.hostname,
       thumbnail: item.thumbnail?.src, snippet: item.description, duration: item.video?.duration,
-      imageUrl: item.properties?.url,
+      imageUrl: item.properties?.url, sourcePageUrl: type === "images" ? item.url : undefined,
       publishedAt: item.page_age || item.video?.published
     }));
     return { provider: "brave", results, whole: type === "images", more: type !== "images" && (json.query?.more_results_available ?? results.length === PAGE_SIZE) };

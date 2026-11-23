@@ -108,6 +108,24 @@ function unusualTrafficHtml() {
       "Google's captcha wall must keep the interstitial card (it cannot be completed through a proxy)");
     assert.equal(String(r.headers.get("x-veyra-challenge") || ""), "true",
       "the Google card must still be flagged as a challenge");
+    assert.match(html, /Search with Veyra/);
+    assert.match(html, /"type":"veyra:google-search-fallback","query":"test","sessionId":"challengetestsid00000000001"/);
+
+    const content = "<!doctype html><title>Google</title><form action='/search'><input name='q'><button>Google Search</button></form>";
+    app.locals.veyraProxyFetchBuffer = async url => ({
+      ok: true, status: 200, contentType: "text/html; charset=utf-8", finalUrl: url, cacheControl: "no-store",
+      body: Buffer.from(url.includes("/search?") ? '<title>Google Search</title><a href="/httpservice/retry/enablejs?sei=fixture">click here</a>' : content),
+    });
+    const view = url => fetch(`${base}/api/view?url=${encodeURIComponent(url)}&sid=challengetestsid00000000001`);
+    r = await view("https://www.google.com/");
+    assert.match(await r.text(), /Google Search<\/button>/);
+    assert.equal(r.headers.get("x-veyra-challenge"), null);
+    r = await view("https://www.google.com/search?q=example");
+    assert.equal(r.headers.get("x-veyra-challenge"), "google-search-interstitial");
+    assert.match(await r.text(), /Google did not return a results page/);
+    r = await view("https://example.com/search?q=example");
+    assert.equal(r.headers.get("x-veyra-challenge"), null);
+    assert.doesNotMatch(await r.text(), /Search with Veyra/);
   } finally {
     app.locals.veyraProxyFetchBuffer = null;
     await new Promise(resolve => server.close(resolve));

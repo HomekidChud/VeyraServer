@@ -205,6 +205,12 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     app.locals.veyraVerticalSearch = {
       async search(type, query, options) {
         verticalCalls++;
+        if (type === "images" && query === "preview fixture") {
+          return { type, status: "ok", provider: "wikimedia", nextPage: 1, results: Array.from({ length: 10 }, (_, i) => ({
+            url: `https://commons.wikimedia.org/wiki/${i}`, title: "Preview fixture",
+            thumbnail: i ? `https://upload.wikimedia.org/photo-${i}.jpg` : ""
+          })) };
+        }
         if (options.preview) {
           assert.equal(options.region, "IN");
           assert.equal(options.noCache, true, "guest category previews cannot use shared caches");
@@ -474,6 +480,28 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
       assert(!(await getSourceResults("Python asyncio", opts)).results.some(row => row.source === "veyra-reference"));
     }
     assert.equal(sourceCalls.length, callsBeforeSkip, "incognito, explicit engines and pagination do not crawl");
+    app.locals.veyraWebSearch = { async search(query, options) {
+      assert.ok(["google.com", "northern lights"].includes(query));
+      assert.equal(options.preferGoogle, query === "northern lights");
+      return { provider: "none", results: [], status: "unavailable", googleConfigured: false };
+    } };
+    const home = await getSourceResults("search:google.com", { incognito: "1" });
+    assert.equal(home.status, "ok");
+    assert.equal(home.results[0].url, "https://www.google.com/");
+    assert.equal(home.results[0].source, "veyra-navigation");
+    const noGoogle = await getSourceResults("search:google.com northern lights", { incognito: "1" });
+    assert.equal(noGoogle.preferredEngine, "google");
+    assert.equal(noGoogle.googleIncluded, false);
+    const previewUrl = `${base}/api/search/vertical?type=images&q=preview+fixture&preview=1`;
+    const preview = await (await fetch(previewUrl)).json();
+    assert.equal(preview.results.length, 6);
+    assert(preview.results.every(row => row.thumbnail));
+    assert.equal(preview.nextPage, null);
+    const beforeIncognito = verticalCalls;
+    assert.deepEqual((await (await fetch(`${previewUrl}&incognito=1`)).json()).results, []);
+    assert.equal(verticalCalls, beforeIncognito);
+    assert.equal((await fetch(`${previewUrl}&page=1&provider=wikimedia`)).status, 400);
+    assert.equal((await fetch(`${base}/api/search/vertical?type=videos&q=preview+fixture&preview=1`)).status, 400);
     console.log("Search, answer and YouTube Express routes passed controlled local integration tests");
   } finally {
     delete app.locals.veyraWebSearch;
