@@ -6036,6 +6036,17 @@ async function sendPlatformEmail({ to, subject, html }) {
 }
 const { createYouTubeEligibility } = require("./services/youtube-eligibility");
 const youtubeEligibility = createYouTubeEligibility({ key: String(process.env.YOUTUBE_DATA_API_KEY || "").trim(), request: undiciFetch });
+const { resolveTikTokShare } = require("./services/tiktok-share");
+app.post("/api/media/tiktok/share", platformRateLimit({ max: 12, windowMs: 60_000, scope: "ip" }), async (req, res) => {
+  req.veyraPrivateTraffic = true;
+  res.set({ "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" });
+  if (req.query.incognito === "1") return res.status(403).json({ state: "unavailable" });
+  const operation = requestAbortSignal(req, res);
+  try {
+    const result = await resolveTikTokShare(req.body?.url, { request: undiciFetch, signal: operation.signal });
+    if (!operation.signal.aborted) res.status(result.state === "invalid" ? 400 : 200).json(result);
+  } finally { operation.dispose(); }
+});
 app.get("/api/media/youtube/:id", platformRateLimit({ max: 30, windowMs: 60_000 }), async (req, res) => {
   res.setHeader("Cache-Control", "no-store");
   const check = app.locals.veyraYoutubeWatchEligibility || youtubeEligibility;
@@ -7042,7 +7053,8 @@ app.post("/api/search/answer/feedback", async (req, res) => {
   res.json({ ok: true, trained: true, rating, scoreBefore: Math.round(training.before * 1000) / 1000, scoreAfter: Math.round(training.after * 1000) / 1000, optimizer: "AdamW", trainingExamples: aiAnswerEngine.qualityModel.examples, calibrated: false });
 });
 app.get('/api/answer/status', (req, res) => res.json({ ...aiAnswerEngine.report(),
-  sourceDiscovery: { strategy: wideAnswerDiscovery ? answerDiscoveryStrategy : "legacy", shortlistLimit: wideAnswerDiscovery ? answerDiscoveryShortlist : null }
+  sourceDiscovery: { strategy: wideAnswerDiscovery ? answerDiscoveryStrategy : "legacy", shortlistLimit: wideAnswerDiscovery ? answerDiscoveryShortlist : null },
+  relatedQuestions: { enabled: wideAnswerDiscovery, max: 4, sources: "verified-overview-citations" }
 }));
 
 

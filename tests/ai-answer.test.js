@@ -46,6 +46,17 @@ assert.equal(invented.supported, 0);
 assert.equal(invented.unsupported, 1, "valid citation ID alone must not make an unsupported claim pass");
 assert.equal(engine.verifyAnswer(`${local.answer} Costs £100`, evidence, { strict: true }).unsupported, 1, "category summaries must not ignore a short or unpunctuated claim");
 const groundingFixture = (id, ...text) => ({ id, url: `https://${id.toLowerCase()}.example/`, verificationSentences: text, matched: text });
+const questionSources = [groundingFixture("S1", "Harbor Railway opened in 1989. Harbor Railway connects the city to the port.")];
+assert.deepEqual(engine.groundedQuestions([
+  "Where does Harbor Railway run? | Harbor Railway links the city to the port. [S1]",
+  "Where does Harbor Railway run? | Harbor Railway links the city to the port. [S1]",
+  "When did Harbor Railway open? | Harbor Railway opened in 1989. [S1]",
+  "How much does Harbor Railway cost? | Tickets cost £90. [S1]",
+  "Where does Harbor Railway stop? | Harbor Railway connects the city to the port. [S9]",
+  "Where does Mountain Rail run? | Harbor Railway links the city to the port. [S1]"
+], "Harbor Railway opening date", "Harbor Railway opened in 1989. [S1]", questionSources), [
+  { question: "Where does Harbor Railway run?", answer: "Harbor Railway links the city to the port. [S1]" }
+]);
 const sunday = "The express delivery service is available on Sundays.";
 const notSunday = "The express delivery service is not available on Sundays.";
 const verifyGrounding = (claim, fixtures, citations = "[S1]") => engine.verifyAnswer(`${claim} ${citations}`, fixtures, { strict: true });
@@ -455,6 +466,22 @@ assert.ok(qualityEvaluation.after.logLoss < qualityEvaluation.before.logLoss, "o
   assert.deepEqual(discoveryPlan(parseSiteScope('Compare "SQLite JSON" versus PostgreSQL')).variants, []);
   assert.deepEqual(discoveryPlan(parseSiteScope("SQLite versus PostgreSQL latest 2026")).variants, []);
   assert.deepEqual(discoveryPlan(parseSiteScope("SQLite vs PostgreSQL -extension")).variants, []);
+  assert.deepEqual(discoveryPlan(parseSiteScope("site:publisher.example When did Game VII come out?")), {
+    complex: true, variants: ["site:publisher.example Game VII official release date announcement",
+      "site:publisher.example Game VII launch availability"]
+  });
+  assert.deepEqual(discoveryPlan(parseSiteScope('site:publisher.example "Game VII" release date')).variants, []);
+  assert.deepEqual(discoveryPlan(parseSiteScope("Game VII release date -rumor")).variants, []);
+  const releaseQuery = "Game VII release date";
+  const releaseLookups = [];
+  const release = await discoverAnswerSources({ query: releaseQuery, scope: parseSiteScope(releaseQuery), allowSource: () => true,
+    search: async (q, _signal, continuation) => {
+      releaseLookups.push(q);
+      assert.equal(continuation, undefined);
+      return { results: Array.from({ length: 24 }, (_, i) => ({ url: `https://host${i}.example/${releaseLookups.length}` })), continuation: 2 };
+    } });
+  assert.deepEqual(releaseLookups, [releaseQuery, "Game VII official release date announcement", "Game VII launch availability"]);
+  assert.equal(release.results.length, 24);
   const partial = await discoverAnswerSources({ query: `site:sqlite.org What is SQLite?`, scope: scoped,
     allowSource: row => allowsSiteUrl(scoped, row.url) && (!row.canonicalUrl || allowsSiteUrl(scoped, row.canonicalUrl)),
     async search(q) {
