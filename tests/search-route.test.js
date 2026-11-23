@@ -13,6 +13,9 @@ process.env.ACCESS_GATE = "0";
 process.env.VEYRA_ALLOW_SIGNUP = "1";
 process.env.VEYRA_SIGNUP_KEY = "";
 process.env.VEYRA_TEST_MODE = "0";
+process.env.VEYRA_DEV_CONFIG_API = "0";
+// This fixture exercises many serial API routes in under one production burst.
+process.env.SHIELD_API_BURST = "300";
 process.env.WEB_SEARCH_ORDER = "google";
 process.env.VEYRA_CHROMIUM_ENABLED = "false";
 process.env.INDEX_AI_FINDINGS = "true";
@@ -123,6 +126,16 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     assert.equal(signup.status, 201, JSON.stringify(login));
     assert.ok(login.token, "the regular fixture account can sign in");
     const authorization = `Bearer ${login.token}`;
+    for (const headers of [{}, { authorization }]) {
+      for (const [method, route] of [["GET", "/api/robots/status"], ["GET", "/api/robots/log"],
+        ["POST", "/api/robots/reset"], ["POST", "/api/neural/reset"]]) {
+        const response = await fetch(`${base}${route}`, { method, headers });
+        assert.equal(response.status, 403);
+        assert.equal((await response.json()).code, "ADMIN_REQUIRED");
+        assert.equal(response.headers.get("cache-control"), "no-store");
+      }
+    }
+    assert.equal((await fetch(`${base}/api/neural/stats`)).status, 200, "public search settings can still show model stats");
     const search = (path, q, privacy, extra = {}) => fetch(`${base}/api/search${path}?${new URLSearchParams({ q, privacy, private: "1", ...extra })}`,
       { headers: { authorization } }).then(r => r.json());
     const callsBeforePrivacyFixtures = webSearchCalls;

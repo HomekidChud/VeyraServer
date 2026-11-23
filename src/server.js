@@ -8623,9 +8623,14 @@ app.post("/api/neural/feedback", async (req, res) => {
   if (!accepted) return res.status(429).json({ ok: false, error: "The training queue is full. Try again later." });
   res.json({ ok: true, queued: neuralTrainer.report().queueSize, durable: mongoStore.connected });
 });
-app.post("/api/neural/reset", (req, res) => { neuralTrainer.queue.length = 0; neuralModel.reset(); neuralModel.save(); res.json({ ok: true }); });
-app.get("/api/robots/status", (req, res) => res.json(neuralRobotPool.report()));
-app.get("/api/robots/log", (req, res) => res.json(neuralRobotPool.getLog(Math.min(100, Number(req.query.limit) || 50))));
+function requireNeuralOperator(req, res, next) {
+  res.set("Cache-Control", "no-store");
+  if (isAdminRequest(req)) return next();
+  return respondError(res, 403, "Only Veyra administrators can manage the neural crawler and model.", "ADMIN_REQUIRED");
+}
+app.post("/api/neural/reset", requireNeuralOperator, (req, res) => { neuralTrainer.queue.length = 0; neuralModel.reset(); neuralModel.save(); res.json({ ok: true }); });
+app.get("/api/robots/status", requireNeuralOperator, (req, res) => res.json(neuralRobotPool.report()));
+app.get("/api/robots/log", requireNeuralOperator, (req, res) => res.json(neuralRobotPool.getLog(Math.min(100, Number(req.query.limit) || 50))));
 app.post("/api/robots/crawl", async (req, res) => {
   try {
     const seeds = req.body.seeds || (req.body.seed ? [req.body.seed] : []);
@@ -8661,7 +8666,7 @@ app.post("/api/robots/feedback", async (req, res) => {
   }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
-app.post("/api/robots/reset", (req, res) => { neuralRobotPool.resetAll(); res.json({ ok: true }); });
+app.post("/api/robots/reset", requireNeuralOperator, (req, res) => { neuralRobotPool.resetAll(); res.json({ ok: true }); });
 
 
 
