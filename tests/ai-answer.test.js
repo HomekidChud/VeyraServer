@@ -419,6 +419,17 @@ assert.ok(qualityEvaluation.after.logLoss < qualityEvaluation.before.logLoss, "o
   assert.equal(capped.diagnostics.shortlistedHosts, 24);
   assert.equal(capped.results.length, 24);
   assert.deepEqual(capped.diagnostics.batches.map(row => row.returned), [24, 24, 24]);
+  const largeComparison = await discoverAnswerSources({
+    query: topic, scope, allowSource: () => true, seeds: crowded("seed"),
+    search: async (query, _signal, next) => {
+      assert.equal(next, undefined, "comparison follow-ups must not also fetch a continuation");
+      return { results: crowded(query === topic ? "original" : query.toLowerCase()), continuation: 2 };
+    }
+  });
+  assert.deepEqual(largeComparison.diagnostics.batches.map(({ lane, returned }) => [lane, returned]),
+    [["original", 24], ["alternate", 24], ["alternate", 24]]);
+  assert.equal(largeComparison.diagnostics.candidates, 96);
+  assert.equal(largeComparison.results.length, 24, "both follow-ups together still share one shortlist cap");
   for (const [query, vertical, expected] of [
     [topic, "", [[topic, undefined], ["SQLite", undefined], ["PostgreSQL", undefined]]],
     [topic, "videos", [[topic, undefined], ["SQLite", undefined]]],
