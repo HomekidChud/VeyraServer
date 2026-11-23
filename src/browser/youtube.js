@@ -43,6 +43,12 @@ function isYoutubeUrl(raw) {
   return hostIsYoutube(u.hostname) || hostIsShortLink(u.hostname);
 }
 
+function isYoutubeHomePage(raw) {
+  const u = safeParseUrl(raw);
+  if (!u || !/^https?:$/.test(u.protocol)) return false;
+  return hostIsYoutube(u.hostname) && u.pathname === "/";
+}
+
 /**
  * Extracts and validates a YouTube video ID from a URL, handling:
  *   /watch?v=ID            (plus extra, unrelated query params — untouched)
@@ -64,7 +70,7 @@ function parseYoutubeUrl(raw, { depth = 0 } = {}) {
   let kind = "watch";
 
   if (hostIsShortLink(host)) {
-    id = decodeURIComponent(u.pathname.split("/").filter(Boolean)[0] || "");
+    try { id = decodeURIComponent(u.pathname.split("/").filter(Boolean)[0] || ""); } catch { return null; }
     kind = "short-link";
   } else if (hostIsYoutube(host)) {
     const segs = u.pathname.split("/").filter(Boolean);
@@ -177,6 +183,7 @@ function classifyWatchPageBlock(html = "") {
 module.exports = {
   VIDEO_ID_RE,
   isYoutubeUrl,
+  isYoutubeHomePage,
   parseYoutubeUrl,
   buildEmbedUrl,
   checkEmbeddable,

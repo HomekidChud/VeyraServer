@@ -1,186 +1,539 @@
 "use strict";
-
-
-
-
+const { parseSiteScope, allowsSiteUrl } = require("./search-site-scope");
+const { unicodeWords, braveLanguage } = require("./search-language");
+const { india, indiaLanguage, indiaAffinity, inrPrice, isIndianProductUrl } = require("./search-region");
+const { createSiteSearch } = require("./site-search");
 
 const cheerio = require("cheerio");
+const WEB_FEED_STEP = 10;
+const WEB_FEED_INDEX_OFFSET = 100;
+const GENERAL_ENGINES = Object.freeze(["searxng", "brave", "bing", "duckduckgo", "google", "mojeek", "ecosia", "yahoo", "startpage"]);
+const REFERENCE_LANGS = new Set("as bn en gu hi kn ml mr ne or pa sa ta te ur".split(" "));
+const referenceHost = lang => `${REFERENCE_LANGS.has(lang) ? lang : "en"}.wikipedia.org`;
 
 function cleanText(s, max = 400) { return String(s || "").replace(/\s+/g, " ").trim().slice(0, max); }
 function safeHttpUrl(raw) {
-  try { const u = new URL(String(raw || "")); return /^https?:$/.test(u.protocol) ? u.href : ""; } catch { return ""; }
+  try { const u = new URL(String(raw || "")); return /^https?:$/.test(u.protocol) && !u.username && !u.password ? u.href : ""; } catch { return ""; }
 }
-function displayUrl(u) { try { const x = new URL(u); return (x.hostname.replace(/^www\./, "") + (x.pathname === "/" ? "" : x.pathname)).slice(0, 120); } catch { return u; } }
+function displayUrl(value) { try { const u = new URL(value); return (u.hostname.replace(/^www\./, "") + (u.pathname === "/" ? "" : u.pathname)).slice(0, 120); } catch { return value; } }
 function row(url, title, snippet, source) {
-  const href = safeHttpUrl(url); if (!href || !title) return null;
-  return { url: href, title: cleanText(title, 300), snippet: cleanText(snippet, 700), displayUrl: displayUrl(href), source };
+  const href = safeHttpUrl(url), label = cleanText(title, 300);
+  if (!href || !label) return null;
+  return { url: href, canonicalUrl: href.replace(/#.*$/, "").replace(/\/$/, ""), title: label, snippet: cleanText(snippet, 700), displayUrl: displayUrl(href), source };
 }
-
 function unwrapDuckDuckGo(href) {
-  const h = String(href || "");
-  try {
-    const u = new URL(h.startsWith("//") ? "https:" + h : h, "https://duckduckgo.com");
-    if (/duckduckgo\.com$/.test(u.hostname) && u.pathname === "/l/") return u.searchParams.get("uddg") || "";
-    return u.href;
-  } catch { return ""; }
+  try { const u = new URL(String(href || "").startsWith("//") ? "https:" + href : String(href || ""), "https://duckduckgo.com"); return /(^|\.)duckduckgo\.com$/i.test(u.hostname) && u.pathname === "/l/" ? u.searchParams.get("uddg") || "" : u.href; } catch { return ""; }
 }
 function unwrapBing(href) {
   try {
     const u = new URL(String(href || ""), "https://www.bing.com");
-    if (/bing\.com$/.test(u.hostname) && u.pathname === "/ck/a") {
-      const enc = u.searchParams.get("u") || "";
-      if (enc.startsWith("a1")) return Buffer.from(enc.slice(2).replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
-      return "";
+    if (/(^|\.)bing\.com$/i.test(u.hostname) && u.pathname === "/ck/a") {
+      const encoded = u.searchParams.get("u") || "";
+      if (!encoded.startsWith("a1")) return "";
+      return Buffer.from(encoded.slice(2).replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
     }
     return u.href;
   } catch { return ""; }
 }
-
 function parseDuckDuckGoHtml(html) {
-  const $ = cheerio.load(String(html || ""));
-  const out = [];
-  $(".result").each((_, el) => {
-    const $el = $(el);
-    if ($el.hasClass("result--ad") || $el.find(".badge--ad").length) return;
-    const a = $el.find("a.result__a").first();
-    const r = row(unwrapDuckDuckGo(a.attr("href")), a.text(), $el.find(".result__snippet").first().text(), "duckduckgo");
-    if (r) out.push(r);
-  });
+  const $ = cheerio.load(String(html || "")); const out = [];
+  $(".result").each((_, el) => { const box = $(el); if (box.hasClass("result--ad") || box.find(".badge--ad").length) return;
+    const a = box.find("a.result__a").first(); const item = row(unwrapDuckDuckGo(a.attr("href")), a.text(), box.find(".result__snippet").first().text(), "duckduckgo"); if (item) out.push(item); });
   return out;
 }
 function parseBingHtml(html) {
-  const $ = cheerio.load(String(html || ""));
-  const out = [];
-  $("li.b_algo").each((_, el) => {
-    const $el = $(el);
-    const a = $el.find("h2 a").first();
-    const snippet = $el.find(".b_caption p, p.b_lineclamp2, p.b_lineclamp3, p.b_lineclamp4, p").first().text();
-    const r = row(unwrapBing(a.attr("href")), a.text(), snippet, "bing");
-    if (r) out.push(r);
+  const $ = cheerio.load(String(html || "")); const out = [];
+  $("li.b_algo").each((_, el) => { const box = $(el); const a = box.find("h2 a").first(); const item = row(unwrapBing(a.attr("href")), a.text(), box.find(".b_caption p, p.b_lineclamp2, p.b_lineclamp3, p.b_lineclamp4, p").first().text(), "bing"); if (item) out.push(item); });
+  return out;
+}
+function parseGoogleApi(json, shopping = false) {
+  return (Array.isArray(json?.items) ? json.items : []).flatMap(x => {
+    const result = row(x.link, x.title, x.snippet, "google");
+    if (!result) return [];
+    // Multiple offers can refer to variants or unrelated products on that page.
+    const offers = x.pagemap?.offer;
+    const price = shopping && Array.isArray(offers) && offers.length === 1
+      ? inrPrice({ value: offers[0]?.price, currency: offers[0]?.pricecurrency }) : null;
+    return [{ ...result, ...(price ? { price } : {}) }];
+  });
+}
+function parseBraveApi(json) {
+  return (Array.isArray(json?.web?.results) ? json.web.results : []).flatMap(x => {
+    if (!x) return [];
+    const result = row(x.url, x.title, x.description || x.snippet, "brave");
+    if (!result) return [];
+    const poster = safeHttpUrl(x.thumbnail?.src);
+    const thumbnail = poster && new URL(poster).origin === "https://imgs.search.brave.com" ? poster : "";
+    if (x.family_friendly === true && thumbnail) {
+      result.media = { type: x.video && typeof x.video === "object" ? "videos" : "images", thumbnail,
+        duration: cleanText(x.video?.duration, 32) };
+    }
+    return [result];
+  });
+}
+function parseBingApi(json) { return (Array.isArray(json?.webPages?.value) ? json.webPages.value : []).map(x => row(x.url, x.name || x.title, x.snippet, "bing")).filter(Boolean); }
+function parseMojeekHtml(html) {
+  const $ = cheerio.load(String(html || "")); const out = [];
+  $("ul.results-standard li, ul.results li").each((_, el) => {
+    const box = $(el); if (box.find(".ad, .advert").length) return;
+    const a = box.find("a.title, h2 a, a.ob").first();
+    const item = row(a.attr("href"), a.text(), box.find("p.s").first().text(), "mojeek");
+    if (item) out.push(item);
   });
   return out;
 }
-function parseGoogleApi(json) {
-  const items = Array.isArray(json?.items) ? json.items : [];
-  return items.map(i => row(i.link, i.title, i.snippet, "google")).filter(Boolean);
-}
-function parseBraveApi(json) {
-  const items = Array.isArray(json?.web?.results) ? json.web.results : [];
-  return items.map(i => row(i.url, i.title, i.description || i.snippet, "brave")).filter(Boolean);
-}
-function parseBingApi(json) {
-  const items = Array.isArray(json?.webPages?.value) ? json.webPages.value : [];
-  return items.map(i => row(i.url, i.name || i.title, i.snippet, "bing")).filter(Boolean);
-}
-
-function dedupe(rows) {
-  const seen = new Set(); const out = [];
-  for (const r of rows) { const k = r.url.replace(/[#?].*$/, "").replace(/\/$/, ""); if (seen.has(k)) continue; seen.add(k); out.push(r); }
+function parseEcosiaHtml(html) {
+  const $ = cheerio.load(String(html || "")); const out = [];
+  $("article.result, div.result, li.result").each((_, el) => {
+    const box = $(el); if (/ad|sponsor/i.test(box.attr("class") || "")) return;
+    const a = box.find("a.result__link, a[data-test-id='result-link'], h2 a, a.url").first();
+    const href = a.attr("href") || box.find("a").attr("href") || "";
+    const item = row(href, box.find("h2, .result__title").first().text() || a.text(), box.find(".result__snippet, .result-snippet, p").first().text(), "ecosia");
+    if (item) out.push(item);
+  });
   return out;
 }
-
+function parseStartpageHtml(html) {
+  const $ = cheerio.load(String(html || "")); const out = [];
+  $("div.w-gl__result, article.result, li.result").each((_, el) => {
+    const box = $(el); if (box.find(".w-gl__advert, .ad").length) return;
+    const a = box.find("a.w-gl__result-title, h2 a, a.result-link").first();
+    const item = row(a.attr("href"), a.text(), box.find("p.w-gl__description, .description, p").first().text(), "startpage");
+    if (item) out.push(item);
+  });
+  return out;
+}
+function parseYahooHtml(html) {
+  const $ = cheerio.load(String(html || "")); const out = [];
+  $("ol#web ol li, #web li, div.algo, li .dd.algo").each((_, el) => {
+    const box = $(el); const a = box.find("h3 a, a.d-ib").first();
+    const item = row(a.attr("href"), a.text(), box.find("p, .compText").first().text(), "yahoo");
+    if (item) out.push(item);
+  });
+  return out;
+}
+function rankTokens(text) {
+  return unicodeWords(String(text || "").replace(/[_-]/g, " ")).map(word => {
+    if (!/^[a-z]+$/.test(word)) return word;
+    if (word.length > 4 && word.endsWith("ies")) return `${word.slice(0, -3)}y`;
+    if (word.length > 3 && word.endsWith("s") && !/(?:ss|us|is|ous|ics)$/.test(word)) return word.slice(0, -1);
+    return word;
+  });
+}
+function charBigrams(value) {
+  const text = String(value || "");
+  const grams = new Set();
+  for (let i = 0; i + 1 < text.length; i++) grams.add(text.slice(i, i + 2));
+  return grams;
+}
+function diceSimilarity(a, b) {
+  const left = charBigrams(a), right = charBigrams(b);
+  if (!left.size || !right.size) return 0;
+  let shared = 0;
+  for (const gram of left) if (right.has(gram)) shared += 1;
+  return (2 * shared) / (left.size + right.size);
+}
+const RANK_STOP = new Set("a an and are as at be but by for from how in is it of on or the to was were what when where which who why with does do did can could should would com www http https".split(" "));
+const relevanceTerms = query => [...new Set(rankTokens(query))].filter(token => !RANK_STOP.has(token)).slice(0, 40);
+const minimumMatches = count => Math.ceil(count * 2 / 3);
+function isTopicalResult(query, result, { requireTitle = false, snippetOnly = false } = {}) {
+  const terms = relevanceTerms(query);
+  if (!terms.length) return true;
+  const title = new Set(rankTokens(result.title));
+  let path = "";
+  try { const u = new URL(result.url); path = `${u.hostname} ${decodeURIComponent(u.pathname)}`; } catch {}
+  const subject = new Set([...title, ...rankTokens(path)]);
+  const all = new Set([...(snippetOnly ? [] : subject), ...rankTokens(result.snippet)]);
+  const matched = term => all.has(term) || (
+    /^[a-z]{4,}$/.test(term) && [term.replace(/e$/, "") + "ing", term + "ed", term + "d"].some(word => all.has(word))
+  );
+  return terms.filter(matched).length >= minimumMatches(terms.length) &&
+    terms.every(term => !/[0-9]/.test(term) || all.has(term)) &&
+    (!requireTitle || terms.some(term => subject.has(term)));
+}
+function scoreResultRelevance(query, row) {
+  const queryTokens = relevanceTerms(query);
+  const titleTokens = new Set(rankTokens(row.title));
+  let displayPath = row.displayUrl || row.url || "";
+  try { displayPath = decodeURIComponent(displayPath); } catch {}
+  const urlTokens = new Set(rankTokens(displayPath));
+  const snippetTokens = new Set(rankTokens(row.snippet));
+  const allTokens = [...new Set([...titleTokens, ...urlTokens, ...snippetTokens])];
+  if (!queryTokens.length) return { score: 0, coverage: 0, matchedTokens: [] };
+  const matched = [];
+  let score = 0;
+  for (const token of queryTokens) {
+    let hit = 0;
+    if (titleTokens.has(token)) hit = 3;
+    else if (urlTokens.has(token)) hit = 2;
+    else if (snippetTokens.has(token)) hit = 1;
+    if (!hit) {
+      // Character-level fuzzy match so typos and word variants still rank (e.g. "gmaes" ~ "games").
+      const fuzzy = allTokens.find(candidate => /^[a-z]{4,}$/.test(token) && /^[a-z]{4,}$/.test(candidate) &&
+        (((candidate.startsWith(token) || token.startsWith(candidate)) && Math.abs(candidate.length - token.length) <= 3) || diceSimilarity(candidate, token) >= 0.72));
+      if (fuzzy) hit = 0.75;
+    }
+    if (hit) { score += hit; matched.push(token); }
+  }
+  const coverage = matched.length / queryTokens.length;
+  score *= 0.4 + 0.6 * coverage;
+  const phrase = rankTokens(query).join(" ");
+  const titlePhrase = rankTokens(row.title).join(" ");
+  if (phrase && titlePhrase === phrase) score += 10;
+  else if (phrase && ` ${titlePhrase} `.includes(` ${phrase} `)) score += 5;
+  score += Math.min(3, (row.providers?.length || 1) - 1) * 1.5;
+  return { score: Math.round(score * 1000) / 1000, coverage: Math.round(coverage * 1000) / 1000, matchedTokens: matched };
+}
+function rankResultsByRelevance(query, rows, region) {
+  const scored = rows.map((row, index) => {
+    const relevance = scoreResultRelevance(query, row);
+    return { row, index, ...relevance, score: relevance.score + (india(region) && relevance.coverage ? indiaAffinity(row) * 1.5 : 0) };
+  });
+  const anyMatched = scored.some(item => item.coverage > 0);
+  scored.sort((a, b) => {
+    // Soft-demote: when at least one result matches the query, zero-coverage rows go to the end.
+    if (anyMatched && a.coverage === 0 !== (b.coverage === 0)) return a.coverage === 0 ? 1 : -1;
+    return b.score - a.score || a.index - b.index;
+  });
+  return scored.map(item => ({ ...item.row, relevance: item.coverage, relevanceScore: item.score }));
+}
+function diversifyWebResults(ranked, limit, scoped = false) {
+  if (scoped) return ranked.slice(0, limit);
+  const domains = new Map(), selected = [], deferred = [];
+  for (const row of ranked) {
+    const key = row.source === "wikipedia" ? "wikipedia.org" : new URL(row.url).hostname.replace(/^www\./, "");
+    const count = domains.get(key) || 0;
+    if (count >= 2) deferred.push(row);
+    else { selected.push(row); domains.set(key, count + 1); }
+  }
+  return [...selected, ...deferred].slice(0, limit);
+}
+function canonicalKey(url) {
+  try { const u = new URL(url); if (!/^https?:$/.test(u.protocol) || u.username || u.password) return ""; u.hash = ""; for (const k of [...u.searchParams.keys()]) if (/^utm_/i.test(k) || /^(fbclid|gclid|mc_cid|mc_eid)$/i.test(k)) u.searchParams.delete(k); u.hostname = u.hostname.toLowerCase(); return u.pathname === "/" && !u.search ? u.origin : u.href; }
+  catch { return ""; }
+}
+function dedupe(rows) { const seen = new Set(); return rows.filter(r => { const key = canonicalKey(r.url); if (!key || seen.has(key)) return false; seen.add(key); r.canonicalUrl = key; return true; }); }
+function classifyGoogleResponse({ status = 0, text = "", error = "" } = {}) {
+  const body = String(text || "").slice(0, 10000).toLowerCase();
+  if (/captcha|unusual traffic|automated queries|sorry\/index/.test(body)) return "challenge";
+  if (/consent\.google|before you continue to google/.test(body)) return "consent";
+  const errorText = String(error).toLowerCase();
+  if (/malformed/.test(errorText)) return "malformed-response";
+  if (/timeout|timed out|abort/.test(errorText)) return "timeout";
+  if (/dns|enotfound|eai_again/.test(errorText)) return "dns-error";
+  if (/tls|ssl|cert/.test(errorText)) return "tls-error";
+  if (/network|econn|enet|ehost/.test(errorText)) return "network-error";
+  if (!status && error) return "network-error";
+  if (status === 403) return "forbidden";
+  if (status === 429) return "rate-limited";
+  if (status >= 500) return "upstream-error";
+  if (status >= 400) return "http-error";
+  if (status >= 200 && !text) return "empty";
+  return "response";
+}
+function errorSummary(provider, error) {
+  const status = Number(error?.status || 0);
+  if (error?.code === "OPERATION_CANCELLED") return { code: "cancelled" };
+  const causeCode = String(error?.cause?.code || error?.code || "").toUpperCase();
+  const networkCode = /ENOTFOUND|EAI_AGAIN/.test(causeCode) ? "dns-error" : /CERT|TLS|SSL/.test(causeCode) ? "tls-error" : /ECONN|EHOST|ENET/.test(causeCode) ? "network-error" : "";
+  const common = status === 429 ? "rate-limited" : status === 403 ? "forbidden" : status >= 500 ? "upstream-error" : error?.name === "AbortError" || error?.code === "FETCH_TIMEOUT" || error?.name === "TimeoutError" ? "timeout" : error instanceof SyntaxError ? "malformed-response" : networkCode || "request-failed";
+  if (provider === "google") return { code: common, classification: classifyGoogleResponse({ status, error: common }) };
+  return { code: common };
+}
 
 function createWebSearch({ fetchText, env = process.env, log = () => {} }) {
   const googleKey = env.GOOGLE_SEARCH_API_KEY || env.GOOGLE_API_KEY || "";
   const googleCx = env.GOOGLE_SEARCH_CX || env.GOOGLE_CSE_ID || "";
   const braveKey = env.BRAVE_SEARCH_API_KEY || "";
   const bingKey = env.BING_SEARCH_API_KEY || "";
-  const order = String(env.WEB_SEARCH_ORDER || "brave,bing,duckduckgo,google").split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
-  const cache = new Map(); const TTL = 5 * 60 * 1000; const MAX = 200;
-  const failures = new Map();
-
+  const order = String(env.WEB_SEARCH_ORDER || GENERAL_ENGINES.join(",")).split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+  const timeoutMs = Math.max(250, Math.min(30000, Number(env.WEB_SEARCH_PROVIDER_TIMEOUT_MS) || 8000));
+  const maxProviders = Math.max(1, Math.min(GENERAL_ENGINES.length, Number(env.WEB_SEARCH_MAX_PROVIDERS) || 6));
+  const parallelism = Math.max(1, Math.min(8, Number(env.WEB_SEARCH_CONCURRENCY) || 6));
+  const overallDeadlineMs = Math.max(250, Math.min(60000, Number(env.WEB_SEARCH_DEADLINE_MS) || 12000));
+  const earlyCancelWindowMs = Math.max(0, Math.min(5000, env.WEB_SEARCH_EARLY_CANCEL_WINDOW_MS == null ? 1000 : Number(env.WEB_SEARCH_EARLY_CANCEL_WINDOW_MS) || 0));
+  const earlyResultThreshold = Math.max(1, Math.min(200, Number(env.WEB_SEARCH_EARLY_RESULT_THRESHOLD) || 40));
+  const cacheTtlMs = Math.max(0, Math.min(600000, Number(env.WEB_SEARCH_CACHE_TTL_MS) || 30000));
+  const cache = new Map(); const MAX_CACHE = 200; const cooldowns = new Map(), nextAllowed = new Map();
+  const health = Object.create(null);
+  let stackBackoffUntil = 0;
   const providers = {
-    google: {
-      available: () => !!(googleKey && googleCx),
-      async run(q, { offset, lang }) {
-        const u = new URL("https://www.googleapis.com/customsearch/v1");
-        u.searchParams.set("key", googleKey); u.searchParams.set("cx", googleCx); u.searchParams.set("q", q);
-        u.searchParams.set("num", "10"); if (offset) u.searchParams.set("start", String(Math.min(91, offset + 1)));
-        if (lang) u.searchParams.set("hl", lang);
-        const r = await fetchText(u.href, { accept: "application/json" });
-        if (!r.ok) throw Object.assign(new Error(`Google API HTTP ${r.status}`), { status: r.status });
-        return { results: parseGoogleApi(JSON.parse(r.text)), total: JSON.parse(r.text).searchInformation?.totalResults ?? null };
-      }
-    },
-    brave: {
-      available: () => !!braveKey,
-      async run(q, { offset, lang }) {
-        const u = new URL("https://api.search.brave.com/res/v1/web/search");
-        u.searchParams.set("q", q); u.searchParams.set("count", "20");
-        if (offset) u.searchParams.set("offset", String(Math.min(9, Math.floor(offset / 20))));
-        if (lang) u.searchParams.set("search_lang", lang);
-        const r = await fetchText(u.href, { accept: "application/json", headers: { "X-Subscription-Token": braveKey } });
-        if (!r.ok) throw Object.assign(new Error(`Brave Search API HTTP ${r.status}`), { status: r.status });
-        const json = JSON.parse(r.text); return { results: parseBraveApi(json), total: null, more: !!json?.query?.more_results_available };
-      }
-    },
-    bing: {
-      
-      
-      available: () => true,
-      async run(q, { offset, lang }) {
-        if (bingKey) {
-          const u = new URL("https://api.bing.microsoft.com/v7.0/search");
-          u.searchParams.set("q", q); u.searchParams.set("count", "20"); u.searchParams.set("offset", String(offset || 0));
-          if (lang) u.searchParams.set("setLang", lang);
-          const r = await fetchText(u.href, { accept: "application/json", headers: { "Ocp-Apim-Subscription-Key": bingKey } });
-          if (!r.ok) throw Object.assign(new Error(`Bing Search API HTTP ${r.status}`), { status: r.status });
-          const json = JSON.parse(r.text); return { results: parseBingApi(json), total: json?.webPages?.totalEstimatedMatches ?? null };
-        }
-        const u = new URL("https://www.bing.com/search"); u.searchParams.set("q", q);
-        if (offset) u.searchParams.set("first", String(offset + 1));
+    ...createSiteSearch({ fetchText, env, row, step: WEB_FEED_STEP, timeoutMs }),
+    stackoverflow: { available: () => true, async run(q, { offset, signal }) {
+      const u = new URL("https://api.stackexchange.com/2.3/search/advanced");
+      u.search = new URLSearchParams({ q, site: "stackoverflow", sort: "relevance", pagesize: String(WEB_FEED_STEP), page: String(1 + offset / WEB_FEED_STEP) }).toString();
+      const response = await fetchText(u.href, { signal, timeoutMs: Math.min(2800, timeoutMs), maxRedirects: 0 });
+      if (!response.ok) throw Object.assign(new Error("Stack Exchange API request failed"), { status: response.status, retryAfterMs: response.retryAfterMs });
+      const payload = JSON.parse(response.text);
+      if (Number(payload.backoff) > 0) stackBackoffUntil = Date.now() + Number(payload.backoff) * 1000;
+      if (payload.quota_remaining === 0) stackBackoffUntil = Math.max(stackBackoffUntil, Date.now() + 60 * 60 * 1000);
+      if (!Array.isArray(payload.items)) throw new Error("Invalid Stack Exchange API response");
+      const results = payload.items.slice(0, WEB_FEED_STEP).flatMap(item => {
+        const url = safeHttpUrl(item?.link);
+        if (!/^https:\/\/stackoverflow\.com\/questions\/\d+(?:\/|$)/.test(url)) return [];
+        const title = cheerio.load(String(item.title || "").slice(0, 600), null, false).text();
+        return [row(url, title, Array.isArray(item.tags) ? item.tags.join(" · ") : "", "stackoverflow")].filter(Boolean);
+      });
+      return { results, more: payload.has_more === true };
+    } },
+    wikipedia: { available: () => true, async run(q, { offset, lang, signal }) {
+      const u = new URL(`https://${referenceHost(lang)}/w/api.php`);
+      u.search = new URLSearchParams({ action: "query", list: "search", format: "json", formatversion: "2",
+        srsearch: q, srnamespace: "0", srprop: "snippet", srinfo: "totalhits",
+        srlimit: String(WEB_FEED_STEP), sroffset: String(offset) }).toString();
+      const response = await fetchText(u.href, { accept: "application/json", signal, timeoutMs: Math.min(3200, timeoutMs),
+        userAgent: "VeyraSearch/1.0 (+https://github.com/HomekidChud/VeyraServer)" });
+      if (!response.ok) throw Object.assign(new Error("Wikipedia Search request failed"), { status: response.status, retryAfterMs: response.retryAfterMs });
+      const payload = JSON.parse(response.text);
+      if (payload.error) throw new Error("Wikipedia Search API error");
+      const results = (Array.isArray(payload.query?.search) ? payload.query.search : []).slice(0, WEB_FEED_STEP).flatMap(item => {
+        if (item?.ns !== 0 || typeof item.title !== "string" || !item.title.trim()) return [];
+        const url = `${u.origin}/wiki/${encodeURIComponent(item.title.replaceAll(" ", "_"))}`;
+        const snippet = cheerio.load(String(item.snippet || "").slice(0, 2400), null, false).text();
+        const result = row(url, item.title, snippet, "wikipedia");
+        return result ? [result] : [];
+      });
+      return { results, total: payload.query?.searchinfo?.totalhits, more: payload.continue?.sroffset === offset + WEB_FEED_STEP };
+    } },
+    google: { available: () => !!(googleKey && googleCx), async run(q, { offset, lang, region, shopping, signal }) {
+      const u = new URL("https://www.googleapis.com/customsearch/v1"); u.searchParams.set("key", googleKey); u.searchParams.set("cx", googleCx); u.searchParams.set("q", q); u.searchParams.set("num", "10"); if (offset) u.searchParams.set("start", String(Math.min(91, offset + 1))); if (lang) u.searchParams.set("hl", lang);
+      if (region) u.searchParams.set("gl", region.toLowerCase());
+      const r = await fetchText(u.href, { accept: "application/json", signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Google Custom Search API request failed"), { status: r.status, retryAfterMs: r.retryAfterMs });
+      const json = JSON.parse(r.text); return { results: parseGoogleApi(json, shopping), total: json.searchInformation?.totalResults ?? null, more: !!json.queries?.nextPage?.length, stride: 10 };
+    } },
+    brave: { available: () => !!braveKey, async run(q, { offset, lang, region, signal, feed }) {
+      const count = feed ? WEB_FEED_STEP : 20;
+      const u = new URL("https://api.search.brave.com/res/v1/web/search"); u.searchParams.set("q", q); u.searchParams.set("count", String(count)); if (offset) u.searchParams.set("offset", String(Math.min(9, Math.floor(offset / count)))); if (lang) u.searchParams.set("search_lang", lang);
+      if (region) u.searchParams.set("country", region);
+      const r = await fetchText(u.href, { accept: "application/json", headers: { "X-Subscription-Token": braveKey }, signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Brave Search API request failed"), { status: r.status, retryAfterMs: r.retryAfterMs }); const json = JSON.parse(r.text); return { results: parseBraveApi(json), total: null, more: !!json?.query?.more_results_available };
+    } },
+    bing: { available: () => true, async run(q, { offset, lang, region, signal, limit, feed }) {
+      const u = new URL(bingKey ? "https://api.bing.microsoft.com/v7.0/search" : "https://www.bing.com/search"); u.searchParams.set("q", q);
+      if (region) u.searchParams.set("cc", region);
+      const requestedLimit = feed ? WEB_FEED_STEP : Math.max(1, Math.min(100, Number(limit) || 30));
+      if (bingKey) { u.searchParams.set("count", String(requestedLimit)); u.searchParams.set("offset", String(offset || 0)); if (lang) u.searchParams.set("setLang", lang); }
+      else {
         if (lang) u.searchParams.set("setlang", lang);
-        const r = await fetchText(u.href, { accept: "text/html" });
-        if (!r.ok) throw Object.assign(new Error(`Bing HTTP ${r.status}`), { status: r.status });
-        return { results: parseBingHtml(r.text), total: null };
+        const pageSize = 10, starts = Array.from({ length: Math.ceil(requestedLimit / pageSize) }, (_, i) => Math.max(0, Number(offset) || 0) + i * pageSize);
+        const pages = await Promise.allSettled(starts.map(async resultOffset => {
+          const pageUrl = new URL(u.href);
+          if (resultOffset > 0) pageUrl.searchParams.set("first", String(resultOffset + 1));
+          pageUrl.searchParams.set("count", String(pageSize));
+          const response = await fetchText(pageUrl.href, { accept: "text/html", signal, timeoutMs });
+          if (!response.ok) throw Object.assign(new Error("Bing search request failed"), { status: response.status, retryAfterMs: response.retryAfterMs });
+          return parseBingHtml(response.text);
+        }));
+        const successful = pages.filter(page => page.status === "fulfilled").flatMap(page => page.value);
+        if (!successful.length) throw pages.find(page => page.status === "rejected")?.reason || new Error("Bing returned no result pages");
+        const results = dedupe(successful).slice(0, requestedLimit);
+        return { results, total: null, more: results.length >= requestedLimit, pagesFetched: pages.filter(page => page.status === "fulfilled").length };
       }
-    },
-    duckduckgo: {
-      available: () => true,
-      async run(q, { offset, lang }) {
-        const u = new URL("https://html.duckduckgo.com/html/"); u.searchParams.set("q", q);
-        if (offset) u.searchParams.set("s", String(offset));
-        if (lang) u.searchParams.set("kl", lang === "en" ? "wt-wt" : `${lang}-${lang}`);
-        const r = await fetchText(u.href, { accept: "text/html" });
-        if (!r.ok) throw Object.assign(new Error(`DuckDuckGo HTTP ${r.status}`), { status: r.status });
-        if (/anomaly-modal|challenge-form|bots use DuckDuckGo too/i.test(r.text)) throw Object.assign(new Error("DuckDuckGo asked for a verification"), { status: 429 });
-        return { results: parseDuckDuckGoHtml(r.text), total: null };
-      }
-    }
+      const r = await fetchText(u.href, { accept: bingKey ? "application/json" : "text/html", headers: bingKey ? { "Ocp-Apim-Subscription-Key": bingKey } : {}, signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Bing search request failed"), { status: r.status, retryAfterMs: r.retryAfterMs });
+      const json = JSON.parse(r.text); const results = parseBingApi(json);
+      return { results, total: json?.webPages?.totalEstimatedMatches ?? null, more: results.length >= requestedLimit };
+    } },
+    mojeek: { firstPage: true, available: () => true, async run(q, { offset, lang, signal }) {
+      const u = new URL("https://www.mojeek.com/search"); u.searchParams.set("q", q); u.searchParams.set("t", String(Math.min(50, 10 + (Number(offset) || 0)))); if (lang) u.searchParams.set("lb", lang);
+      const r = await fetchText(u.href, { accept: "text/html", signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Mojeek search request failed"), { status: r.status, retryAfterMs: r.retryAfterMs });
+      return { results: parseMojeekHtml(r.text), total: null };
+    } },
+    ecosia: { available: () => true, async run(q, { offset, lang, signal }) {
+      const u = new URL("https://www.ecosia.org/search"); u.searchParams.set("q", q); if (offset) u.searchParams.set("p", String(Math.floor(Number(offset) / 10) + 1)); if (lang) u.searchParams.set("hl", lang);
+      const r = await fetchText(u.href, { accept: "text/html", signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Ecosia search request failed"), { status: r.status, retryAfterMs: r.retryAfterMs });
+      const results = parseEcosiaHtml(r.text);
+      return { results, total: null, more: results.length >= WEB_FEED_STEP, stride: WEB_FEED_STEP };
+    } },
+    startpage: { available: () => true, async run(q, { offset, lang, signal }) {
+      const u = new URL("https://www.startpage.com/sp/search"); u.searchParams.set("query", q); if (offset) u.searchParams.set("page", String(Math.floor(Number(offset) / 10) + 1)); if (lang) u.searchParams.set("language", lang);
+      const r = await fetchText(u.href, { accept: "text/html", signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Startpage search request failed"), { status: r.status, retryAfterMs: r.retryAfterMs });
+      const results = parseStartpageHtml(r.text);
+      return { results, total: null, more: results.length >= WEB_FEED_STEP, stride: WEB_FEED_STEP };
+    } },
+    yahoo: { available: () => true, async run(q, { offset, lang, signal }) {
+      const u = new URL("https://search.yahoo.com/search"); u.searchParams.set("p", q); if (offset) u.searchParams.set("b", String(Number(offset) + 1)); if (lang) u.searchParams.set("vl", lang);
+      const r = await fetchText(u.href, { accept: "text/html", signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("Yahoo search request failed"), { status: r.status, retryAfterMs: r.retryAfterMs });
+      const results = dedupe(parseYahooHtml(r.text));
+      return { results, total: null, more: results.length >= WEB_FEED_STEP, stride: WEB_FEED_STEP };
+    } },
+    duckduckgo: { firstPage: true, available: () => true, async run(q, { offset, lang, region, signal }) {
+      const u = new URL("https://html.duckduckgo.com/html/"); u.searchParams.set("q", q); if (offset) u.searchParams.set("s", String(offset)); if (region || lang) u.searchParams.set("kl", region ? "in-en" : lang === "en" ? "wt-wt" : `${lang}-${lang}`);
+      const r = await fetchText(u.href, { accept: "text/html", signal, timeoutMs }); if (!r.ok) throw Object.assign(new Error("DuckDuckGo search request failed"), { status: r.status, retryAfterMs: r.retryAfterMs });
+      if (/anomaly-modal|challenge-form|bots use DuckDuckGo too/i.test(r.text)) throw Object.assign(new Error("DuckDuckGo returned a verification challenge"), { status: 429 }); return { results: parseDuckDuckGoHtml(r.text), total: null };
+    } }
   };
-
-  async function search(query, { offset = 0, engine = "", lang = "" } = {}) {
-    const q = cleanText(query, 600);
-    if (!q) return { provider: "none", results: [], attempts: [] };
-    const want = engine && providers[engine] ? [engine, ...order.filter(p => p !== engine)] : order;
-    const key = `${want.join(",")}|${offset}|${lang}|${q.toLowerCase()}`;
-    const hit = cache.get(key);
-    if (hit && Date.now() - hit.time < TTL) return { ...hit.value, cached: true };
-    const attempts = [];
-    for (const name of want) {
-      const p = providers[name];
-      if (!p) continue;
-      if (!p.available()) { attempts.push({ provider: name, skipped: "not-configured" }); continue; }
-      if ((failures.get(name) || 0) > Date.now()) { attempts.push({ provider: name, skipped: "cooldown" }); continue; }
-      const started = Date.now();
-      try {
-        const packed = await p.run(q, { offset, lang });
-        const results = dedupe(packed.results || []);
-        attempts.push({ provider: name, ms: Date.now() - started, count: results.length });
-        if (!results.length) continue;
-        const value = { provider: name, results: results.slice(0, 20), total: packed.total ?? null, more: !!packed.more, attempts, googleConfigured: providers.google.available(), braveConfigured: providers.brave.available(), bingConfigured: !!bingKey };
-        cache.set(key, { time: Date.now(), value });
-        while (cache.size > MAX) cache.delete(cache.keys().next().value);
-        return value;
-      } catch (e) {
-        attempts.push({ provider: name, ms: Date.now() - started, error: e.message });
-        if (e.status === 429 || e.status === 403) failures.set(name, Date.now() + 60 * 1000);
-        log("warn", "SEARCH", `${name} web search failed: ${e.message}`);
+  function configured(name) { return !!providers[name]?.available(); }
+  function healthRecord(name) { return health[name] || { attempted: 0, successfulRequests: 0, nonEmpty: 0, emptyResponses: 0, failures: 0, consecutiveFailures: 0, latencyEwmaMs: null, latencySamplesMs: [], lastStatus: "not-checked", lastCheckedAt: null }; }
+  function withLatency(old, ms) { return [...(old.latencySamplesMs || []), ms].slice(-100); }
+  function percentile(values, q) { if (!values.length) return null; const sorted = [...values].sort((a, b) => a - b); return sorted[Math.min(sorted.length - 1, Math.ceil(q * sorted.length) - 1)]; }
+  function recordSuccess(name, results, ms) {
+    const old = healthRecord(name), now = Date.now();
+    health[name] = { ...old, attempted: old.attempted + 1, successfulRequests: old.successfulRequests + 1, nonEmpty: old.nonEmpty + (results.length ? 1 : 0), emptyResponses: old.emptyResponses + (results.length ? 0 : 1), failures: old.failures, consecutiveFailures: 0, latencySamplesMs: withLatency(old, ms), latencyEwmaMs: old.latencyEwmaMs == null ? ms : Math.round(old.latencyEwmaMs * 0.7 + ms * 0.3), lastStatus: results.length ? "success" : "empty", lastLatencyMs: ms, lastCheckedAt: now, lastSuccessAt: now };
+    cooldowns.delete(name);
+  }
+  function recordFailure(name, ms, info, error) {
+    const old = healthRecord(name), now = Date.now(), consecutiveFailures = old.consecutiveFailures + 1;
+    const retryAfter = Number(error?.retryAfterMs);
+    const cooldownMs = Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(60000, retryAfter) : error?.status === 429 || error?.status === 403 ? 60000 : consecutiveFailures >= 3 ? 30000 : 10000;
+    const until = now + cooldownMs; cooldowns.set(name, until);
+    health[name] = { ...old, attempted: old.attempted + 1, failures: old.failures + 1, consecutiveFailures, latencySamplesMs: withLatency(old, ms), latencyEwmaMs: old.latencyEwmaMs == null ? ms : Math.round(old.latencyEwmaMs * 0.7 + ms * 0.3), lastStatus: info.code, lastLatencyMs: ms, lastCheckedAt: now, lastFailureAt: now, breakerOpenUntil: until };
+  }
+  function healthSummary(name) {
+    const item = healthRecord(name), now = Date.now();
+    return { configured: configured(name), attempted: item.attempted, successfulRequests: item.successfulRequests, nonEmpty: item.nonEmpty, emptyResponses: item.emptyResponses, failures: item.failures, successRate: item.attempted ? Math.round(item.successfulRequests / item.attempted * 1000) / 1000 : null, consecutiveFailures: item.consecutiveFailures, latencyEwmaMs: item.latencyEwmaMs, latencyP50Ms: percentile(item.latencySamplesMs || [], 0.5), latencyP95Ms: percentile(item.latencySamplesMs || [], 0.95), lastLatencyMs: item.lastLatencyMs ?? null, lastStatus: item.lastStatus, lastCheckedAt: item.lastCheckedAt, cooldownMsRemaining: Math.max(0, (cooldowns.get(name) || 0) - now), circuitState: (cooldowns.get(name) || 0) > now ? "open" : "closed" };
+  }
+  function providerUtility(name) {
+    const item = healthRecord(name);
+    if (!item.attempted) return 0.65 * 0.5 + 0.2 * 0.5 + 0.15;
+    const reliability = (item.successfulRequests + 1) / (item.attempted + 2);
+    const latency = 1 / (1 + Math.max(0, item.latencyEwmaMs || 0) / 2500);
+    return 0.65 * reliability + 0.2 * latency + 0.15 / Math.sqrt(item.attempted + 1);
+  }
+  async function runProvider(name, q, params) {
+    const controller = new AbortController(); const started = Date.now();
+    let timer, abortListener;
+    const abortUpstream = () => controller.abort();
+    if (params.signal?.aborted) controller.abort();
+    else params.signal?.addEventListener("abort", abortUpstream, { once: true });
+    try {
+      if (controller.signal.aborted) throw Object.assign(new Error("Operation cancelled."), { code: "OPERATION_CANCELLED" });
+      const abortPromise = new Promise((_, reject) => { abortListener = () => reject(Object.assign(new Error("Provider request cancelled"), { name: "AbortError" })); controller.signal.addEventListener("abort", abortListener, { once: true }); });
+      const packed = await Promise.race([providers[name].run(q, { ...params, signal: controller.signal }), abortPromise, new Promise((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(Object.assign(new Error("Provider deadline exceeded"), { name: "AbortError" })); }, timeoutMs); })]);
+      const rawResults = dedupe(packed.results || []);
+      const results = params.filterRows(rawResults); const ms = Date.now() - started;
+      if (results.length) params.onResults?.(Date.now());
+      recordSuccess(name, rawResults, ms);
+      return { name, results, total: packed.total ?? null, more: !!packed.more, stride: packed.stride || params.limit, ms };
+    } catch (e) {
+      const ms = Date.now() - started;
+      if (params.isCancelled?.()) return { name, results: [], ms, error: "cancelled", cancelled: true };
+      if (params.isEarlyCancel?.()) return { name, results: [], ms, cancelledAfterSufficientResults: true };
+      const info = params.isDeadlineExpired?.() ? { code: "overall-deadline", ...(name === "google" ? { classification: "timeout" } : {}) } : errorSummary(name, e);
+      recordFailure(name, ms, info, e);
+      log("warn", "SEARCH", `${name} search provider failed (${info.code})`);
+      return { name, results: [], ms, error: info.code, classification: info.classification };
+    } finally { clearTimeout(timer); if (abortListener) controller.signal.removeEventListener("abort", abortListener); params.signal?.removeEventListener("abort", abortUpstream); }
+  }
+  async function search(query, { offset = 0, engine = "", preferGoogle = false, domainBrowse = false, lang = "", signal, limit = 20, noCache = false, region = "", shopping = false, feed = false, reference = false, topic = "", privateSearch = false } = {}) {
+    const requestStartedAt = Date.now(); let firstResultAt = null;
+    const requestedLimit = Math.max(1, Math.min(50, Number(limit) || 20));
+    const q = cleanText(query, 600); if (!q) return { provider: "none", results: [], attempts: [], responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: null };
+    const scope = parseSiteScope(q);
+    if (scope.invalid) return { provider: "none", results: [], attempts: [], more: false, siteFilter: { invalid: true }, responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: null };
+    const domainOnly = domainBrowse && !scope.text && scope.include[0];
+    const providerQuery = domainOnly ? `${q} ${domainOnly}` : q;
+    region = india(region) ? "IN" : "";
+    shopping = Boolean(region && shopping);
+    const regionalLanguage = region ? indiaLanguage(scope.text || q, lang) : "";
+    const referenceLang = (regionalLanguage || lang).toLowerCase().split("-")[0];
+    const includeReference = feed && reference && !engine && !shopping && scope.text &&
+      allowsSiteUrl(scope, `https://${referenceHost(referenceLang)}/`);
+    const specialist = new Set(["wikipedia", "stackoverflow"]);
+    const includeStack = feed && reference && !engine && !shopping && allowsSiteUrl(scope, "https://stackoverflow.com/") &&
+      (scope.include.includes("stackoverflow.com") || /\b(?:javascript|typescript|python|pandas|numpy|rust|kotlin|sql|postgresql|golang|node\.js|reactjs|css|html|docker|kubernetes|linux|git|regex)\b/i.test(scope.text));
+    const native = feed && reference && !engine && !shopping && !privateSearch && scope.text
+      ? Object.entries(providers).filter(([, p]) => p.native && !(offset && p.firstPage) &&
+        p.hosts.some(host => allowsSiteUrl(scope, `https://${host}/`)) && (scope.include.length || p.intent.test(scope.text)))
+        .map(([name]) => name) : [];
+    preferGoogle = !engine && preferGoogle;
+    const requested = [...new Set(engine && GENERAL_ENGINES.includes(engine) ? [engine]
+      : [...(preferGoogle ? ["google"] : []), ...order.filter(name => GENERAL_ENGINES.includes(name))])].filter(name => !(name === "searxng" && privateSearch));
+    const key = JSON.stringify([requested, preferGoogle, native, offset, region, shopping, feed, !!includeReference, !!includeStack, topic, requestedLimit, regionalLanguage || lang, providerQuery.toLowerCase()]);
+    const hit = noCache ? null : cache.get(key);
+    if (hit && Date.now() - hit.time < cacheTtlMs) return { ...hit.value, cached: true, responseTimeMs: Date.now() - requestStartedAt };
+    const attempts = []; let eligible = [];
+    for (const name of requested) {
+      if (feed && offset && providers[name].firstPage) continue;
+      if (!configured(name)) { attempts.push({ provider: name, skipped: "not-configured" }); continue; }
+      if ((cooldowns.get(name) || 0) > Date.now()) { attempts.push({ provider: name, skipped: "cooldown" }); continue; }
+      eligible.push(name);
+    }
+    if (!engine) {
+      eligible = eligible.slice(0, preferGoogle && eligible[0] === "google" ? Math.max(2, maxProviders) : maxProviders);
+      if (eligible.some(name => healthRecord(name).attempted)) {
+        const originalOrder = new Map(eligible.map((name, index) => [name, index]));
+        eligible.sort((a, b) => providerUtility(b) - providerUtility(a) || originalOrder.get(a) - originalOrder.get(b));
       }
     }
-    return { provider: "none", results: [], attempts, googleConfigured: providers.google.available(), braveConfigured: providers.brave.available(), bingConfigured: !!bingKey };
+    eligible.unshift(...native.filter(name => !(cooldowns.get(name) > Date.now())).slice(0, 3));
+    if (includeReference && !(cooldowns.get("wikipedia") > Date.now())) eligible.unshift("wikipedia");
+    if (includeStack && !(Math.max(stackBackoffUntil, cooldowns.get("stackoverflow") || 0) > Date.now())) eligible.unshift("stackoverflow");
+    if (preferGoogle && eligible.includes("google")) eligible = ["google", ...eligible.filter(name => name !== "google")];
+    const requestController = new AbortController();
+    let callerCancelled = false, deadlineExpired = false, earlyCancelled = false;
+    const observedResultKeys = new Set();
+    const scopedRows = rows => scope.active || shopping ? rows.filter(result =>
+      (!scope.active || allowsSiteUrl(scope, result.url)) && (!shopping || isIndianProductUrl(result.url))) : rows;
+    const requestBudgetMs = overallDeadlineMs;
+    const deadlineAt = Date.now() + requestBudgetMs;
+    const abortForCaller = () => { callerCancelled = true; requestController.abort(); };
+    if (signal?.aborted) abortForCaller(); else signal?.addEventListener("abort", abortForCaller, { once: true });
+    const deadlineTimer = setTimeout(() => { deadlineExpired = true; requestController.abort(); }, requestBudgetMs);
+    const settled = new Array(eligible.length); let cursor = 0;
+    async function worker() {
+      while (cursor < eligible.length && !requestController.signal.aborted) {
+        const index = cursor++, name = eligible[index];
+        const interval = providers[name].minInterval;
+        if (interval) {
+          if (nextAllowed.get(name) > Date.now()) { attempts.push({ provider: name, skipped: "rate-pacing" }); continue; }
+          nextAllowed.set(name, Date.now() + interval);
+        }
+        const providerLang = regionalLanguage ? (name === "brave" ? braveLanguage(regionalLanguage) : regionalLanguage.split("-")[0]) : lang;
+        const item = await runProvider(name, specialist.has(name) || providers[name].native ? scope.text : providerQuery, { offset, limit: requestedLimit,
+          lang: name === "wikipedia" ? referenceLang : providerLang, region, shopping, feed, filterRows: scopedRows,
+          signal: requestController.signal, isCancelled: () => callerCancelled, isDeadlineExpired: () => deadlineExpired,
+          isEarlyCancel: () => earlyCancelled, onResults: at => { if (firstResultAt == null) firstResultAt = at; } });
+        settled[index] = item;
+        for (const result of item.results) { const key = canonicalKey(result.url); if (key) observedResultKeys.add(key); }
+        if (!callerCancelled && !deadlineExpired && !earlyCancelled && observedResultKeys.size >= earlyResultThreshold && deadlineAt - Date.now() <= earlyCancelWindowMs) {
+          earlyCancelled = true; requestController.abort();
+        }
+      }
+    }
+    try { await Promise.all(Array.from({ length: Math.min(parallelism, eligible.length) }, worker)); }
+    finally { clearTimeout(deadlineTimer); signal?.removeEventListener("abort", abortForCaller); }
+    const successful = settled.filter(Boolean);
+    for (const item of successful) attempts.push({ provider: item.name, ms: item.ms, count: item.results.length, ...(item.cancelledAfterSufficientResults ? { skipped: "cancelled-after-sufficient-results" } : {}), ...(item.error ? { error: item.error, ...(item.classification ? { classification: item.classification } : {}) } : {}) });
+    const merged = new Map();
+    for (const item of successful) for (const result of item.results) {
+      const id = canonicalKey(result.url); const existing = merged.get(id);
+      if (!existing) merged.set(id, { ...result, providers: [item.name], source: item.name });
+      else {
+        if (!existing.providers.includes(item.name)) existing.providers.push(item.name);
+        if (result.upstreamEngines) existing.upstreamEngines = [...new Set([...(existing.upstreamEngines || []), ...result.upstreamEngines])].slice(0, 12);
+        if (result.snippet.length > existing.snippet.length) existing.snippet = result.snippet;
+        if (result.price && !existing.price) existing.price = result.price;
+        if (result.media && !existing.media) existing.media = result.media;
+      }
+    }
+    // Rank the merged provider results by token relevance to the query so the
+    // most on-topic pages surface first instead of raw provider arrival order.
+    const rankQuery = domainOnly || topic === null ? "" : topic || scope.text || q;
+    const ranked = rankResultsByRelevance(rankQuery, [...merged.values()], region);
+    const relevant = feed ? ranked.filter(row => isTopicalResult(rankQuery, row, { requireTitle: !!topic || !scope.active })) : ranked;
+    const results = feed ? diversifyWebResults(relevant, requestedLimit, scope.active || !!engine) : relevant.slice(0, requestedLimit);
+    const source = (feed ? results[0]?.source : successful.find(x => x.results.length)?.name) || "none";
+    const value = { provider: source, results, ranking: { method: feed ? "topical-diverse-v2" : "token-relevance" }, total: successful.reduce((n, x) => n + (x.total || x.results.length), 0) || null, more: successful.some(x => x.more), attempts, googleConfigured: configured("google"), braveConfigured: configured("brave"), bingConfigured: configured("bing"), providersUsed: successful.filter(x => x.results.length).map(x => x.name), cancelled: callerCancelled, earlyCancelled, deadlineExceeded: deadlineExpired, responseTimeMs: Date.now() - requestStartedAt, timeToFirstResultMs: firstResultAt == null ? null : firstResultAt - requestStartedAt, diagnostics: { providerCount: eligible.length, parallelism: Math.min(parallelism, eligible.length), overallDeadlineMs: requestBudgetMs, earlyCancelWindowMs, earlyResultThreshold, providers: Object.fromEntries(Object.keys(providers).map(name => [name, healthSummary(name)])), google: healthSummary("google") } };
+    if (scope.active) {
+      value.total = null;
+      value.siteFilter = { include: scope.include, exclude: scope.exclude };
+    }
+    if (feed) {
+      // A valid later page may follow a thin page; do not treat a filtered
+      // batch as proof of exhaustion once the feed has already begun.
+      value.more = !callerCancelled && value.more && offset + WEB_FEED_STEP < WEB_FEED_INDEX_OFFSET;
+      value.nextOffset = value.more ? offset + WEB_FEED_STEP : null;
+      value.status = results.length ? "ok" : callerCancelled ? "cancelled" :
+        successful.some(item => !item.error && !item.cancelledAfterSufficientResults) ? "empty" : "unavailable";
+    } else if (scope.active) {
+      const nextOffset = offset + Math.min(requestedLimit, ...successful.filter(item => item.more).map(item => item.stride));
+      value.more = value.more && nextOffset < 60;
+      if (value.more) value.nextOffset = nextOffset;
+      if (!results.length) value.timeToFirstResultMs = null;
+    }
+    if (!noCache && !callerCancelled && results.length && cacheTtlMs) { cache.set(key, { time: Date.now(), value }); while (cache.size > MAX_CACHE) cache.delete(cache.keys().next().value); }
+    return value;
   }
-  return { search, googleConfigured: () => providers.google.available(), order };
+  return { search, googleConfigured: () => configured("google"), order, providers: Object.keys(providers), diagnostics: () => ({ adaptiveOrdering: true, maxProviders, parallelism, overallDeadlineMs, providers: Object.fromEntries(Object.keys(providers).map(name => [name, healthSummary(name)])) }) };
 }
 
-module.exports = { createWebSearch, parseDuckDuckGoHtml, parseBingHtml, parseGoogleApi, parseBraveApi, parseBingApi, unwrapBing, unwrapDuckDuckGo };
+module.exports = { createWebSearch, GENERAL_ENGINES, WEB_FEED_STEP, WEB_FEED_INDEX_OFFSET, parseDuckDuckGoHtml, parseBingHtml, parseMojeekHtml, parseEcosiaHtml, parseStartpageHtml, parseYahooHtml, parseGoogleApi, parseBraveApi, parseBingApi, unwrapBing, unwrapDuckDuckGo, classifyGoogleResponse, canonicalKey, rankResultsByRelevance, scoreResultRelevance, isTopicalResult, diversifyWebResults, minimumMatches, diceSimilarity };

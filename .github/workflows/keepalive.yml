@@ -1,0 +1,26 @@
+name: Keep Render service awake
+
+# Render's free tier spins the web service down after ~15 minutes without
+# inbound traffic. While it spins back up, Render serves its own loading page,
+# which Chrome refuses to frame — Veyra tabs then show
+# "veyraserver-xscy.onrender.com refused to connect (ERR_BLOCKED_BY_RESPONSE)".
+# This workflow pings the service every 10 minutes so it never goes idle.
+# If the service URL changes, update it here (and in the browser web config).
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping the Veyra API health endpoint
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 120 https://veyraserver-xscy.onrender.com/health)
+          echo "health responded: $code"
+          if [ "$code" != "200" ]; then
+            echo "::warning::VeyraServer health check returned $code (service may be suspended or the URL changed)"
+          fi

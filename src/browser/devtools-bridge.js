@@ -287,7 +287,7 @@ function installVeyraDevtools(emitFn, opts) {
   function storageList(kind) { const s = store(kind), out = []; for (let i = 0; i < s.length && i < 2000; i++) { const k = s.key(i); const v = s.getItem(k) || ""; out.push([k, v.length > 20000 ? v.slice(0, 20000) + "…" : v]); } return out; }
 
   
-  const ext = { css: new Map(), zoom: 1 };
+  const ext = { css: new Map(), scripts: new Map(), scriptValues: new Map(), zoom: 1 };
   function extStyle(key, css) {
     let el = document.querySelector("style[" + OWN + '="ext-' + key + '"]');
     if (!css) { if (el) el.remove(); ext.css.delete(key); return; }
@@ -403,6 +403,22 @@ function installVeyraDevtools(emitFn, opts) {
       if (/@import\b|url\s*\(|javascript\s*:|expression\s*\(|-moz-binding|behavior\s*:|@font-face|@namespace\b/i.test(css)) throw new Error("Veyra only allows isolated CSS extensions; imports, URLs and script-capable constructs are blocked.");
       if (css.length > 120000) throw new Error("Extension CSS exceeds the 120 KB safety limit.");
       extStyle("user-" + String(p.key).replace(/[^\w-]/g, ""), css.slice(0, 120000)); return true;
+    },
+    "ext.script": p => {
+      const key = String(p.key || "user").replace(/[^\w-]/g, "");
+      const source = String(p.script || "");
+      if (source.length > 200000) throw new Error("Userscript exceeds the 200 KB safety limit.");
+      const old = ext.scripts.get(key); if (old === source) return true;
+      if (!source.trim()) { ext.scripts.delete(key); extStyle("script-" + key, ""); return true; }
+      const values = ext.scriptValues.get(key) || Object.create(null); ext.scriptValues.set(key, values);
+      const gmGet = name => values[String(name)] ?? null;
+      const gmSet = (name, value) => { values[String(name)] = value; return value; };
+      const gmDelete = name => { delete values[String(name)]; return true; };
+      const gmList = () => Object.keys(values).slice(0, 200);
+      const gmStyle = css => { if (String(css).length > 120000) throw new Error("GM_addStyle CSS is too large."); extStyle("script-" + key, String(css)); };
+      const run = new Function("GM_getValue", "GM_setValue", "GM_deleteValue", "GM_listValues", "GM_addStyle", `${source}\n//# sourceURL=veyra-userscript-${key}.user.js`);
+      run(gmGet, gmSet, gmDelete, gmList, gmStyle);
+      ext.scripts.set(key, source); return true;
     },
     "ext.zoom": p => { ext.zoom = Math.max(.25, Math.min(5, Number(p.zoom) || 1)); document.documentElement.style.zoom = ext.zoom === 1 ? "" : String(ext.zoom); return ext.zoom; },
     "ext.reader": () => readerView(),

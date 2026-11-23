@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const cheerio = require("cheerio");
+const { parse: parseModuleImports } = require("es-module-lexer");
 const crypto = require("crypto");
 const dns = require("dns").promises;
 const net = require("net");
@@ -9,38 +10,67 @@ const fsp = fs.promises;
 const path = require("path");
 const os = require("os");
 const { BrowserEngine } = require("./browser/browser-engine");
+const { blockPlaybackPopup } = require("./browser/popup-follow");
+const { pageActionsRuntime } = require("./browser/page-actions-runtime");
 const { VpnManager } = require("./network/vpn");
 const { createShield } = require("./network/shield");
-const { createWebSearch } = require("./services/websearch");
+const { upstreamHeaderCapOptions } = require("./network/header-cap");
+const { createWebSearch, GENERAL_ENGINES, WEB_FEED_STEP, WEB_FEED_INDEX_OFFSET, canonicalKey, rankResultsByRelevance, isTopicalResult, diversifyWebResults, minimumMatches } = require("./services/websearch");
+const { languageTag, normalizeSearchText, unicodeWords } = require("./services/search-language");
+const { walkSitemap, hasRel } = require("./services/crawl-sitemap");
+const { india, indiaAffinity, isIndianProductUrl } = require("./services/search-region");
+const { createVerticalSearch, TYPES: SEARCH_VERTICALS, lastVerticalPage, indexedWatchPage, safeUrl: verticalResultUrl } = require("./services/vertical-search");
+const { createPublisherMedia } = require("./services/publisher-media");
+const { merchantProductUrl, PRODUCT_BYTES } = require("./services/india-storefronts");
+const { publicImageUrl, imageIdentity } = require("./services/crawl-page-data");
+const { parseSiteScope, allowsSiteUrl } = require("./services/search-site-scope");
+const { searchPrivacy, masksSearchScope, allowsSearchResult } = require("./services/search-privacy");
+const { annotateMatchBatch, matchModelVersion } = require("./services/search-match");
+const { createSourceSearch, defaultEvidence, sourcePageUrl } = require("./services/source-search");
+const { referenceResults, navigationResult } = require("./services/reference-catalog");
 const { installBrandRoutes, isReservedOriginPath, brandNotFoundHtml } = require("./services/brand");
 const VEYRA_VERSION = require("../package.json").version;
 const { SessionManager } = require("./core/session-manager");
 const { AuthStore } = require("./core/auth");
+const { AccessGate } = require("./core/access-gate");
+const { AccessPolicy } = require("./core/access-policy");
 const { WorkerPool } = require("./core/worker-pool");
 const { MongoStore } = require("./core/mongo-store");
 const youtubeCompat = require("./browser/youtube");
+const { watchVideo, installWatchPlayer } = require("./browser/youtube-watch-player");
 const mediaErrors = require("./browser/media-errors");
+const { watchEmptyProxyShell, announceProxyStatus } = require("./browser/proxy-shell");
 const { isMainThread } = require("worker_threads");
 const { NeuralRobotPool } = require("./services/neural-robots");
 const { NeuralCrawlerModel } = require("./services/neural-crawler");
 const { NeuralLearningWorker } = require("./services/neural-learning");
-const { ChallengeSolver } = require("./browser/challenge-solver");
+const { createPublicCrawlTrainer, trainingUrl } = require("./services/neural-training-data");
+const { isChallengePage, detectChallengeType } = require("./browser/challenge-detector");
 const { CastServer, InternetConnectionManager } = require("./network/cast-server");
+const { WsRelay } = require("./network/ws-relay");
 const { AIAnswerEngine } = require("./services/ai-answer");
+const { discoverAnswerSources, STRATEGY: answerDiscoveryStrategy, SHORTLIST: answerDiscoveryShortlist } = require("./services/answer-discovery");
+const { AcquisitionManager, rankSearchCandidates } = require("./services/acquisition-manager");
 const { RenewingManager } = require("./services/renewing-system");
 const fullPage = require("./browser/full-page.js");
 const { FailoverController } = require("./browser/browser-failover.js");
 const { SnapshotStore } = require("./browser/snapshot-store.js");
-
-
+const { createSourceViewerStore, parseSourceScheme, sourcePage, consolePage: renderConsolePage } = require("./services/console-ui");
+const httpReader = require("./services/http-reader");
 const IS_THREAD_WORKER = !isMainThread && process.env.VEYRA_THREAD_WORKER === "1";
 const { fetch: undiciFetch, Agent: UndiciAgent } = require("undici");
+const https = require("node:https");
+const zlib = require("node:zlib");
+const { setTimeout: wait } = require("node:timers/promises");
+const { isGoogleAccountsUrl, requestGoogleAccounts } = require("./network/google-accounts-transport");
+const { searchEntry, googleProxySearchQuery } = require("./services/search-entry");
 const veyraConfigModule = require("./config");
 
 
 const VEYRA_CONFIG = veyraConfigModule.applyToProcessEnv(veyraConfigModule.loadConfig());
 
 const app = express();
+const sourceViewerStore = createSourceViewerStore({ maxEntries: 100, ttlMs: 5 * 60_000 });
 const PORT = numberEnv("PORT", 10000, 1, 65535);
 
 function numberEnv(name, fallback, min, max) {
@@ -98,6 +128,9 @@ const P = VEYRA_CONFIG.caps;
 
 
 const LEAN_MODE = boolEnv("VEYRA_LEAN_MODE", VEYRA_CONFIG.plan.key === "free");
+// When Chromium runs on an external provider the local plan caps no longer
+// apply — the remote host carries the CPU/RAM, so Veyra can drive more pages.
+const REMOTE_BROWSER = String(process.env.BROWSER_BACKEND || "local").trim().toLowerCase() === "remote";
 const MB = 1024 * 1024;
 const CFG = Object.freeze({
   leanMode: LEAN_MODE,
@@ -108,11 +141,28 @@ const CFG = Object.freeze({
   
   youtubeFastProxyOnly: boolEnv("YT_FAST_PROXY_ONLY", LEAN_MODE),
   youtubeMaxHeight: numberEnv("YT_MAX_HEIGHT", 360, 144, 1080),
+  // YouTube discovers a large, mostly speculative asset graph. Warming it
+  // after every proxied document can starve the foreground request lane,
+  // especially when several mobile tabs are opened at once.
+  youtubeWarmResources: boolEnv("YT_WARM_RESOURCES", false),
+  // Cookie-free YouTube home HTML is safe to reuse briefly across sessions;
+  // this avoids a full upstream round-trip for every new mobile tab.
+  youtubeDocumentCache: boolEnv("YT_DOCUMENT_CACHE", true),
+  // YouTube's own bundles do not need Veyra URL rewriting: the injected
+  // runtime already intercepts fetch/XHR and handles relative-resource fallback.
+  youtubeSkipStaticJsRewrite: boolEnv("YT_SKIP_STATIC_JS_REWRITE", true),
+  // 8.28.22: the cross-origin 302 sent the browser off to YouTube's CDN,
+  // where the fast-proxy iframe could not follow it. Keep YouTube's bundles
+  // inside the proxy so they load in-frame. Only enable the direct path
+  // when the caller is already the same origin as YouTube (native tab).
+  youtubeDirectStaticAssets: boolEnv("YT_DIRECT_STATIC_ASSETS", false),
   processRole: enumEnv("PROCESS_ROLE", "web", ["web", "worker", "all"]),
   
   
   
-  logicalRobots: numberEnv("CRAWLER_ROBOTS", 10000, 1, 10000),
+  // Logical robots are schedulers, not sockets. Keep the fleet above 10k for
+  // broad work sharing while MAX_ACTIVE_FETCHES remains the real network cap.
+  logicalRobots: numberEnv("CRAWLER_ROBOTS", 12000, 1, 20000),
   requestedMaxActiveFetches: numberEnv("MAX_ACTIVE_FETCHES", numberEnv("MAX_GLOBAL_CONCURRENCY", P.maxActiveFetches, 1, 256), 1, 256),
   maxActiveFetches: Math.min(numberEnv("MAX_ACTIVE_FETCHES", numberEnv("MAX_GLOBAL_CONCURRENCY", P.maxActiveFetches, 1, 256), 1, 256), P.maxActiveFetches),
   globalConcurrency: Math.min(numberEnv("MAX_ACTIVE_FETCHES", numberEnv("MAX_GLOBAL_CONCURRENCY", P.maxActiveFetches, 1, 256), 1, 256), P.maxActiveFetches),
@@ -144,11 +194,14 @@ const CFG = Object.freeze({
   maxSrcsetCandidates: numberEnv("MAX_SRCSET_CANDIDATES", 100, 10, 500),
   browserMaxActiveFetches: Math.min(numberEnv("BROWSER_MAX_ACTIVE_FETCHES", P.browserMaxActiveFetches, 1, 64), P.browserMaxActiveFetches),
   browserPerHostConcurrency: numberEnv("BROWSER_PER_HOST_CONCURRENCY", 8, 1, 32),
-  browserEnabled: boolEnv("BROWSER_ENABLED", true),
+  // The free plan is intentionally proxy-only. Keep this server-side gate so
+  // a stale dashboard env var cannot turn on Chromium until the instance is
+  // moved to a larger plan.
+  browserEnabled: VEYRA_CONFIG.plan.key !== "free" && boolEnv("VEYRA_CHROMIUM_ENABLED", boolEnv("BROWSER_ENABLED", false)),
   browserHeadless: boolEnv("BROWSER_HEADLESS", true),
-  maxBrowserSessions: Math.min(numberEnv("MAX_BROWSER_SESSIONS", P.browserSessions, 1, 16), P.browserSessions),
-  maxBrowserPages: Math.min(numberEnv("MAX_BROWSER_PAGES", P.browserPages, 1, 32), P.browserPages),
-  maxBrowserContexts: Math.min(numberEnv("MAX_BROWSER_CONTEXTS", P.browserContexts, 1, 16), P.browserContexts),
+  maxBrowserSessions: REMOTE_BROWSER ? Math.min(numberEnv("MAX_BROWSER_SESSIONS", Math.max(4, P.browserSessions), 1, 64), 64) : Math.min(numberEnv("MAX_BROWSER_SESSIONS", P.browserSessions, 1, 16), P.browserSessions),
+  maxBrowserPages: REMOTE_BROWSER ? Math.min(numberEnv("MAX_BROWSER_PAGES", Math.max(8, P.browserPages), 1, 64), 64) : Math.min(numberEnv("MAX_BROWSER_PAGES", P.browserPages, 1, 32), P.browserPages),
+  maxBrowserContexts: REMOTE_BROWSER ? Math.min(numberEnv("MAX_BROWSER_CONTEXTS", Math.max(8, P.browserContexts), 1, 64), 64) : Math.min(numberEnv("MAX_BROWSER_CONTEXTS", P.browserContexts, 1, 16), P.browserContexts),
   browserIdleTimeoutMs: numberEnv("BROWSER_IDLE_TIMEOUT_MS", LEAN_MODE ? 90000 : 300000, 10000, 86400000),
   browserSessionTtlMs: numberEnv("BROWSER_SESSION_TTL_MS", 1800000, 60000, 86400000),
   browserNavigationTimeoutMs: numberEnv("BROWSER_NAVIGATION_TIMEOUT_MS", LEAN_MODE ? 20000 : 30000, 5000, 120000),
@@ -157,6 +210,7 @@ const CFG = Object.freeze({
   browserEvictMinIdleMs: numberEnv("BROWSER_EVICT_MIN_IDLE_MS", 60000, 10000, 86400000),
   browserBackend: enumEnv("BROWSER_BACKEND", "local", ["local", "remote"]),
   browserBackendUrl: process.env.BROWSER_BACKEND_URL || "",
+  browserBackendConnectTimeoutMs: numberEnv("BROWSER_BACKEND_CONNECT_TIMEOUT_MS", 30000, 5000, 120000),
   dnsCacheTtlMs: numberEnv("DNS_CACHE_TTL_MS", 5000, 0, 60000),
   maxPendingQueue: Math.min(numberEnv("MAX_PENDING_QUEUE", P.maxPendingQueue, 50, 20000), P.maxPendingQueue),
   maxPages: Math.min(numberEnv("MAX_PAGES", P.maxPages, 1, 100000), P.maxPages),
@@ -179,6 +233,7 @@ const CFG = Object.freeze({
   maxSitemapUrls: numberEnv("MAX_SITEMAP_URLS", 50000, 100, 500000),
   maxJobAgeMs: numberEnv("MAX_JOB_AGE_MS", 60 * 60 * 1000, 60 * 1000, 24 * 60 * 60 * 1000),
   proxyCacheMs: numberEnv("CACHE_TTL_MS", 10000, 0, 300000),
+  proxyStaleWhileRevalidateMs: numberEnv("CACHE_STALE_WHILE_REVALIDATE_MS", 120000, 0, 900000),
   maxProxyCacheEntries: numberEnv("MAX_CACHE_ENTRIES", LEAN_MODE ? 60 : 200, 10, 5000),
   searchCacheMs: numberEnv("SEARCH_CACHE_TTL_MS", 30000, 0, 600000),
   maxSearchCacheEntries: numberEnv("MAX_SEARCH_CACHE_ENTRIES", 100, 10, 5000),
@@ -187,15 +242,13 @@ const CFG = Object.freeze({
   maxClientLog: numberEnv("MAX_CLIENT_LOG", 500, 50, 5000),
   maxSearchQueryChars: numberEnv("MAX_SEARCH_QUERY_CHARS", 256, 32, 1000),
   maxSearchResults: numberEnv("MAX_SEARCH_RESULTS", 20, 1, 50),
-  apiSearchCostMicros: numberEnv("API_SEARCH_COST_MICROS", 1000, 1, 1000000),
-  apiKeyInitialCreditsMicros: numberEnv("API_KEY_INITIAL_CREDITS_MICROS", 0, 0, 1000000000000),
-  maxProxyBodyBytes: numberEnv("MAX_PROXY_BODY_BYTES", 4 * 1024 * 1024, 64 * 1024, 32 * 1024 * 1024),
-  maxProxyTextBytes: numberEnv("MAX_PROXY_TEXT_BYTES", 8 * 1024 * 1024, 256 * 1024, 32 * 1024 * 1024),
-  maxProxyImageBytes: numberEnv("MAX_PROXY_IMAGE_BYTES", LEAN_MODE ? 2 * MB : 16 * 1024 * 1024, 256 * 1024, 64 * 1024 * 1024),
-  maxProxyMediaBytes: numberEnv("MAX_PROXY_MEDIA_BYTES", LEAN_MODE ? 4 * MB : 32 * 1024 * 1024, 512 * 1024, 128 * 1024 * 1024),
-  maxProxyOtherBytes: numberEnv("MAX_PROXY_OTHER_BYTES", LEAN_MODE ? 2 * MB : 16 * 1024 * 1024, 256 * 1024, 64 * 1024 * 1024),
+  maxProxyBodyBytes: numberEnv("MAX_PROXY_BODY_BYTES", 8 * 1024 * 1024, 64 * 1024, 256 * 1024 * 1024),
+  maxProxyTextBytes: numberEnv("MAX_PROXY_TEXT_BYTES", LEAN_MODE ? 8 * 1024 * 1024 : 16 * 1024 * 1024, 256 * 1024, 256 * 1024 * 1024),
+  maxProxyImageBytes: numberEnv("MAX_PROXY_IMAGE_BYTES", LEAN_MODE ? 4 * MB : 64 * 1024 * 1024, 256 * 1024, 512 * 1024 * 1024),
+  maxProxyMediaBytes: numberEnv("MAX_PROXY_MEDIA_BYTES", LEAN_MODE ? 16 * MB : 256 * 1024 * 1024, 512 * 1024, 2 * 1024 * 1024 * 1024),
+  maxProxyOtherBytes: numberEnv("MAX_PROXY_OTHER_BYTES", LEAN_MODE ? 8 * 1024 * 1024 : 64 * 1024 * 1024, 256 * 1024, 512 * 1024 * 1024),
   maxFormBodyBytes: numberEnv("MAX_FORM_BODY_BYTES", 1 * 1024 * 1024, 16 * 1024, 8 * 1024 * 1024),
-  maxDownloadBytes: numberEnv("MAX_DOWNLOAD_BYTES", 64 * 1024 * 1024, 256 * 1024, 256 * 1024 * 1024),
+  maxDownloadBytes: numberEnv("MAX_DOWNLOAD_BYTES", 512 * 1024 * 1024, 256 * 1024, 4 * 1024 * 1024 * 1024),
   maxCacheBodyBytes: Math.min(numberEnv("MAX_CACHE_BODY_BYTES", RESOURCE_PROFILE === "free" ? 1024 * 1024 : 4 * 1024 * 1024, 64 * 1024, 16 * 1024 * 1024), RESOURCE_PROFILE === "free" ? 1024 * 1024 : 4 * 1024 * 1024),
   proxySessionTtlMs: numberEnv("PROXY_SESSION_TTL_MS", 30 * 60 * 1000, 60 * 1000, 24 * 60 * 60 * 1000),
   maxProxySessions: numberEnv("MAX_PROXY_SESSIONS", P.maxProxySessions || 500, 10, 5000),
@@ -218,6 +271,8 @@ const CFG = Object.freeze({
   mongoCacheBodyMaxBytes: numberEnv("MONGODB_CACHE_BODY_MAX_BYTES", 768 * 1024, 16 * 1024, 768 * 1024),
   mongoCacheTtlMs: numberEnv("MONGODB_CACHE_TTL_MS", 15 * 60 * 1000, 10 * 1000, 24 * 60 * 60 * 1000),
   mongoSharedCache: boolEnv("MONGODB_SHARED_CACHE", true),
+  sessionCacheEnabled: boolEnv("SESSION_CACHE_ENABLED", true),
+  globalCacheEnabled: boolEnv("GLOBAL_CACHE_ENABLED", true),
   userAgent: process.env.VEYRA_USER_AGENT || `VeyraBrowseCrawler/${VEYRA_VERSION} (+https://github.com/HomekidChud/VeyraServer)`,
   frontendOrigins: csvEnv("FRONTEND_ORIGIN", ["*"]),
   
@@ -234,6 +289,9 @@ const CFG = Object.freeze({
   indexSeeds: csvEnv("INDEX_SEEDS", []),
   indexSeedCrawl: boolEnv("INDEX_SEED_CRAWL", true),
   indexRefreshMs: numberEnv("INDEX_REFRESH_MS", 6 * 60 * 60 * 1000, 0, 30 * 24 * 60 * 60 * 1000),
+  indexAiFindings: boolEnv("INDEX_AI_FINDINGS", true),
+  indexAiMaxPages: numberEnv("INDEX_AI_MAX_PAGES", 24, 1, 100),
+  indexAiMaxDepth: numberEnv("INDEX_AI_MAX_DEPTH", 2, 0, 5),
   indexSnapshotEnabled: boolEnv("INDEX_SNAPSHOT_ENABLED", false),
   indexSnapshotPath: process.env.INDEX_SNAPSHOT_PATH || "/tmp/veyra-search-index.json",
   processBrowserFallback: boolEnv("BROWSER_RENDER_FALLBACK", false),
@@ -242,6 +300,7 @@ const CFG = Object.freeze({
   proxyForwardCompatHeaders: boolEnv("PROXY_FORWARD_COMPAT_HEADERS", true),
   proxyForwardClientHints: boolEnv("PROXY_FORWARD_CLIENT_HINTS", true),
   proxyStreamOversize: boolEnv("PROXY_STREAM_OVERSIZE", true),
+  proxyPassthroughBinary: boolEnv("PROXY_PASSTHROUGH_BINARY", true),
   proxyRelativeFallback: boolEnv("PROXY_RELATIVE_FALLBACK", true),
   proxyApiBodyBytes: numberEnv("PROXY_API_BODY_BYTES", 4 * 1024 * 1024, 64 * 1024, 32 * 1024 * 1024),
   proxyJsHeavyThreshold: numberEnv("PROXY_JS_HEAVY_THRESHOLD", 4, 1, 20),
@@ -272,26 +331,38 @@ const CFG = Object.freeze({
   parseWorkerTimeoutMs: numberEnv("PARSE_WORKER_TIMEOUT_MS", 20000, 1000, 120000),
   parseWorkerHeapMb: numberEnv("PARSE_WORKER_HEAP_MB", MEMORY_LIMIT_MB && MEMORY_LIMIT_MB <= 2048 ? 160 : 384, 64, 4096),
   
-  sessionIdleTtlMs: numberEnv("SESSION_IDLE_TTL_MS", numberEnv("PROXY_SESSION_TTL_MS", P.sessionIdleMs, 60 * 1000, 24 * 60 * 60 * 1000), 60 * 1000, 24 * 60 * 60 * 1000),
+  sessionIdleTtlMs: numberEnv("SESSION_IDLE_TTL_MS", 60 * 1000, 60 * 1000, 24 * 60 * 60 * 1000),
   sessionMaxAgeMs: numberEnv("SESSION_MAX_AGE_MS", 24 * 60 * 60 * 1000, 10 * 60 * 1000, 7 * 24 * 60 * 60 * 1000),
   
   
   
   adminGate: boolEnv("VEYRA_ADMIN_GATE", true),
-  sessionTimeLimitMs: numberEnv("SESSION_TIME_LIMIT_MS", 2 * 60 * 1000, 0, 7 * 24 * 60 * 60 * 1000),
+  // Two minutes is shorter than a normal mobile browsing interaction and
+  // caused an otherwise healthy YouTube tab to become unusable mid-load.
+  sessionTimeLimitMs: numberEnv("SESSION_TIME_LIMIT_MS", 5 * 60 * 1000, 0, 7 * 24 * 60 * 60 * 1000),
   
   adminSessionTimeLimitMs: 10 * 60 * 1000,
   authSecret: process.env.VEYRA_AUTH_SECRET || "",
   authDataDir: process.env.VEYRA_DATA_DIR || path.join(__dirname, "..", "data"),
   authAllowSignup: boolEnv("VEYRA_ALLOW_SIGNUP", true),
+  authSignupKey: process.env.VEYRA_SIGNUP_KEY || "",
   authTokenTtlMs: numberEnv("VEYRA_AUTH_TOKEN_TTL_MS", 7 * 24 * 60 * 60 * 1000, 10 * 60 * 1000, 90 * 24 * 60 * 60 * 1000),
   adminEmails: String(process.env.VEYRA_ADMIN_EMAILS || "").split(",").map(x => x.trim().toLowerCase()).filter(Boolean),
-  testMode: boolEnv("VEYRA_TEST_MODE", false),
+  testMode: !process.env.RENDER && ![process.env.VEYRA_ENV, process.env.NODE_ENV].some(x => /^(production|prod)$/i.test(String(x || "").trim())) && boolEnv("VEYRA_TEST_MODE", false),
+  workDir: process.env.VEYRA_WORK_DIR || path.join(os.tmpdir(), "veyra-browse-jobs"),
   sessionMaxCookieBytes: numberEnv("SESSION_MAX_COOKIE_BYTES", 128 * 1024, 4 * 1024, 4 * 1024 * 1024),
   serverIdleSleepMs: numberEnv("SERVER_IDLE_SLEEP_MS", 10 * 60 * 1000, 0, 24 * 60 * 60 * 1000),
   browserWarmIdleMs: numberEnv("BROWSER_WARM_IDLE_MS", 15 * 60 * 1000, 0, 24 * 60 * 60 * 1000),
   devConfigApi: boolEnv("VEYRA_DEV_CONFIG_API", VEYRA_CONFIG.envName === "development"),
   adminToken: process.env.VEYRA_ADMIN_TOKEN || "",
+  gateEnabled: boolEnv("GATE_ENABLED", /^(production|prod)$/i.test(String(process.env.VEYRA_ENV || process.env.NODE_ENV || "").trim())),
+  gateRotateMs: numberEnv("GATE_ROTATE_MS", 10 * 60 * 1000, 60 * 1000, 24 * 60 * 60 * 1000),
+  gateGraceMs: numberEnv("GATE_GRACE_MS", 20 * 60 * 1000, 60 * 1000, 7 * 24 * 60 * 60 * 1000),
+  gateSessionTtlMs: numberEnv("GATE_SESSION_TTL_MS", 30 * 24 * 60 * 60 * 1000, 60 * 1000, 365 * 24 * 60 * 60 * 1000),
+  gateWaitlistOpen: boolEnv("GATE_WAITLIST_OPEN", true),
+  gateOwnerTokens: process.env.GATE_OWNER_TOKENS || "",
+  gateMaxSessions: numberEnv("GATE_MAX_SESSIONS", 20000, 10, 500000),
+  gateMaxWaitlist: numberEnv("GATE_MAX_WAITLIST", 100000, 10, 500000),
   plan: VEYRA_CONFIG.plan.key,
   vpnDefaultProfile: process.env.VPN_DEFAULT_PROFILE || "",
   vpnProxyServer: process.env.VPN_PROXY_SERVER || "",
@@ -302,7 +373,10 @@ const CFG = Object.freeze({
   maxDiscoveredUrlLength: numberEnv("MAX_DISCOVERED_URL_LENGTH", 4096, 256, 20000),
   maxCrossOriginResources: Math.min(numberEnv("MAX_CROSS_ORIGIN_RESOURCES", P.maxCrossOriginResources, 0, 10000), P.maxCrossOriginResources),
   skipLowValueThirdParty: boolEnv("SKIP_LOW_VALUE_THIRD_PARTY", true),
-  playwrightBrowsersPath: process.env.PLAYWRIGHT_BROWSERS_PATH || "0"
+// Leave unset when the env var is absent: forcing "0" points Playwright at
+  // node_modules/.local-browsers and hides the default ~/.cache/ms-playwright
+  // install, which made a perfectly installed Chromium look "not installed".
+  playwrightBrowsersPath: process.env.PLAYWRIGHT_BROWSERS_PATH || null
 });
 try { fs.mkdirSync(CFG.authDataDir, { recursive: true }); } catch {}
 
@@ -310,43 +384,84 @@ try { fs.mkdirSync(CFG.authDataDir, { recursive: true }); } catch {}
 
 
 
+function createPublicSocketLookup(resolve = dns.lookup) {
+  return (hostname, options, callback) => {
+    const opts = typeof options === "function" ? {} : (options || {});
+    const cb = typeof options === "function" ? options : callback;
+    Promise.resolve().then(() => withTimeout(resolve(hostname, { all: true, verbatim: true }), CFG.dnsTimeoutMs, "DNS lookup timed out.")).then(records => {
+      if (!records?.length) throw Object.assign(new Error("Destination could not be resolved."), { code: "ENOTFOUND" });
+      if (records.some(record => !assertIpPublic(record.address))) throw Object.assign(new Error("DNS resolved to a private or reserved address."), { code: "SSRF_BLOCKED" });
+      const preferred = opts.family ? records.filter(record => record.family === opts.family) : records;
+      const addresses = preferred.length ? preferred : records;
+      if (opts.all) cb(null, addresses.map(record => ({ address: record.address, family: record.family })));
+      else cb(null, addresses[0].address, addresses[0].family);
+    }).catch(error => cb(error));
+  };
+}
 const DIRECT_HTTP_AGENT = new UndiciAgent({
-  connect: { timeout: 12000, autoSelectFamily: true, autoSelectFamilyAttemptTimeout: 250 },
-  keepAliveTimeout: 10000,
-  keepAliveMaxTimeout: 30000,
-  connections: 24,
-  pipelining: 1
+  connect: { timeout: 12000, autoSelectFamily: true, autoSelectFamilyAttemptTimeout: 250, lookup: createPublicSocketLookup() },
+  // Keep upstream sockets warm longer and allow more parallel connections per
+  // origin so a page's many subresources (same CDN/host) fetch concurrently
+  // instead of queueing behind 24 sockets, and TCP/TLS handshakes are reused.
+  keepAliveTimeout: 30000,
+  keepAliveMaxTimeout: 60000,
+  connections: 64,
+  pipelining: 1,
+  // undici's default response-header cap is 16KB; big-header sites (YouTube
+  // serves Chrome 156 UAs ~19KB of headers) overflowed it and the document
+  // fetch died with a generic "fetch failed". See src/network/header-cap.js.
+  ...upstreamHeaderCapOptions()
 });
+const GOOGLE_ACCOUNTS_HTTPS_AGENT = new https.Agent({ keepAlive: true, maxSockets: 16, lookup: createPublicSocketLookup() });
 
-const isProductionEnvironment = /^(?:production|prod)$/i.test(String(process.env.VEYRA_ENV || process.env.NODE_ENV || ""));
-const trustProxy = /^(?:1|true|yes|on)$/i.test(String(process.env.VEYRA_TRUST_PROXY || ""));
 const shield = createShield(process.env, { lean: CFG.leanMode, log: (level, source, message) => setImmediate(() => serverLog(level, source, message)) });
-// Only trust an explicitly configured single reverse proxy. Trusting arbitrary forwarded
-// headers lets direct callers bypass auth and abuse rate limits.
-app.set("trust proxy", trustProxy ? 1 : false);
+// VPN profile discovery can log while the server module is still initializing.
+const serverLogs = [];
+let logSeq = 0;
+app.set("trust proxy", true);
 app.disable("x-powered-by");
 app.use(shield.middleware);
-installBrandRoutes(app, { frontendUrl: () => CFG.frontendUrl, version: VEYRA_VERSION, isPreviewBot: ua => shield.isPreviewBot(ua), hasProxiedReferer: req => !!proxiedPageFromReferer(req, { allowCookie: false }) });
-const configuredOrigins = Array.isArray(CFG.frontendOrigins) ? CFG.frontendOrigins : [];
-if (isProductionEnvironment && configuredOrigins.includes("*")) {
-  console.warn("[Veyra CORS] Wildcard frontend origin is disabled in production. Configure explicit VEYRA_FRONTEND_ORIGINS values.");
-}
-const allowedOrigins = configuredOrigins.includes("*") && !isProductionEnvironment ? true : configuredOrigins.filter(origin => origin !== "*");
-app.use(cors({
-  origin(origin, callback) {
-    // Non-browser requests do not need an Origin header. Browser callers must match
-    // the deployment allowlist; wildcard reflection is intentionally development-only.
-    if (!origin || allowedOrigins === true) return callback(null, true);
-    return callback(null, allowedOrigins.includes(origin));
-  },
+// Veyra Access Gate: initialized below and applied after CORS, so a denied
+// request is readable by the browser shell as a policy decision.
+let accessGate = null;
+let gateMiddleware = null;
+// NOTE: the cross-session cookie handoff ("/api/handoff/cookies", the
+// "Bring session back" bookmarklet, the paste-import form) was removed.
+// Sign-in now happens inside the fast proxy itself: the site's login and
+// OAuth pages load through the proxy in the session's own cookie jar, and
+// OAuth popups open as proxied Veyra tabs with opener semantics relayed
+// by the app. No cookie ever crosses between the user's browser and a
+// Veyra session, or between two Veyra sessions.
+const allowedOrigins = CFG.frontendOrigins.includes("*") ? true : CFG.frontendOrigins;
+const browserCorsOptions = {
+  origin: allowedOrigins,
   methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  exposedHeaders: ["X-Veyra-Request-ID", "X-Veyra-Canonical-URL", "X-Veyra-Challenge", "X-Veyra-Content-Type", "X-Veyra-Session-ID", "X-Veyra-Session-Expires"]
-}));
+  maxAge: 600,
+  // Terminate browser preflights here. If these continue to the API fallback,
+  // the browser sees a 404 and reports the request as a generic fetch failure.
+  preflightContinue: false,
+  exposedHeaders: ["X-Veyra-Request-ID", "X-Veyra-Canonical-URL", "X-Veyra-Challenge", "X-Veyra-Content-Type", "X-Veyra-Session-ID", "X-Veyra-Session-Expires", "Retry-After"]
+};
+const browserCors = cors(browserCorsOptions);
+const proxyOptionsCors = cors({ ...browserCorsOptions, preflightContinue: true });
+app.use((req, res, next) => {
+  // A real OPTIONS request to a proxied resource is not a CORS preflight.
+  if (req.method === "OPTIONS" && /^\/api\/(?:view|resource)\/?$/i.test(req.path) &&
+      !req.get("Access-Control-Request-Method") && !req.get("Access-Control-Request-Headers")) return proxyOptionsCors(req, res, next);
+  return browserCors(req, res, next);
+});
+app.use((req, res, next) => gateMiddleware ? gateMiddleware(req, res, next) : next());
+installBrandRoutes(app, { frontendUrl: () => CFG.frontendUrl, version: VEYRA_VERSION, isPreviewBot: ua => shield.isPreviewBot(ua), hasProxiedReferer: req => !!proxiedPageFromReferer(req) });
 
 
 app.use(["/api/resource", "/api/view"], express.raw({ type: () => true, limit: CFG.maxProxyBodyBytes, inflate: true }));
 app.use(express.json({ limit: "256kb" }));
 app.use(express.urlencoded({ extended: false, limit: CFG.maxFormBodyBytes }));
+app.use(["/api/session", "/api/browser/session", "/api/search"], (req, res, next) => {
+  res.set("Cache-Control", "no-store");
+  if (req.query.private === "1" || (req.baseUrl === "/api/search" && !authStore.userFromRequest(req))) req.veyraPrivateTraffic = true;
+  next();
+});
 
 
 app.use((req, res, next) => {
@@ -360,7 +475,15 @@ const jobs = new Map();
 const activeByRoot = new Map();
 const proxyCache = new Map();
 const fetchInflight = new Map();
+const revalidateInflight = new Map();
 const searchCache = new Map();
+const runtimeSessionPolicy = {
+  guestTimeLimitMs: CFG.sessionTimeLimitMs,
+  adminTimeLimitMs: CFG.adminSessionTimeLimitMs,
+  idleTtlMs: CFG.sessionIdleTtlMs,
+  maxAgeMs: CFG.sessionMaxAgeMs,
+  maxSessions: CFG.maxProxySessions
+};
 const sessionManager = new SessionManager({
   maxSessions: CFG.maxProxySessions, idleTtlMs: CFG.sessionIdleTtlMs, hardTtlMs: CFG.sessionMaxAgeMs, timeLimitMs: CFG.sessionTimeLimitMs,
   maxCookieBytes: CFG.sessionMaxCookieBytes, serverIdleMs: CFG.serverIdleSleepMs,
@@ -380,14 +503,36 @@ const neuralTrainer = new NeuralLearningWorker({
   maxQueue: numberEnv("NEURAL_TRAIN_QUEUE_MAX", 5000, 100, 100000),
   log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
 });
-if (isProductionEnvironment && !CFG.authSecret) {
-  throw new Error("VEYRA_AUTH_SECRET is required in production. Generate a long random secret and configure durable account storage before deploying.");
-}
+const learnFromPublicCrawls = boolEnv("NEURAL_PUBLIC_CRAWL_TRAINING", false);
+const observePublicCrawl = learnFromPublicCrawls ? createPublicCrawlTrainer({
+  model: neuralModel,
+  enqueue: example => neuralTrainer.enqueuePersistent(example)
+}) : null;
 const authStore = new AuthStore({
   dataDir: CFG.authDataDir, secret: CFG.authSecret, tokenTtlMs: CFG.authTokenTtlMs,
-  adminEmails: CFG.adminEmails, allowSignup: CFG.authAllowSignup, persistence: mongoStore, testMode: CFG.testMode,
+  adminEmails: CFG.adminEmails, allowSignup: CFG.authAllowSignup, signupKey: CFG.authSignupKey, persistence: mongoStore, testMode: CFG.testMode,
+  
   log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
 });
+const publisherMedia = createPublisherMedia({
+  log: (level, message) => setImmediate(() => serverLog(level, "PUBLISHER_MEDIA", message))
+});
+
+// Access gate — invite-only front door for the whole service.
+const accessPolicy = new AccessPolicy({ dataDir: CFG.authDataDir, enabled: CFG.gateEnabled, waitlistOpen: CFG.gateWaitlistOpen, persistence: mongoStore });
+accessGate = new AccessGate({
+  enabled: CFG.gateEnabled, dataDir: CFG.authDataDir,
+  rotateMs: CFG.gateRotateMs, graceMs: CFG.gateGraceMs, sessionTtlMs: CFG.gateSessionTtlMs,
+  waitlistOpen: CFG.gateWaitlistOpen, ownerTokens: CFG.gateOwnerTokens,
+  adminToken: CFG.adminToken, maxSessions: CFG.gateMaxSessions, maxWaitlist: CFG.gateMaxWaitlist,
+  frontendUrl: CFG.frontendUrl,
+  persistence: mongoStore, policy: accessPolicy, staffRequest: isGateStaffRequest,
+  log: (level, source, message) => setImmediate(() => serverLog(level, source, message))
+});
+gateMiddleware = accessGate.middleware();
+void accessPolicy.ready().then(() => serverLog("info", "GATE", `Browser access: ${accessPolicy.state.mode}; waitlist ${accessPolicy.state.waitlistOpen ? "open" : "closed"}.`))
+  .catch(e => serverLog("warn", "GATE", e.message));
+void accessGate.hydrateFromPersistence();
 
 class Semaphore {
   constructor(limit) { this.limit = Math.max(1, limit); this.active = 0; this.waiters = []; }
@@ -488,7 +633,6 @@ const failoverController = IS_THREAD_WORKER ? null : new FailoverController({
 
 
 const snapshotStore = IS_THREAD_WORKER ? null : new SnapshotStore({
-  mongo: mongoStore,
   log: (level, source, message) => serverLog(level, source, message)
 });
 
@@ -500,14 +644,10 @@ if (!IS_THREAD_WORKER) {
         failoverController.recordBrowserResult(session.proxySessionId, false, reason);
       }
     },
-    onStorageState: (proxySessionId, storageState) => {
+    onStorageState: (proxySessionId, storageState, chromiumUserAgent = "") => {
       
-      if (storageState?.cookies && proxySessionId) {
-        sessionManager.importPlaywrightCookies(proxySessionId, storageState.cookies);
-        
-        if (mongoStore.enabled) {
-          mongoStore.putSessionCookies(proxySessionId, storageState.cookies).catch(() => {});
-        }
+      if (storageState?.cookies && sessionManager.has(proxySessionId) && !sessionManager.checkLimit(proxySessionId)) {
+        sessionManager.importPlaywrightCookies(proxySessionId, storageState.cookies, chromiumUserAgent);
       }
     },
     onVerification: (session, challenge) => {
@@ -521,6 +661,11 @@ if (!IS_THREAD_WORKER) {
 
 
 sessionManager.on("expire", (sid, rec, reason) => {
+  const suffix = ` | sid=${sid}`;
+  for (const map of [proxyCache, fetchInflight, revalidateInflight]) {
+    for (const key of map.keys()) if (key.endsWith(suffix)) map.delete(key);
+  }
+  for (const [key, context] of clientLastResolvedPage) if (context.sid === sid) clientLastResolvedPage.delete(key);
   try { vpnManager.disconnect?.(sid); } catch {}
   
   try { renewingManager?.clearSession(sid); } catch {}
@@ -532,7 +677,11 @@ sessionManager.on("expire", (sid, rec, reason) => {
   if (failoverController) failoverController.breakers.delete(sid);
   if (snapshotStore) snapshotStore.clearSession(sid);
   
-  if (mongoStore.enabled) mongoStore.deleteSessionCookies(sid).catch(() => {});
+  // Delete legacy rows, if present. Live cookies and snapshots are RAM-only.
+  if (mongoStore.enabled) {
+    void mongoStore.deleteSessionCookies(sid).catch(() => {});
+    void mongoStore.deleteSessionSnapshots(sid).catch(() => {});
+  }
   return browserEngine.stopForProxySession?.(sid);
 });
 sessionManager.on("sleep", async () => {
@@ -549,16 +698,6 @@ if (!IS_THREAD_WORKER) sessionManager.start();
 
 
 
-
-if (!IS_THREAD_WORKER && mongoStore.enabled) {
-  sessionManager.setHydrateFn((sid, rec) => {
-    mongoStore.getSessionCookies(sid).then(cookies => {
-      if (cookies && cookies.length) {
-        sessionManager.importPlaywrightCookies(sid, cookies);
-      }
-    }).catch(() => {});
-  });
-}
 
 const browserEngineTimer = IS_THREAD_WORKER ? null : setInterval(() => {
   browserEngine.expireIdle().catch(() => {});
@@ -650,6 +789,7 @@ class BrowserTaskScheduler {
     }
     if (bestIndex < 0) return null;
     this.queue.splice(bestIndex, 1);
+    best.detachAbort?.();
     return best;
   }
 
@@ -685,6 +825,8 @@ class BrowserTaskScheduler {
   }
 
   request(key, task, meta = {}) {
+    const cancelled = () => Object.assign(new Error("Session deleted."), { code: "SESSION_EXPIRED" });
+    if (meta.signal?.aborted) return Promise.reject(cancelled());
     const k = String(key || `anon-${++this.seq}`);
     const existing = this.inFlight.get(k);
     if (existing) {
@@ -716,6 +858,17 @@ class BrowserTaskScheduler {
     };
     this.inFlight.set(k, promise);
     this.queue.push(item);
+    if (meta.signal) {
+      const abort = () => {
+        const index = this.queue.indexOf(item);
+        if (index < 0) return;
+        this.queue.splice(index, 1);
+        this.inFlight.delete(k);
+        item.reject(cancelled());
+      };
+      item.detachAbort = () => meta.signal.removeEventListener("abort", abort);
+      meta.signal.addEventListener("abort", abort, { once: true });
+    }
     this.stats.queued = Math.max(this.stats.queued, this.queue.length);
     this._pump();
     return promise;
@@ -742,11 +895,9 @@ const dnsPublicCache = new Map();
 const searchIndex = new Map();
 const invertedIndex = new Map();
 const termCounts = new Map();
-const serverLogs = [];
 const clientLogs = [];
 const requestLog = [];
 let requestLogSeq = 0;
-let logSeq = 0;
 const serverStartedAt = Date.now();
 const rewriteFailures = [];
 function recordRewriteFailure(url, mode, err) {
@@ -754,22 +905,33 @@ function recordRewriteFailure(url, mode, err) {
   if (rewriteFailures.length > 100) rewriteFailures.splice(0, rewriteFailures.length - 100);
   serverLog("error", "PROXY", `HTML/CSS/JS rewrite failed for ${url} (${mode}): ${err?.message || err} — served the page unrewritten instead of failing the request.`);
 }
-const ROOT = path.join("/tmp", "veyra-browse-jobs");
+const ROOT = CFG.workDir;
 fs.mkdirSync(ROOT, { recursive: true });
 
 const sourceStore = {
   async write(job, resourceId, text) {
-    if (job.sourceFiles >= CFG.maxSourceFiles) return null;
-    const remaining = Math.max(0, CFG.maxScanBytes - job.textBytesStored);
-    if (!remaining) return null;
-    const safe = String(text).slice(0, Math.min(CFG.maxTextBytesPerResource, remaining));
+    if (job.sourceFiles + job.pendingSourceFiles >= CFG.maxSourceFiles) return null;
+    const remaining = Math.min(CFG.maxTextBytesPerResource, CFG.maxScanBytes - job.textBytesStored - job.pendingSourceBytes);
+    if (remaining <= 0) return null;
+    const binary = Buffer.from(text);
+    let end = Math.min(binary.length, remaining);
+    while (end < binary.length && (binary[end] & 0xc0) === 0x80) end--;
+    const safe = binary.subarray(0, end);
     const file = path.join(job.sourceDir, `${resourceId}.txt`);
-    await fsp.writeFile(file, safe, "utf8");
-    job.sourceFiles += 1;
-    job.textBytesStored += Buffer.byteLength(safe);
-    return file;
+    job.pendingSourceFiles++;
+    job.pendingSourceBytes += safe.length;
+    try {
+      await fsp.writeFile(file, safe);
+      job.sourceFiles++;
+      job.textBytesStored += safe.length;
+      return file;
+    } finally {
+      job.pendingSourceFiles--;
+      job.pendingSourceBytes -= safe.length;
+    }
   },
   async read(job, resource) {
+    if (resource?.sourcePending) await resource.sourcePending;
     if (!resource?.sourceFile) return resource?.inlinePreview || "";
     try { return await fsp.readFile(resource.sourceFile, "utf8"); }
     catch { return resource.inlinePreview || ""; }
@@ -816,11 +978,7 @@ function jobLog(job, level, message, meta = {}) {
   if (job.logs.length > 250) job.logs.splice(0, job.logs.length - 250);
   serverLog(level, "CRAWLER", message, { jobId: job.id, ...meta });
 }
-function isIncognitoSid(sid) {
-  const id = String(sid || "");
-  if (!id) return false;
-  try { return !!sessionManager.peek(id)?.incognito; } catch { return false; }
-}
+const canCacheSession = rec => !!rec?.userId && !rec.incognito;
 function requestLogAdd(entry) {
   requestLog.push({ id: ++requestLogSeq, ...entry });
   if (requestLog.length > CFG.maxRequestLog) requestLog.splice(0, requestLog.length - CFG.maxRequestLog);
@@ -836,6 +994,7 @@ app.use((req, res, next) => {
   req.veyraRequestId = requestId;
   res.setHeader("X-Veyra-Request-ID", requestId);
   res.on("finish", () => {
+    if (req.veyraPrivateTraffic || (req.query?.sid && !canCacheSession(sessionManager.peek(req.query.sid)))) return;
     const ms = Number(process.hrtime.bigint() - start) / 1e6;
     const target = req.query?.url ? sanitizeLogUrl(req.query.url) : "";
     requestLogAdd({
@@ -846,7 +1005,7 @@ app.use((req, res, next) => {
       status: res.statusCode,
       ms: Math.round(ms * 10) / 10,
       
-      targetHost: target && !isIncognitoSid(req.query?.sid) ? (() => { try { return new URL(target).hostname; } catch { return ""; } })() : ""
+      targetHost: target ? (() => { try { return new URL(target).hostname; } catch { return ""; } })() : ""
     });
   });
   next();
@@ -898,12 +1057,12 @@ function queryStringValue(value) {
   if (Array.isArray(value)) return value.map(x => String(x || "").trim()).find(Boolean) || "";
   return String(value || "").trim();
 }
-function firstValidUrl(values, base) {
+function firstValidUrl(values, base, options) {
   const list = Array.isArray(values) ? values : [values];
   for (const value of list) {
     const candidate = queryStringValue(value);
     if (!candidate) continue;
-    const normalized = normalizeUrl(candidate, base);
+    const normalized = normalizeUrl(candidate, base, options);
     if (normalized) return normalized;
   }
   return null;
@@ -921,22 +1080,37 @@ function unwrapProxyTarget(value, base) {
         return "";
       }
     } catch {}
-    try {
-      const decoded = decodeURIComponent(raw);
-      if (decoded !== raw && /^https?:\/\//i.test(decoded)) { raw = decoded; continue; }
-    } catch {}
+    // Decode an encoded URL wrapper, never the escapes inside a URL that's
+    // already unwrapped. A second decode can change signed paths and queries.
+    if (!/^(?:[a-z][a-z\d+.-]*:|\/)/i.test(raw)) {
+      try {
+        const decoded = decodeURIComponent(raw);
+        if (decoded !== raw && /^https?:\/\//i.test(decoded)) { raw = decoded; continue; }
+      } catch {}
+    }
     break;
   }
   return raw;
 }
-function normalizeUrl(value, base) {
+function normalizeUrl(value, base, { preserveQuery = false } = {}) {
   try {
     const raw = unwrapProxyTarget(value, base);
     if (!raw) return null;
     const u = new URL(raw, base);
     if (!['http:', 'https:'].includes(u.protocol)) return null;
+    if (u.username || u.password) return null;
+    canonicalizeGeoFsHost(u);
+    if (preserveQuery) { u.hash = ""; return u.href; }
     return normalizedSearch(u.href);
   } catch { return null; }
+}
+function canonicalizeGeoFsHost(url) {
+  // GeoFS publishes the playable site at www.geo-fs.com. The commonly typed
+  // geofs.com alias has an invalid certificate at the edge, so following it
+  // from the proxy fails before HTTP redirect handling can run.
+  const host = String(url?.hostname || "").toLowerCase();
+  if (host === "geofs.com" || host === "www.geofs.com") url.hostname = "www.geo-fs.com";
+  return url;
 }
 function resolveNavigation(value, documentUrl) {
   if (value == null) return null;
@@ -945,6 +1119,8 @@ function resolveNavigation(value, documentUrl) {
   try {
     const u = new URL(raw, documentUrl);
     if (!['http:', 'https:'].includes(u.protocol)) return null;
+    if (u.username || u.password) return null;
+    canonicalizeGeoFsHost(u);
     return u.href;
   } catch { return null; }
 }
@@ -957,8 +1133,74 @@ function makeViewUrl(url, sid = "") {
   const q = `/api/view?url=${encodeURIComponent(url)}`;
   return sid ? `${q}&sid=${encodeURIComponent(sid)}` : q;
 }
+// A document navigation (top-level page or iframe), as opposed to an
+// API/script fetch of /api/view. Iframe loads of the proxied page always
+// accept text/html; direct script fetches do not.
+function documentNavigation(req) {
+  const dest = String(req.get("Sec-Fetch-Dest") || "").toLowerCase();
+  if (dest === "document" || dest === "iframe" || dest === "frame") return true;
+  if (dest) return false;
+  return /text\/html/i.test(String(req.get("Accept") || ""));
+}
+// The escaped (path-based) form is only safe for site paths that cannot be
+// confused with Veyra's own origin routes: not a reserved asset/brand path,
+// not /api/*, and not a bare static asset (those are loaded as resources,
+// not navigated to as documents). The site ROOT is escapable too: the
+// escaped form carries __veyra_url/__veyra_sid params, and the brand root
+// route passes through when they are present. Without this, root pages
+// lived at /api/view, so location.pathname was "/api/view" — apps that
+// route on their own pathname (Roblox's SDUI landing app matches "/" to
+// pick its page config and otherwise renders nothing) broke.
+function escapedPathFor(target) {
+  try {
+    const u = new URL(target);
+    const p = u.pathname;
+    if (!p || (p !== "/" && p.length < 2)) return null;
+    if (p === "/") return u;
+    if (/^\/api\//i.test(p)) return null;
+    if (isReservedOriginPath(p)) return null;
+    if (/^\/(?:console|view_source|status|health)(?:\/|$)/i.test(p)) return null;
+    if (/\.(?:m?js|css|png|jpe?g|gif|webp|svg|ico|woff2?|ttf|otf|mp4|webm|mp3|ogg|wasm|json|map|pdf|zip)(?:\/|$)/i.test(p)) return null;
+    return u;
+  } catch { return null; }
+}
+function markEscapedNavigation(req, res, url, sid) {
+  const sep = url.search ? "&" : "?";
+  const popup = req.query?.veyra_popup === "1" ? "&veyra_popup=1" : "";
+  const player = req.query?.__veyra_youtube_inline === "1" && watchVideo(url.href) ? "&__veyra_youtube_inline=1" : "";
+  const loc = requestOrigin(req) + url.pathname + url.search
+    + `${sep}__veyra_url=${encodeURIComponent(url.href)}&__veyra_sid=${encodeURIComponent(sid)}${popup}${player}` + url.hash;
+  res.setHeader("location", loc);
+  res.setHeader("cache-control", "no-store");
+  res.setHeader("x-veyra-escaped-path", "1");
+  return res.status(302).end();
+}
+// ---------- In-proxy sign-in (fast proxy, no Chromium) ----------
+// Sign-in happens inside the fast proxy: the site's login/OAuth pages load
+// through the proxy in the session's own cookie jar, and OAuth popups open
+// as proxied Veyra tabs with opener semantics relayed by the app. The old
+// direct-login handoff (open the real site in the user's own browser, then
+// import its cookies back into the Veyra session) was removed — no cookie
+// ever crosses sessions.
+// (This block intentionally left without endpoints; see the runtime's
+// sign-in interception below and the popup relay further down.)
+function requestOrigin(req) {
+  const proto = String(req.get("X-Forwarded-Proto") || req.protocol || "https").split(",")[0].trim() || "https";
+  const host = String(req.get("host") || "").slice(0, 200);
+  return host ? `${proto}://${host}` : String(CFG.frontendUrl || "https://veyraserver-xscy.onrender.com");
+}
+// (Removed) the direct-login handoff: HANDOFF_LOGIN_PAGES,
+// AUTH_PAGE_PATH and handoffLoginRedirect computed where the user's own
+// browser should land to sign in on the real site. Sign-in now happens
+// inside the fast proxy, so there is no such destination to compute.
 function makeResourceUrl(url, referrer = "", sid = "") {
-  const q = `/api/resource?url=${encodeURIComponent(url)}`;
+  // Cesium replaces {z}/{x}/{y} after receiving a URL template. Keep those
+  // tokens literal in the proxy query; encoding them as %7B...%7D makes the
+  // replacement pass miss them and requests the literal placeholder path.
+  const encodedTarget = encodeURIComponent(url)
+    .replace(/%257B/g, "{").replace(/%257D/g, "}")
+    .replace(/%7B/g, "{").replace(/%7D/g, "}");
+  const q = `/api/resource?url=${encodedTarget}`;
   const parts = [];
   try { const r = new URL(referrer); parts.push(`from=${encodeURIComponent(r.href)}`); } catch {}
   if (sid) parts.push(`sid=${encodeURIComponent(sid)}`);
@@ -1047,60 +1289,8 @@ function normalizeSessionId(value) {
   return /^[A-Za-z0-9_-]{16,80}$/.test(sid) ? sid : crypto.randomUUID().replaceAll("-", "");
 }
 function sessionRecord(sid) {
+  
   return sessionManager.touch(sid);
-}
-function sessionCapability(req) {
-  return String(req.get("X-Veyra-Session-Token") || req.query?.sessionToken || req.query?.cap || req.body?.sessionToken || req.body?.sessionCapability || "");
-}
-function apiKeyFromRequest(req) {
-  const explicit = String(req.get("X-Veyra-API-Key") || req.get("X-API-Key") || "").trim();
-  if (explicit) return explicit;
-  const auth = String(req.get("authorization") || "");
-  const match = /^Bearer\s+(\S+)$/.exec(auth);
-  return match?.[1] || "";
-}
-function apiKeyCredits(found) { return Math.max(0, Math.trunc(Number(found?.key?.creditsMicros) || 0)); }
-function apiKeyPublicCredits(found) {
-  const balanceMicros = apiKeyCredits(found), spentMicros = Math.max(0, Math.trunc(Number(found?.key?.spentMicros) || 0));
-  return { balanceMicros, spentMicros, balanceUsd: Number((balanceMicros / 1e6).toFixed(6)), spentUsd: Number((spentMicros / 1e6).toFixed(6)), searchCostMicros: CFG.apiSearchCostMicros, searchCostUsd: Number((CFG.apiSearchCostMicros / 1e6).toFixed(6)) };
-}
-function requireApiKey(req, res, next) {
-  const found = authStore.findApiKey(apiKeyFromRequest(req));
-  if (!found) return respondError(res, 401, "A valid Veyra API key is required.", "API_KEY_REQUIRED");
-  if (apiKeyCredits(found) < CFG.apiSearchCostMicros) return respondError(res, 402, `Insufficient API credits. Add at least $${(CFG.apiSearchCostMicros / 1e6).toFixed(6)} to this key.`, "API_CREDITS_EXHAUSTED", { credits: apiKeyPublicCredits(found) });
-  req.veyraApiKey = found;
-  next();
-}
-function consumeApiSearchCredit(found) {
-  const cost = CFG.apiSearchCostMicros;
-  if (apiKeyCredits(found) < cost) throw Object.assign(new Error("Insufficient API credits."), { status: 402, code: "API_CREDITS_EXHAUSTED" });
-  found.key.creditsMicros = apiKeyCredits(found) - cost;
-  found.key.spentMicros = Math.max(0, Math.trunc(Number(found.key.spentMicros) || 0)) + cost;
-  found.key.usage ||= { requests: 0, last24h: 0 };
-  found.key.usage.requests = Math.max(0, Number(found.key.usage.requests) || 0) + 1;
-  found.key.usage.lastSearchAt = new Date().toISOString();
-  found.key.lastUsedAt = new Date().toISOString();
-  authStore.persistUser(found.user);
-  return cost;
-}
-function constantTimeMatch(a, b) {
-  const left = Buffer.from(String(a || ""));
-  const right = Buffer.from(String(b || ""));
-  return left.length === right.length && left.length > 0 && crypto.timingSafeEqual(left, right);
-}
-function sessionAccessAllowed(req, sid, rec = sessionManager.peek(sid)) {
-  if (!rec) return false;
-  const user = authStore.userFromRequest(req);
-  if (rec.userId && rec.userId !== user?.id) return false;
-  return constantTimeMatch(sessionCapability(req), rec.accessToken);
-}
-function requireSessionAccess(req, res, next) {
-  const sid = String(req.params?.sid || req.body?.sessionId || req.body?.sid || req.query?.sid || req.query?.sessionId || "");
-  const rec = sessionManager.peek(sid);
-  if (!rec || !sessionAccessAllowed(req, sid, rec)) return respondError(res, 403, "This browsing session is not available to this request.", "SESSION_ACCESS_DENIED");
-  req.veyraSession = rec;
-  req.veyraSessionId = sid;
-  next();
 }
 function cookieDomainMatches(host, domain) {
   const h = String(host || "").toLowerCase();
@@ -1115,7 +1305,10 @@ function storeSetCookies(sessionId, url, response) {
   if (!sessionId || typeof response?.headers?.getSetCookie !== "function") return;
   const values = response.headers.getSetCookie();
   if (!values?.length) return;
-  const session = sessionRecord(sessionId), u = new URL(url);
+  if (sessionManager.checkLimit(sessionId)) return;
+  const session = sessionManager.peek(sessionId);
+  if (!session) return;
+  const u = new URL(url);
   for (const raw of values.slice(0, 50)) {
     const parts = String(raw).split(";").map(x => x.trim());
     const pair = parts.shift();
@@ -1147,7 +1340,9 @@ function storeSetCookies(sessionId, url, response) {
 }
 function cookieHeader(sessionId, url) {
   if (!sessionId) return "";
-  const session = sessionRecord(sessionId), u = new URL(url), pairs = [];
+  const session = sessionManager.peek(sessionId);
+  if (!session) return "";
+  const u = new URL(url), pairs = [];
   for (const [key, cookie] of [...session.cookies.entries()]) {
     if (cookie.expiresAt && cookie.expiresAt <= Date.now()) { session.cookies.delete(key); continue; }
     if (cookie.secure && u.protocol !== "https:") continue;
@@ -1167,6 +1362,10 @@ function retryAfterMs(headers) {
   if (Number.isFinite(n)) return Math.max(0, Math.min(30000, n * 1000));
   const t = Date.parse(raw);
   return Number.isFinite(t) ? Math.max(0, Math.min(30000, t - Date.now())) : 0;
+}
+function proxyRetryAfter(result) {
+  if (result.status !== 429 && result.status !== 503) return "";
+  return result.retryAfter || (result.retryAfterMs > 0 ? String(Math.ceil(result.retryAfterMs / 1000)) : "");
 }
 function backoffMs(attempt, retryAfter = 0) {
   if (retryAfter) return retryAfter;
@@ -1191,6 +1390,20 @@ function isRetryableNetworkError(err) {
   const code = networkErrorCode(err);
   return /^(?:EAI_AGAIN|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENETUNREACH|EHOSTUNREACH|UND_ERR_CONNECT_TIMEOUT|UND_ERR_SOCKET|UND_ERR_HEADERS_TIMEOUT)$/i.test(code) || /fetch failed/i.test(String(err?.message || ''));
 }
+async function proxyViewGet(req, res) {
+  try {
+    return await proxyRequest(req, res, "view");
+  } catch (error) {
+    // Both URL shapes are the same GET navigation. The path-shaped lane
+    // used to skip this last retry after following /api/view's redirect.
+    const retryable = error?.code !== "VPN_KILL_SWITCH" && (error?.code === "UPSTREAM_NETWORK_ERROR"
+      ? isRetryableNetworkError({ code: error.upstreamCode }) : isRetryableNetworkError(error));
+    if (!retryable || req.aborted || res.destroyed || res.headersSent) throw error;
+    await new Promise(resolve => setTimeout(resolve, 350));
+    if (req.aborted || res.destroyed || res.headersSent) throw error;
+    return proxyRequest(req, res, "view");
+  }
+}
 function decorateUpstreamError(err, url) {
   const e = err instanceof Error ? err : new Error(String(err));
   e.upstreamCode = networkErrorCode(err) || 'UPSTREAM_NETWORK_ERROR';
@@ -1213,7 +1426,18 @@ function oversizeStream(response, head, reader) {
     cancel() { if (taken) return; taken = true; try { (reader ? reader.cancel() : response.body?.cancel())?.catch?.(() => {}); } catch {} }
   };
 }
-async function readBodyLimited(response, limit, keepStream = false, bodyTimeoutMs = CFG.bodyTimeoutMs, signal = null) {
+function discardUpstreamBody(response) {
+  try { void response.body?.cancel().catch(() => {}); } catch {}
+}
+async function readBodyLimited(response, limit, keepStream = false, bodyTimeoutMs = CFG.bodyTimeoutMs, signal = null, passthrough = false) {
+  // Fast-proxy passthrough: binary bodies (media, archives, wasm, ...) are
+  // piped to the client byte-for-byte without buffering the whole resource
+  // in memory first — every packet flows through as it arrives.
+  if (passthrough && response.body) {
+    try {
+      return { body: Buffer.alloc(0), bytes: 0, truncated: false, tooLarge: false, stream: oversizeStream(response, [], response.body.getReader()), passthrough: true };
+    } catch {}
+  }
   const len = Number(response.headers.get("content-length"));
   if (Number.isFinite(len) && len > limit) {
     if (keepStream && response.body) return { body: Buffer.alloc(0), bytes: len, truncated: true, tooLarge: true, stream: oversizeStream(response, [], null) };
@@ -1250,31 +1474,40 @@ async function readBodyLimited(response, limit, keepStream = false, bodyTimeoutM
   return { body: Buffer.concat(chunks), bytes: total, truncated, tooLarge: truncated };
 }
 async function fetchBuffer(url, opts = {}) {
-  let current = normalizeUrl(url);
+  let current = normalizeUrl(url, undefined, opts);
   if (!current) throw new Error("Invalid HTTP(S) URL.");
   const maxRedirects = opts.maxRedirects ?? CFG.maxRedirects;
   const limit = opts.limit ?? CFG.maxTextBytesPerResource;
-  const method = String(opts.method || "GET").toUpperCase();
+  let method = String(opts.method || "GET").toUpperCase();
+  // A failed write may have already reached the upstream; never replay it
+  // automatically. Redirects still follow the HTTP method rules below.
+  const retriesAllowed = ["GET", "HEAD", "OPTIONS"].includes(method) ? (opts.retries ?? CFG.maxRetries) : 0;
   const headers = new Headers(opts.headers || {});
   headers.set("user-agent", opts.userAgent || CFG.userAgent);
   if (!headers.has("accept")) headers.set("accept", opts.accept || "text/html,application/xhtml+xml,application/xml,text/css,application/javascript,text/javascript,image/avif,image/webp,image/apng,image/svg+xml,font/*,video/*,audio/*,*/*;q=0.05");
   if (opts.range && !headers.has("range")) headers.set("range", String(opts.range).slice(0, 200));
+  if (headers.has("range") && !headers.has("accept-encoding")) headers.set("accept-encoding", "identity");
   const sessionId = String(opts.sessionId || "");
   const redirectChain = [];
+  const upstreamSignal = opts.signal;
+  const canceled = () => Object.assign(new Error("Operation cancelled."), { code: "OPERATION_CANCELLED" });
+  const retryWait = ms => wait(ms, undefined, { signal: upstreamSignal }).catch(error => {
+    if (upstreamSignal?.aborted) throw canceled();
+    throw error;
+  });
   let cached = opts.cached || null;
   for (let redirect = 0; redirect <= maxRedirects; redirect++) {
+    if (upstreamSignal?.aborted) throw canceled();
     await assertPublicUrl(current, opts.dnsCache || dnsPublicCache);
+    if (redirect > 0) await opts.beforeRedirect?.(current);
     let lastError = null;
     let retriesUsed = 0;
-    for (let attempt = 0; attempt <= (opts.retries ?? CFG.maxRetries); attempt++) {
+    for (let attempt = 0; attempt <= retriesAllowed; attempt++) {
+      if (upstreamSignal?.aborted) throw canceled();
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), opts.timeout ?? CFG.requestTimeoutMs);
-      const upstreamSignal = opts.signal;
       const onAbort = () => controller.abort();
-      if (upstreamSignal) {
-        if (upstreamSignal.aborted) throw Object.assign(new Error("Operation cancelled."), { code: "OPERATION_CANCELLED" });
-        upstreamSignal.addEventListener("abort", onAbort, { once: true });
-      }
+      upstreamSignal?.addEventListener("abort", onAbort, { once: true });
       try {
         const reqHeaders = new Headers(headers);
         if (sessionId) {
@@ -1293,43 +1526,67 @@ async function fetchBuffer(url, opts = {}) {
           throw e;
         }
         const directMode = !suppliedDispatcher && !vpnEnabledForRequest;
-        const dispatcher = suppliedDispatcher || (directMode ? (attempt % 2 === 0 ? DIRECT_HTTP_AGENT : undefined) : undefined);
-        const response = await undiciFetch(current, {
-          method,
-          headers: reqHeaders,
-          redirect: "manual",
-          signal: controller.signal,
-          body: opts.body && method !== "GET" && method !== "HEAD" ? opts.body : undefined,
-          ...(dispatcher ? { dispatcher } : {})
-        });
+        const dispatcher = suppliedDispatcher || (directMode ? DIRECT_HTTP_AGENT : undefined);
+        // The same public Google Accounts URL is rejected by Undici but returns its normal redirect via Node HTTPS; scope this fallback to direct traffic so VPN/custom dispatchers are never bypassed.
+        const requestBody = opts.body && method !== "GET" && method !== "HEAD" ? opts.body : undefined;
+        // Test seam: fetchBuffer is the retry/redirect core of the fast proxy,
+        // and tests inject a stub upstream here instead of hitting the network.
+        const upstreamFetch = opts.upstreamFetch || undiciFetch;
+        const response = directMode && isGoogleAccountsUrl(current)
+          ? await requestGoogleAccounts(current, { method, headers: reqHeaders, body: requestBody, agent: GOOGLE_ACCOUNTS_HTTPS_AGENT, signal: controller.signal })
+          : await upstreamFetch(current, { method, headers: reqHeaders, redirect: "manual", signal: controller.signal, body: requestBody, ...(dispatcher ? { dispatcher } : {}) });
         if (sessionId) storeSetCookies(sessionId, current, response);
         clearTimeout(timer);
-        if (upstreamSignal) upstreamSignal.removeEventListener("abort", onAbort);
         if (response.status === 304) {
           if (cached) return { ...cached.response, status: cached.response.status || 200, revalidated: true, redirectChain };
           
           
           
           
-        } else if (response.status >= 300 && response.status < 400) {
+        } else if ([301, 302, 303, 307, 308].includes(response.status)) {
           const loc = response.headers.get("location");
+          discardUpstreamBody(response);
           if (!loc) throw new Error(`HTTP ${response.status} redirect without Location`);
           const next = resolveNavigation(loc, current);
           if (!next) throw new Error("Invalid redirect destination.");
+          // Match native browser redirects: form POSTs commonly land on a
+          // GET page after login. Never resubmit credentials on those hops.
+          if (([301, 302].includes(response.status) && method === "POST")
+            || (response.status === 303 && method !== "GET" && method !== "HEAD")) {
+            method = "GET";
+            for (const name of ["content-encoding", "content-language", "content-location", "content-type", "content-length", "origin"]) headers.delete(name);
+          }
+          // The destination gets its own session-jar cookies; never forward
+          // explicit credentials supplied for a different origin.
+          if (new URL(next).origin !== new URL(current).origin) {
+            for (const name of [...headers.keys()]) if (isCredentialRequestHeader(name)) headers.delete(name);
+          }
           redirectChain.push({ url: current, status: response.status });
           current = next;
           cached = null;
+          // The redirect itself succeeded, so an error from an earlier retried
+          // attempt is stale. Without this, "fail once, then redirect" pages
+          // throw the old error instead of following the redirect.
+          lastError = null;
           break;
         }
-        if (retryableStatus(response.status) && attempt < (opts.retries ?? CFG.maxRetries)) {
+        if (retryableStatus(response.status) && attempt < retriesAllowed) {
           lastError = Object.assign(new Error(`HTTP ${response.status}`), { status: response.status });
           retriesUsed += 1;
-          await sleep(backoffMs(attempt, retryAfterMs(response.headers)));
+          discardUpstreamBody(response);
+          await retryWait(backoffMs(attempt, retryAfterMs(response.headers)));
           continue;
         }
         const contentType = response.headers.get("content-type") || "";
         const bodyLimit = typeof opts.limitForContentType === "function" ? opts.limitForContentType(contentType, response.headers) : limit;
-        const body = await readBodyLimited(response, bodyLimit, !!opts.streamOversize, opts.bodyTimeoutMs ?? CFG.bodyTimeoutMs, upstreamSignal);
+        // Playlists are text, even when served with an audio/* MIME type.
+        // Buffer them for URI rewriting instead of streaming them unchanged.
+        const passthrough = (opts.passthroughEventStream && isProxyEventStream(contentType))
+          || (!!opts.passthroughBinary && !isHlsPlaylistType(contentType)
+          && /^(?:video\/|audio\/|font\/|application\/(?:pdf|zip|x-7z-compressed|octet-stream|wasm|dash\+xml))/i.test(contentType));
+        const body = method === "HEAD" || response.status === 304
+          ? { body: Buffer.alloc(0), bytes: 0, truncated: false, tooLarge: false }
+          : await readBodyLimited(response, bodyLimit, !!opts.streamOversize || passthrough, opts.bodyTimeoutMs ?? CFG.bodyTimeoutMs, upstreamSignal, passthrough);
         const upstreamEncoding = response.headers.get("content-encoding") || "";
         const headerLength = response.headers.get("content-length") || "";
         
@@ -1355,19 +1612,32 @@ async function fetchBuffer(url, opts = {}) {
           expires: response.headers.get("expires") || "",
           contentRange: response.headers.get("content-range") || "",
           acceptRanges: response.headers.get("accept-ranges") || "",
+          allow: response.headers.get("allow") || "",
           linkHeader: response.headers.get("link") || "",
+          robotsTag: response.headers.get("x-robots-tag") || "",
           contentDisposition: response.headers.get("content-disposition") || "",
+          allow: response.headers.get("allow") || "",
           setCookieHeader: response.headers.get("set-cookie") || "",
+          retryAfter: response.headers.get("retry-after") || "",
+          retryAfterMs: retryAfterMs(response.headers),
           contentEncoding: upstreamEncoding,
           contentLength,
           serverHeader: response.headers.get("server") || "",
           cfMitigated: response.headers.get("cf-mitigated") || "",
+          // Mirror the upstream's own nosniff decision: some CDNs (e.g.
+          // download.gameanalytics.com on S3) serve scripts as
+          // binary/octet-stream WITHOUT x-content-type-options, and browsers
+          // execute those scripts fine — until the proxy adds nosniff, which
+          // makes Chrome refuse them ("Refused to execute script ... MIME
+          // type ... not executable") and breaks game SDK bootstraps.
+          xContentTypeOptions: response.headers.get("x-content-type-options") || "",
           xFrameOptions: response.headers.get("x-frame-options") || "",
           contentSecurityPolicy: response.headers.get("content-security-policy") || "",
           bytes: body.bytes,
           truncated: body.truncated,
           tooLarge: body.tooLarge,
           stream: body.stream || null,
+          passthrough: !!body.passthrough,
           body: body.body,
           redirectChain,
           retries: retriesUsed,
@@ -1375,18 +1645,21 @@ async function fetchBuffer(url, opts = {}) {
         };
       } catch (e) {
         clearTimeout(timer);
-        if (upstreamSignal) upstreamSignal.removeEventListener("abort", onAbort);
+        controller.abort();
         
         
-        if (e?.code === "OPERATION_CANCELLED" || upstreamSignal?.aborted) throw Object.assign(new Error("Operation cancelled."), { code: "OPERATION_CANCELLED" });
+        if (e?.code === "OPERATION_CANCELLED" || upstreamSignal?.aborted) throw canceled();
         
         const vpnCause = e?.cause?.code && String(e.cause.code).startsWith("VPN_") ? e.cause : (String(e?.code || "").startsWith("VPN_") ? e : null);
         if (vpnCause) throw Object.assign(new Error(vpnCause.message), { code: vpnCause.code, status: vpnCause.code === "VPN_KILL_SWITCH" ? 503 : 502, upstreamCode: vpnCause.code, upstreamPhase: 'vpn', upstreamMessage: vpnCause.message });
         lastError = decorateUpstreamError(e, current);
-        const retryableError = isRetryableNetworkError(e) && attempt < (opts.retries ?? CFG.maxRetries);
+        const retryableError = isRetryableNetworkError(e) && attempt < retriesAllowed;
         if (!retryableError) break;
         retriesUsed += 1;
-        await sleep(backoffMs(attempt));
+        await retryWait(backoffMs(attempt));
+      } finally {
+        clearTimeout(timer);
+        upstreamSignal?.removeEventListener("abort", onAbort);
       }
     }
     if (lastError) throw lastError;
@@ -1399,13 +1672,293 @@ async function fetchBuffer(url, opts = {}) {
 const webSearch = createWebSearch({
   fetchText: async (url, opts = {}) => {
     const r = await fetchBuffer(url, {
-      headers: opts.headers || {}, accept: opts.accept || "application/json", timeout: 12000,
-      retries: 1, limit: 2 * 1024 * 1024
+      headers: opts.headers || {}, accept: opts.accept || "application/json", timeout: opts.timeoutMs || 12000,
+      signal: opts.signal, retries: 0, limit: 2 * 1024 * 1024, maxRedirects: opts.maxRedirects, userAgent: opts.userAgent
     });
-    return { ok: r.ok, status: r.status, text: r.body.toString("utf8"), finalUrl: r.finalUrl };
+    return { ok: r.ok && !r.truncated, status: r.status, text: r.body.toString("utf8"), finalUrl: r.finalUrl, retryAfterMs: r.retryAfterMs };
   },
   env: process.env,
   log: (level, source, message) => serverLog(level, source, message)
+});
+const merchantRobotsCache = new Map();
+const merchantUserAgent = `VeyraSearch/${VEYRA_VERSION} (+https://github.com/HomekidChud/VeyraServer)`;
+async function fetchIndiaCatalog(url, { signal, kind }) {
+  const u = new URL(url);
+  if (kind === "catalog" ? u.pathname !== "/search/suggest.json" || !merchantProductUrl("/products/placeholder", u.hostname) || u.origin !== `https://${u.hostname}`
+    : merchantProductUrl(url) !== url) throw new Error("Unrecognized storefront URL");
+  const deadline = AbortSignal.timeout(kind === "catalog" ? 3600 : 2200);
+  const requestSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
+  requestSignal.throwIfAborted();
+  let policy = merchantRobotsCache.get(u.origin);
+  if (!policy || policy.expiresAt <= Date.now()) {
+    const r = await fetchBuffer(`${u.origin}/robots.txt`, {
+      timeout: 1250, bodyTimeoutMs: 1000, signal: requestSignal, limit: 512 * 1024, maxRedirects: 0,
+      accept: "text/plain,*/*;q=0.1", retries: 0, userAgent: merchantUserAgent
+    });
+    const text = r.body.toString("utf8");
+    if ((!r.ok && r.status !== 404 && r.status !== 410) || r.truncated || r.tooLarge ||
+        (r.ok && detectChallenge(text, r.contentType, r.status, { server: r.serverHeader, "cf-mitigated": r.cfMitigated }))) throw new Error("Storefront crawl policy unavailable");
+    policy = { group: r.ok ? robotsMatchGroup(parseRobots(text), merchantUserAgent) : null, expiresAt: Date.now() + 60 * 60_000 };
+    merchantRobotsCache.set(u.origin, policy);
+  }
+  if (!robotsAllowed(url, policy) || policy.group?.crawlDelayMs) throw new Error("Storefront requests not permitted at search speed");
+  requestSignal.throwIfAborted();
+  const r = await fetchBuffer(url, { timeout: kind === "catalog" ? 2250 : 1450, bodyTimeoutMs: 1250, signal: requestSignal, retries: 0,
+    limit: kind === "catalog" ? 512 * 1024 : PRODUCT_BYTES, maxRedirects: 0, preserveQuery: true,
+    accept: kind === "catalog" ? "application/json" : "text/html", userAgent: merchantUserAgent });
+  requestSignal.throwIfAborted();
+  if (!r.ok || (kind === "catalog" && r.truncated)) throw new Error("Storefront request failed");
+  return r.body.toString("utf8");
+}
+
+const sourceSearchEnabled = boolEnv("VEYRA_SOURCE_SEARCH", true);
+const searchRobots = new Map();
+async function readSearchSource(url, { signal, allowUrl }) {
+  const agent = merchantUserAgent;
+  const fetchSource = app.locals.veyraSourceSearchFetch || fetchBuffer;
+  const canRead = async target => {
+    signal.throwIfAborted();
+    if (sourcePageUrl(target) !== target || normalizeUrl(target, undefined, { preserveQuery: true }) !== target ||
+        !allowUrl(target) || !sameRedirectHost(url, target) ||
+        (url.startsWith("https:") && !target.startsWith("https:"))) throw new Error("Source outside crawl scope");
+    const origin = new URL(target).origin;
+    let policy = searchRobots.get(origin);
+    if (!policy || policy.expiresAt <= Date.now()) {
+      const r = await fetchSource(`${origin}/robots.txt`, { timeout: 850, bodyTimeoutMs: 850, signal,
+        limit: 256 * 1024, maxRedirects: 0, retries: 0, userAgent: agent, accept: "text/plain,*/*;q=0.1" });
+      const text = r.body.toString("utf8");
+      if (r.truncated || (r.ok && (!/^text\/plain\b/i.test(r.contentType) || r.cfMitigated ||
+          detectChallenge(text, r.contentType, r.status))) || (!r.ok && ![404, 410].includes(r.status))) {
+        throw new Error("Source crawl policy unavailable");
+      }
+      policy = { group: r.ok ? robotsMatchGroup(parseRobots(text), agent) : null, expiresAt: Date.now() + 10 * 60_000 };
+      searchRobots.set(origin, policy);
+      if (searchRobots.size > 512) searchRobots.delete(searchRobots.keys().next().value);
+    }
+    // Leave publishers requesting slower pacing to the scheduled crawler.
+    if (!robotsAllowed(target, policy) || policy.group?.crawlDelayMs) throw new Error("Source disallows live crawling");
+  };
+  await canRead(url);
+  const r = await fetchSource(url, { timeout: 1200, bodyTimeoutMs: 1000, signal, limit: 768 * 1024, maxRedirects: 2,
+    retries: 0, userAgent: agent, accept: "text/html,application/xhtml+xml", beforeRedirect: canRead });
+  const body = r.body.toString("utf8");
+  if (!r.ok || r.truncated || r.cfMitigated || !/^(?:text\/html|application\/xhtml\+xml)\b/i.test(r.contentType) ||
+      /\b(?:private|no-store)\b/i.test(r.cacheControl) || /(?:^|,)\s*(?:\*|cookie|authorization)\s*(?:,|$)/i.test(r.vary) ||
+      detectChallenge(body, r.contentType, r.status)) return null;
+  return { body, finalUrl: r.finalUrl, robotsTag: r.robotsTag };
+}
+const sourceSearch = createSourceSearch({ readPage: readSearchSource });
+
+const verticalSearch = createVerticalSearch({
+  webSearch: (query, opts) => (app.locals.veyraWebSearch || webSearch).search(query, opts),
+  fetchIndiaCatalog,
+  indexedImages: localImageSearch,
+  indexedVideos: localVideoSearch,
+  indexedProducts: (q, offset, limit, region) => localSearch(q, offset, limit, { region, topical: true, requireTerms: true, onlyIndianProducts: true }),
+  fetchText: async (url, opts) => {
+    const r = await fetchBuffer(url, {
+      method: opts.method, body: opts.body, headers: opts.headers, accept: opts.accept || "application/json",
+      timeout: opts.timeoutMs, signal: opts.signal, retries: 0, maxRedirects: 0, limit: 1024 * 1024,
+      userAgent: `VeyraSearch/${VEYRA_VERSION} (+https://github.com/HomekidChud/VeyraServer)`
+    });
+    return { ok: r.ok && !r.truncated, status: r.status, text: r.body.toString("utf8"), retryAfterMs: r.retryAfterMs };
+  }
+});
+
+const acquisitionManager = new AcquisitionManager({
+  assertPublicUrl,
+  userAgent: CFG.userAgent,
+  timeoutMs: CFG.requestTimeoutMs,
+  maxBytes: CFG.maxProxyTextBytes,
+  maxRedirects: CFG.maxRedirects,
+  maxRetries: CFG.maxRetries,
+  searchFirstDeadlineMs: Number(process.env.SEARCH_FIRST_DEADLINE_MS) || 20000,
+  perHostConcurrency: CFG.perHostConcurrency,
+  globalConcurrency: CFG.maxActiveFetches,
+  cacheTtlMs: CFG.mongoCacheTtlMs,
+  cacheMax: CFG.maxProxyCacheEntries,
+  persistence: mongoStore,
+});
+app.get("/api/acquisition/status", (req, res) => res.json({ ok: true, ...acquisitionManager.report(), chromiumEnabled: CFG.browserEnabled }));
+
+const MAX_VIEW_SOURCE_BYTES = 1024 * 1024;
+function viewSourceUrlHasSecrets(value) {
+  try { return [...new URL(value).searchParams.keys()].some(name => /(?:token|secret|password|session|signature|credential|authorization|accesskey|api[_-]?key|(?:^|[_-])key(?:$|[_-])|(?:^|[_-])sig(?:$|[_-])|^(?:auth|code|jwt)$)/i.test(name)); }
+  catch { return true; }
+}
+function sourceViewerFrameAncestors() {
+  const allowed = new Set(["'self'"]);
+  for (const candidate of Array.isArray(CFG.frontendOrigins) ? CFG.frontendOrigins : []) {
+    try {
+      const origin = new URL(String(candidate)).origin;
+      if (/^https?:$/.test(new URL(origin).protocol)) allowed.add(origin);
+    } catch {}
+  }
+  return [...allowed].join(" ");
+}
+app.post("/api/view-source", async (req, res) => {
+  try {
+    const target = normalizeUrl(String(req.body?.url || ""));
+    if (!target) return res.status(400).json({ ok: false, error: "A valid public HTTP(S) URL is required.", code: "INVALID_URL" });
+    if (target.length > 2048) return res.status(400).json({ ok: false, error: "Source URLs are limited to 2,048 characters.", code: "SOURCE_URL_TOO_LONG" });
+    if (viewSourceUrlHasSecrets(target)) return res.status(400).json({ ok: false, error: "URLs containing credential or signature parameters cannot be stored in a source link.", code: "SENSITIVE_URL" });
+    const assertPublicSourceUrl = app.locals.veyraSourceAssertPublic || acquisitionManager.assertPublicUrl;
+    await assertPublicSourceUrl(target);
+    const fetchSource = app.locals.veyraSourceFetch || ((url, options) => acquisitionManager.fetch(url, options));
+    const response = await fetchSource(target, {
+      engine: "view-source", timeoutMs: Math.min(CFG.requestTimeoutMs, 15000), maxBytes: MAX_VIEW_SOURCE_BYTES,
+      retries: 0, noCache: true, accept: "text/html,application/xhtml+xml,text/plain,text/css,application/json,application/xml,text/xml,application/javascript"
+    });
+    const finalUrl = normalizeUrl(response?.finalUrl || target);
+    if (!finalUrl || viewSourceUrlHasSecrets(finalUrl)) return res.status(400).json({ ok: false, error: "The final source URL is not eligible for a shareable Veyra source link.", code: "SENSITIVE_URL" });
+    if (finalUrl.length > 2048) return res.status(400).json({ ok: false, error: "The final source URL is too long for a Veyra link.", code: "SOURCE_URL_TOO_LONG" });
+    await assertPublicSourceUrl(finalUrl);
+    const contentType = String(response?.contentType || "application/octet-stream").toLowerCase();
+    if (!response?.ok) return res.status(502).json({ ok: false, error: "Source response was unavailable.", code: "SOURCE_FETCH_FAILED" });
+    if (!/(?:text\/(?:html|plain|css|xml|javascript)|application\/(?:xhtml\+xml|json|xml|javascript))\b/i.test(contentType)) {
+      return res.status(415).json({ ok: false, error: "Only text-based web documents can be viewed as source.", code: "SOURCE_CONTENT_TYPE_UNSUPPORTED" });
+    }
+    const body = Buffer.isBuffer(response.body) ? response.body : Buffer.from(String(response.body || ""), "utf8");
+    if (body.length > MAX_VIEW_SOURCE_BYTES) return res.status(413).json({ ok: false, error: "Source exceeds the 1 MiB limit.", code: "SOURCE_TOO_LARGE" });
+    const link = sourceViewerStore.create({ url: finalUrl, text: body.toString("utf8"), contentType, status: response.status || 200 });
+    res.set("Cache-Control", "no-store").json({ ok: true, ...link, bytes: body.length });
+  } catch (error) {
+    const status = Number(error?.status) >= 400 && Number(error?.status) < 500 ? Number(error.status) : 502;
+    res.status(status).json({ ok: false, error: String(error?.message || "Source capture failed.").slice(0, 300), code: /^[A-Z0-9_:-]{1,64}$/i.test(String(error?.code || "")) ? String(error.code) : "SOURCE_FETCH_FAILED" });
+  }
+});
+app.get("/view_source/:sourceId/:link", (req, res) => {
+  const entry = sourceViewerStore.get(req.params.sourceId, req.params.link);
+  if (!entry) return res.status(404).type("text").send("Source view not found or expired.");
+  res.set({
+    "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": `default-src 'none'; style-src 'unsafe-inline'; script-src 'none'; img-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors ${sourceViewerFrameAncestors()}`
+  }).type("html").send(sourcePage(entry));
+});
+
+const MAX_HTTP_READER_BYTES = Math.min(CFG.maxProxyTextBytes || 4 * 1024 * 1024, 4 * 1024 * 1024);
+function httpReaderError(error) {
+  const code = String(error?.code || "HTTP_READER_FAILED").toUpperCase();
+  const known = {
+    INVALID_URL: [400, "A valid public HTTP(S) URL is required."],
+    URL_TOO_LONG: [400, "Reader URLs are limited to 2,048 characters."],
+    SENSITIVE_URL: [400, "URLs containing credentials or sensitive query parameters cannot be scraped."],
+    ROBOTS_DISALLOWED: [403, "The site's robots.txt disallows crawler extraction of this URL."],
+    SSRF_BLOCKED: [403, "The target did not pass public-address safety checks."],
+    PRIVATE_ADDRESS: [403, "The target did not pass public-address safety checks."],
+    CONTENT_TYPE_UNSUPPORTED: [415, "Only public text and HTML documents can be extracted."],
+    RESPONSE_TOO_LARGE: [413, "The page exceeds the HTTP reader's bounded response size."],
+    UPSTREAM_HTTP_ERROR: [502, "The site did not return a successful page response."],
+    FETCH_TIMEOUT: [504, "The site did not respond before the reader timeout."],
+    YOUTUBE_UNAVAILABLE: [502, "YouTube's public metadata endpoint is temporarily unavailable."],
+  };
+  const [status, message] = known[code] || [502, "The page could not be extracted over HTTP."];
+  return { status, code, message };
+}
+function httpReaderRequestOrigin(req) {
+  for (const raw of [CFG.publicApiOrigin, process.env.RENDER_EXTERNAL_URL]) {
+    try {
+      const candidate = new URL(String(raw || ""));
+      if (/^https?:$/.test(candidate.protocol) && candidate.hostname) return candidate.origin;
+    } catch {}
+  }
+  try {
+    const candidate = new URL(`${req.protocol}://${req.get("host")}`);
+    if (["localhost", "127.0.0.1", "::1"].includes(candidate.hostname)) return candidate.origin;
+  } catch {}
+  return "";
+}
+async function acquireHttpReaderPayload(target, req) {
+  const assertPublic = app.locals.veyraReaderAssertPublic || acquisitionManager.assertPublicUrl;
+  await assertPublic(target);
+  const parsedVideo = youtubeCompat.parseYoutubeUrl(target);
+  if (parsedVideo) {
+    const check = await youtubeCompat.checkEmbeddable(parsedVideo.videoId, app.locals.veyraYoutubeFetch || fetchOfficialJson);
+    const message = check.ok ? "" : check.code === "YOUTUBE_EMBED_DISABLED"
+      ? "This video is not publicly embeddable; Veyra will not proxy or bypass the official player restriction."
+      : "YouTube's public metadata endpoint is unavailable right now.";
+    const embedUrl = check.ok ? youtubeCompat.buildEmbedUrl(parsedVideo, httpReaderRequestOrigin(req)) : "";
+    return httpReader.scrapePayload({
+      requestedUrl: target, finalUrl: target,
+      page: { title: check.title || "YouTube video", text: "", links: [], headings: [], extractionStatus: check.ok ? "official-embed" : check.code },
+      response: { status: 200, contentType: "application/json" },
+      youtubeVideo: check.ok ? check : null, embedUrl, message,
+    });
+  }
+
+  const fetchReader = app.locals.veyraReaderFetch || ((url, options) => acquisitionManager.fetch(url, options));
+  const response = await fetchReader(target, {
+    engine: "http-reader", timeoutMs: Math.min(CFG.requestTimeoutMs || 12000, 12000),
+    maxBytes: MAX_HTTP_READER_BYTES, retries: 0,
+    accept: "text/html,application/xhtml+xml,text/plain,application/json,application/xml,text/xml",
+  });
+  if (!response || Number(response.status) >= 400) throw Object.assign(new Error("Upstream HTTP request failed."), { code: "UPSTREAM_HTTP_ERROR" });
+  const finalUrl = normalizeUrl(response.finalUrl || target);
+  if (!finalUrl || finalUrl.length > 2048) throw Object.assign(new Error("Invalid final URL."), { code: "URL_TOO_LONG" });
+  if (viewSourceUrlHasSecrets(finalUrl)) throw Object.assign(new Error("Sensitive final URL."), { code: "SENSITIVE_URL" });
+  await assertPublic(finalUrl);
+  const contentType = String(response.contentType || "text/html; charset=utf-8").toLowerCase();
+  if (!/(?:text\/(?:html|plain|xml)|application\/(?:xhtml\+xml|json|xml))(?:\s*;|$)/i.test(contentType)) {
+    throw Object.assign(new Error("Unsupported content type."), { code: "CONTENT_TYPE_UNSUPPORTED" });
+  }
+  const body = Buffer.isBuffer(response.body) ? response.body : Buffer.from(String(response.body || ""), "utf8");
+  if (body.length > MAX_HTTP_READER_BYTES) throw Object.assign(new Error("Response exceeds reader limit."), { code: "RESPONSE_TOO_LARGE" });
+  const htmlDocument = /(?:text\/html|application\/xhtml\+xml)/i.test(contentType);
+  const page = htmlDocument
+    ? acquisitionManager.parseDocument(body, finalUrl)
+    : { url: finalUrl, canonical: finalUrl, title: finalUrl, description: "", author: null, publishedAt: null, language: null, headings: [], text: body.toString("utf8").slice(0, httpReader.MAX_READER_TEXT_CHARS), links: [], feedLinks: [], extractionStatus: body.length ? "extracted" : "empty" };
+  const youtubeVideos = youtubeCompat.isYoutubeUrl(finalUrl) && htmlDocument && !["challenge", "consent"].includes(page.extractionStatus)
+    ? httpReader.youtubeItemsFromHtml(body.toString("utf8")) : [];
+  let message = "";
+  if (page.extractionStatus === "consent") message = "The site returned a consent page. Veyra will not bypass it.";
+  else if (page.extractionStatus === "challenge") message = "The site returned a security or anti-bot challenge. Veyra will not bypass it.";
+  else if (youtubeCompat.isYoutubeUrl(finalUrl) && !youtubeVideos.length && !page.text) message = "YouTube did not expose a static feed in this response. Its interactive home/search experience needs JavaScript; use the official site or a public video link.";
+  return httpReader.scrapePayload({ requestedUrl: target, finalUrl, page, response, youtubeVideos, message });
+}
+function renderHttpReaderError(target, error) {
+  const failure = httpReaderError(error);
+  return httpReader.scrapePayload({
+    requestedUrl: target, finalUrl: target,
+    page: { title: "HTTP reader unavailable", text: "", links: [], headings: [], extractionStatus: failure.code },
+    response: { status: failure.status, contentType: "text/html" }, message: failure.message,
+  });
+}
+function setHttpReaderHeaders(res, nonce) {
+  res.set({
+    "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff", "X-Robots-Tag": "noindex, nofollow",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Content-Security-Policy": `default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}'; img-src https://i.ytimg.com https://yt3.ggpht.com data:; frame-src https://www.youtube-nocookie.com; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors ${sourceViewerFrameAncestors()}`,
+  });
+}
+app.get("/api/scrape", async (req, res) => {
+  const target = normalizeUrl(String(req.query.url || ""));
+  if (!target) return res.status(400).json({ ok: false, code: "INVALID_URL", error: "A valid public HTTP(S) URL is required." });
+  if (target.length > 2048) return res.status(400).json({ ok: false, code: "URL_TOO_LONG", error: "Reader URLs are limited to 2,048 characters." });
+  if (viewSourceUrlHasSecrets(target)) return res.status(400).json({ ok: false, code: "SENSITIVE_URL", error: "URLs containing credentials or sensitive query parameters cannot be scraped." });
+  try {
+    const payload = await acquireHttpReaderPayload(target, req);
+    return res.set({ "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff", "X-Robots-Tag": "noindex, nofollow" }).json(payload);
+  } catch (error) {
+    const failure = httpReaderError(error);
+    return res.status(failure.status).json({ ok: false, code: failure.code, error: failure.message });
+  }
+});
+app.get("/api/reader", async (req, res) => {
+  const target = normalizeUrl(String(req.query.url || ""));
+  if (!target || target.length > 2048 || viewSourceUrlHasSecrets(target)) {
+    const error = Object.assign(new Error("Invalid or sensitive URL."), { code: !target ? "INVALID_URL" : target.length > 2048 ? "URL_TOO_LONG" : "SENSITIVE_URL" });
+    const nonce = crypto.randomBytes(18).toString("base64");
+    const rendered = httpReader.renderReaderHtml(renderHttpReaderError("", error), { nonce });
+    setHttpReaderHeaders(res, nonce);
+    return res.status(200).type("html").send(rendered.html);
+  }
+  let payload;
+  try { payload = await acquireHttpReaderPayload(target, req); }
+  catch (error) { payload = renderHttpReaderError(target, error); }
+  const nonce = crypto.randomBytes(18).toString("base64");
+  const rendered = httpReader.renderReaderHtml(payload, { sessionId: normalizeSessionId(req.query.sid) || "", nonce });
+  setHttpReaderHeaders(res, nonce);
+  return res.status(200).type("html").send(rendered.html);
 });
 
 function cacheGet(map, key, ttl) {
@@ -1418,43 +1971,107 @@ function cacheSet(map, key, value, maxEntries) {
   map.set(key, { time: Date.now(), ...value });
   while (map.size > maxEntries) map.delete(map.keys().next().value);
 }
+function cacheSafeUrl(raw) {
+  try {
+    const url = new URL(String(raw || ""));
+    if (!/^https?:$/.test(url.protocol) || url.username || url.password) return false;
+    return ![...url.searchParams.keys()].some(name => /(?:token|secret|password|session|signature|credential|authorization|accesskey|api[_-]?key|(?:^|[_-])key(?:$|[_-])|(?:^|[_-])sig(?:$|[_-])|^(?:auth|code|jwt)$)/i.test(name));
+  } catch { return false; }
+}
+function cacheSafeResponse(result, url) {
+  if (!result || typeof result !== "object" || !cacheSafeUrl(url) || result.ok === false || result.truncated || result.tooLarge) return false;
+  if (result.status != null && (Number(result.status) < 200 || Number(result.status) >= 300 || Number(result.status) === 206)) return false;
+  const header = name => { try { return result.headers?.get?.(name) || result.headers?.[name] || ""; } catch { return ""; } };
+  const cacheControl = String(result.cacheControl || header("cache-control"));
+  const vary = String(result.vary || header("vary")).trim();
+  const setCookie = String(result.setCookieHeader || header("set-cookie"));
+  if (/(?:^|,)\s*(?:no-store|no-cache|private)\b/i.test(cacheControl) || vary || setCookie) return false;
+  return true;
+}
+function isCredentialRequestHeader(name) {
+  return /^(?:authorization|cookie2?|proxy-authorization|api[-_]key|x-(?:(?:[\w-]+-)?(?:api[-_]key|auth[-_]token|access[-_]token|authorization)|csrf[-_]token|xsrf[-_]token))$/i.test(name);
+}
+function hasCredentialRequestHeaders(headers) {
+  const names = [];
+  if (headers && typeof headers.forEach === "function") headers.forEach((_value, name) => names.push(name));
+  else names.push(...Object.keys(headers || {}));
+  return names.some(isCredentialRequestHeader);
+}
+async function validateCacheEntry(entry, key, url) {
+  if (!entry || cacheSafeResponse(entry.response, url)) return entry;
+  proxyCache.delete(key);
+  if (mongoStore.enabled) { try { await mongoStore.deleteProxyCache(key); } catch {} }
+  return null;
+}
 async function fetchCached(url, opts = {}) {
   const method = String(opts.method || "GET").toUpperCase();
-  const normalized = normalizeUrl(url);
+  const normalized = normalizeUrl(url, undefined, opts);
   const referrerKey = String(opts.referrer || "");
   const sid = String(opts.sessionId || "");
   
   
   
   const userAgentKey = opts.userAgent ? crypto.createHash("sha1").update(String(opts.userAgent)).digest("hex").slice(0, 16) : "default";
-  const baseKey = `${method} ${normalized} | ref=${referrerKey} | ua=${userAgentKey}`;
+  const baseKey = `proxy-cache:v3 ${method} ${normalized} | ref=${referrerKey} | ua=${userAgentKey}`;
   const key = `${baseKey} | sid=${sid}`;
-  const sharedKey = `${method} ${normalized} | ua=${userAgentKey} | sid=*`;
-  const canCoalesce = method === "GET" && !opts.noCache && !opts.streamOversize;
+  const sharedKey = `proxy-cache:v3 ${method} ${normalized} | ua=${userAgentKey} | sid=*`;
+  const rec = sid ? sessionManager.peek(sid) : null;
+  const live = () => !sid || (!!rec && sessionManager.peek(sid) === rec && !sessionManager.checkLimit(sid));
+  const checkLive = () => {
+    if (sid && (rec?.abort.signal.aborted || (rec && !live()) || sessionManager.isTerminated(sid))) {
+      throw Object.assign(new Error("This Veyra session was deleted."), { code: "SESSION_EXPIRED", status: 410 });
+    }
+  };
+  checkLive();
+  const headers = new Headers(opts.headers || {});
+  const safeRequest = method === "GET" && !opts.noCache
+    && !opts.beforeRedirect
+    && !opts.private && cacheSafeUrl(normalized) && !hasCredentialRequestHeaders(headers)
+    && !headers.has("range") && !(sid && (cookieHeader(sid, normalized) || vpnManager.requiresVpnForSession(sid)));
+  const sessionCache = safeRequest && CFG.sessionCacheEnabled && canCacheSession(rec);
+  const sharedCache = safeRequest && CFG.globalCacheEnabled && (!sid || canCacheSession(rec));
+  // Streaming callers may share buffered cache entries, never a live reader.
+  const canCoalesce = (sessionCache || sharedCache) && !opts.streamOversize && !opts.passthroughBinary;
   if (canCoalesce) { const existing = fetchInflight.get(key); if (existing) return existing; }
   const work = (async () => {
-    let cachedEntry = opts.noCache || method !== "GET" ? null : proxyCache.get(key) || null;
-    if (!cachedEntry && method === "GET" && CFG.mongoSharedCache) cachedEntry = proxyCache.get(sharedKey) || null;
-    if (!cachedEntry && method === "GET" && mongoStore.enabled) {
-      const persisted = await mongoStore.getProxyCache(key);
-      if (persisted) { cacheSet(proxyCache, key, persisted, CFG.maxProxyCacheEntries); cachedEntry = persisted; }
-    }
-    if (!cachedEntry && method === "GET" && CFG.mongoSharedCache && mongoStore.enabled) {
+    let cachedEntry = sessionCache ? await validateCacheEntry(proxyCache.get(key) || null, key, normalized) : null;
+    if (!cachedEntry && sharedCache) cachedEntry = await validateCacheEntry(proxyCache.get(sharedKey) || null, sharedKey, normalized);
+    if (!cachedEntry && sharedCache && CFG.mongoSharedCache && mongoStore.enabled) {
       const persisted = await mongoStore.getProxyCache(sharedKey);
-      if (persisted) { cacheSet(proxyCache, sharedKey, persisted, CFG.maxProxyCacheEntries); cachedEntry = persisted; }
+      checkLive();
+      if (persisted) cachedEntry = await validateCacheEntry(persisted, sharedKey, normalized);
     }
-    if (cachedEntry && Date.now() - cachedEntry.time <= CFG.proxyCacheMs && !opts.revalidate) return { ...cachedEntry.response, cacheHit: true };
-    const result = await fetchBuffer(url, { ...opts, cached: cachedEntry && method === "GET" ? cachedEntry : null });
-    if (!opts.noCache && method === "GET") {
-      const noStore = /no-store/i.test(result.cacheControl || "");
+    checkLive();
+    const cacheAge = cachedEntry ? Date.now() - cachedEntry.time : Infinity;
+    if (cachedEntry && cacheAge <= CFG.proxyCacheMs && !opts.revalidate) return { ...cachedEntry.response, cacheHit: true, cacheAgeMs: cacheAge };
+    if (cachedEntry && !opts.revalidate && CFG.proxyStaleWhileRevalidateMs > 0 && cacheAge <= CFG.proxyCacheMs + CFG.proxyStaleWhileRevalidateMs) {
+      if (!revalidateInflight.has(key)) {
+        const refresh = fetchCached(url, { ...opts, revalidate: true }).catch(() => null).finally(() => revalidateInflight.delete(key));
+        revalidateInflight.set(key, refresh);
+      }
+      return { ...cachedEntry.response, cacheHit: true, stale: true, cacheAgeMs: cacheAge };
+    }
+    // Local injection point for tests: mock the upstream fetch without touching network.
+    const upstreamFetchBuffer = app.locals.veyraProxyFetchBuffer || null;
+    const signal = rec ? (opts.signal ? AbortSignal.any([rec.abort.signal, opts.signal]) : rec.abort.signal) : opts.signal;
+    const result = await (upstreamFetchBuffer || fetchBuffer)(url, { ...opts, signal, cached: cachedEntry });
+    if (rec && !live()) {
+      result.stream?.cancel();
+      checkLive();
+    }
+    if (sessionCache || sharedCache) {
       const bodyBytes = Buffer.byteLength(result.body || Buffer.alloc(0));
-      if (!noStore && !result.truncated && !result.tooLarge && bodyBytes <= CFG.maxCacheBodyBytes) cacheSet(proxyCache, key, { response: result, etag: result.etag, lastModified: result.lastModified }, CFG.maxProxyCacheEntries);
-      const shareableType = /(?:text\/css|javascript|font\/|image\/|image\/svg\+xml)/i.test(String(result.contentType || ""));
-      const noSessionCookies = !result.setCookieHeader && (!sid || !cookieHeader(sid, normalized));
-      const incognito = isIncognitoSid(sid);
-      const shared = !incognito && CFG.mongoSharedCache && shareableType && noSessionCookies && !noStore && !result.truncated && !result.tooLarge && bodyBytes <= Math.min(CFG.maxCacheBodyBytes, CFG.mongoCacheBodyMaxBytes);
-      if (shared) { const sharedResult = { ...result, sessionId: "" }; cacheSet(proxyCache, sharedKey, { response: sharedResult, etag: result.etag, lastModified: result.lastModified }, CFG.maxProxyCacheEntries); void mongoStore.putProxyCache(sharedKey, result, { url: result.finalUrl || normalized, sessionId: "" }); }
-      else if (!sid && !incognito && !noStore && !result.truncated && !result.tooLarge && bodyBytes <= Math.min(CFG.maxCacheBodyBytes, CFG.mongoCacheBodyMaxBytes)) void mongoStore.putProxyCache(key, result, { url: result.finalUrl || normalized, sessionId: "" });
+      const responseCacheable = cacheSafeResponse(result, normalized) && cacheSafeUrl(result.finalUrl || normalized)
+        && !result.redirectChain?.length && !result.stream && bodyBytes <= CFG.maxCacheBodyBytes;
+      if (sessionCache && responseCacheable) cacheSet(proxyCache, key, { response: result, etag: result.etag, lastModified: result.lastModified }, CFG.maxProxyCacheEntries);
+      else if (sessionCache) proxyCache.delete(key);
+      const shareableType = /^(?:text\/css|(?:text|application)\/(?:x-)?javascript|font\/|image\/)/i.test(String(result.contentType || ""));
+      const explicitlyPublic = /(?:^|,)\s*public(?:\s*,|\s*$)/i.test(String(result.cacheControl || ""));
+      if (sharedCache && responseCacheable && shareableType && explicitlyPublic) {
+        const sharedResult = { ...result, sessionId: "" };
+        cacheSet(proxyCache, sharedKey, { response: sharedResult, etag: result.etag, lastModified: result.lastModified }, CFG.maxProxyCacheEntries);
+        if (CFG.mongoSharedCache && mongoStore.enabled) void mongoStore.putProxyCache(sharedKey, sharedResult, { url: result.finalUrl || normalized, sessionId: "" });
+      }
     }
     return result;
   })();
@@ -1577,6 +2194,7 @@ function crawlPriority(url, kind, reason = "discovered") {
   const r = String(reason || "").toLowerCase();
   if (r === "root") score += 1000;
   if (r === "sitemap") score += 250;
+  if (r === "locale-alternate") score += 160;
   if (r === "canonical") score += 180;
   if (r === "navigation") score += 100;
   if (r === "browser-network" || r === "dynamic") score += 140;
@@ -1601,51 +2219,84 @@ function parseRobots(text) {
     const value = line.slice(idx + 1).trim();
     if (key === "user-agent") {
       const agent = value.toLowerCase();
+      if (!/^(?:\*|[a-z_-]+)$/.test(agent)) continue;
       if (!current || current.closed) { current = { agents: [], allow: [], disallow: [], crawlDelayMs: 0, sitemaps: [], closed: false }; groups.push(current); }
       current.agents.push(agent);
-    } else if (current) {
+    } else if (current && ["allow", "disallow", "crawl-delay", "sitemap"].includes(key)) {
       if (key === "allow" && value) current.allow.push(value);
       else if (key === "disallow" && value) current.disallow.push(value);
       else if (key === "crawl-delay" && Number.isFinite(Number(value))) current.crawlDelayMs = Math.min(60000, Math.max(0, Number(value) * 1000));
       else if (key === "sitemap" && value) current.sitemaps.push(value);
+      if (key !== "sitemap") current.closed = true;
     }
-    if (key !== "user-agent") current.closed = true;
   }
   return groups;
 }
-function robotsMatchGroup(groups) {
-  const agent = CFG.userAgent.toLowerCase();
-  const exact = groups.filter(g => g.agents.some(a => a !== "*" && agent.includes(a))).sort((a,b) => b.agents.join("").length - a.agents.join("").length);
-  if (exact.length) return exact[0];
-  return groups.find(g => g.agents.includes("*")) || null;
+function robotsMatchGroup(groups, userAgent = CFG.userAgent) {
+  const agent = userAgent.toLowerCase().split(/[\s/]/, 1)[0];
+  const ranked = groups.map(group => ({ group, specificity: group.agents.reduce((max, token) =>
+    token !== "*" && agent.includes(token) ? Math.max(max, token.length) : max, 0) }));
+  const best = ranked.reduce((max, item) => Math.max(max, item.specificity), 0);
+  const matches = ranked.filter(item => best ? item.specificity === best : item.group.agents.includes("*")).map(item => item.group);
+  if (!matches.length) return null;
+  return { allow: matches.flatMap(g => g.allow), disallow: matches.flatMap(g => g.disallow),
+    crawlDelayMs: matches.reduce((max, g) => Math.max(max, g.crawlDelayMs), 0) };
+}
+function normalizedRobotsPath(value) {
+  return String(value).replace(/%[0-9a-f]{2}/gi, part => {
+    const char = String.fromCharCode(parseInt(part.slice(1), 16));
+    return /^[a-z0-9._~-]$/i.test(char) ? char : part.toUpperCase();
+  }).replace(/[^\x00-\x7f]/gu, char => encodeURIComponent(char));
 }
 function pathMatchesRule(pathname, rule) {
   if (!rule) return false;
-  const escaped = String(rule).replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
-  try { return new RegExp(`^${escaped}`).test(pathname); } catch { return false; }
+  const end = rule.endsWith("$");
+  const parts = (end ? rule.slice(0, -1) : rule).split("*");
+  if (parts.length === 1) return end ? pathname === parts[0] : pathname.startsWith(parts[0]);
+  const prefix = parts.shift();
+  if (!pathname.startsWith(prefix)) return false;
+  const suffix = end ? parts.pop() : "";
+  if (!pathname.endsWith(suffix)) return false;
+  const boundary = pathname.length - suffix.length;
+  let offset = prefix.length;
+  for (const part of parts) {
+    if (!part) continue;
+    const found = pathname.indexOf(part, offset);
+    if (found < 0 || found + part.length > boundary) return false;
+    offset = found + part.length;
+  }
+  return offset <= boundary;
 }
 function robotsAllowed(url, robots) {
   if (!robots) return true;
+  if (robots.unreachable) return false;
   try {
     const group = robots.group;
     if (!group) return true;
     const u = new URL(url);
-    const target = `${u.pathname}${u.search}` || "/";
-    const disallow = group.disallow.filter(Boolean).map(x => ({ rule: x, len: x.length })).sort((a,b) => b.len - a.len);
-    const allow = group.allow.filter(Boolean).map(x => ({ rule: x, len: x.length })).sort((a,b) => b.len - a.len);
-    const d = disallow.find(x => pathMatchesRule(target, x.rule));
-    const a = allow.find(x => pathMatchesRule(target, x.rule));
-    if (a && (!d || a.len >= d.len)) return true;
-    return !d;
-  } catch { return true; }
+    const target = normalizedRobotsPath(`${u.pathname}${u.search}` || "/");
+    const best = rules => rules.reduce((max, value) => {
+      const rule = normalizedRobotsPath(value);
+      return rule.length > max && pathMatchesRule(target, rule) ? rule.length : max;
+    }, 0);
+    return best(group.allow) >= best(group.disallow);
+  } catch { return false; }
 }
 
-async function loadRobots(job) {
+async function readRobots(job, origin) {
   try {
-    const robotsUrl = new URL("/robots.txt", job.root).href;
-    const r = await fetchCached(robotsUrl, { timeout: CFG.robotsTimeoutMs, limit: 512 * 1024, accept: "text/plain,*/*;q=0.1" });
-    if (r.status >= 400) throw new Error(`HTTP ${r.status}`);
+    const robotsUrl = new URL("/robots.txt", origin).href;
+    const r = await fetchCached(robotsUrl, { timeout: CFG.robotsTimeoutMs, limit: 512 * 1024, maxRedirects: 5,
+      accept: "text/plain,*/*;q=0.1", retries: 0, signal: job.controller.signal });
+    if (r.status >= 500 || [401, 403, 429].includes(r.status) || r.tooLarge || r.truncated) {
+      throw new Error(`HTTP ${r.status} or unreadable robots response`);
+    }
+    if (r.status >= 400 && r.status < 500) return { groups: [], group: null, sitemaps: [] };
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const text = r.body.toString("utf8");
+    if (detectChallenge(text, r.contentType, r.status, { server: r.serverHeader, "cf-mitigated": r.cfMitigated })) {
+      throw new Error("robots.txt requires site verification");
+    }
     const groups = parseRobots(text);
     const group = robotsMatchGroup(groups);
     const sitemaps = [];
@@ -1653,46 +2304,78 @@ async function loadRobots(job) {
       const u = normalizeUrl(line[1], robotsUrl); if (u) sitemaps.push(u);
     }
     for (const g of groups) for (const sm of (g.sitemaps || [])) { const u = normalizeUrl(sm, robotsUrl); if (u) sitemaps.push(u); }
-    job.robots = { groups, group, sitemaps: [...new Set(sitemaps)] };
-    job.robotsReady = true;
-    if (group?.crawlDelayMs) job.hostDelayMs = Math.max(job.hostDelayMs, group.crawlDelayMs);
-    for (const sm of job.robots.sitemaps) job.sitemaps.add(sm);
-    jobLog(job, "debug", "robots.txt processed", { crawlDelayMs: job.hostDelayMs });
+    jobLog(job, "debug", "robots.txt processed", { origin, crawlDelayMs: group?.crawlDelayMs || 0 });
+    return { groups, group, sitemaps: [...new Set(sitemaps)] };
   } catch (e) {
-    job.robots = { groups: [], group: null, sitemaps: [] };
-    job.robotsReady = true;
-    jobLog(job, "debug", `robots.txt unavailable: ${e.message}`);
+    if (!job.controller.signal.aborted) jobLog(job, "debug", `robots.txt unreachable on ${origin}: ${e.message}; deferring requests`);
+    return { unreachable: true, groups: [], group: null, sitemaps: [] };
   }
 }
-async function loadSitemaps(job) {
-  const pending = [...new Set([
-    ...job.sitemaps,
-    normalizeUrl("/sitemap.xml", job.root),
-    normalizeUrl("/sitemap_index.xml", job.root)
-  ].filter(Boolean))];
-  const seen = new Set();
-  const pendingSet = new Set(pending);
-  let files = 0, urls = 0;
-  async function processSitemap(sm) {
-    if (seen.has(sm) || files >= CFG.maxSitemapFiles || urls >= CFG.maxSitemapUrls || job.stopRequested) return;
-    seen.add(sm); files += 1;
-    try {
-      const r = await fetchCached(sm, { timeout: CFG.sitemapTimeoutMs, limit: 8 * 1024 * 1024, accept: "application/xml,text/xml,text/plain,*/*;q=0.1" });
-      if (r.status >= 400 || r.tooLarge) throw new Error(`HTTP ${r.status}`);
-      const xml = r.body.toString("utf8");
-      for (const match of xml.matchAll(/<loc>\s*([^<]+?)\s*<\/loc>/gi)) {
-        const u = normalizeUrl(match[1], sm); if (!u) continue;
-        if (/\.xml(?:$|\?)/i.test(u) && /sitemap/i.test(u)) { if (!seen.has(u) && !pendingSet.has(u) && pending.length < 250) { pending.push(u); pendingSet.add(u); } continue; }
-        if (crawlOriginAllowed(job, u)) { addLink(job, u, "html", sm, "sitemap"); urls += 1; }
-        if (urls >= CFG.maxSitemapUrls) break;
-      }
-    } catch (e) { jobLog(job, "debug", `Sitemap failed: ${sm} — ${e.message}`); }
+async function crawlRobots(job, url) {
+  const origin = new URL(url).origin;
+  if (!job.robotsByOrigin.has(origin)) {
+    if (job.robotsByOrigin.size >= Math.max(2, CFG.maxCrossOriginResources + 2)) return { unreachable: true };
+    job.robotsByOrigin.set(origin, readRobots(job, origin));
   }
-  while (pending.length && files < CFG.maxSitemapFiles && urls < CFG.maxSitemapUrls && !job.stopRequested) {
+  return job.robotsByOrigin.get(origin);
+}
+async function assertCrawlAllowed(job, url, pageFrom = "") {
+  const signal = job.controller.signal;
+  signal.throwIfAborted();
+  if (pageFrom && !crawlOriginAllowed(job, url) && !sameRedirectHost(url, pageFrom)) {
+    throw Object.assign(new Error("Page redirect left the crawl scope."), { code: "CRAWL_POLICY" });
+  }
+  const policy = await crawlRobots(job, url);
+  signal.throwIfAborted();
+  if (!robotsAllowed(url, policy)) throw Object.assign(new Error("Crawl deferred by robots.txt policy."), { code: "CRAWL_POLICY" });
+  const spacing = policy.group?.crawlDelayMs || 0;
+  if (spacing) {
+    const origin = new URL(url).origin;
+    const start = Math.max(Date.now(), job.hostLastRequested.get(origin) || 0);
+    job.hostLastRequested.set(origin, start + spacing);
+    const remaining = start - Date.now();
+    if (remaining > 0) await wait(remaining, undefined, { signal });
+  }
+}
+async function loadRobots(job) {
+  job.robots = await crawlRobots(job, job.root);
+  job.robotsReady = true;
+  for (const sitemap of job.robots.sitemaps) if (crawlOriginAllowed(job, sitemap)) job.sitemaps.add(sitemap);
+}
+async function loadSitemaps(job) {
+  const pending = [], pendingSet = new Set(), pageUrls = new Set();
+  const queueSitemap = url => {
+    if (!url || !crawlOriginAllowed(job, url) || pendingSet.has(url) || pendingSet.size >= CFG.maxSitemapFiles) return;
+    pendingSet.add(url);
+    pending.push(url);
+  };
+  for (const url of [...job.sitemaps, normalizeUrl("/sitemap.xml", job.root), normalizeUrl("/sitemap_index.xml", job.root)]) queueSitemap(url);
+  let files = 0;
+  async function processSitemap(sm) {
+    if (pageUrls.size >= CFG.maxSitemapUrls || job.stopRequested) return;
+    files += 1;
+    try {
+      await assertCrawlAllowed(job, sm, sm);
+      const r = await fetchCached(sm, { timeout: CFG.sitemapTimeoutMs, limit: 8 * 1024 * 1024, accept: "application/xml,text/xml,text/plain,*/*;q=0.1",
+        retries: 0, signal: job.controller.signal, beforeRedirect: url => assertCrawlAllowed(job, url, sm) });
+      if (!r.ok || r.tooLarge || r.truncated) throw new Error(`HTTP ${r.status} or unreadable sitemap`);
+      const xml = r.body.toString("utf8");
+      const source = r.finalUrl || sm;
+      walkSitemap(xml, (raw, kind) => {
+        const url = normalizeUrl(raw, source);
+        if (!url || !crawlOriginAllowed(job, url) || job.stopRequested) return;
+        if (kind === "sitemap-index") return queueSitemap(url);
+        if (pageUrls.size >= CFG.maxSitemapUrls || pageUrls.has(url)) return;
+        pageUrls.add(url);
+        addLink(job, url, "html", source, kind);
+      }, Math.max(CFG.maxSitemapFiles, Math.min(100_000, CFG.maxSitemapUrls * 2)));
+    } catch (e) { if (!job.controller.signal.aborted && e.code !== "CRAWL_POLICY") jobLog(job, "debug", `Sitemap failed: ${sm} — ${e.message}`); }
+  }
+  while (pending.length && pageUrls.size < CFG.maxSitemapUrls && !job.stopRequested) {
     const batch = pending.splice(0, CFG.sitemapConcurrency);
     await Promise.allSettled(batch.map(processSitemap));
   }
-  if (files) jobLog(job, "info", `Sitemap pass: ${files} file(s), ${urls} URL(s) discovered.`);
+  if (files) jobLog(job, "info", `Sitemap pass: ${files} file(s), ${pageUrls.size} URL(s) discovered.`);
 }
 
 
@@ -1708,54 +2391,225 @@ function makeGetFormProxyAction(url, sid) {
   return `/api/form-get/${token}/${safeSid}`;
 }
 
-function challengeFallbackHtml(url, info, sid = "", bridgeToken = "") {
+// TEMPORARY: Veyra's streamed Chromium is not fully working yet, so the
+// "Verify in real Chromium" handoff is hidden from the challenge screen.
+// Flip this back to false once Chromium fully works to restore the option.
+const CHROMIUM_VERIFY_DISABLED = true;
+
+function challengeFallbackHtml(url, info, sid = "", apiOrigin = "") {
   const safe = escapeHtml(url);
   let query = "";
   try { const u = new URL(url); const cont = u.searchParams.get("continue"); const src = cont ? new URL(cont) : u; query = src.searchParams.get("q") || src.searchParams.get("query") || ""; } catch {}
-  const google = info?.type === "unusual-traffic";
-  const title = google ? "Google is asking for a captcha" : "This site requires its own security verification";
+  const googleQuery = googleProxySearchQuery(url);
+  const google = info?.type === "unusual-traffic" || info?.type === "google-search-interstitial";
+  const title = info?.type === "google-search-interstitial" ? "Google did not return a results page" :
+    google ? "Google is asking for a captcha" : "This site requires its own security verification";
   const why = google
-    ? "Google blocks searches that come from cloud servers like the one Veyra runs on, and its captcha can't be completed through a proxy. This isn't something Veyra can bypass. Connecting Veyra VPN to a residential exit usually avoids it."
+    ? "Google did not serve search results through Fast Proxy. Continue with Veyra Search or open Google directly. Veyra will not bypass Google's checks."
     : `Veyra's server proxy detected a security or bot-verification page (${escapeHtml(info?.type || "verification")}). It was not indexed as site content and Veyra will not attempt to bypass the site's security controls.`;
   const alt = query ? [
     ["Bing", `https://www.bing.com/search?q=${encodeURIComponent(query)}`],
     ["Brave Search", `https://search.brave.com/search?q=${encodeURIComponent(query)}`],
     ["DuckDuckGo", `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`]
   ].map(([n, h]) => `<a class="secondary" href="${escapeHtml(h)}" target="_blank" rel="noopener noreferrer">Open “${escapeHtml(query)}” on ${n}</a>`).join("") : "";
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#10151d;color:#eaf0f6;font:15px/1.5 system-ui,sans-serif}.card{max-width:650px;margin:24px;padding:32px;background:#171e28;border:1px solid #303a48;border-radius:18px;box-shadow:0 20px 60px #0008}.ey{font-size:11px;letter-spacing:.15em;text-transform:uppercase;color:#86a9d5}.card h1{font-size:26px;margin:10px 0}.card p{color:#aab5c4}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px}.actions a{display:inline-block;padding:10px 15px;border-radius:9px;text-decoration:none}.primary{background:#4b82c9;color:#fff}.secondary{border:1px solid #3a4657;color:#dce5ef}.secondary:hover{background:#1f2835}</style></head><body><main class="card"><div class="ey">Veyra Browser</div><h1>${escapeHtml(title)}</h1><p>${why}</p><div class="actions"><a class="primary" href="#" id="veyraChromium">Verify in real Chromium</a>${alt}<a class="secondary" href="${safe}" target="_blank" rel="noopener noreferrer">Open directly in a new tab</a><a class="secondary" href="${escapeHtml(makeViewUrl(url, sid))}">Retry through Veyra</a></div><p style="font-size:13px;margin-top:18px">Chromium shows the site's own check so <b>you</b> can complete it. Veyra does not solve, evade, or weaken CAPTCHA/anti-bot checks.</p></main><script>(function(){var m={type:"veyra:challenge",url:${JSON.stringify(String(url)).replace(/</g, "\\u003c")},kind:${JSON.stringify(String(info?.type || "verification"))},bridgeToken:${JSON.stringify(String(bridgeToken || ""))},auto:${process.env.CHALLENGE_AUTO_HANDOFF == null ? "true" : /^(1|true|yes|on)$/i.test(String(process.env.CHALLENGE_AUTO_HANDOFF)) ? "true" : "false"}};try{if(parent!==window)parent.postMessage(m,"*")}catch(e){}var b=document.getElementById("veyraChromium");if(b)b.onclick=function(e){e.preventDefault();m.auto=false;m.manual=true;try{parent.postMessage(m,"*")}catch(x){}}})();</script></body></html>`;
+  // TEMPORARY: with CHROMIUM_VERIFY_DISABLED the "Verify in real Chromium"
+  // button and the veyra:challenge handoff script are omitted until streamed
+  // Chromium fully works. The retry + open-directly actions remain.
+  const chromiumActions = CHROMIUM_VERIFY_DISABLED ? "" : `<a class="primary" href="#" id="veyraChromium">Verify in real Chromium</a>`;
+  const chromiumNote = CHROMIUM_VERIFY_DISABLED
+    ? ""
+    : `<p style="font-size:13px;margin-top:18px">Chromium shows the site's own check so <b>you</b> can complete it. Veyra does not solve, evade, or weaken CAPTCHA/anti-bot checks. Once you finish the check, this tab returns to the fast proxy automatically.</p>`;
+  const chromiumScript = CHROMIUM_VERIFY_DISABLED ? "" : `<script>(function(){var m={type:"veyra:challenge",url:${JSON.stringify(String(url)).replace(/</g, "\\u003c")},kind:${JSON.stringify(String(info?.type || "verification"))},auto:${process.env.CHALLENGE_AUTO_HANDOFF == null ? "true" : /^(1|true|yes|on)$/i.test(String(process.env.CHALLENGE_AUTO_HANDOFF)) ? "true" : "false"}};try{if(parent!==window)parent.postMessage(m,"*")}catch(e){}var b=document.getElementById("veyraChromium");if(b){if(parent===window){b.href=${JSON.stringify(String(url)).replace(/</g, "\\u003c")};b.target="_blank";b.textContent="Open Google directly to verify"}else b.onclick=function(e){e.preventDefault();m.auto=false;m.manual=true;try{parent.postMessage(m,"*")}catch(x){}}}})();</script>`;
+  // The cross-session cookie handoff (open the real site in your own
+  // browser, then bring your cookies back) was removed. Sign-in and
+  // verification happen inside the fast proxy: the challenge page runs in
+  // the proxied frame with the session's own cookie jar. "Open directly"
+  // remains as an escape hatch for the user's own browser, but no cookie
+  // ever crosses back into the Veyra session.
+  const directClass = CHROMIUM_VERIFY_DISABLED ? "primary" : "secondary";
+  const veyraSearch = googleQuery ? '<button class="primary" type="button" id="veyraSearchInstead">Search with Veyra</button>' : "";
+  const message = JSON.stringify({ type: "veyra:google-search-fallback", query: googleQuery, sessionId: sid }).replace(/</g, "\\u003c");
+  const searchFallbackScript = veyraSearch ? `<script>(function(){var b=document.getElementById('veyraSearchInstead');if(parent===window){b.hidden=true;return}b.addEventListener('click',function(){parent.postMessage(${message},'*')})})();</script>` : "";
+  // Route every "open in a new tab" action through the app: a popup opened by
+  // this sandboxed frame inherits the sandbox, and any site that sends
+  // Cross-Origin-Opener-Policy (chess.com, Google, Twitter, …) then refuses to
+  // load with ERR_BLOCKED_BY_RESPONSE. A popup opened by the top-level app is
+  // a normal tab and always works. If the app does not answer the ping (very
+  // old cached frontend), the plain link still runs as before.
+  const handoffEscapeScript = `<script>(function(){if(parent===window)return;var haveParent=false;try{addEventListener('message',function(ev){try{var d=ev.data;if(d&&d.type==='veyra:open-direct-ack')haveParent=true}catch(e){}});parent.postMessage({type:'veyra:open-direct-ping'},'*')}catch(e){}var links=document.querySelectorAll('.actions a[target="_blank"]');for(var i=0;i<links.length;i++){(function(a){a.addEventListener('click',function(e){if(!haveParent)return;e.preventDefault();try{parent.postMessage({type:'veyra:open-direct',url:a.href},'*')}catch(err){}})})(links[i])}})();</${"script"}>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>body{margin:0;min-height:100vh;display:grid;place-items:center;background:#10151d;color:#eaf0f6;font:15px/1.5 system-ui,sans-serif}.card{max-width:650px;margin:24px;padding:32px;background:#171e28;border:1px solid #303a48;border-radius:18px;box-shadow:0 20px 60px #0008}.ey{font-size:11px;letter-spacing:.15em;text-transform:uppercase;color:#86a9d5}.card h1{font-size:26px;margin:10px 0}.card p{color:#aab5c4}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:22px}.actions :is(a,button){padding:10px 15px;border-radius:9px;text-decoration:none;font:inherit;cursor:pointer}.primary{background:#4b82c9;color:#fff;border:0}.secondary{border:1px solid #3a4657;color:#dce5ef}.secondary:hover{background:#1f2835}</style></head><body><main class="card"><div class="ey">Veyra Browser</div><h1>${escapeHtml(title)}</h1><p>${why}</p><div class="actions">${veyraSearch}${chromiumActions}<a class="${veyraSearch ? "secondary" : directClass}" href="${safe}" target="_blank" rel="noopener noreferrer">Open directly in a new tab</a><a class="secondary" href="${escapeHtml(makeViewUrl(url, sid))}">Retry through Veyra</a>${alt}</div>${chromiumNote}</main>${chromiumScript}${handoffEscapeScript}${searchFallbackScript}</body></html>`;
 }
 function escapeHtml(s) { return String(s).replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m])); }
 
 function rewriteCssText(text, base, sid = "") {
   const src = String(text || "");
+  // url(...) already covers both property values and @import url(...).
   const withUrls = src.replace(/url\(\s*(["']?)([^"')]+)\1\s*\)/gi, (m, quote, value) => {
     const u = resolveResource(value.trim(), base);
     return u ? `url("${makeResourceUrl(u, base, sid)}")` : m;
   });
-  return withUrls.replace(/@import\s+(?:url\(\s*)?(["'])([^"']+)\1\s*\)?/gi, (m, quote, value) => {
+  return withUrls.replace(/(@import\s+)(["'])([^"']+)\2/gi, (m, prefix, quote, value) => {
     const u = resolveResource(value.trim(), base);
-    return u ? `@import "${makeResourceUrl(u, base, sid)}"` : m;
+    return u ? `${prefix}"${makeResourceUrl(u, base, sid)}"` : m;
   });
 }
-function rewriteJsText(text, base, sid = "") {
-  const patterns = [
-    
-    
-    
-    /(\bimport\s*\(\s*)(["'`])([^"'`$]+)\2(?=\s*[,)])/g,
-    /(\bimport\s+(?:[^'"`;()]*?\s+from\s+)?|\bexport\s+[^'"`;()]*?\s+from\s+)(["'])([^"']+)\2(?=\s*(?:;|$|\n|\r|assert\b|with\b))/gm
-  ];
-  let out = String(text || "");
-  
-  
-  out = out.replace(/navigator\.serviceWorker\.register\s*\(/g, 'navigator.serviceWorker.register=function(){return Promise.reject(new Error("Service workers are not available in Veyra proxy mode."))};navigator.serviceWorker.register(');
-  for (const re of patterns) {
-    out = out.replace(re, (m, prefix, quote, spec) => {
-      const u = resolveResource(spec, base);
-      return u ? `${prefix}${quote}${makeResourceUrl(u, base, sid)}${quote}` : m;
-    });
+function rewriteModuleSpecifiers(source, base, sid) {
+  if (!/\b(?:import|export)\b/.test(source)) return source;
+  let imports, sourceOrigin;
+  try { [imports] = parseModuleImports(source); sourceOrigin = new URL(base).origin; } catch { return source; }
+  const chunks = [];
+  let cursor = 0;
+  for (const entry of imports) {
+    const { type, specifier } = entry;
+    // Bare import-map keys and computed dynamic imports are not URLs we can resolve here.
+    if (!specifier || !/^(?:https?:\/\/|\/|\.{1,2}\/)/i.test(specifier)) continue;
+    const target = resolveResource(specifier, base);
+    if (!target) continue;
+    const dynamic = type === "dynamic";
+    if (dynamic && entry.glob) continue;
+    const start = dynamic ? entry.start : entry.start - 1;
+    const end = dynamic ? entry.end : entry.end + 1;
+    const quote = source[start];
+    if (start < cursor || !["'", '"', "`"].includes(quote) || source[end - 1] !== quote) continue;
+    // Browsers key ESM instances by URL. Sibling importers on the same site
+    // must generate the same URL for shared modules (e.g. React singletons).
+    // Use an origin-only referrer without changing the session or target.
+    chunks.push(source.slice(cursor, start), JSON.stringify(makeResourceUrl(target, sourceOrigin, sid)));
+    cursor = end;
   }
+  if (!cursor) return source;
+  chunks.push(source.slice(cursor));
+  return chunks.join("");
+}
+function rewriteJsText(text, base, sid = "") {
+  let out = rewriteModuleSpecifiers(String(text || ""), base, sid);
+  // Neutralise service-worker registration inside proxied JS. The replacement
+  // must stay valid in *expression* position (e.g. `await navigator
+  // .serviceWorker.register(...)` in MSN/casual-games bundles) — a bare
+  // `x = fn;` statement there is a SyntaxError ("Invalid left-hand side in
+  // assignment"), so wrap the reassignment in parens and call it instead.
+  out = out.replace(/navigator\.serviceWorker\.register\s*\(/g, '(navigator.serviceWorker.register=function(){return Promise.reject(new Error("Service workers are not available in Veyra proxy mode."))})(');
+  out = out.replace(/(["'`])(https?:\/\/[^"'`\s]+)\1/g, (m, quote, value) => {
+    const u = resolveResource(value, base);
+    try {
+      if (!u) return m;
+      const target = new URL(u), source = new URL(base);
+      // Origin and directory literals can be URL bases, not resource
+      // requests. Browserling appends a stylesheet filename to its CSS
+      // directory at runtime; pre-rewriting the base appends the filename
+      // to the proxy's query instead. Let the runtime proxy the final URL.
+      if (target.pathname.endsWith("/") && !target.search && !target.hash) return m;
+      // GeoFS keeps terrain, imagery, weather, and multiplayer APIs on
+      // separate geo-fs.com subdomains. Image/Cesium loaders do not pass
+      // through fetch/XHR, so keep these URLs same-origin in the bundle.
+      const geoFsFamily = /(^|\.)geo-fs\.com$/i;
+      if (target.origin === source.origin || (geoFsFamily.test(source.hostname) && geoFsFamily.test(target.hostname))) {
+        // EXCEPTION: URLs that Cesium's Resource will use as a *base* for
+        // tile templates. When the template has a query string (like the
+        // terrain template "{z}/{x}/{y}.terrain?v={version}"), Cesium's
+        // getDerivedResource REPLACES the whole query — dropping the proxy's
+        // url/from/sid parameters and producing 404s at
+        // /api/resource/<z>/<x>/<y>.terrain. Keep these absolute and let
+        // the runtime fetch/XHR patch wrap each tile request instead.
+        const idx = out.indexOf(m);
+        const before = out.slice(Math.max(0, idx - 120), idx);
+        if (/\bgeofs\.(?:srtmServer|dataServer|blackMarbleServer|landuseServer|buildingServer|treeServer|objectServer|aircraftServer|runwayServer)\s*=\s*$/.test(before)) {
+          return m;
+        }
+        return `${quote}${makeResourceUrl(u, base, sid)}${quote}`;
+      }
+    } catch {}
+    return m;
+  });
   return out;
+}
+// Workers created through the proxy load their script from a proxy URL
+// (/api/resource or an escaped path), so every URL the worker resolves
+// itself — importScripts("lib/x.js"), emscripten's scriptDirectory +
+// "module.wasm", location.origin + path — anchors onto the proxy origin
+// instead of the real site and 404s (PolyTrack's physics WASM never loads
+// and the game stays on its loading screen). Prepend a tiny prelude that
+// re-anchors worker network calls onto the worker's virtual base URL.
+// It is prepended AFTER rewriteJsText so the JS rewriter cannot mangle the
+// prelude's own URL strings.
+function workerScopePrelude(base, sid = "") {
+  if (!/^https?:\/\//i.test(String(base || ""))) return "";
+  const workerSid = String(sid || "");
+  return `
+;/* Veyra worker scope: re-anchor worker-resolved URLs onto the real site */
+;(function(){
+  try{
+    var VB=${JSON.stringify(String(base))};
+    var VSID=${JSON.stringify(workerSid)};
+    var O=self.location.origin;
+    var RD="";try{RD=new URL("./",self.location.href).href}catch(e){}
+    var VD="";try{VD=new URL("./",VB).href}catch(e){}
+    var API_RE=/^\\/api\\/(?:view|resource|download|form-get|open|crawl|search|suggest|browser|debug|session|sessions|config|vpn|extensions|status|health)(?:[\\/?#]|$)/;
+    function P(abs){return O+"/api/resource?url="+encodeURIComponent(abs.href)+"&from="+encodeURIComponent(VB)+(VSID?"&sid="+encodeURIComponent(VSID):"")}
+    // Site code that derives API hosts from location.hostname (Roblox's
+    // RealTime gateway: hostname minus "www." prefixed with "apis.") builds
+    // <sub>.<proxy-host> URLs inside the worker too — proxy them straight
+    // through and they 502 on the proxy host. Remap the proxy-host suffix
+    // back onto the virtual site's host before proxying, mirroring
+    // fixDerivedHost in the page runtime.
+    var PH="";try{PH=self.location.hostname}catch(e){}
+    function DH(abs){
+      try{
+        if(!PH||abs.hostname===PH||!abs.hostname.endsWith("."+PH))return abs;
+        var sub=abs.hostname.slice(0,abs.hostname.length-PH.length-1);
+        if(!sub)return abs;
+        var vh="";try{vh=new URL(VB).hostname}catch(e){}
+        if(!vh||vh===PH)return abs;
+        var base=vh.replace(/^www\\./i,"");
+        if(!base)return abs;
+        return new URL(abs.protocol+"//"+sub+"."+base+abs.pathname+abs.search+abs.hash);
+      }catch(e){return abs}
+    }
+    function fix(u){
+      try{
+        var s=String(u);
+        var abs=new URL(s,VB);
+        if(abs.origin===O){
+          if(API_RE.test(abs.pathname))return s;
+          if(RD&&s.indexOf(RD)===0&&VD){try{abs=new URL(VD+s.slice(RD.length))}catch(e){}}
+        }
+        abs=DH(abs);
+        if(/^https?:$/.test(abs.protocol)&&abs.origin!==O)return P(abs);
+      }catch(e){}
+      return u;
+    }
+    if(typeof importScripts==="function"){
+      var IS=importScripts;
+      self.importScripts=function(){
+        var a=[];for(var i=0;i<arguments.length;i++)a.push(fix(arguments[i]));
+        return IS.apply(null,a);
+      };
+    }
+    if(typeof fetch==="function"){
+      var NF=fetch.bind(self);
+      self.fetch=function(u,o){
+        try{
+          if(u&&typeof u==="object"&&typeof u.url==="string"){
+            var f=fix(u.url);
+            if(f!==u.url&&typeof Request!=="undefined")return NF(new Request(f,u),o);
+          }else{
+            var f2=fix(String(u));
+            if(f2!==String(u))return NF(f2,o);
+          }
+        }catch(e){}
+        return NF(u,o);
+      };
+    }
+    if(typeof XMLHttpRequest!=="undefined"&&XMLHttpRequest.prototype&&XMLHttpRequest.prototype.open){
+      var XO=XMLHttpRequest.prototype.open;
+      XMLHttpRequest.prototype.open=function(m,u){
+        try{arguments[1]=fix(String(u))}catch(e){}
+        return XO.apply(this,arguments);
+      };
+    }
+  }catch(e){}
+})();
+`;
 }
 function rewriteSrcset(raw, base, sid = "") {
   return String(raw || "").split(",").map(candidate => {
@@ -1766,14 +2620,21 @@ function rewriteSrcset(raw, base, sid = "") {
     return parts.join(" ");
   }).join(", ");
 }
-function injectRuntime(html, original, sid = "", bridgeToken = "") {
+function injectRuntime(html, original, sid = "", watchPlayer = null) {
   const code = `<script data-veyra-runtime>(function(){
   const CANONICAL=${JSON.stringify(original)};
   const SESSION_ID=${JSON.stringify(sid)};
-  const BRIDGE_TOKEN=${JSON.stringify(String(bridgeToken || ""))};
+  const watchPlayer=${JSON.stringify(watchPlayer)};
+  const directElements=new WeakSet();
+  let watchNavigate=null;
+  const watchMarker=u=>watchPlayer&&u.pathname==='/watch'&&u.searchParams.get('v')===watchPlayer.videoId&&u.hostname===new URL(CANONICAL).hostname?'&__veyra_youtube_inline=1':'';
   const API_ORIGIN=${JSON.stringify(process.env.PUBLIC_API_ORIGIN || "")};
+  const ESCAPED_DOCUMENT=location.pathname!=='/api/view';
+  const POPUP_FRAME=window.parent!==window&&/[?&]veyra_popup=1(?:&|$)/.test(String(location.search||''));
   let virtualUrl=CANONICAL;
-  window.__VEYRA_PAGE_URL__=CANONICAL;
+  // The browser does not send its fragment with the document request.
+  try{if(location.hash){const u=new URL(virtualUrl);u.hash=location.hash;virtualUrl=u.href}}catch{}
+  window.__VEYRA_PAGE_URL__=virtualUrl;
   window.__VEYRA_PROXY__=true;
   function unwrap(v){
     let raw=String(v||'');
@@ -1792,25 +2653,59 @@ function injectRuntime(html, original, sid = "", bridgeToken = "") {
     return raw;
   }
   function ownOrigin(o){return o===location.origin||(!!API_ORIGIN&&o===API_ORIGIN)}
+  // Escaped-path URLs carry Veyra's routing params (__veyra_url/__veyra_sid)
+  // in the query. Site code copies its own query string when it builds
+  // links, so the params would spread into every navigation and the
+  // reported virtual URL. Strip them wherever a URL becomes virtual.
+  function cleanVeyraParams(u){try{
+    if(u&&u.search&&(u.searchParams.has('__veyra_url')||u.searchParams.has('__veyra_sid')||u.searchParams.has('__veyra_youtube_inline'))){
+      u.search=u.search.slice(1).split('&').filter(value=>{
+        try{return !/^__veyra_(url|sid|youtube_inline)$/.test(decodeURIComponent(value.split('=')[0]))}catch{return true}
+      }).join('&');
+    }
+  }catch{}return u}
   const VEYRA_ROUTES=/^[/]api[/](view|resource|download|form-get|open|crawl|search|suggest|browser|debug|session|vpn|status|health)([/?#]|$)/;
   function fixOwn(u){try{if(!ownOrigin(u.origin))return u;
-    if(!/^[/]api[/]/.test(u.pathname))return new URL(u.pathname+u.search+u.hash,virtualUrl);
+    if(!/^[/]api[/]/.test(u.pathname))return cleanVeyraParams(new URL(u.pathname+u.search+u.hash,virtualUrl));
     // location.pathname is "/api/view" on a proxied page, so app code that builds
     // URLs from it yields "/api/view/<rest>"; map that onto the real page path.
     const vp=new URL(virtualUrl);
-    if(/^[/]api[/]view[/]/.test(u.pathname))return new URL(vp.pathname.replace(/[/]$/,'')+u.pathname.slice(9)+u.search+u.hash,vp);
-    // Other non-Veyra /api/... paths are page-relative specifiers resolved against /api/view.
-    if(!VEYRA_ROUTES.test(u.pathname))return new URL(u.pathname.slice(5)+u.search+u.hash,virtualUrl);
+    if(/^[/]api[/]view[/]/.test(u.pathname))return cleanVeyraParams(new URL(vp.pathname.replace(/[/]$/,'')+u.pathname.slice(9)+u.search+u.hash,vp));
+    // In path-shaped documents /api/... is the site's actual root path
+    // (e.g. Boxity's /api/identity/principal). Only query-form documents
+    // can pick up the proxy's /api/ directory when resolving a relative URL.
+    if(!VEYRA_ROUTES.test(u.pathname))return cleanVeyraParams(new URL((ESCAPED_DOCUMENT?u.pathname:u.pathname.slice(4))+u.search+u.hash,virtualUrl));
   }catch{}return u}
   // Read a Request's real URL via the native getter: some apps (YouTube) hand fetch()
   // a data: Request with a spoofed own 'url' getter to replay a cached response.
   const reqUrlGet=(()=>{try{return Object.getOwnPropertyDescriptor(Request.prototype,'url').get}catch{return null}})();
   function realUrl(v){if(v==null)return '';if(typeof v==='string')return v;try{if(reqUrlGet&&typeof Request!=='undefined'&&v instanceof Request)return reqUrlGet.call(v)}catch{}if(typeof v.url==='string')return v.url;if(typeof v.href==='string')return v.href;return String(v)}
-  function toVirtual(raw){if(/^[?#]/.test(raw))return new URL(raw,virtualUrl);const u=new URL(raw,location.href);return ownOrigin(u.origin)?fixOwn(u):u}
+  // Site code that derives API hosts from location.hostname (e.g. Roblox's
+  // RealTime gateway builder takes location.hostname, strips "www.", and
+  // prefixes "apis.") produces <sub>.<proxy-host> URLs that point at the
+  // proxy origin instead of the site — on a public proxy host those DNS names
+  // don't exist and every request 502s (locally "localhost" is often
+  // special-cased by the site itself, hiding the bug). Remap the proxy-host
+  // suffix back onto the virtual site's host so the URL describes the
+  // site's own subdomain and the fetch/XHR wrappers proxy it normally.
+  function fixDerivedHost(u){
+    try{
+      const ph=location.hostname;
+      if(!ph||u.hostname===ph||!u.hostname.endsWith('.'+ph))return u;
+      const sub=u.hostname.slice(0,u.hostname.length-ph.length-1);
+      if(!sub)return u;
+      const vh=new URL(virtualUrl).hostname;
+      if(!vh||vh===ph)return u;
+      const base=vh.replace(/^www\\./i,'');
+      if(!base||base===vh&&/^www\\./i.test(vh))return u;
+      return new URL(u.protocol+'//'+sub+'.'+base+u.pathname+u.search+u.hash);
+    }catch{return u}
+  }
+  function toVirtual(raw){if(/^[?#]/.test(raw))return cleanVeyraParams(new URL(raw,virtualUrl));const u=new URL(raw,location.href);return cleanVeyraParams(fixDerivedHost(ownOrigin(u.origin)?fixOwn(u):u))}
   function resolve(v){try{const raw=unwrap(realUrl(v));return (raw===''?new URL(virtualUrl):toVirtual(raw)).href}catch{return String(v||'')}}
   function shouldProxy(v){try{const u=new URL(unwrap(v));return /^https?:$/.test(u.protocol)}catch{return false}}
-  function proxy(kind,u){const prefix=API_ORIGIN || location.origin;const base=prefix+(kind==='view'?'/api/view?url=':'/api/resource?url=')+encodeURIComponent(u);const from=encodeURIComponent(new URL(virtualUrl).href);return kind==='view'?base+'&sid='+encodeURIComponent(SESSION_ID):base+'&from='+from+'&sid='+encodeURIComponent(SESSION_ID)}
-  function topPost(msg){try{window.top.postMessage({...msg,bridgeToken:BRIDGE_TOKEN},'*')}catch{}}
+  function proxy(kind,u){const prefix=API_ORIGIN || location.origin;const base=prefix+(kind==='view'?'/api/view?url=':'/api/resource?url=')+encodeURIComponent(u);const from=encodeURIComponent(new URL(virtualUrl).href);return kind==='view'?base+'&sid='+encodeURIComponent(SESSION_ID)+(POPUP_FRAME?'&veyra_popup=1':'')+(watchPlayer?watchMarker(new URL(u,virtualUrl)):''):base+'&from='+from+'&sid='+encodeURIComponent(SESSION_ID)}
+  function topPost(msg){try{window.top.postMessage(msg,'*')}catch{}}
   function emit(source,url,extra){if(!url)return;topPost({type:'veyra:navigate',url,source,sessionId:SESSION_ID,...extra})}
   let netSeq=0;
   function hdrObj(h){const o={};try{if(!h)return o;if(typeof h.forEach==='function'&&!Array.isArray(h)){h.forEach((v,k)=>{o[k]=String(v).slice(0,2000)});return o}if(Array.isArray(h)){for(const [k,v] of h)o[String(k).toLowerCase()]=String(v).slice(0,2000);return o}for(const k of Object.keys(h))o[k.toLowerCase()]=String(h[k]).slice(0,2000)}catch{}return o}
@@ -1820,12 +2715,121 @@ function injectRuntime(html, original, sid = "", bridgeToken = "") {
   function canonicalizeMaybeProxy(href){try{const raw=unwrap(href);if(!raw)return null;const u=toVirtual(raw);if(!/^https?:$/.test(u.protocol))return null;return u.href}catch{return null}}
   const HP=(typeof History!=='undefined'&&History.prototype)||null;
   const nativeReplaceState=HP?HP.replaceState:history.replaceState;
+  function escapedHistoryUrl(next){
+    const u=new URL(next);
+    if(/^[/]api[/]/.test(u.pathname))return proxy('view',next);
+    const markers=SESSION_ID?(u.search?'&':'?')+'__veyra_url='+encodeURIComponent(u.href)+'&__veyra_sid='+encodeURIComponent(SESSION_ID)+(POPUP_FRAME?'&veyra_popup=1':'')+watchMarker(u):'';
+    return location.origin+u.pathname+u.search+markers+u.hash;
+  }
+  function keepEscapedContext(next){
+    try{
+      if(!SESSION_ID||/^[/]api[/]/.test(location.pathname))return;
+      const shown=escapedHistoryUrl(next);
+      if(location.href!==shown)nativeReplaceState.call(history,history.state,'',shown);
+    }catch{}
+  }
+  // An upstream redirect or a native relative navigation can change the
+  // target. Anchor the current document before the site's scripts reload it.
+  keepEscapedContext(virtualUrl);
   function rootProxiedFrame(){try{return window.parent===window||!window.parent.__VEYRA_PROXY__}catch{return true}}
-  function remember(next){virtualUrl=next;window.__VEYRA_PAGE_URL__=next;if(rootProxiedFrame())try{document.cookie='veyra_ctx='+encodeURIComponent(next)+'|'+encodeURIComponent(SESSION_ID)+';path=/;max-age=3600;'+(location.protocol==='https:'?'SameSite=None;Secure;Partitioned':'SameSite=Lax')}catch{}}
+  // The main proxied page is embedded in the Veyra app, but its parent is
+  // cross-origin (the app lives on another origin), so rootProxiedFrame()
+  // alone cannot tell it apart from a page opened directly at a proxy URL —
+  // every popup guard silently turned off and window.open()/target=_blank
+  // escaped into raw browser tabs at path-based proxy URLs. The app answers
+  // an embed ping; once acked, popups route through the app as new Veyra
+  // tabs and element inspection works on the main frame too.
+  var appEmbedded=false;
+  try{addEventListener('message',function(ev){try{if(ev.source===window.top&&ev.data&&ev.data.type==='veyra:embed-ack')appEmbedded=true}catch{}});topPost({type:'veyra:embed-ping',sessionId:SESSION_ID})}catch{}
+  // ----- Popup relay: OAuth popups open as proxied Veyra tabs -----
+  // A site's window.open() (Google/Microsoft/Apple sign-in, "continue with
+  // …" OAuth popups) must not escape to a raw browser tab, and the popup
+  // flow needs opener semantics: the popup posts its OAuth response to
+  // window.opener, the opener polls .closed, and either side may reply via
+  // event.source. The app opens the popup as a proxied Veyra tab and
+  // relays every postMessage between the two frames; each side receives a
+  // synthetic MessageEvent whose origin is the OTHER side's virtual (real)
+  // origin, so the site's own origin checks keep passing. Everything runs
+  // in this session's cookie jar — no cross-session cookies anywhere.
+  var POPUP_SEQ=0;
+  var POPUP_DOCUMENT=Math.random().toString(36).slice(2);
+  var POPUP_HANDLES=Object.create(null);
+  // The relay is not subject to the browser's native popup blocker. Spend
+  // one trusted activation on a popup, and only during its input dispatch.
+  let popupGesture=null;
+  function rememberPopupGesture(ev){
+    if(!ev.isTrusted||navigator.userActivation?.isActive===false)return;
+    popupGesture={event:ev,used:false};
+  }
+  window.addEventListener('click',rememberPopupGesture,true);
+  window.addEventListener('auxclick',rememberPopupGesture,true);
+  function claimPopupGesture(){
+    if(!popupGesture||popupGesture.used||popupGesture.event.eventPhase===0)return false;
+    popupGesture.used=true;return true;
+  }
+  function blankPopupUrl(raw){return !raw||/^about:blank(?:[?#].*)?$/i.test(raw)}
+  function popupReplyShim(dir,popupId){
+    return {closed:false,focus:function(){},length:0,opener:null,
+      postMessage:function(data,origin){
+        if(dir==='to-opener')topPost({type:'veyra:popup-to-opener',data:data,targetOrigin:origin,sessionId:SESSION_ID,virtualUrl:virtualUrl});
+        else topPost({type:'veyra:popup-message',popupId:popupId,data:data,targetOrigin:origin,sessionId:SESSION_ID,virtualUrl:virtualUrl});
+      }};
+  }
+  function popupDispatchRelay(d){
+    try{
+      if(d==null||typeof d!=='object')return;
+      // d.from says which side sent the original message ('opener' or
+      // 'popup'); the synthetic event's source shim must reply to that
+      // side — the opposite direction.
+      var src=null;
+      if(d.from==='opener')src=popupReplyShim('to-opener','');
+      else if(d.from==='popup')src=popupReplyShim('to-popup',d.popupId||'');
+      var ev=null;
+      try{ev=new MessageEvent('message',{data:d.data,origin:String(d.origin||API_ORIGIN||location.origin),lastEventId:'',ports:[]})}catch(e){return}
+      // The constructor rejects a plain object as the source (it wants a
+      // WindowProxy/MessagePort), so shadow the accessor with an own
+      // property pointing at the relay reply shim.
+      try{if(src)Object.defineProperty(ev,'source',{value:src,configurable:true})}catch(e){}
+      window.dispatchEvent(ev);
+    }catch(e){}
+  }
+  try{addEventListener('message',function(ev){
+    try{
+      if(ev.source!==window.parent)return;
+      var d=ev.data;
+      if(!d||typeof d!=='object'||typeof d.type!=='string')return;
+      if(d.type==='veyra:popup-role'){
+        try{if(!window.opener)window.opener=popupReplyShim('to-opener','')}catch(e){}
+        try{window.close=function(){topPost({type:'veyra:popup-self-close',sessionId:SESSION_ID})}}catch(e){}
+        return;
+      }
+      if(d.type==='veyra:relay-message'){popupDispatchRelay(d);return}
+      if(d.type==='veyra:popup-closed'&&d.popupId&&POPUP_HANDLES[d.popupId]){try{POPUP_HANDLES[d.popupId].closed=true;delete POPUP_HANDLES[d.popupId]}catch(e){}return}
+    }catch(e){}
+  })}catch(e){}
+  // The app marks a popup tab's frame URL with veyra_popup=1 so the shim
+  // installs synchronously at injection time — before any site script can
+  // touch window.opener (no round-trip race on the first load).
+  try{
+    if(POPUP_FRAME){
+      try{if(!window.opener)window.opener=popupReplyShim('to-opener','')}catch(e){}
+      try{window.close=function(){topPost({type:'veyra:popup-self-close',sessionId:SESSION_ID})}}catch(e){}
+    }
+  }catch(e){}
+  // Escape watchdog handshake: the app probes each loaded frame; only a frame
+  // still running this runtime can answer. A frame that navigated off the
+  // proxy to a real site (e.g. an X-Frame-Options blocked auth redirect)
+  // stays silent, which lets the app recover the tab. The ack goes to
+  // window.top via topPost — replying to ev.source can loop back into the
+  // frame when the page's own SDKs wrap window.postMessage.
+  try{addEventListener('message',function(ev){try{if(ev.data&&ev.data.type==='veyra:embed-probe'){topPost({type:'veyra:embed-probe-ack',sessionId:SESSION_ID})}}catch{}})}catch{}
+  function remember(next){virtualUrl=next;window.__VEYRA_PAGE_URL__=next;if(watchNavigate)watchNavigate(next)}
   function proxyHistory(method,native){return function(state,title,url){
-    let next=virtualUrl;try{if(url!=null)next=fixOwn(new URL(unwrap(String(url)),virtualUrl)).href}catch{}
+    const next=url==null?virtualUrl:resolve(url);
+    // Preserve the real pathname for SPAs, but keep routing markers in every
+    // iframe history entry. The app only sees the clean virtual URL.
+    try{native.call(this||history,state,title,/^[/]api[/]/.test(location.pathname)?proxy('view',next):escapedHistoryUrl(next))}catch{return}
     remember(next);
-    try{native.call(this||history,state,title,proxy('view',next))}catch{}
     emit('history.'+method,next);return undefined;
   }}
   // Patch the prototype (not just the instance): apps such as YouTube call
@@ -1834,18 +2838,371 @@ function injectRuntime(html, original, sid = "", bridgeToken = "") {
   try{if(HP){const np=HP.pushState,nr=HP.replaceState;HP.pushState=proxyHistory('pushState',np);HP.replaceState=proxyHistory('replaceState',nr)}else{const np=history.pushState,nr=history.replaceState;history.pushState=proxyHistory('pushState',np);history.replaceState=proxyHistory('replaceState',nr)}}catch{}
   // Watchdog: if anything still escapes (pristine History from another realm),
   // map the escaped path back onto the real site and restore the proxied URL.
-  function heal(){try{if(!/^[/]api[/]/.test(location.pathname)){const next=new URL(location.pathname+location.search+location.hash,virtualUrl).href;remember(next);nativeReplaceState.call(history,history.state,'',proxy('view',next));emit('history.heal',next)}}catch{}}
+  // Escaped navigation (e.g. /en-gb/play/games/<slug>/cg-<id>) serves the page
+  // at the same path as the original site so apps that parse location.pathname
+  // (MSN Casual Games extracts the game ID from it) see the real path. The
+  // previous version immediately rewrote the URL back to /api/view, which
+  // re-broke those apps before their boot code could read the path. Now we
+  // keep the escaped path as the visible URL and only remember the virtual
+  // URL, so pathname stays the real site path for the lifetime of the page.
+  function heal(){try{if(!/^[/]api[/]/.test(location.pathname)){const next=cleanVeyraParams(new URL(location.pathname+location.search+location.hash,virtualUrl)).href;keepEscapedContext(next);if(next!==virtualUrl){remember(next);emit('history.heal',next)}}}catch{}}
   try{setInterval(heal,300);addEventListener('popstate',()=>{try{const u=canonicalizeMaybeProxy(location.href);if(u&&u!==virtualUrl){remember(u);emit('history.popstate',u)}}catch{}})}catch{}
   try{
     const LP=Location&&Location.prototype;
-    if(LP&&LP.assign){const nativeAssign=LP.assign;LP.assign=function(next){const u=canonicalizeMaybeProxy(next);if(u){emit('location.assign',u);return;}return nativeAssign.call(this,next)}}
-    if(LP&&LP.replace){const nativeReplace=LP.replace;LP.replace=function(next){const u=canonicalizeMaybeProxy(next);if(u){emit('location.replace',u);return;}return nativeReplace.call(this,next)}}
+    // OAuth/login redirects (location.assign/replace) must not render through
+    // the proxy: the auth page's own scripts then navigate the frame to the
+    // real site (e.g. MSN's authorize 404 page sets window.location to
+    // https://www.msn.com/), which the app's iframe cannot show — the user
+    // gets Chrome's "This content is blocked" error. Route sign-in redirects
+    // through the app: it loads the site's sign-in page through the fast
+    // proxy in the tab, so the user signs in inside Veyra — the session's
+    // own cookie jar carries the signed-in state, no cross-session cookies.
+    if(LP&&LP.assign){const nativeAssign=LP.assign;LP.assign=function(next){const u=canonicalizeMaybeProxy(next);if(u){if(!rootProxiedFrame()){emit('location.assign',u);return;}if(appEmbedded&&isSigninRedirect(u)){topPost({type:'veyra:signin',url:u,sessionId:SESSION_ID,pageUrl:virtualUrl});return;}return nativeAssign.call(this,proxy('view',u));}return nativeAssign.call(this,next)}}
+    if(LP&&LP.replace){const nativeReplace=LP.replace;LP.replace=function(next){const u=canonicalizeMaybeProxy(next);if(u){if(!rootProxiedFrame()){emit('location.replace',u);return;}if(appEmbedded&&isSigninRedirect(u)){topPost({type:'veyra:signin',url:u,sessionId:SESSION_ID,pageUrl:virtualUrl});return;}return nativeReplace.call(this,proxy('view',u));}return nativeReplace.call(this,next)}}
+    // Report the virtual (original) page URL from location: apps such as MSN
+    // Casual Games parse location.pathname (/en-gb/play/games/<slug>/cg-<id>)
+    // to extract the active game ID. On the proxied page the path is
+    // /api/view, so the extraction returns nothing, the GameplayV2 data
+    // fetch is skipped and the game iframe never receives a URL.
+    // location's accessors are own properties of the window.location instance
+    // (not Location.prototype) in Chromium, so define them there.
+    try{
+      const vp=()=>{try{return new URL(virtualUrl)}catch{return null}};
+      const target=window.location;
+      const defs={};
+      for(const prop of ['pathname','search','hash','href','origin']){
+        const d=Object.getOwnPropertyDescriptor(target,prop)||Object.getOwnPropertyDescriptor(LP,prop);
+        if(d&&d.get){const nativeGet=d.get;
+          defs[prop]={get:function(){
+            try{const v=vp();
+              if(v){
+                if(prop==='pathname')return v.pathname;
+                if(prop==='search')return v.search;
+                if(prop==='hash')return v.hash;
+                if(prop==='href')return v.href;
+                if(prop==='origin')return v.origin;
+              }
+            }catch{}
+            return nativeGet.call(this);
+          },configurable:true};
+        }
+      }
+      try{Object.defineProperties(target,defs)}catch{}
+    }catch{}
   }catch{}
   try{navigator.serviceWorker&&navigator.serviceWorker.register&&(navigator.serviceWorker.register=function(){topPost({type:'veyra:browser-required',reason:'service-worker',sessionId:SESSION_ID,pageUrl:virtualUrl});return Promise.reject(new DOMException('This page requires browser service-worker support.','NotSupportedError'))})}catch{}
-  try{if(typeof WebSocket==='function'){const NativeWebSocket=WebSocket;window.WebSocket=function(url,protocols){try{const target=resolve(url);if(/^wss?:/i.test(String(target))){topPost({type:'veyra:browser-required',reason:'websocket',sessionId:SESSION_ID,pageUrl:virtualUrl,url:target})}}catch{};throw new Error('This page requires browser WebSocket support; switching to Chromium.');};window.WebSocket.prototype=NativeWebSocket.prototype}}catch{}
-  // Empty SPA shell detector (Roblox, browser.lol, etc.): if the main root stays
-  // empty after scripts have had a chance to run, ask the parent to switch to Chromium.
-  try{(function(){var fired=false;function check(){if(fired)return;try{var root=document.querySelector('#root,#app,#__next,[data-reactroot],#react-root');var body=document.body;var text=(body&&body.innerText||'').replace(/\\s+/g,' ').trim();var kids=body?body.children.length:0;var emptyRoot=root&&!(root.textContent||'').trim()&&root.children.length===0;var sparse=!text||text.length<40&&kids<4;if(emptyRoot||sparse){fired=true;topPost({type:'veyra:browser-required',reason:'empty-spa-shell',sessionId:SESSION_ID,pageUrl:virtualUrl})}}catch{}}setTimeout(check,2500);setTimeout(check,6000)})()}catch{}
+  try{if(typeof WebSocket==='function'){const NativeWebSocket=WebSocket;function relayWsBase(){try{const o=API_ORIGIN||location.origin;return o.replace(/^http:/i,'ws:').replace(/^https:/i,'wss:')}catch(e){return ''}}
+    function ProxiedWebSocket(url,protocols){
+      try{
+        const target=resolve(url);
+        if(/^wss?:/i.test(String(target))){
+          // WebSocket relay: connect to the VeyraServer WS proxy with the session's
+          // exit (and its cookie jar), so real-time sites (games, chat) work in fast
+          // proxy mode. If the relay is unreachable the page still gets a real close.
+          const relayBase=relayWsBase();
+          if(relayBase){
+            const qs='url='+encodeURIComponent(target)+'&sid='+encodeURIComponent(SESSION_ID)+(virtualUrl?'&from='+encodeURIComponent(virtualUrl):'');
+            return protocols===undefined?new NativeWebSocket(relayBase+'/ws/relay?'+qs):new NativeWebSocket(relayBase+'/ws/relay?'+qs,protocols);
+          }
+        }
+      }catch(e){}
+      return protocols===undefined?new NativeWebSocket(url):new NativeWebSocket(url,protocols);
+    }
+    ProxiedWebSocket.prototype=NativeWebSocket.prototype;ProxiedWebSocket.CONNECTING=0;ProxiedWebSocket.OPEN=1;ProxiedWebSocket.CLOSING=2;ProxiedWebSocket.CLOSED=3;
+    try{Object.defineProperty(ProxiedWebSocket,'name',{value:'WebSocket'})}catch(e){}
+    window.WebSocket=ProxiedWebSocket;}}catch{}
+  // Same-origin proxied frames still address each other with the site's real
+  // origins: MSN posts to its login widget with targetOrigin
+  // https://login.live.com, and the MSN Games SDK posts to its configured
+  // parentOrigin (https://www.msn.com). Every proxied frame shares the proxy
+  // origin, so the browser drops those messages with a console error and the
+  // handshake the app depends on never completes. When a proxied frame
+  // receives a message addressed to a different absolute origin, relay it
+  // with '*' — the sender already holds the same-origin window handle, so
+  // nothing is disclosed that it could not read directly.
+  try{(function(){
+    // postMessage is an OWN property of each window instance (not on
+    // Window.prototype), so the patch must replace window.postMessage itself —
+    // a Window.prototype-level patch is silently shadowed and never runs.
+    if(!window.__VEYRA_PROXY__)return;
+    var nativePM=window.postMessage;
+    if(typeof nativePM!=='function')return;
+    window.postMessage=function(message,targetOrigin,transfer){
+      try{
+        if(this===window&&arguments.length>=2&&typeof targetOrigin==='string'&&targetOrigin!=='*'&&targetOrigin!=='/'){
+          var u=null;try{u=new URL(targetOrigin,location.href)}catch{}
+          if(u&&/^https?:$/.test(u.protocol)&&u.origin!==location.origin){
+            return nativePM.call(this,message,'*',transfer)
+          }
+        }
+      }catch{}
+      return nativePM.apply(this,arguments)
+    }
+  })()}catch{}
+  // Some games gate themselves to their publisher's domains by reading
+  // location.hostname (PolyTrack: *.msn.com/*.msnfun.com) and halt with an
+  // "unofficial version" screen on any other host — including the proxy
+  // origin. The game's own code exposes window.polytrackModConfiguration
+  // (unblocked:true) as its supported escape hatch for mirrors; set it so
+  // proxied play works. No other site reads this variable.
+  try{if(!window.polytrackModConfiguration)window.polytrackModConfiguration={unblocked:true}}catch{}
+  // Web workers (physics/AI simulation bundles in games like PolyTrack) load
+  // relative script URLs that resolve against the escaped proxy path and 404.
+  // Route the worker script through the proxy like any other resource; the
+  // /api/resource URL is same-origin, so the Worker still constructs.
+  try{(function(){
+    if(typeof Worker!=='function')return;
+    var NativeWorker=Worker;
+    function VeyraWorker(url,opts){
+      try{
+        // Blob/data workers (DRACO decoder, meshopt, game code) are created
+        // locally and must go to the native constructor; resolve() rewrites
+        // them to their inner http URL, which the proxy then 404s.
+        var raw=String(realUrl(url)||'');
+        if(/^(blob:|data:)/i.test(raw))return new NativeWorker(url,opts);
+        var target=resolve(url);
+        if(/^https?:$/.test(new URL(target,location.href).protocol)){
+          try{return new NativeWorker(proxy('resource',target),opts)}catch(e){}
+        }
+      }catch(e){}
+      return new NativeWorker(url,opts);
+    }
+    try{Object.defineProperty(VeyraWorker,'name',{value:'Worker'})}catch(e){}
+    VeyraWorker.prototype=NativeWorker.prototype;
+    window.Worker=VeyraWorker;
+  })()}catch{}
+  // Runtime-created <script> and <iframe> elements (webpack/rspack lazy chunks,
+  // JSONP, OAuth silent-auth frames) bypass the HTML rewriting, so cross-origin
+  // URLs hit the origin directly. CDNs like assets.msn.com restrict CORS to the
+  // real site origin and chunk loaders set crossOrigin="anonymous", which then
+  // fails and leaves the app blank; OAuth frames fail whole-app hydration the
+  // same way. Intercept src assignment and route site resources through the
+  // proxy so runtime loading is same-origin and CORS-free.
+  try{(function(){
+    var nativeCreate=document.createElement.bind(document);
+    var VAPI=/^\\/api\\/(view|resource|download|form-get|open|crawl|search|suggest|browser|debug|session|vpn|status|health|devtools|cast)([\\/?#]|$)/;
+    function srcFix(v,kind,sc){
+      try{
+        var raw=String(v||'');
+        if(!raw||/^(data:|blob:|about:|javascript:)/i.test(raw))return v;
+        var u=new URL(raw,location.href);
+        // Site code that derives API hosts from location.hostname builds
+        // <sub>.<proxy-host> resource URLs (Roblox injects a <script src>
+        // for its rotating-client-service prelude that way). Proxying them
+        // as-is 502s on the proxy host, so remap the proxy-host suffix back
+        // onto the virtual site's host first — same as fixDerivedHost in
+        // toVirtual.
+        u=fixDerivedHost(u);
+        if(VAPI.test(u.pathname))return v;
+        if(/^[a-z][a-z0-9+.-]*:\\/\\//i.test(raw)){
+          if(u.protocol!=='http:'&&u.protocol!=='https:')return v;
+          // Absolute URLs to the virtual site's own origin: for SCRIPTS keep
+          // the URL verbatim. Turbopack-style chunk loaders key their chunk
+          // registry by the exact URL they hand to the created <script>, so
+          // rewriting it to /api/resource?url=... makes the loaded chunk
+          // register under a key nothing waits for and hydration hangs
+          // forever (browser.lol). Scripts are CORS-free, so a direct fetch
+          // of the site's own asset URL is safe and matches the direct-site
+          // behavior exactly.
+          // /cdn-cgi/ is Cloudflare's own reserved path prefix. The proxy host
+          // (Render) is itself behind Cloudflare, so a path-form /cdn-cgi/ URL
+          // is answered by Render's edge, NOT by the escaped-path fallback —
+          // a site's challenge-platform script would load the WRONG domain's
+          // copy and its managed challenge could never complete (poxel.io).
+          // Always send /cdn-cgi/ script srcs through the proxy so they come
+          // from the site itself, with the session's cookie jar.
+          if(sc && /^\\/cdn-cgi\\//i.test(u.pathname)){try{return proxy(kind,u.href)}catch(e){return v}}
+          if(sc){try{var vp0=new URL(virtualUrl);if(u.origin===vp0.origin)return u.href}catch(e){}}
+          if(u.origin===location.origin){
+            // Absolute URLs at the proxy origin: proper API routes pass
+            // through; escaped paths (site code resolved a relative URL
+            // against the proxy document path, e.g. /api/font.woff2) are
+            // recovered against the real page URL and re-proxied.
+            if(VAPI.test(u.pathname))return v;
+            try{return proxy(kind,new URL(u.pathname.replace(/^\\/api\\//,'')+u.search,virtualUrl).href)}catch(e){return v}
+          }
+          return proxy(kind,u.href);
+        }
+        var real=new URL(raw,virtualUrl);
+        if(!/^https?:$/.test(real.protocol))return v;
+        if(real.origin===location.origin)return v;
+        // Same-origin scripts keep their real path (e.g. /_next/static/chunks/x.js).
+        // Turbopack-style runtimes key lazy chunk registrations by the raw src
+        // attribute; /api/resource?url=... forms break that match and the chunk
+        // promise never resolves. Path-form srcs match natively and the
+        // escaped-path fallback middleware resolves them via the Referer sid.
+        // Same /cdn-cgi/ rule as the absolute branch above: a root-relative
+        // /cdn-cgi/... script src must be proxied, never left in path form
+        // (Render's Cloudflare edge would answer it with its own copy).
+        if(sc && /^\\/cdn-cgi\\//i.test(real.pathname)){try{return proxy(kind,real.href)}catch(e){return v}}
+        if(sc){try{var vp=new URL(virtualUrl);if(real.origin===vp.origin)return real.pathname+real.search}catch(e){}}
+        return proxy(kind,real.href);
+      }catch(e){return v}
+    }
+    // Runtime-created resources: scripts and iframes were already covered, but
+    // images, media, tracks, embeds, objects and stylesheets created by SPA
+    // code bypassed the HTML rewriting — relative URLs then hit the proxy
+    // origin directly and cross-origin loads failed CORS. Route every
+    // resource element's src/href/data through the proxy.
+    var FIX_ATTRS={script:'src',iframe:'src',img:'src',source:'src',audio:'src',video:'src',track:'src',embed:'src',object:'data',link:'href'};
+    function fixElement(el,name){
+      try{
+        var attr=FIX_ATTRS[name];
+        if(!attr)return el;
+        var kind=name==='iframe'?'view':'resource';
+        var proto=Object.getPrototypeOf(el);
+        var desc=Object.getOwnPropertyDescriptor(proto,attr);
+        if(desc&&desc.set)Object.defineProperty(el,attr,{get:desc.get,set:function(v){desc.set.call(el,srcFix(v,kind,name==='script'))},configurable:true});
+        var nativeSetAttr=el.setAttribute.bind(el);
+        el.setAttribute=function(k,v){if(String(k).toLowerCase()===attr)v=srcFix(v,kind,name==='script');return nativeSetAttr(k,v)};
+      }catch(e){}
+      return el;
+    }
+    document.createElement=function(tag,options){
+      var el=nativeCreate(tag,options);
+      return fixElement(el,String(tag).toLowerCase());
+    };
+    // THREE.js and other engines build resource elements with
+    // document.createElementNS('http://www.w3.org/1999/xhtml', 'img'),
+    // bypassing the createElement patch. Texture URLs then hit the proxy
+    // origin unrewritten and 404, crashing WebGL games (PolyTrack's
+    // smoke.png / clouds.jpg). Cover the namespace variant too.
+    try{
+      var nativeCreateNS=document.createElementNS.bind(document);
+      document.createElementNS=function(ns,tag,options){
+        var el=nativeCreateNS(ns,tag,options);
+        return fixElement(el,String(tag).toLowerCase());
+      };
+    }catch(e){}
+    // new Image() does not go through document.createElement.
+    try{
+      var NativeImage=window.Image;
+      function VeyraImage(w,h){return fixElement(new NativeImage(w,h),'img')}
+      try{Object.defineProperty(VeyraImage,'name',{value:'Image'})}catch(e){}
+      VeyraImage.prototype=NativeImage.prototype;
+      window.Image=VeyraImage;
+    }catch(e){}
+    // innerHTML/insertAdjacentHTML parse resource tags without calling
+    // createElement or setAttribute, so patch the shared setAttribute too.
+    try{
+      var nativeSetAttrAny=Element.prototype.setAttribute;
+      Element.prototype.setAttribute=function(k,v){
+        try{
+          var kk=String(k).toLowerCase();
+          var tag=String(this.tagName||'').toLowerCase();
+          if(FIX_ATTRS[tag]===kk)v=srcFix(v,tag==='iframe'?'view':'resource',tag==='script');
+        }catch(e){}
+        return nativeSetAttrAny.call(this,k,v);
+      };
+    }catch(e){}
+    // innerHTML/insertAdjacentHTML parse raw markup through the HTML parser,
+    // which bypasses createElement and setAttribute entirely — those elements
+    // would fetch raw paths. A MutationObserver rewrites them on insertion.
+    try{
+      var FIX_SEL=Object.keys(FIX_ATTRS).join(',');
+      function fixAttr(el,attr){
+        try{
+          if(directElements.has(el))return;
+          var v=el.getAttribute(attr);
+          if(v&&v.indexOf('javascript:')!==0&&v.indexOf('/api/')!==0&&v.charAt(0)!=='#'&&!/^(data|blob|about|mailto|tel):/i.test(v))
+            el.setAttribute(attr,v);
+        }catch(e){}
+      }
+      function fixTree(root){
+        try{
+          if(root.nodeType===3){
+            // Text appended to a <style> after insertion.
+            var p=root.parentElement;
+            if(p&&String(p.tagName||'').toLowerCase()==='style')fixStyleText(p);
+            return;
+          }
+          if(root.nodeType!==1)return;
+          var t=String(root.tagName||'').toLowerCase();
+          if(FIX_ATTRS[t])fixAttr(root,FIX_ATTRS[t]);
+          if(t==='style')fixStyleText(root);
+          if(root.querySelectorAll){
+            var els=root.querySelectorAll(FIX_SEL);
+            for(var i=0;i<els.length;i++){
+              var et=String(els[i].tagName||'').toLowerCase();
+              if(FIX_ATTRS[et])fixAttr(els[i],FIX_ATTRS[et]);
+            }
+            var sts=root.querySelectorAll('style');
+            for(var k=0;k<sts.length;k++)fixStyleText(sts[k]);
+          }
+        }catch(e){}
+      }
+      // url(...) inside JS-injected <style> resolves against the proxy
+      // document path (/api/view), producing 404s like /api/font.woff2.
+      // Rewrite them to proxied absolute URLs.
+      function fixCssText(txt){
+        try{
+          txt=String(txt||'');
+          if(txt.indexOf('url(')===-1)return txt;
+          return txt.replace(/url\\(\\s*(['"]?)([^'")]+)\\1\\s*\\)/gi,function(m,q,v){
+            try{
+              v=String(v).trim();
+              if(!v||v.indexOf('/api/')===0||v.charAt(0)==='#'||/^(data:|blob:|about:|mailto:)/i.test(v))return m;
+              var abs=new URL(v,virtualUrl).href;
+              if(!/^https?:$/.test(new URL(abs).protocol))return m;
+              var po=API_ORIGIN||location.origin;
+              if(abs.indexOf(po+'/api/')===0){
+                var rest=abs.slice(po.length+5);
+                // Proper proxy URLs (/api/resource?url=...) are left alone;
+                // escaped paths like /api/font.woff2 are resolved back to
+                // the real site and re-proxied.
+                if(/^(view|resource|download|form-get|open|crawl|search|suggest|browser|debug|session|sessions|config|vpn|extensions|status|health|devtools|cast)([\/?#]|$)/.test(rest))return m;
+                try{return 'url("'+proxy('resource',new URL(rest,virtualUrl).href)+'")'}catch(e){return m}
+              }
+              return 'url("'+proxy('resource',abs)+'")';
+            }catch(e){return m}
+          });
+        }catch(e){return txt}
+      }
+      function fixStyleText(st){
+        try{
+          var txt=st.textContent||'';
+          var changed=fixCssText(txt);
+          if(changed!==txt)st.textContent=changed;
+        }catch(e){}
+      }
+      var veyraMO=new MutationObserver(function(muts){
+        for(var i=0;i<muts.length;i++){
+          var nodes=muts[i].addedNodes;
+          if(!nodes)continue;
+          for(var j=0;j<nodes.length;j++)fixTree(nodes[j]);
+        }
+      });
+      veyraMO.observe(document.documentElement,{childList:true,subtree:true});
+      // Shadow DOM (MSN casual games, game-play iframes, etc.) is invisible
+      // to the document-level observer — observe every shadow root as it
+      // is attached so its resource elements get rewritten too.
+      try{
+        var nativeAttachShadow=Element.prototype.attachShadow;
+        Element.prototype.attachShadow=function(init){
+          var root=nativeAttachShadow.call(this,init);
+          try{veyraMO.observe(root,{childList:true,subtree:true})}catch(e){}
+          return root;
+        };
+      }catch(e){}
+      // Constructable stylesheets (replaceSync/replace/insertRule) never touch
+      // the DOM, so url(font.woff2) resolves against /api/ and 404s. Rewrite
+      // the CSS text as it enters the sheet.
+      try{
+        if(window.CSSStyleSheet){
+          var nativeRSS=CSSStyleSheet.prototype.replaceSync;
+          if(nativeRSS)CSSStyleSheet.prototype.replaceSync=function(txt){try{txt=fixCssText(txt)}catch(e){}return nativeRSS.call(this,txt)};
+          var nativeRS=CSSStyleSheet.prototype.replace;
+          if(nativeRS)CSSStyleSheet.prototype.replace=function(txt){try{txt=fixCssText(txt)}catch(e){}return nativeRS.call(this,txt)};
+          var nativeIR=CSSStyleSheet.prototype.insertRule;
+          if(nativeIR)CSSStyleSheet.prototype.insertRule=function(rule,idx){try{rule=fixCssText(String(rule))}catch(e){}return nativeIR.call(this,rule,idx)};
+        }
+      }catch(e){}
+    }catch(e){}
+  })()}catch(e){}
+  // Give slow apps time to hydrate and leave working game/media surfaces alone.
+  try{(${watchEmptyProxyShell.toString()})(document,window,()=>{
+    if(rootProxiedFrame())topPost({type:'veyra:browser-required',reason:'empty-spa-shell',sessionId:SESSION_ID,pageUrl:virtualUrl});
+  })}catch{}
   const nativeFetch=window.fetch;if(nativeFetch)window.fetch=function(input,init){
     const started=performance.now(); const method=String(init&&init.method||input&&input.method||'GET').toUpperCase(); const original=realUrl(input); let target=''; let reqX={initiator:'fetch'};try{reqX.requestHeaders=hdrObj(init&&init.headers||(typeof Request!=='undefined'&&input instanceof Request?input.headers:null));if(init&&typeof init.body==='string')reqX.requestBody=init.body.slice(0,20000)}catch{}
     try{target=resolve(input);if(shouldProxy(target)){const ok=r=>{net(method,target,r.status,performance.now()-started,r.ok,r,reqX);return r},bad=e=>{net(method,target,0,performance.now()-started,false,null,{...reqX,error:String(e&&e.message||e)});throw e};const dest=proxy('resource',target);if(typeof Request!=='undefined'&&input instanceof Request){const src=input;const hasBody=!/^(GET|HEAD)$/i.test(src.method)&&!(init&&'body' in init);return (hasBody?src.clone().arrayBuffer():Promise.resolve(undefined)).then(buf=>{const opts={method:src.method,headers:src.headers,credentials:src.credentials,cache:src.cache,redirect:src.redirect,integrity:src.integrity,signal:src.signal};if(buf&&buf.byteLength)opts.body=buf;if(src.keepalive&&!(buf&&buf.byteLength>60000))opts.keepalive=true;return nativeFetch(dest,Object.assign(opts,init||{}))}).then(ok,bad)}if(init&&init.body&&typeof ReadableStream!=='undefined'&&init.body instanceof ReadableStream){return new Response(init.body).arrayBuffer().then(buf=>{const o=Object.assign({},init,{body:buf});delete o.duplex;return nativeFetch(dest,o)}).then(ok,bad)}return nativeFetch(dest,init).then(ok,bad);}}catch{}
@@ -1855,34 +3212,119 @@ function injectRuntime(html, original, sid = "", bridgeToken = "") {
   try{const NativeEventSource=window.EventSource;if(NativeEventSource)window.EventSource=function(url,options){const target=resolve(url);return new NativeEventSource(shouldProxy(target)?proxy('resource',target):url,options)}}catch{}
   try{const nativeBeacon=navigator.sendBeacon&&navigator.sendBeacon.bind(navigator);if(nativeBeacon)navigator.sendBeacon=function(url,data){try{const target=resolve(url);if(shouldProxy(target)){let body=data;let type='text/plain;charset=UTF-8';if(typeof Blob!=='undefined'&&data instanceof Blob)type=data.type||type;void fetch(proxy('resource',target),{method:'POST',body,keepalive:true,headers:{'content-type':type}});return true}}catch{}return nativeBeacon(url,data)}}catch{}
   function submitTarget(form,submitter){try{return canonicalizeMaybeProxy((submitter&&submitter.getAttribute('data-veyra-formaction'))||(submitter&&submitter.getAttribute('formaction'))||form.getAttribute('data-veyra-action')||form.getAttribute('action')||virtualUrl)}catch{return null}}
-  function emitGetForm(form,submitter,source){const target=submitTarget(form,submitter);if(!target)return false;const method=String(form.method||'get').toUpperCase();if(method!=='GET')return false;const fd=new FormData(form,submitter||undefined);const u=new URL(target);for(const [k,v] of fd.entries())if(typeof v==='string')u.searchParams.append(k,v);emit(source||'form.submit',u.href);return true}
-  try{const nativeFormSubmit=HTMLFormElement.prototype.submit;HTMLFormElement.prototype.submit=function(){try{if(emitGetForm(this,null,'form.submit'))return;const target=submitTarget(this,null);const method=String(this.method||'get').toUpperCase();if(target&&method==='POST'){const fd=new FormData(this);const entries=[];for(const [k,v] of fd.entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});return;}}catch{}return nativeFormSubmit.call(this)}}catch{}
-  try{const nativeRequestSubmit=HTMLFormElement.prototype.requestSubmit;if(nativeRequestSubmit)HTMLFormElement.prototype.requestSubmit=function(submitter){try{if(emitGetForm(this,submitter,'form.requestSubmit'))return;const target=submitTarget(this,submitter);const method=String(this.method||'get').toUpperCase();if(target&&method==='POST'){const entries=[];for(const [k,v] of new FormData(this,submitter).entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});return;}}catch{}return nativeRequestSubmit.call(this,submitter)}}catch{}
-  try{const nativeOpen=window.open;window.open=function(url,target,features){const u=canonicalizeMaybeProxy(url);if(u){topPost({type:'veyra:open',url:u,sessionId:SESSION_ID});return null}return nativeOpen.call(window,url,target,features)}}catch{}
+  function emitGetForm(form,submitter,source){if(rootProxiedFrame())return false;const target=submitTarget(form,submitter);if(!target)return false;const method=String(form.method||'get').toUpperCase();if(method!=='GET')return false;const fd=new FormData(form,submitter||undefined);const u=new URL(target);for(const [k,v] of fd.entries())if(typeof v==='string')u.searchParams.append(k,v);emit(source||'form.submit',u.href);return true}
+  try{const nativeFormSubmit=HTMLFormElement.prototype.submit;HTMLFormElement.prototype.submit=function(){try{if(rootProxiedFrame())return nativeFormSubmit.call(this);if(emitGetForm(this,null,'form.submit'))return;const target=submitTarget(this,null);const method=String(this.method||'get').toUpperCase();if(target&&method==='POST'){const fd=new FormData(this);const entries=[];for(const [k,v] of fd.entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});return;}}catch{}return nativeFormSubmit.call(this)}}catch{}
+  try{const nativeRequestSubmit=HTMLFormElement.prototype.requestSubmit;if(nativeRequestSubmit)HTMLFormElement.prototype.requestSubmit=function(submitter){try{if(rootProxiedFrame())return nativeRequestSubmit.call(this,submitter);if(emitGetForm(this,submitter,'form.requestSubmit'))return;const target=submitTarget(this,submitter);const method=String(this.method||'get').toUpperCase();if(target&&method==='POST'){const entries=[];for(const [k,v] of new FormData(this,submitter).entries()){if(typeof v!=='string'){topPost({type:'veyra:unsupported',reason:'File uploads are not supported by the server proxy.'});return;}entries.push([k,v])}topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});return;}}catch{}return nativeRequestSubmit.call(this,submitter)}}catch{}
+  ${blockPlaybackPopup.toString()}
+  try{const nativeOpen=window.open;window.open=function(url,target,features){
+    const raw=String(url??'').trim();
+    const blank=blankPopupUrl(raw);
+    const u=blank?null:canonicalizeMaybeProxy(raw);
+    const tgt=String(target||'').toLowerCase();
+    // A navigation button that opens its destination over the current page —
+    // window.open(url,'_self'), and '_top'/'_parent' from the root frame —
+    // must never become a new tab: it is in-place navigation.
+    if(tgt==='_self'||((tgt==='_top'||tgt==='_parent')&&rootProxiedFrame())){
+      if(!u)return null;
+      if(!rootProxiedFrame()){emit('location.assign',u);return null}
+      try{location.assign(proxy('view',u))}catch(e){}
+      return null;
+    }
+    if(u&&blockPlaybackPopup(virtualUrl,u))return null;
+    if(!appEmbedded){
+      // A frame does not get native popups before the embed handshake.
+      if(window.parent!==window)return null;
+      return nativeOpen.call(window,u?proxy('view',u):url,target,features);
+    }
+    if((!u&&!blank)||!claimPopupGesture())return null;
+    const popupId='vp'+POPUP_DOCUMENT+'-'+(++POPUP_SEQ);
+    const shim=popupReplyShim('to-popup',popupId);
+    let opened=false,href='about:blank',timer;
+    shim.name=String(target||'');
+    function navigatePopup(next){
+      const rawNext=String(next??'').trim();
+      const destination=blankPopupUrl(rawNext)?null:canonicalizeMaybeProxy(rawNext);
+      if(shim.closed||!destination)return;
+      if(blockPlaybackPopup(virtualUrl,destination)){shim.close();return}
+      href=destination;
+      clearTimeout(timer);
+      if(opened)topPost({type:'veyra:popup-navigate',popupId:popupId,url:destination,sessionId:SESSION_ID});
+      else{
+        opened=true;
+        topPost({type:'veyra:popup-open',url:destination,name:shim.name,popupId:popupId,sessionId:SESSION_ID,virtualUrl:virtualUrl});
+      }
+    }
+    const popupLocation={get href(){return href},set href(next){navigatePopup(next)},replace:navigatePopup,assign:navigatePopup,toString:function(){return href}};
+    Object.defineProperty(shim,'location',{get:function(){return popupLocation},set:navigatePopup});
+    shim.close=function(){
+      if(shim.closed)return;
+      shim.closed=true;
+      clearTimeout(timer);
+      delete POPUP_HANDLES[popupId];
+      if(opened)topPost({type:'veyra:popup-close',popupId:popupId,sessionId:SESSION_ID});
+    };
+    POPUP_HANDLES[popupId]=shim;
+    // A blank OAuth window is a placeholder, not a visible tab. The page
+    // can assign its real destination asynchronously on the same handle.
+    if(u)navigatePopup(u);
+    else timer=setTimeout(shim.close,120000);
+    return shim;
+  }}catch{}
   function fmtArg(x,d){d=d||0;if(typeof x==='string')return x;if(x instanceof Error)return (x.name||'Error')+': '+x.message+(x.stack?'\\n'+String(x.stack).split('\\n').slice(1,6).join('\\n'):'');if(typeof Node!=='undefined'&&x instanceof Node)return x.nodeType===1?'<'+x.tagName.toLowerCase()+(x.id?'#'+x.id:'')+(x.className&&typeof x.className==='string'?'.'+x.className.trim().split(/\\s+/).slice(0,3).join('.'):'')+'>':x.nodeName;if(typeof x==='function')return 'ƒ '+(x.name||'anonymous')+'()';try{const seen=new WeakSet();return JSON.stringify(x,(k,v)=>{if(typeof v==='object'&&v){if(seen.has(v))return '[Circular]';seen.add(v)}if(typeof v==='function')return 'ƒ';if(typeof v==='bigint')return String(v)+'n';return v})||String(x)}catch{return String(x)}}
   let consoleBudget=400,consoleWindow=Date.now();
   try{['log','info','debug','warn','error','trace','dir','table','assert','group','groupCollapsed','groupEnd','count','timeEnd'].forEach(level=>{if(typeof console[level]!=='function')return;const native=console[level].bind(console);console[level]=(...args)=>{native(...args);if(level==='assert'){if(args[0])return;args=['Assertion failed:',...args.slice(1)]}const now=Date.now();if(now-consoleWindow>2000){consoleWindow=now;consoleBudget=400}if(--consoleBudget<0)return;let stack='';if(level==='trace'||level==='error'){try{stack=String(new Error().stack||'').split('\\n').slice(2,9).join('\\n')}catch{}}let msg='';try{msg=args.map(x=>fmtArg(x)).join(' ')}catch{}topPost({type:'veyra:page-console',level:level==='assert'?'error':level,sessionId:SESSION_ID,message:msg.slice(0,20000),stack,time:now,pageUrl:virtualUrl})}})}catch{}
-  window.addEventListener('error',e=>topPost({type:'veyra:page-error',level:'error',sessionId:SESSION_ID,message:e.message||'Resource error',url:e.filename||'',line:e.lineno||null,column:e.colno||null,stack:e.error&&e.error.stack||'',pageUrl:virtualUrl}),true);
-  window.addEventListener('unhandledrejection',e=>topPost({type:'veyra:page-error',level:'error',sessionId:SESSION_ID,message:e.reason&&e.reason.message||String(e.reason||'Unhandled rejection'),stack:e.reason&&e.reason.stack||'',pageUrl:virtualUrl}),true);
+  function failedResource(target){
+    if(!target||target===window||target.nodeType!==1)return null;
+    const tag=String(target.tagName||'').toLowerCase();
+    if(!tag)return null;
+    const raw=target.currentSrc||target.src||target.href||target.poster||target.data||target.getAttribute('src')||target.getAttribute('href')||target.getAttribute('poster')||'';
+    let url='';
+    try{const parsed=new URL(unwrap(raw),virtualUrl);if(/^https?:$/.test(parsed.protocol))url=parsed.href}catch{}
+    let type=tag;
+    if(tag==='link')type=String(target.rel||'').toLowerCase().includes('stylesheet')?'stylesheet':'link';
+    else if(tag==='img'||tag==='image')type='image';
+    else if(tag==='video'||tag==='audio'||tag==='source')type='media';
+    const id=String(target.id||'').slice(0,120);
+    const selector=tag+(id?'#'+id:'');
+    let status=Number(target.status||target.statusCode||target.responseStatus);
+    if(!Number.isFinite(status)||status<100||status>599)status=null;
+    return {tag,type,url,selector,status};
+  }
+  window.addEventListener('error',function(e){
+    const resource=failedResource(e.target);
+    const rawMessage=String(e.message||'');
+    const opaque=!resource&&!e.filename&&/^Script error[.]?$/i.test(rawMessage)&&!e.error;
+    const resourceUrl=resource&&resource.url||'';
+    const message=resource?'Failed to load <'+resource.tag+'> resource.':rawMessage||'Resource error';
+    const note=opaque?'The browser provided only a generic Script error with no source location or stack. Cross-origin error details may be hidden unless the script and its server opt in to error sharing.':resource?(resource.status?'The page reports a failed resource; HTTP status '+resource.status+'.':'The failed element is identified, but its error event does not include an HTTP status or network failure reason. Check Network for the request.') : '';
+    topPost({type:'veyra:page-error',level:'error',sessionId:SESSION_ID,message,errorName:e.error&&e.error.name||'',errorDescription:e.error&&e.error.message||'',diagnosis:opaque?'cross-origin-script':resource?'resource-load':'',browserNote:note,context:resource?'Failed resource element: <'+resource.tag+'>.':opaque?'Browser-sanitized cross-origin script error.':'',url:e.filename||resourceUrl,resourceUrl,resourceTag:resource&&resource.tag||'',resourceType:resource&&resource.type||'',resourceStatus:resource&&resource.status,pageUrl:virtualUrl,line:e.lineno||null,column:e.colno||null,stack:e.error&&e.error.stack||'',time:Date.now(),resourceSelector:resource&&resource.selector||''});
+  },true);
+  window.addEventListener('unhandledrejection',e=>topPost({type:'veyra:page-error',level:'error',sessionId:SESSION_ID,message:e.reason&&e.reason.message||String(e.reason||'Unhandled rejection'),errorName:e.reason&&e.reason.name||'',errorDescription:e.reason&&e.reason.message||'',context:'Unhandled promise rejection.',stack:e.reason&&e.reason.stack||'',pageUrl:virtualUrl,time:Date.now()}),true);
   let inspectMode=false, inspectLast=0, inspectSelected=null;
   function inspectPath(el){const parts=[];let n=el;while(n&&n.nodeType===1&&parts.length<7){let s=n.tagName.toLowerCase();if(n.id)s+='#'+n.id.replace(/[^a-zA-Z0-9_-]/g,'-');else{let c=0,p=n;while((p=p.previousElementSibling))if(p.tagName===n.tagName)c++;if(c)s += ':nth-of-type(' + String(c+1) + ')'}parts.unshift(s);n=n.parentElement}return parts.join(' > ')}
   function inspectData(el){if(!el||el.nodeType!==1)return null;const rect=el.getBoundingClientRect();const attrs={};for(const a of [...el.attributes].slice(0,40))attrs[a.name]=a.value;let styles={};let computed={};try{const cs=getComputedStyle(el);for(const k of ['display','position','width','height','margin','padding','color','background','font','font-size','line-height','opacity','z-index','overflow','border','grid-template-columns','grid-template-rows','flex-direction','justify-content','align-items']){styles[k]=cs.getPropertyValue(k)||''}}catch{}try{const cs=getComputedStyle(el);for(let i=0;i<cs.length&&i<140;i++){const k=cs[i];if(/^(margin|padding|font|color|background|display|position|width|height|border|grid|flex|overflow|opacity|z-index)/i.test(k))computed[k]=cs.getPropertyValue(k)}}catch{}const outer=String(el.outerHTML||'').slice(0,16000);const children=[...el.children].slice(0,60).map((c,i)=>({index:i,tag:c.tagName.toLowerCase(),id:c.id||'',classes:String(c.className||'').slice(0,300),path:inspectPath(c)}));const parent=el.parentElement?{tag:el.parentElement.tagName.toLowerCase(),id:el.parentElement.id||'',path:inspectPath(el.parentElement)}:null;return {tag:el.tagName.toLowerCase(),id:el.id||'',classes:String(el.className||'').slice(0,500),attrs,path:inspectPath(el),outerHTML:outer,rect:{x:rect.x,y:rect.y,width:rect.width,height:rect.height},scrollWidth:el.scrollWidth||0,scrollHeight:el.scrollHeight||0,styles,computed,inlineStyle:el.getAttribute('style')||'',parent,children,tree:inspectPath(el)} }
   function inspectEmit(type,el){const data=inspectData(el);if(!data)return;topPost({type,sessionId:SESSION_ID,pageUrl:virtualUrl,...data})}
+${pageActionsRuntime()}
   window.addEventListener('message',function(ev){const d=ev.data||{};if(!d||d.type!=='veyra:inspect')return;inspectMode=!!d.enabled;if(!inspectMode&&inspectSelected){try{inspectSelected.style.removeProperty('outline')}catch{}inspectSelected=null}topPost({type:'veyra:inspect-state',enabled:inspectMode,sessionId:SESSION_ID,pageUrl:virtualUrl})});
   // DevTools bridge: loaded on demand from the Veyra origin the first time the
   // frontend's DevTools / extensions talk to this page.
   let dtLoading=null;const dtQueue=[];
-  function dtReply(msg){try{window.parent.postMessage({...msg,bridgeToken:BRIDGE_TOKEN},'*')}catch{}}
+  function dtReply(msg){try{window.parent.postMessage(msg,'*')}catch{}}
   function dtLoad(){if(window.__veyraDevtools)return Promise.resolve(window.__veyraDevtools);if(dtLoading)return dtLoading;dtLoading=new Promise((resolve,reject)=>{const sc=document.createElement('script');sc.setAttribute('data-veyra-devtools','bridge');sc.src=(API_ORIGIN||location.origin)+'/api/devtools/bridge.js?v=1';sc.onload=()=>{try{resolve(window.installVeyraDevtools(dtReply,{unwrap:x=>{const r=unwrap(x);try{return r?new URL(r,virtualUrl).href:''}catch{return r}},pageUrl:()=>virtualUrl}))}catch(e){reject(e)}};sc.onerror=()=>{dtLoading=null;reject(new Error('Could not load the DevTools bridge.'))};(document.head||document.documentElement).appendChild(sc)});return dtLoading}
   function dtSer(e){return {message:String(e&&e.message||e),stack:String(e&&e.stack||'')}}
-  window.addEventListener('message',function(ev){const d=ev.data||{};if(!d||d.type!=='veyra:dt'||d.bridgeToken!==BRIDGE_TOKEN)return;if(ev.source!==window.parent||window.parent===window)return;if(!rootProxiedFrame())return;
+  window.addEventListener('message',function(ev){const d=ev.data||{};if(!d||d.type!=='veyra:dt')return;if(ev.source!==window.parent||window.parent===window)return;if(!rootProxiedFrame())return;
     dtLoad().then(b=>b.call(String(d.method||''),d.params||{})).then(result=>{let safe=result;try{safe=JSON.parse(JSON.stringify(result===undefined?null:result))}catch{safe=null}dtReply({type:'veyra:dt-result',id:d.id,ok:true,result:safe,pageUrl:virtualUrl})},e=>dtReply({type:'veyra:dt-result',id:d.id,ok:false,error:dtSer(e),pageUrl:virtualUrl}))});
   // Keyboard shortcuts pressed inside the page are forwarded to the Veyra UI
   // (the parent frame never sees keydown events that happen in this iframe).
   const SC_SHIFT=['i','j','c','v','delete','t','n','b','o','m','r','p','k','tab','pageup','pagedown'];
   const SC_MOD=['t','w','n','l','r','f','p','j','h','d','k','e','u','g','s',',','pageup','pagedown','=','+','-','0','1','2','3','4','5','6','7','8','9','tab'];
   const SC_ALT=['arrowleft','arrowright','home','d','t','w'];
-  document.addEventListener('keydown',function(ev){try{if(!rootProxiedFrame())return;const k=String(ev.key||'').toLowerCase();const mod=ev.ctrlKey||ev.metaKey;
+  function browserlingOwnsKeyboard(ev){
+    if(!ev.target?.closest?.('.view-screen[tabindex]'))return false;
+    const u=new URL(virtualUrl);
+    return (u.hostname==='www.browserling.com'||u.hostname==='browserling.com')&&u.pathname.startsWith('/browse/');
+  }
+  document.addEventListener('keydown',function(ev){try{if(!rootProxiedFrame()||browserlingOwnsKeyboard(ev))return;const k=String(ev.key||'').toLowerCase();const mod=ev.ctrlKey||ev.metaKey;
     let fwd=false;
     if(k==='f12'||k==='f5'||k==='f6')fwd=true;
     else if(mod&&ev.shiftKey&&SC_SHIFT.includes(k))fwd=true;
@@ -1894,13 +3336,107 @@ function injectRuntime(html, original, sid = "", bridgeToken = "") {
   }catch{}},true);
   window.addEventListener('message',function(ev){const d=ev.data||{};if(d.type==='veyra:find'){try{const q=String(d.query||'').slice(0,200);if(!q){window.getSelection()?.removeAllRanges();topPost({type:'veyra:find-result',matches:0,pageUrl:virtualUrl});return;}let text=String(document.body?.innerText||'').slice(0,2000000);const hay=text.toLocaleLowerCase(),needle=q.toLocaleLowerCase();const matches=needle?(hay.split(needle).length-1):0;window.find(q,false,String(d.direction||'forward')==='backward',true,false,false,false);topPost({type:'veyra:find-result',matches,pageUrl:virtualUrl});}catch{}}else if(d.type==='veyra:find-close'){try{window.getSelection()?.removeAllRanges();}catch{}}else if(d.type==='veyra:print'){try{window.print();}catch{}}});
   document.addEventListener('mousemove',function(ev){if(!inspectMode)return;const now=performance.now();if(now-inspectLast<45)return;inspectLast=now;let el=ev.target;if(!(el instanceof Element))return;inspectEmit('veyra:inspect-hover',el)},true);
-  document.addEventListener('click',function(ev){if(inspectMode){ev.preventDefault();ev.stopPropagation();let el=ev.target;while(el&&el.nodeType===1&&el.tagName==='HTML')el=el.parentElement;inspectSelected=el;if(el)inspectEmit('veyra:inspect-select',el);return;}
-    const a=ev.target&&ev.target.closest?ev.target.closest('a[href],area[href]'):null;if(!a)return;
-    const raw=a.getAttribute('href')||'';const u=canonicalizeMaybeProxy(raw);if(!u)return;
+  // Sign-in inside Veyra: a click on a detected sign-in control (text like
+  // "Sign in"/"Log in", or a login/oauth/auth URL) is handed to the app,
+  // which loads the site's sign-in page through the fast proxy in the tab.
+  // The user signs in inside Veyra — credentials go through the session's
+  // own cookie jar and never cross sessions. Sign-up is deliberately
+  // excluded from interception: "Sign up"/"Create account"/"Register"
+  // controls and signup URLs load the site's real signup page through Veyra
+  // so the user creates the account inside Veyra.
+  var SIGNIN_AUTH_HOST=/^(?:accounts?\\.google\\.com|appleid\\.apple\\.com|login\\.(?:microsoftonline|microsoft|live)\\.com|securetoken\\.com|(?:auth|sso|signin|login|accounts)\\.[a-z0-9-]+\\.[a-z]{2,})$/i;
+  var SIGNIN_AUTH_PATH=/(?:^|\\/)(?:login|signin|sign-in|log-in|oauth|oauth2|openid|sso|servicelogin|authentication|authorize|dialog\\/oauth|i\\/oauth2|users\\/sign_in)(?:\\/?$|\\?|#)/i;
+  // Sign-up is not sign-in: a "Sign up"/"Create account"/"Register" control
+  // (label or URL) must load the site's real signup page through Veyra so the
+  // user creates their account inside Veyra — never the browser handoff.
+  var SIGNUP_TEXT=/^(?:sign up|sign-up|signup|join(?: now| free)?|create (?:an )?account|register|get started)\\b/i;
+  var SIGNUP_PATH=/(?:^|\\/)(?:signup|sign-up|register|registration|join|create-account)(?:\\/?$|\\?|#)/i;
+  // Auth providers bury signup deeper in the path (accounts.google.com/signup/v2/webcreateaccount).
+  var SIGNUP_PATH_ANYWHERE=/(?:^|\\/)(?:signup|sign-up|register|create-account)/i;
+  function isSigninRedirect(u){
+    try{
+      const uu=new URL(u,virtualUrl);
+      const host=uu.hostname.toLowerCase();
+      const pathPart=uu.pathname+uu.search;
+      // Sign-up destinations never trigger the sign-in handoff: they load
+      // through the proxy so the user signs up inside Veyra.
+      if(pathPart&&SIGNUP_PATH.test(pathPart))return false;
+      if(host&&SIGNIN_AUTH_HOST.test(host)&&pathPart&&SIGNUP_PATH_ANYWHERE.test(pathPart))return false;
+      return !!(host&&SIGNIN_AUTH_HOST.test(host))||!!(pathPart&&SIGNIN_AUTH_PATH.test(pathPart));
+    }catch(e){return false}
+  }
+  // Sign-in CLICK interception removed. The interceptor used to
+  // preventDefault on sign-in controls (anchors AND form submit buttons)
+  // and post veyra:signin so the app could offer the old handoff choice.
+  // With in-proxy-only sign-in that interception is worse than useless:
+  // a form submit button (GitHub's "Continue with Google") had its
+  // submission KILLED, and the interceptor's URL resolution fell back to
+  // the current page, so the app reloaded the login page in a loop.
+  // Sign-in controls now navigate naturally: anchors load their rewritten
+  // /api/view href in-frame, forms POST through the proxy (the escaped
+  // path middleware follows the site's own redirects - GitHub's Google
+  // initiate lands on accounts.google.com inside the proxied frame), and
+  // window.open popups go through the popup relay. Only location.assign/
+  // replace still posts veyra:signin (isSigninRedirect below), which the
+  // app loads in-tab through the fast proxy.
+  function anchorFromEvent(ev){
+    try{
+      if(ev.composedPath){
+        const p=ev.composedPath();
+        for(let i=0;i<p.length;i++){
+          const n=p[i];
+          if(n&&(n.tagName==='A'||n.tagName==='AREA')&&n.getAttribute('href')!=null)return n;
+        }
+      }
+    }catch{}
+    try{
+      let t=ev.target;
+      while(t&&t!==document){
+        if((t.tagName==='A'||t.tagName==='AREA')&&t.getAttribute('href')!=null)return t;
+        t=t.parentElement;
+      }
+    }catch{}
+    return null;
+  }
+  document.addEventListener('click',function(ev){if(rootProxiedFrame()&&!appEmbedded)return;if(inspectMode){ev.preventDefault();ev.stopPropagation();let el=ev.target;while(el&&el.nodeType===1&&el.tagName==='HTML')el=el.parentElement;inspectSelected=el;if(el)inspectEmit('veyra:inspect-select',el);return;}
+    // The anchor can live inside shadow DOM (MSN casual-game cards), where
+    // ev.target is retargeted to the shadow host and closest() never finds
+    // it — resolve through the composed path instead.
+    const a=anchorFromEvent(ev);if(!a||directElements.has(a))return;
+    const raw=a.getAttribute('href')||'';
+    // In the app-embedded root frame, pure-hash links keep their native
+    // scroll-to-anchor behaviour instead of a full proxy reload.
+    if(rootProxiedFrame()&&raw.charAt(0)==='#')return;
+    const tgt=String(a.getAttribute('target')||'').toLowerCase();
+    if(tgt&&tgt!=='_self')return;
+    // In the app-embedded root frame, same-frame links navigate the iframe
+    // natively to their rewritten href; only nested proxied frames need the
+    // document-navigation message (their parent is another proxied page).
+    if(rootProxiedFrame())return;
+    const u=canonicalizeMaybeProxy(raw);if(!u)return;
     ev.preventDefault();ev.stopPropagation();
-    if(String(a.getAttribute('target')||'').toLowerCase()==='_blank')topPost({type:'veyra:open',url:u,sessionId:SESSION_ID});else emit('document-navigation',u);
+    emit('document-navigation',u);
   },true);
+  function relayTargetLink(ev){
+    if(!appEmbedded||ev.defaultPrevented)return;
+    if(ev.type==='auxclick'&&ev.button!==1)return;
+    const a=anchorFromEvent(ev);if(!a||a.hasAttribute('download'))return;
+    const tgt=String(a.getAttribute('target')||'').toLowerCase();
+    if(!tgt||tgt==='_self')return;
+    // Run after the page's link handler so it can cancel the navigation.
+    ev.preventDefault();
+    const raw=(a.getAttribute('href')||'').trim();
+    const u=blankPopupUrl(raw)||raw==='#'?null:canonicalizeMaybeProxy(raw);
+    // A static href="#" may already have been rewritten as a proxy URL.
+    if(!u||(u.endsWith('#')&&u.slice(0,-1)===virtualUrl.split('#')[0]))return;
+    if(tgt!=='_top'&&tgt!=='_parent'&&blockPlaybackPopup(virtualUrl,u,true))return;
+    if(tgt!=='_top'&&tgt!=='_parent'&&(!ev.isTrusted||!claimPopupGesture()))return;
+    topPost({type:'veyra:open',url:u,target:tgt,sessionId:SESSION_ID});
+  }
+  document.addEventListener('click',relayTargetLink);
+  document.addEventListener('auxclick',relayTargetLink);
   document.addEventListener('submit',function(ev){
+    if(rootProxiedFrame())return;
     const form=ev.target;if(!form)return;const method=String(form.method||'get').toUpperCase();
     const target=submitTarget(form,ev.submitter);if(!target)return;
     if(method==='GET'){
@@ -1911,7 +3447,8 @@ function injectRuntime(html, original, sid = "", bridgeToken = "") {
       ev.preventDefault();topPost({type:'veyra:form',url:target,method:'POST',entries,sessionId:SESSION_ID});
     }
   },true);
-  document.addEventListener('click',function(ev){try{const el=ev.target&&ev.target.closest?ev.target.closest('button[type=submit],input[type=submit],button[formaction]'):null;if(!el||el.disabled)return;const form=el.form;if(!form)return;if(String(form.method||'get').toUpperCase()!=='GET')return;if(submitTarget(form,el)){ev.preventDefault();ev.stopPropagation();emitGetForm(form,el,'form.click')}}catch{}},true);
+  document.addEventListener('click',function(ev){if(rootProxiedFrame())return;try{const el=ev.target&&ev.target.closest?ev.target.closest('button[type=submit],input[type=submit],button[formaction]'):null;if(!el||el.disabled)return;const form=el.form;if(!form)return;if(String(form.method||'get').toUpperCase()!=='GET')return;if(submitTarget(form,el)){ev.preventDefault();ev.stopPropagation();emitGetForm(form,el,'form.click')}}catch{}},true);
+  ${watchPlayer ? `watchNavigate=(${installWatchPlayer.toString()})(watchPlayer,directElements);` : ""}
   window.addEventListener('load',function(){
     try{const icon=document.querySelector('link[rel~=' + JSON.stringify('icon') + '],link[rel~=' + JSON.stringify('shortcut icon') + ']');let favicon=icon&&icon.getAttribute('href')||'';try{if(favicon.startsWith('/api/resource?url='))favicon=new URLSearchParams(favicon.split('?')[1]).get('url')||favicon;else favicon=new URL(favicon,virtualUrl).href}catch{}const title=document.title||new URL(virtualUrl).hostname;emit('document-navigation',virtualUrl,{title,favicon})}catch{emit('document-navigation',virtualUrl)}
   });
@@ -1934,7 +3471,17 @@ function restoreInlineScriptBlocks(html, originals) {
   for (const item of originals || []) out = out.split(item.token).join(item.body);
   return out;
 }
-function rewriteHtml(html, base, sid = "", bridgeToken = "") {
+function restoreAndRewriteInlineScriptBlocks(html, originals, base, sid = "") {
+  let out = String(html || "");
+  let isGeoFs = false;
+  try { isGeoFs = /(^|\.)geo-fs\.com$/i.test(new URL(base).hostname); } catch {}
+  for (const item of originals || []) {
+    const body = isGeoFs ? rewriteJsText(item.body, base, sid) : item.body;
+    out = out.split(item.token).join(body);
+  }
+  return out;
+}
+function rewriteHtml(html, base, sid = "", watchPlayer = null) {
   const protectedScripts = protectInlineScriptBlocks(html);
   const $ = cheerio.load(protectedScripts.html, { decodeEntities: false });
   const declaredBase = $("base[href]").first().attr("href");
@@ -1942,6 +3489,9 @@ function rewriteHtml(html, base, sid = "", bridgeToken = "") {
   $("base").remove();
   $("meta[http-equiv]").filter((_, el) => String($(el).attr("http-equiv") || "").toLowerCase() === "content-security-policy").remove();
   $("a[href],area[href]").each((_, el) => { const u = resolveNavigation($(el).attr("href"), effectiveBase); if (u) $(el).attr("href", makeViewUrl(u, sid)); });
+  for (const attr of ["data-href", "data-url", "data-action", "data-endpoint", "ping"]) {
+    $(`[${attr}]`).each((_, el) => { const raw = $(el).attr(attr); const u = resolveNavigation(raw, effectiveBase) || resolveResource(raw, effectiveBase); if (u) $(el).attr(attr, makeResourceUrl(u, effectiveBase, sid)); });
+  }
   $("form[action]").each((_, el) => {
     const raw = $(el).attr("action");
     const u = resolveNavigation(raw, effectiveBase);
@@ -1975,12 +3525,75 @@ function rewriteHtml(html, base, sid = "", bridgeToken = "") {
   $("link[href]").each((_, el) => {
     const rel = String($(el).attr("rel") || "").toLowerCase();
     if (rel.includes("canonical")) return;
-    const raw = $(el).attr("href"); const u = resolveResource(raw, effectiveBase); if (u) { $(el).attr("href", makeResourceUrl(u, effectiveBase, sid)); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); }
+    const raw = $(el).attr("href"); const u = resolveResource(raw, effectiveBase); if (!u) return;
+    // Script preloads keep the same-origin path form as the <script> tags they
+    // preload, so the preloader and the parser hit one URL (and Turbopack's
+    // head-manifest processing sees native paths).
+    if ((rel.includes("preload") || rel.includes("modulepreload")) && String($(el).attr("as") || "").toLowerCase() === "script") {
+      // /cdn-cgi/ preloads must be proxied like their <script> partners —
+      // the proxy host's own Cloudflare edge answers path-form /cdn-cgi/.
+      try { const lu = new URL(u); if (lu.origin === new URL(effectiveBase).origin && !/^\/cdn-cgi\//i.test(lu.pathname)) { $(el).attr("href", lu.pathname + lu.search); $(el).removeAttr("crossorigin"); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); return; } } catch {}
+    }
+    $(el).attr("href", makeResourceUrl(u, effectiveBase, sid)); $(el).removeAttr("crossorigin"); if ($(el).attr("integrity")) $(el).removeAttr("integrity");
   });
-  $("script[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), effectiveBase); if (u) { $(el).attr("src", makeResourceUrl(u, effectiveBase, sid)); if ($(el).attr("integrity")) $(el).removeAttr("integrity"); } });
-  for (const tag of ["img", "source", "audio", "input", "embed"]) {
+  $("script[src]").each((_, el) => {
+    const rawSrc = $(el).attr("src");
+    const u = resolveResource(rawSrc, effectiveBase);
+    if (!u) return;
+    // CesiumJS builds its Assets/ base from the last <script> whose src ends
+    // in "Cesium.js". Once rewritten to /api/resource?url=..., that src no
+    // longer matches the regex, so buildModuleUrl falls back to
+    // location.origin + "/" + undefined. Set CESIUM_BASE_URL to the real
+    // script's parent path before Cesium loads so the proxy URL never leaks
+    // into the path.
+    if (/Cesium\.js(?:\?|#|$)/i.test(String(rawSrc || ""))) {
+      try { const cesiumBase = new URL(".", u).href; $(`<script>window.CESIUM_BASE_URL = ${JSON.stringify(cesiumBase)};</script>`).insertBefore(el); } catch {}
+    }
+    // Same-origin scripts keep their original path (e.g. /_next/static/chunks/x.js).
+    // Framework runtimes like Turbopack key chunk registrations by the raw src
+    // attribute and recompute chunk keys from it; /api/resource?url=... proxy
+    // URLs break that key match and hydration silently hangs (browser.lol).
+    // Path-form srcs match the runtime's expectations natively, and the
+    // escaped-path fallback middleware resolves them against the referring
+    // document's virtual page URL and session.
+    let scriptUrl = null;
+    // /cdn-cgi/ (Cloudflare challenge platform) scripts are proxied, never
+    // left in path form: the proxy host's own Cloudflare edge would serve its
+    // own copy of /cdn-cgi/ and the site's managed challenge would break.
+    try { const su = new URL(u); if (su.origin === new URL(effectiveBase).origin && !/^\/cdn-cgi\//i.test(su.pathname)) scriptUrl = su; } catch {}
+    $(el).attr("src", scriptUrl ? scriptUrl.pathname + scriptUrl.search : makeResourceUrl(u, effectiveBase, sid));
+    $(el).removeAttr("crossorigin");
+    if ($(el).attr("integrity")) $(el).removeAttr("integrity");
+  });
+  // Rewrite a parser-loaded <video src> just like <source src>. The runtime
+  // cannot reliably catch loads the browser starts while parsing the document.
+  for (const tag of ["img", "source", "audio", "video", "input", "embed"]) {
     $(`${tag}[src]`).each((_, el) => { const u = resolveResource($(el).attr("src"), effectiveBase); if (u) $(el).attr("src", makeResourceUrl(u, effectiveBase, sid)); });
   }
+  // Several large sites (including GeoFS) defer script loading through
+  // data-deferredsrc or a loader-specific dest attribute. Those URLs bypass
+  // the normal script[src] rewrite and otherwise resolve against Veyra's own
+  // /api/view document instead of the website.
+  // GeoFS uses data-deferredsrc on both scripts and lazy images. Rewrite the
+  // whole attribute family or image URLs resolve against Veyra's origin.
+  $("[data-deferredsrc]").each((_, el) => {
+    const raw = $(el).attr("data-deferredsrc"); const u = resolveResource(raw, effectiveBase);
+    if (!u) return;
+    // Same CESIUM_BASE_URL treatment for deferred-loaded Cesium scripts.
+    if (/Cesium\.js(?:\?|#|$)/i.test(String(raw || ""))) {
+      try { const cesiumBase = new URL(".", u).href; $(`<script>window.CESIUM_BASE_URL = ${JSON.stringify(cesiumBase)};</script>`).insertBefore(el); } catch {}
+    }
+    $(el).attr("data-deferredsrc", makeResourceUrl(u, effectiveBase, sid));
+  });
+  $("script[dest]").each((_, el) => {
+    const raw = $(el).attr("dest"); const u = resolveResource(raw, effectiveBase);
+    if (!u) return;
+    // Same CESIUM_BASE_URL treatment for dest-loaded Cesium scripts.
+    if (/Cesium\.js(?:\?|#|$)/i.test(String(raw || ""))) {
+      try { const cesiumBase = new URL(".", u).href; $(`<script>window.CESIUM_BASE_URL = ${JSON.stringify(cesiumBase)};</script>`).insertBefore(el); } catch {}
+    }
+    $(el).attr("dest", makeResourceUrl(u, effectiveBase, sid));
+  });
   $("video[poster]").each((_, el) => { const u = resolveResource($(el).attr("poster"), effectiveBase); if (u) $(el).attr("poster", makeResourceUrl(u, effectiveBase, sid)); });
   $("track[src]").each((_, el) => { const u = resolveResource($(el).attr("src"), effectiveBase); if (u) $(el).attr("src", makeResourceUrl(u, effectiveBase, sid)); });
   
@@ -2020,28 +3633,28 @@ function rewriteHtml(html, base, sid = "", bridgeToken = "") {
     if (preloadMarkup) $("head").first().prepend(preloadMarkup);
   }
 
-  return injectRuntime(restoreInlineScriptBlocks($.html(), protectedScripts.originals), base, sid, bridgeToken);
+  return injectRuntime(restoreAndRewriteInlineScriptBlocks($.html(), protectedScripts.originals, effectiveBase, sid), base, sid, watchPlayer);
 }
 
 const SEARCH_STOP_WORDS = new Set([
   "a","an","and","are","as","at","be","by","for","from","has","have","how","in","is","it","of","on","or","that","the","this","to","was","what","when","where","which","who","why","with","you","your"
 ]);
 function tokenizeSearch(value) {
-  const raw = String(value || "").toLocaleLowerCase();
-  const tokens = raw.normalize("NFKC").match(/[\p{L}\p{N}][\p{L}\p{N}'_-]{1,63}/gu) || [];
-  return tokens.map(x => x.replace(/^['_-]+|['_-]+$/g, "")).filter(x => x && (x.length > 1 || /\d/.test(x)) && !SEARCH_STOP_WORDS.has(x));
+  return unicodeWords(value).filter(x => !SEARCH_STOP_WORDS.has(x));
 }
 function parseSearchQuery(query) {
-  const source = String(query || "").trim().slice(0, CFG.maxSearchQueryChars);
+  const input = String(query || "").trim();
+  const raw = input.slice(0, CFG.maxSearchQueryChars);
+  const siteScope = parseSiteScope(input);
+  const source = siteScope.text.slice(0, CFG.maxSearchQueryChars);
   const phrases = [];
-  const stripped = source.replace(/"([^\"]{1,160})"/g, (_, phrase) => { phrases.push(phrase.trim().toLocaleLowerCase()); return " "; });
-  const filters = { site: "", intitle: "", inurl: "" };
+  const stripped = source.replace(/"([^\"]{1,160})"/g, (_, phrase) => { phrases.push(normalizeSearchText(phrase.trim())); return " "; });
+  const filters = { site: siteScope.include.at(-1) || "", intitle: "", inurl: "" };
   const negative = [];
   const positiveRaw = [];
   for (const part of stripped.split(/\s+/).filter(Boolean)) {
-    if (/^site:[^\s]+$/i.test(part)) filters.site = part.slice(5).toLocaleLowerCase();
-    else if (/^intitle:[^\s]+$/i.test(part)) filters.intitle = part.slice(8).toLocaleLowerCase();
-    else if (/^inurl:[^\s]+$/i.test(part)) filters.inurl = part.slice(6).toLocaleLowerCase();
+    if (/^intitle:[^\s]+$/i.test(part)) filters.intitle = normalizeSearchText(part.slice(8));
+    else if (/^inurl:[^\s]+$/i.test(part)) filters.inurl = normalizeSearchText(part.slice(6));
     else if (/^-[^\s-]+$/.test(part)) negative.push(...tokenizeSearch(part.slice(1)));
     else positiveRaw.push(part);
   }
@@ -2050,9 +3663,9 @@ function parseSearchQuery(query) {
   terms = [...new Set(terms)].slice(0, CFG.maxSearchQueryTerms);
   const negativeTerms = [...new Set(negative)].slice(0, CFG.maxSearchQueryTerms);
   const normalizedPhrases = [...new Set(phrases)].filter(Boolean).slice(0, 8);
-  return { raw: source, terms, negativeTerms, phrases: normalizedPhrases, filters };
+  return { raw, terms, negativeTerms, phrases: normalizedPhrases, filters, siteScope };
 }
-function searchFieldHas(doc, field, term) { return String(doc[field] || "").toLocaleLowerCase().includes(term); }
+function searchFieldHas(doc, field, term) { return normalizeSearchText(doc[field]).includes(term); }
 function removeIndexedDocument(doc) {
   if (!doc?.termFreq) return;
   for (const term of doc.termFreq.keys()) {
@@ -2072,14 +3685,17 @@ function extractPageMeta(text, url) {
   const title = String($("title").first().text() || $("h1").first().text() || "").replace(/\s+/g, " ").trim().slice(0, 300) || hostOf(url);
   const description = String($("meta[name='description'],meta[property='og:description']").first().attr("content") || "").replace(/\s+/g, " ").trim().slice(0, 600);
   const headings = String($("h1,h2,h3").map((_, el) => $(el).text()).get().join(" | ") || "").replace(/\s+/g, " ").trim().slice(0, 1200);
-  const bodyText = String($("main,article").first().text() || $("body").text() || "").replace(/\s+/g, " ").trim();
+  // Preserve word boundaries between adjacent HTML blocks (notably headings
+  // followed by paragraphs), without splitting inline formatting.
+  $("h1,h2,h3,h4,h5,h6,p,li,br,dt,dd,td,th,div,section").after(" ");
+  const bodyText = String($("main,article").first().text() || $("body").text() || "").replace(/\s+/g, " ").trim().slice(0, CFG.maxIndexTextChars);
   const textContent = (description ? `${description} ` : "") + bodyText;
   const snippet = description || bodyText.slice(0, 600) || title;
   let favicon = "";
   const rawIcon = $("link[rel~='icon'],link[rel='shortcut icon']").first().attr("href");
   if (rawIcon) favicon = resolveResource(rawIcon, url) || "";
   const canonical = resolveNavigation($("link[rel='canonical']").attr("href"), url);
-  const lang = String($("html").attr("lang") || "").slice(0, 32);
+  const lang = languageTag($("html").attr("lang") || $("html").attr("xml:lang"));
   const allText = `${title} ${headings} ${textContent} ${url}`;
   const termFreq = new Map();
   for (const term of tokenizeSearch(allText)) termFreq.set(term, (termFreq.get(term) || 0) + 1);
@@ -2124,6 +3740,7 @@ function indexDocument(url, text, precomputedMeta = null) {
       host: meta.host,
       path: meta.path,
       wordCount: meta.wordCount,
+      searchImages: meta.searchImages || [],
       indexedAt: now(),
       termFreq: meta.termFreq
     };
@@ -2136,6 +3753,34 @@ function indexDocument(url, text, precomputedMeta = null) {
     return null;
   }
 }
+function indexNeuralPage(page, query = "") {
+  const url = normalizeUrl(page?.url);
+  if (!url || page.indexable === false) return null;
+  const searchImages = isReferenceImageSource(url) && Array.isArray(page.images) ? page.images.slice(0, 20) : [];
+  if ((!page.text || page.text.length < 80) && !searchImages.length) return null;
+  const title = String(page.title || hostOf(url)).replace(/\s+/g, " ").trim().slice(0, 300);
+  const headings = Array.isArray(page.headings) ? page.headings.join(" | ").replace(/\s+/g, " ").trim().slice(0, 1200) : "";
+  const description = String(page.metadata?.description || page.metadata?.["og:description"] || "").replace(/\s+/g, " ").trim().slice(0, 600);
+  const text = String(page.text || "")
+    .replace(/\b(?:jump to content|main menu|move to sidebar|hide navigation|search search|appearance|donate|contribute|help learn to edit|community portal|recent changes|upload file|special pages|add to word list|audio player|play pronunciation|cookie settings)\b/gi, " ")
+    .replace(/\s+/g, " ").trim().slice(0, CFG.maxIndexTextChars);
+  const termFreq = new Map();
+  for (const term of tokenizeSearch(`${title} ${headings} ${description} ${text} ${url} ${searchImages.map(image => image.title).join(" ")}`)) termFreq.set(term, (termFreq.get(term) || 0) + 1);
+  const doc = indexDocument(url, text, {
+    title, description, headings, snippet: description || text.slice(0, 600), text,
+    favicon: "", canonical: url, lang: page.language || "", host: hostOf(url), path: pathOf(url),
+    wordCount: Math.max(1, tokenizeSearch(text).length), termFreq, searchImages
+  });
+  if (doc) {
+    doc.indexedBy = "neural-crawler";
+    doc.sourceQuery = String(query || "").slice(0, CFG.maxSearchQueryChars);
+    doc.neuralScore = Number(page.score || 0);
+    doc.queryRelevance = Number(page.queryRelevance || 0);
+    doc.contentHash = crypto.createHash("sha1").update(text).digest("hex");
+    void mongoStore.upsertSearchDocument(doc);
+  }
+  return doc;
+}
 function invalidateSearchCaches() { searchCache.clear(); }
 function makeSearchSnippet(doc, parsed) {
   const source = String(doc.snippet || doc.text || doc.description || doc.title || "").replace(/\s+/g, " ").trim();
@@ -2146,10 +3791,13 @@ function makeSearchSnippet(doc, parsed) {
   const start = Math.max(0, hit - 90), end = Math.min(source.length, start + 300);
   return `${start > 0 ? "…" : ""}${source.slice(start, end)}${end < source.length ? "…" : ""}`;
 }
-function localSearch(query, offset, limit) {
+function localSearch(query, offset, limit, options = {}) {
   const parsed = parseSearchQuery(query);
   const N = searchIndex.size;
-  if (!N) return { total: 0, results: [], indexSize: 0, terms: parsed.terms, filters: parsed.filters };
+  if (!N || (options.requireTerms && !parsed.terms.length)) return { total: 0, results: [], indexSize: N, terms: parsed.terms, filters: parsed.filters };
+  // Day buckets keep millisecond timing from reordering otherwise tied pages
+  // between feed requests; the final URL comparison breaks exact ties.
+  const dayMs = 86_400_000, rankingDay = Math.floor(Date.now() / dayMs);
   const candidateScores = new Map();
   const k1 = 1.35, b = 0.75;
   let avgLen = 0;
@@ -2165,11 +3813,21 @@ function localSearch(query, offset, limit) {
   }
   for (const url of candidateUrls) {
     const doc = searchIndex.get(url); if (!doc) continue;
-    const host = doc.host.toLocaleLowerCase();
-    if (parsed.filters.site && !(host === parsed.filters.site || host.endsWith(`.${parsed.filters.site}`))) continue;
+    if (options.privacy && !allowsSearchResult(options.privacy, doc)) continue;
+    if (options.onlyWithImages && !doc.searchImages?.length) continue;
+    if (options.onlyWatchPages && !indexedWatchPage(doc.url)) continue;
+    if (options.onlyIndianProducts && !isIndianProductUrl(doc.url)) continue;
+    if (!allowsSiteUrl(parsed.siteScope, doc.url)) continue;
     if (parsed.filters.intitle && !searchFieldHas(doc, "title", parsed.filters.intitle)) continue;
-    if (parsed.filters.inurl && !String(doc.url).toLocaleLowerCase().includes(parsed.filters.inurl)) continue;
+    if (parsed.filters.inurl && !searchFieldHas(doc, "url", parsed.filters.inurl)) continue;
     if (parsed.negativeTerms.some(term => doc.termFreq.has(term) || searchFieldHas(doc, "url", term))) continue;
+    if (options.topical && parsed.terms.length) {
+      const matched = parsed.terms.filter(term => doc.termFreq.has(term));
+      if (matched.length < minimumMatches(parsed.terms.length) || parsed.terms.some(term => /\d/.test(term) && !doc.termFreq.has(term))) continue;
+      const headingWords = new Set(tokenizeSearch(`${doc.title} ${doc.headings} ${doc.url}`));
+      if (!matched.some(term => headingWords.has(term)) && !(parsed.terms.length > 1 &&
+        ` ${tokenizeSearch(`${doc.description} ${doc.text}`).join(" ")} `.includes(` ${parsed.terms.join(" ")} `))) continue;
+    }
     let score = 0;
     for (const term of parsed.terms) {
       const postings = invertedIndex.get(term); const tf = postings?.get(doc.url) || 0; const df = postings?.size || 0;
@@ -2184,17 +3842,19 @@ function localSearch(query, offset, limit) {
       if (searchFieldHas(doc, "description", term)) score += 0.9 * idf;
     }
     for (const phrase of parsed.phrases) {
-      const phraseText = `${doc.title} ${doc.headings} ${doc.text} ${doc.description}`.toLocaleLowerCase();
+      const phraseText = normalizeSearchText(`${doc.title} ${doc.headings} ${doc.text} ${doc.description}`);
       if (phraseText.includes(phrase)) score += 7;
     }
     if (!parsed.terms.length && (doc.title || doc.description)) score += 0.05;
-    const ageDays = Math.max(0, (Date.now() - Date.parse(doc.indexedAt || now())) / 86400000);
+    const indexedAt = Date.parse(doc.indexedAt);
+    const ageDays = Number.isFinite(indexedAt) ? Math.max(0, rankingDay - Math.floor(indexedAt / dayMs)) : 0;
     score += 0.25 / (1 + ageDays);
     if (score > 0) candidateScores.set(doc.url, score);
   }
   const ranked = [...candidateScores.entries()].map(([url, score]) => {
     const neural = neuralModel.scoreUrl(url, { type: "html", internal: true });
-    return [url, score + (neural - 0.5) * 0.35, neural];
+    const regionalBoost = india(options.region) ? indiaAffinity(searchIndex.get(url)) : 0;
+    return [url, score * (1 + regionalBoost * 0.16) + (neural - 0.5) * 0.35, neural];
   }).sort((a,b) => b[1] - a[1] || a[0].localeCompare(b[0]));
   const total = ranked.length;
   const results = ranked.slice(offset, offset + limit).map(([url, score, neuralScore]) => {
@@ -2202,15 +3862,85 @@ function localSearch(query, offset, limit) {
     return {
       title: doc.title, url: doc.url, snippet: makeSearchSnippet(doc, parsed), displayUrl: doc.displayUrl,
       favicon: doc.favicon || searchFavicon(doc.url), source: "veyra-index", score: Number(score.toFixed(4)), neuralScore: Number(neuralScore.toFixed(4)),
-      indexedAt: doc.indexedAt, lang: doc.lang, domain: doc.host
+      indexedAt: doc.indexedAt, lang: doc.lang, domain: doc.host,
+      ...(options.includeText ? { canonicalUrl: doc.url, contentText: String(doc.text || "").slice(0, Math.max(1000, Math.min(60000, Number(options.maxTextChars) || 30000))), description: doc.description || "", headings: doc.headings || "" } : {})
     };
   });
   return { total, results, indexSize: N, terms: parsed.terms, filters: parsed.filters };
 }
+// Do not turn the public Images tab into an unfiltered index of arbitrary
+// third-party imagery. Crawl metadata for other sites is not surfaced here.
+function isReferenceImageSource(url) {
+  let host;
+  try { const u = new URL(url); if (u.protocol !== "https:" || u.port) return false; host = u.hostname; } catch { return false; }
+  return ["nasa.gov", "noaa.gov", "usgs.gov", "si.edu", "nhm.ac.uk", "esa.int"]
+    .some(domain => host === domain || host.endsWith(`.${domain}`));
+}
+function localVideoSearch(query, offset, limit, region) {
+  return localSearch(query, offset, limit, { region, onlyWatchPages: true, requireTerms: !parseSiteScope(query).include.length, topical: true });
+}
+function localImageSearch(query, region) {
+  const parsed = parseSearchQuery(query);
+  if ((!parsed.terms.length && !parsed.siteScope.include.length) || parsed.siteScope.invalid) return [];
+  const { results } = localSearch(query, 0, 40, { region, onlyWithImages: true });
+  const feeds = results.filter(page => isReferenceImageSource(page.url)).map(page => {
+    const candidates = [];
+    for (const item of searchIndex.get(page.url)?.searchImages || []) {
+      const url = publicImageUrl(item.url, page.url);
+      if (!url || !isReferenceImageSource(url)) continue;
+      const title = item.title || page.title;
+      let path = new URL(url).pathname;
+      try { path = decodeURIComponent(path); } catch {}
+      const words = new Set(tokenizeSearch(`${item.title || (item.primary ? page.title : "")} ${path.replace(/[-_]/g, " ")}`));
+      if (parsed.terms.length && !parsed.terms.some(term => words.has(term))) continue;
+      candidates.push({ url, imageUrl: url, sourcePageUrl: page.url, source: hostOf(page.url), thumbnail: url, title, snippet: page.title });
+    }
+    return candidates;
+  });
+  // A single long article must not use up every slot before other publishers.
+  const images = [], seen = new Set();
+  for (let i = 0; i < 20; i++) for (const feed of feeds) {
+    if (!feed[i]) continue;
+    const id = imageIdentity(feed[i].imageUrl);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    images.push(feed[i]);
+    if (images.length === 24) return images;
+  }
+  return images;
+}
 function localSearchSuggestions(query, limit = 8) {
-  const prefix = String(query || "").trim().toLocaleLowerCase().split(/\s+/).pop() || "";
-  const source = prefix ? [...termCounts.keys()].filter(t => t.startsWith(prefix)) : [...termCounts.keys()];
-  return source.sort((a,b) => (termCounts.get(b) || 0) - (termCounts.get(a) || 0) || a.localeCompare(b)).slice(0, limit);
+  const typed = String(query || "").trimStart().slice(0, CFG.maxSearchQueryChars);
+  if (!typed.trim() || parseSiteScope(typed).active || /[\u0000-\u001f\u007f]/.test(typed)) return [];
+  const fragment = /[\p{L}\p{M}\p{N}'’-]+$/u.exec(typed);
+  if (!fragment && !typed.endsWith(" ")) return [];
+  const prefix = normalizeSearchText(fragment?.[0] || "");
+  const lead = fragment ? typed.slice(0, fragment.index) : typed;
+  const context = [...new Set(tokenizeSearch(lead))].slice(-4);
+  const anchors = context.map(term => invertedIndex.get(term)).filter(Boolean).sort((a,b) => a.size - b.size);
+  if (!prefix && !anchors.length) return [];
+  const nearby = new Map();
+  const nextWord = context.at(-1);
+  let visited = 0;
+  for (const [url] of anchors[0] || []) {
+    if (++visited > 100) break;
+    if (!anchors.every(postings => postings.has(url))) continue;
+    const doc = searchIndex.get(url);
+    for (const field of [doc?.title, doc?.headings, doc?.description]) {
+      const words = tokenizeSearch(field);
+      const found = new Map();
+      for (let i = 0; i < words.length; i++) {
+        const term = words[i];
+        if (term !== prefix && term.startsWith(prefix) && !context.includes(term)) {
+          found.set(term, Math.max(found.get(term) || 0, nextWord && words[i - 1] === nextWord ? 4 : 1));
+        }
+      }
+      for (const [term, weight] of found) nearby.set(term, (nearby.get(term) || 0) + weight);
+    }
+  }
+  const source = prefix ? [...termCounts.keys()].filter(term => term !== prefix && term.startsWith(prefix) && !context.includes(term)) : [...nearby.keys()];
+  return source.sort((a,b) => (nearby.get(b) || 0) - (nearby.get(a) || 0) || (termCounts.get(b) || 0) - (termCounts.get(a) || 0) || a.localeCompare(b))
+    .slice(0, limit).map(term => `${lead}${term}`);
 }
 function editDistance(a, b) {
   const prev = Array.from({ length: b.length + 1 }, (_, i) => i);
@@ -2326,7 +4056,7 @@ function addLink(job, rawUrl, hint, source, reason = "discovered") {
     
     
     if (job.pageAccelerator && u !== job.root) return true;
-    if (job.pagesDiscovered >= CFG.maxPages || !robotsAllowed(u, job.robots)) return true;
+    if (job.pagesDiscovered >= CFG.maxPages || (sameOrigin(u, job.root) && !robotsAllowed(u, job.robots))) return true;
     job.pagesDiscovered += 1;
     job.pageFrontier.add({ url: u, type, source: source || null, reason, priority }, priority, key);
     return true;
@@ -2458,7 +4188,8 @@ function discoverHtml(job, text, base, depth = 0) {
     const rel = String($(el).attr("rel") || "").toLowerCase();
     const as = String($(el).attr("as") || "").toLowerCase();
     let hint = rel.includes("stylesheet") ? "css" : as === "script" ? "js" : as === "style" ? "css" : as === "image" ? "image" : as === "font" ? "font" : /video|audio/.test(as) ? "media" : rel.includes("manifest") ? "manifest" : (rel.includes("canonical") || rel.includes("alternate") || rel.includes("amphtml")) ? "html" : typeFor($(el).attr("href"));
-    const reason = rel.includes("preload") ? "preload" : rel.includes("modulepreload") ? "modulepreload" : rel.includes("canonical") ? "canonical" : "link";
+    const reason = hasRel(rel, "alternate") && languageTag($(el).attr("hreflang")) ? "locale-alternate"
+      : rel.includes("preload") ? "preload" : rel.includes("modulepreload") ? "modulepreload" : rel.includes("canonical") ? "canonical" : "link";
     addLink(job, $(el).attr("href"), hint, effectiveBase, reason);
   });
   $("script[src]").each((_, el) => addLink(job, $(el).attr("src"), "js", effectiveBase, "script"));
@@ -2581,9 +4312,31 @@ function discoverMediaManifest(job, text, base) {
   if(isHls){for(const line of src.split(/\r?\n/)){const raw=line.trim();if(!raw||raw.startsWith('#'))continue;const u=resolveResource(raw,base);if(u)addLink(job,u,'media',base,'media-manifest');}return;}
   if(/<MPD[\s>]/i.test(src)||/dash\+xml|\.mpd(?:$|[?#])/i.test(base)){for(const m of src.matchAll(/(?:media|initialization|sourceURL|href)\s*=\s*["']([^"']+)["']/gi)){const u=resolveResource(m[1],base);if(u)addLink(job,u,'media',base,'media-manifest');}for(const m of src.matchAll(/<BaseURL[^>]*>([^<]+)<\/BaseURL>/gi)){const u=resolveResource(m[1].trim(),base);if(u)addLink(job,u,'media',base,'media-manifest');}}
 }
+function isHlsPlaylistType(contentType) {
+  return /^(?:application|audio)\/(?:vnd\.apple\.|x-)?mpegurl(?:\s*;|$)/i.test(String(contentType || "").trim());
+}
 function rewriteMediaManifest(text, base, sid='') {
   const src=String(text||'');
-  if(/^#EXTM3U/m.test(src)||/mpegurl|\.m3u8(?:$|[?#])/i.test(base))return src.split(/\r?\n/).map(line=>{const raw=line.trim();if(!raw||raw.startsWith('#'))return line;const u=resolveResource(raw,base);return u?makeResourceUrl(u,base,sid):line;}).join('\n');
+  if (/^\uFEFF?#EXTM3U(?:\r?\n|$)/.test(src)) {
+    const proxyUri = raw => {
+      if (/\{\$[A-Za-z0-9_-]+\}/.test(raw)) return raw;
+      const url = resolveResource(raw, base);
+      return url ? makeResourceUrl(url, base, sid) : raw;
+    };
+    return src.split(/(\r?\n)/).map((line, i) => {
+      if (i % 2) return line;
+      const raw = line.trim();
+      if (!raw) return line;
+      if (!raw.startsWith("#")) return proxyUri(raw);
+      // Some references are in attributes rather than on their own line
+      // (alternate renditions, initialization maps, low-latency parts).
+      // Consume whole quoted values so commas inside NAME, VALUE or URI
+      // aren't mistaken for attribute separators.
+      return line.replace(/^(\s*#EXT-X-[A-Z0-9-]+:)(.*)$/, (_, prefix, attributes) =>
+        prefix + attributes.replace(/(^|,)([A-Z0-9-]+)=("[^"]*"|[^,]*)/g, (attr, separator, name, value) =>
+          name === "URI" && /^"[^"]*"$/.test(value) ? `${separator}URI="${proxyUri(value.slice(1, -1))}"` : attr));
+    }).join("");
+  }
   if(/<MPD[\s>]/i.test(src)||/dash\+xml|\.mpd(?:$|[?#])/i.test(base)){const $=cheerio.load(src,{decodeEntities:false,xmlMode:true});$('[media],[initialization],[sourceURL],[href],BaseURL').each((_,el)=>{if(String(el.tagName||'').toLowerCase()==='baseurl'){const raw=$(el).text().trim();const u=resolveResource(raw,base);if(u)$(el).text(makeResourceUrl(u,base,sid));return;}for(const attr of ['media','initialization','sourceURL','href']){const raw=$(el).attr(attr);if(raw){const u=resolveResource(raw,base);if(u)$(el).attr(attr,makeResourceUrl(u,base,sid));}}});return $.xml();}
   return src;
 }
@@ -2602,15 +4355,16 @@ function createJob(root, options = {}) {
   return {
     id, root, url: root, createdAt: now(), pageAccelerator, pageAcceleratorWarmMs: pageWarmMs, pageAcceleratorHardMs: pageHardMs, warmDeadlineAt: pageAccelerator ? Date.now() + pageWarmMs : 0, pageAcceleratorHardDeadlineAt: pageAccelerator ? Date.now() + pageHardMs : 0, fastPhaseComplete: false, finishedAt: null, done: false, stopRequested: false, status: "queued", statusText: "Queued",
     pageFrontier: new PriorityFrontier(CFG.maxPendingQueue), resourceFrontier: new PriorityFrontier(CFG.maxPendingQueue), criticalResourceFrontier: new PriorityFrontier(Math.min(CFG.maxPendingQueue, CFG.criticalResourceBudget * 4)), visited: new Set(), discovered: new Set(), retryCounts: new Map(),
-    resources: [], links: [], logs: [], logSeq: 0, sourceDir: path.join(ROOT, id), sourceFiles: 0, textBytesStored: 0,
+    resources: [], links: [], logs: [], logSeq: 0, sourceDir: path.join(ROOT, id), sourceFiles: 0, textBytesStored: 0, pendingSourceFiles: 0, pendingSourceBytes: 0,
     activeWorkers: 0, activeHtmlWorkers: 0, activeAssetWorkers: 0, processed: 0, pagesDiscovered: 0, resourcesScheduled: 0, crossOriginResources: 0, sitemapLoading: false, browserDiscoveredCount: 0, browserDiscoveredHosts: new Set(),
     crawlOrigins: new Set([new URL(root).origin]),
     hostPolicy: new Map(),
-    robots: null, robotsReady: false, sitemaps: new Set(), challengeHosts: new Set(), hostActive: new Map(), hostCooldowns: new Map(), hostLastRequested: new Map(), hostFailures: new Map(), hostDelayMs: 0, stopReason: null, backgroundPaused: false,
-    counts: { htmlPages: 0, css: 0, js: 0, data: 0, assets: 0, links: 0, bytesScanned: 0, bytesStored: 0, bytesDiscarded: 0, requestCount: 0, retries: 0, challenges: 0, errors: 0 },
+    robots: null, robotsByOrigin: new Map(), robotsReady: false, sitemaps: new Set(), challengeHosts: new Set(), hostActive: new Map(), hostCooldowns: new Map(), hostLastRequested: new Map(), hostFailures: new Map(), stopReason: null, backgroundPaused: false,
+    counts: { htmlPages: 0, renderedHtmlPages: 0, css: 0, js: 0, data: 0, assets: 0, links: 0, bytesScanned: 0, bytesStored: 0, bytesDiscarded: 0, requestCount: 0, retries: 0, challenges: 0, errors: 0 },
     controller: new AbortController(),
     dnsCache: new Map(),
     robotPool: null,
+    finalRobotReport: null,
     robotEvents: []
   };
 }
@@ -2627,7 +4381,7 @@ function publicJob(job) {
     searchIndex: searchIndexStats(),
     robotsLoaded: job.robotsReady, sitemapsFound: job.sitemaps.size, sourceFiles: job.sourceFiles, textBytesStored: job.textBytesStored,
     resourceCount: job.resources.length, linkCount: job.links.length, browserDiscovered: job.browserDiscoveredCount || 0, browserDiscoveredHosts: job.browserDiscoveredHosts?.size || 0, criticalQueue: job.criticalResourceFrontier.size, logs: job.logs.slice(-120),
-    robotMesh: job.robotPool ? { summary: job.robotPool.report(1).summary } : null,
+    robotMesh: job.robotPool || job.finalRobotReport ? { summary: job.robotPool?.report(1).summary || job.finalRobotReport.summary } : null,
     queue: { critical: job.criticalResourceFrontier.snapshot().slice(0, 50), pages: job.pageFrontier.snapshot().slice(0, 50), resources: job.resourceFrontier.snapshot().slice(0, 50) }
   };
 }
@@ -2676,6 +4430,8 @@ async function fetchResourceProbe(item, opts) {
   const headOpts = { ...opts, method: "HEAD", body: undefined, retries: Math.min(1, opts.retries ?? 0) };
   const head = await fetchCached(item.url, headOpts);
   if (head.status >= 200 && head.status < 400 && (head.contentType || head.contentLength)) return head;
+  if (head.status === 429 || head.status >= 500) return head;
+  await opts.beforeProbe?.(item.url);
   const rangeOpts = { ...opts, method: "GET", range: "bytes=0-65535", limit: 64 * 1024, limitForContentType: () => 64 * 1024, retries: Math.min(1, opts.retries ?? 0) };
   return fetchCached(item.url, rangeOpts);
 }
@@ -2714,39 +4470,42 @@ async function processItem(job, item) {
   if (job.stopRequested) return;
   const key = linkKey(item.type, item.url); if (job.visited.has(key)) return;
   job.visited.add(key);
-  if (item.type === "html" && (!crawlOriginAllowed(job, item.url) || !robotsAllowed(item.url, job.robots))) return;
+  if (item.type === "html" && !crawlOriginAllowed(job, item.url)) return;
   if (job.counts.bytesScanned >= CFG.maxScanBytes) { job.stopRequested = true; job.stopReason = "scan-byte-limit"; return; }
   const host = hostOf(item.url);
   if (job.challengeHosts.has(host)) return;
-  const previousCooldown = job.hostCooldowns.get(host) || 0;
-  if (previousCooldown > Date.now()) await sleep(previousCooldown - Date.now());
-  const last = job.hostLastRequested.get(host) || 0;
-  if (job.hostDelayMs && last + job.hostDelayMs > Date.now()) await sleep(last + job.hostDelayMs - Date.now());
-  job.hostLastRequested.set(host, Date.now());
   const accept = item.type === "html" ? "text/html,application/xhtml+xml,application/xml,text/plain;q=0.4,*/*;q=0.05" : "text/css,application/javascript,text/javascript,application/json,image/avif,image/webp,image/apng,image/svg+xml,image/*,font/*,video/*,audio/*,*/*;q=0.05";
   try {
+    const checkPolicy = url => assertCrawlAllowed(job, url, item.type === "html" ? item.url : "");
+    const remainingCooldown = (job.hostCooldowns.get(host) || 0) - Date.now();
+    if (remainingCooldown > 0) await wait(remainingCooldown, undefined, { signal: job.controller.signal });
+    await checkPolicy(item.url);
     job.counts.requestCount += 1;
-    const r = await fetchResourceProbe(item, { accept, limit: CFG.maxTextBytesPerResource, limitForContentType: crawlLimitForContentType, timeout: job.pageAccelerator ? Math.min(CFG.requestTimeoutMs, LEAN_MODE ? 3500 : 8000) : CFG.requestTimeoutMs, retries: job.pageAccelerator ? Math.min(1, CFG.maxRetries) : CFG.maxRetries, referrer: item.source || "", dnsCache: job.dnsCache, signal: job.controller.signal, bodyTimeoutMs: job.pageAccelerator ? Math.min(CFG.bodyTimeoutMs, LEAN_MODE ? 4000 : 8000) : CFG.bodyTimeoutMs });
+    const r = await fetchResourceProbe(item, { accept, limit: CFG.maxTextBytesPerResource, limitForContentType: crawlLimitForContentType, timeout: job.pageAccelerator ? Math.min(CFG.requestTimeoutMs, LEAN_MODE ? 3500 : 8000) : CFG.requestTimeoutMs, retries: job.pageAccelerator ? Math.min(1, CFG.maxRetries) : CFG.maxRetries, referrer: item.source || "", dnsCache: job.dnsCache, signal: job.controller.signal, beforeRedirect: checkPolicy, beforeProbe: checkPolicy, bodyTimeoutMs: job.pageAccelerator ? Math.min(CFG.bodyTimeoutMs, LEAN_MODE ? 4000 : 8000) : CFG.bodyTimeoutMs });
+    if (job.controller.signal.aborted) return;
     job.counts.bytesScanned += r.bytes;
     if (r.retries) job.counts.retries += r.retries;
     if (r.truncated || r.tooLarge) { job.counts.bytesDiscarded += r.bytes; jobLog(job, "warn", `Response skipped after size limit: ${item.url}`); return; }
     if (job.counts.bytesScanned > CFG.maxScanBytes) { job.stopRequested = true; job.stopReason = "scan-byte-limit"; return; }
     const lower = r.contentType.toLowerCase();
     const finalUrl = r.finalUrl || item.url;
-    if (finalUrl && sameRedirectHost(finalUrl, item.url)) { try { job.crawlOrigins.add(new URL(finalUrl).origin); } catch {} }
+    // A permitted CDN asset can have its own origin. It must not make that
+    // origin eligible for pages (including later sitemap alternates).
+    if (item.type === "html" && finalUrl && sameRedirectHost(finalUrl, item.url)) {
+      try { job.crawlOrigins.add(new URL(finalUrl).origin); } catch {}
+    }
     if (r.linkHeader) discoverLinkHeader(job, r.linkHeader, finalUrl);
     const challenge = detectChallenge(r.body.toString("utf8"), r.contentType, r.status, { server: r.serverHeader, "cf-mitigated": r.cfMitigated });
     if (challenge) {
       job.counts.challenges += 1;
       job.challengeHosts.add(host);
-      job.status = "challenge";
-      if (item.url === job.root) job.stopRequested = true;
+      if (item.url === job.root) { job.status = "challenge"; job.stopRequested = true; }
       jobLog(job, "warn", `Security verification detected; crawl branch stopped: ${item.url}`);
       return;
     }
     if (!r.ok) {
-      job.counts.errors += 1;
       if ([400,401,403,404,405,410,422].includes(r.status)) {
+        job.counts.errors += 1;
         const resourceLike = item.type !== "html";
         jobLog(job, resourceLike ? "debug" : "warn", resourceLike ? `HTTP ${r.status}; resource unavailable: ${item.url}` : `HTTP ${r.status}; page not indexed: ${item.url}`, { type: item.type, source: item.source || null });
         return;
@@ -2755,6 +4514,7 @@ async function processItem(job, item) {
     }
     let type = item.type;
     if (lower.includes("text/html") || lower.includes("application/xhtml+xml")) type = "html";
+    if (type === "html" && !crawlOriginAllowed(job, finalUrl)) return;
     else if (lower.includes("text/css")) type = "css";
     else if (lower.includes("javascript") || lower.includes("ecmascript")) type = "js";
     else if (/json|xml|text\/plain|graphql/.test(lower)) type = "data";
@@ -2767,17 +4527,48 @@ async function processItem(job, item) {
     const isTextType = type === "html" || type === "css" || type === "js" || type === "data";
     const text = isTextType ? r.body.toString("utf8") : "";
     const id = job.resources.length;
-    const sourceFile = isTextType ? await sourceStore.write(job, id, text) : null;
     const resource = {
       id, url: r.finalUrl || item.url, requestedUrl: item.url, type, status: r.status, contentType: r.contentType,
-      bytes: r.bytes, bytesLabel: bytesLabel(r.bytes), truncated: r.truncated, sourceFile, inlinePreview: sourceFile ? "" : (isTextType ? text.slice(0, 8000) : ""), sourceId: item.source || null,
+      bytes: r.bytes, bytesLabel: bytesLabel(r.bytes), truncated: r.truncated, sourceFile: null, inlinePreview: isTextType ? text.slice(0, 8000) : "", sourceId: item.source || null,
       redirectChain: r.redirectChain || [], revalidated: !!r.revalidated
     };
+    // Reserve the array index synchronously. Reads of a published row wait only for its own write.
     job.resources.push(resource);
+    if (isTextType) {
+      resource.sourcePending = sourceStore.write(job, id, text).then(file => {
+        resource.sourceFile = file;
+        if (file) resource.inlinePreview = "";
+      }).catch(error => {
+        jobLog(job, "warn", `Could not store crawl source ${id}: ${error.code || error.message}`);
+      });
+      await resource.sourcePending;
+      delete resource.sourcePending;
+    }
     const link = job.links.find(x => x.url === item.url || x.url === resource.url); if (link) { link.captured = true; link.redirectChain = resource.redirectChain; link.url = resource.url; }
     job.hostFailures.set(host, 0); job.hostCooldowns.delete(host); noteHostSuccess(job, host);
     if (type === "html") {
-      job.counts.htmlPages += 1; await discoverContent(job, "html", text, resource.url, r.contentType);
+      job.counts.htmlPages += 1;
+      // Crawler upgrade (8.20.0): JS-heavy pages have an empty HTML shell — everything
+      // is rendered client-side after fetch. When the real browser engine is available,
+      // render the page in Chromium so the search index gets the real DOM text and
+      // link discovery sees the actual navigation graph, not the raw un-executed source.
+      const signals = browserCapabilitySignals(text, { "content-type": r.contentType });
+      if (signals.heavy && canRenderHtmlWithBrowser(job)) {
+        const rendered = await renderHtmlWithBrowser(job, resource.url, text);
+        if (rendered) {
+          jobLog(job, "info", `Rendered JS-heavy page with real browser engine (${rendered.textLen} chars of DOM text vs ${rendered.rawTextLen} in raw HTML, ${rendered.renderMs}ms): ${item.url}`);
+          // Use the browser's final URL (after redirects) as the canonical page for indexing/discovery.
+          const finalResourceUrl = sameOrigin(rendered.finalUrl || resource.url, resource.url) ? rendered.finalUrl : resource.url;
+          // discoverContent indexes HTML internally — pass the rendered body through it exactly once.
+          await discoverContent(job, "html", rendered.html, finalResourceUrl, r.contentType);
+          job.counts.renderedHtmlPages += 1;
+          job.counts.bytesStored += Math.min(rendered.html.length, CFG.maxTextBytesPerResource);
+          return; // skip the raw-HTML path below.
+        } else {
+          jobLog(job, "debug", `Browser render unavailable/failed for JS-heavy page; falling back to raw HTML: ${item.url}`);
+        }
+      }
+      await discoverContent(job, "html", text, resource.url, r.contentType);
       job.counts.bytesStored += Math.min(r.bytes, CFG.maxTextBytesPerResource);
     } else if (type === "css") {
       job.counts.css += 1; await discoverContent(job, "css", text, resource.url, r.contentType);
@@ -2796,6 +4587,7 @@ async function processItem(job, item) {
     }
     if (job.processed && job.processed % 100 === 0) jobLog(job, "debug", `Processed ${job.processed.toLocaleString()} resources; ${bytesLabel(job.counts.bytesScanned)} scanned.`);
   } catch (e) {
+    if (job.controller.signal.aborted || e.code === "OPERATION_CANCELLED" || e.code === "CRAWL_POLICY") return;
     job.counts.errors += 1;
     const failures = (job.hostFailures.get(host) || 0) + 1;
     job.hostFailures.set(host, failures);
@@ -2817,6 +4609,63 @@ async function processItem(job, item) {
     const noisyError = item.type === "html" || status >= 500 || status === 429;
     jobLog(job, status === 429 ? "warn" : (noisyError ? "error" : "debug"), `Fetch failed ${item.url} — ${e.name || "Error"}: ${e.message}`, { retryClass: statusRetryClass(status), type: item.type, source: item.source || null });
   } finally { job.processed += 1; }
+}
+/** Crawler upgrade: render a JS-heavy HTML page in a real Chromium session so we index actual DOM text. */
+function canRenderHtmlWithBrowser(job) {
+  // Test-injectable gate so a controlled test can force-enable without a real Chromium.
+  try { if (app.locals && app.locals.veyraCrawlRenderHtml) return true; } catch {}
+  if (!browserEngine) return false;
+  try { if (browserEngine.cfg?.browserEnabled === false) return false; } catch {}
+  if (job.pageAccelerator && CFG.leanMode) return false; // lean+accelerator: don't pay the render cost.
+  // only when the engine is actually ready
+  try {
+    const st = browserEngine.status?.();
+    if (st && typeof st.sessions === "number" && st.sessions > 0) return true;
+  } catch {}
+  // fall back to: browserEnabled is set AND browser engine has any sessions or is startable
+  try {
+    if (browserEngine.browser || browserEngine.startPromise) return true;
+  } catch {}
+  return CFG.browserEnabled === true;
+}
+async function renderHtmlWithBrowser(job, url, rawHtml) {
+  if (job.stopRequested) return null;
+  // Test-injectable render path: replace the real browser engine with a mock.
+  const injectedRender = (typeof app !== "undefined" && app.locals && app.locals.veyraCrawlRenderHtml) || null;
+  if (injectedRender) return injectedRender(job, url, rawHtml);
+  if (!browserEngine) return null;
+  if (job.stopRequested) return null;
+  const startedAt = Date.now();
+  const tabId = `crawl-${job.id}-${Date.now()}`;
+  let sid = null;
+  try {
+    const created = await browserEngine.create(tabId, url, job.id, null, { fastStart: true });
+    sid = created?.id || null;
+    if (!sid) return null;
+    // Never index a verification or error page as the page's real content.
+    if (created?.verification || (created?.status && !["NORMAL", "LOADING"].includes(created.status))) return null;
+    if (created?.error) return null;
+    const rendered = await browserEngine.renderedContent(sid, 8000);
+    const html = String(rendered?.html || "");
+    const rawVisibleText = visibleTextOfHtml(rawHtml);
+    const renderedVisibleText = visibleTextOfHtml(html);
+    // Only use the render if JS actually added meaningful visible content beyond the raw shell.
+    if (renderedVisibleText.length <= rawVisibleText.length + 100) return null;
+    return {
+      html, textLen: renderedVisibleText.length, rawTextLen: rawVisibleText.length,
+      renderMs: Date.now() - startedAt, finalUrl: rendered.url, title: rendered.title,
+    };
+  } catch (e) {
+    jobLog(job, "debug", `Browser render for ${url} errored: ${e?.message}`);
+    return null;
+  } finally {
+    if (sid) { try { await browserEngine.stop(sid); } catch {} }
+  }
+}
+function visibleTextOfHtml(html) {
+  const $ = require("cheerio").load(String(html || ""), { decodeEntities: false });
+  $("script,style,noscript,template").remove();
+  return String($("body").text() || "").replace(/\s+/g, " ").trim();
 }
 class CooperativeRobotPool {
   constructor(job) {
@@ -3217,18 +5066,18 @@ async function runCrawl(job) {
   job.robotFleet = CFG.logicalRobots;
   job.networkSlots = CFG.maxActiveFetches;
   job.robotPool = new CooperativeRobotPool(job);
+  let sitemapPass;
   try {
     await loadRobots(job);
-    if (!job.stopRequested && !job.pageAccelerator) {
+    if (!job.stopRequested && !job.pageAccelerator && !job.robots.unreachable) {
       job.sitemapLoading = true;
-      void loadSitemaps(job).catch(e => jobLog(job, "debug", `Sitemap pass failed: ${e.message}`)).finally(() => { job.sitemapLoading = false; });
+      sitemapPass = loadSitemaps(job).catch(e => jobLog(job, "debug", `Sitemap pass failed: ${e.message}`)).finally(() => { job.sitemapLoading = false; });
     }
     job.status = "crawling";
     job.statusText = job.pageAccelerator
       ? `Fast page warm-up with ${effectiveCrawlerConcurrency(job)} network workers…`
       : `Exhaustive same-origin crawl with ${CFG.logicalRobots.toLocaleString()} cooperative robots…`;
     await job.robotPool.run();
-    job.done = true; job.finishedAt = now();
     if (job.status === "challenge") job.statusText = "Security verification required; crawl stopped.";
     else if (job.stopRequested && job.stopReason === "scan-byte-limit") { job.status = "done"; job.statusText = `Scan budget reached (${bytesLabel(CFG.maxScanBytes)}).`; }
     else if (job.stopRequested && job.stopReason === "resource-limit") { job.status = "done"; job.statusText = `Resource safety limit reached (${CFG.maxResources.toLocaleString()}).`; }
@@ -3237,11 +5086,20 @@ async function runCrawl(job) {
     else if (job.stopRequested && job.stopReason === "abandoned") { job.status = "stopped"; job.statusText = "Stopped automatically — nobody has checked this crawl for a while (CRAWL_ABANDON_MS)."; }
     else if (job.stopRequested && job.stopReason === "shutdown") { job.status = "stopped"; job.statusText = "Stopped — server is shutting down."; }
     else if (job.stopRequested) { job.status = "stopped"; job.statusText = "Stopped by user."; }
+    else if (job.robots.unreachable) { job.status = "deferred"; job.statusText = "Crawl deferred: robots.txt was unreachable."; }
     else { job.status = "done"; job.statusText = `Complete — ${job.processed.toLocaleString()} resources scanned.`; }
-    jobLog(job, job.status === "done" ? "info" : "warn", job.statusText, { robots: job.robotPool.report(12).summary });
-    void mongoStore.saveCrawlSummary(job);
   } catch (e) {
-    job.done = true; job.finishedAt = now(); job.status = "error"; job.statusText = e.message || "Crawler error"; jobLog(job, "error", e.stack || e.message);
+    job.stopRequested = true;
+    job.status = "error"; job.statusText = e.message || "Crawler error"; jobLog(job, "error", e.stack || e.message);
+  } finally {
+    if (job.stopRequested) job.controller.abort();
+    if (sitemapPass) await sitemapPass;
+    if (job.robotPool.activePromises.size) await Promise.allSettled([...job.robotPool.activePromises]);
+    job.finalRobotReport = job.robotPool.report(100);
+    job.robotPool = null;
+    job.robotsByOrigin.clear();
+    job.done = true; job.finishedAt = now();
+    jobLog(job, job.status === "done" ? "info" : "warn", job.statusText, { robots: job.finalRobotReport.summary });
     void mongoStore.saveCrawlSummary(job);
   }
 }
@@ -3383,7 +5241,7 @@ function browserCapabilitySignals(html = "", headers = {}) {
   const spa = /__next|__nuxt|webpack|vite|react|angular|vue|svelte|ng-version|roblox|rbxcdn|rbx\.com/i.test(text);
   
   
-  const gameOrRemoteBrowser = /roblox\.com|rbxcdn\.com|browser\.lol|now\.gg|play\.google\.com\/store|geforce\.com\/games/i.test(lower);
+  const gameOrRemoteBrowser = /roblox\.com|rbxcdn\.com|browser\.lol|now\.gg|play\.google\.com\/store|geforce\.com\/games|msn\.com\/[a-z-]+\/play\/games|\/play\/games\/cg-|casualgamesgameplay|poki\.com\/[a-z-]+\/g\/|crazygames\.com\/[a-z0-9-]+\/|miniclip\.com\/game|kongregate\.com\/games|itch\.io\/embed|gamepix\.com\/play/i.test(lower);
   const scriptHeavy = scriptCount >= CFG.proxyJsHeavyThreshold && (fetchSignals >= 1 || moduleCount > 0 || shellSignals);
   const spaHeavy = spa && (fetchSignals >= 2 || shellSignals || moduleCount > 0);
   const heavy = shellSignals || fetchSignals >= 4 || scriptHeavy || spaHeavy || gameOrRemoteBrowser;
@@ -3401,10 +5259,14 @@ const FORCE_BROWSER_HOSTS = new Set([
 ]);
 function hostNeedsRealBrowser(url) {
   try {
-    const h = new URL(url).hostname.toLowerCase().replace(/^www\./, "");
+    const u = new URL(url);
+    const h = u.hostname.toLowerCase().replace(/^www\./, "");
     if (FORCE_BROWSER_HOSTS.has(h) || FORCE_BROWSER_HOSTS.has("www." + h)) return true;
     if (/(^|\.)roblox\.com$/.test(h) || /(^|\.)rbxcdn\.com$/.test(h)) return true;
     if (/(^|\.)browser\.lol$/.test(h)) return true;
+    // MSN casual games (PolyTrack etc.) are MSAL-authenticated WebGL apps that
+    // refuse to hydrate through the fast proxy — they need real Chromium.
+    if (/(^|\.)msn\.com$/.test(h) && /^\/[a-z-]+\/play\/games\//i.test(u.pathname)) return true;
   } catch {}
   return false;
 }
@@ -3426,6 +5288,7 @@ app.post('/api/browser/capability', async (req, res) => {
   const raw = normalizeUrl(String(req.body?.url || ''));
   if (!raw) return respondError(res, 400, 'Invalid URL.', 'INVALID_URL');
   const proxySessionId = String(req.body?.proxySessionId || req.body?.sessionId || "");
+  const youtubeHome = youtubeCompat.isYoutubeHomePage(raw);
 
   
   
@@ -3452,7 +5315,7 @@ app.post('/api/browser/capability', async (req, res) => {
 
   try {
     await assertPublicUrl(raw);
-    const result = await fetchCached(raw, { accept: 'text/html,application/xhtml+xml', limit: Math.min(CFG.maxProxyTextBytes, 1024 * 1024), timeout: CFG.requestTimeoutMs, retries: 0, referrer: '' });
+    const result = await fetchCached(raw, { private: !canCacheSession(sessionManager.peek(proxySessionId)), sessionId: proxySessionId, accept: 'text/html,application/xhtml+xml', limit: Math.min(CFG.maxProxyTextBytes, 1024 * 1024), timeout: CFG.requestTimeoutMs, retries: 0, referrer: '' });
     const signals = browserCapabilitySignals(result.body?.toString('utf8') || '', { 'content-type': result.contentType });
     const challenge = detectChallenge(result.body?.toString('utf8') || '', result.contentType, result.status, { server: result.serverHeader, 'cf-mitigated': result.cfMitigated, finalUrl: result.finalUrl });
     
@@ -3460,26 +5323,36 @@ app.post('/api/browser/capability', async (req, res) => {
     
     
     const lean = CFG.leanMode && !CFG.leanAutoBrowser;
-    const forceBrowser = hostNeedsRealBrowser(result.finalUrl || raw) || signals.gameOrRemoteBrowser;
+    // When the browser engine is disabled (free plan / lean mode), never tell
+    // the client to use the browser engine — it does not exist. Fall back to
+    // FAST_PROXY so the fast proxy iframe is used directly instead of waiting
+    // for a Chromium session that will never start.
+    const browserAvailable = CFG.browserEnabled === true;
+    const forceBrowser = browserAvailable && (hostNeedsRealBrowser(result.finalUrl || raw) || signals.gameOrRemoteBrowser || youtubeHome);
     
     
     
     
     signals.fullPage = fullPage.hasFullPageState(result.body?.toString('utf8') || '');
     let mode = 'FAST_PROXY';
-    if (challenge || forceBrowser) mode = 'BROWSER_ENGINE';
-    else if (signals.heavy) mode = (lean || signals.fullPage) ? 'ACCELERATED_PROXY' : 'BROWSER_ENGINE';
+    if (browserAvailable && (challenge || forceBrowser)) mode = 'BROWSER_ENGINE';
+    else if (signals.heavy) mode = (lean || signals.fullPage || !browserAvailable) ? 'ACCELERATED_PROXY' : 'BROWSER_ENGINE';
     
     const failoverInfo = failoverController ? failoverController.breakerStatus(proxySessionId) : null;
     if (mode === 'BROWSER_ENGINE' && failoverInfo && failoverInfo.state === 'open') {
       mode = 'FAST_PROXY';
     }
-    const hasSnapshot = snapshotStore ? await snapshotStore.has(proxySessionId, result.finalUrl || raw) : false;
+    const hasSnapshot = snapshotStore && CFG.sessionCacheEnabled && canCacheSession(sessionManager.peek(proxySessionId))
+      ? await snapshotStore.has(proxySessionId, result.finalUrl || raw) : false;
     res.json({ ok: true, url: result.finalUrl || raw, mode, lean: CFG.leanMode, challenge: challenge ? challenge.type : null, forceBrowser: !!forceBrowser, signals, fullPage: signals.fullPage, status: result.status, contentType: result.contentType, failover: failoverInfo, snapshot: hasSnapshot });
   } catch (e) {
-    
-    const forceBrowser = hostNeedsRealBrowser(raw);
-    res.json({ ok: true, url: raw, mode: forceBrowser ? 'BROWSER_ENGINE' : (CFG.leanMode ? 'ACCELERATED_PROXY' : 'BROWSER_ENGINE'), lean: CFG.leanMode, forceBrowser, reason: 'capability_probe_failed', error: e.message });
+    // When the browser engine is disabled, never fall back to BROWSER_ENGINE;
+    // the client would wait for a Chromium session that will never start.
+    const forceBrowser = CFG.browserEnabled === true && (hostNeedsRealBrowser(raw) || youtubeHome);
+    // When Chromium is disabled, fall back to ACCELERATED_PROXY regardless of
+    // lean mode — the browser engine is not running on this server.
+    const mode = forceBrowser ? 'BROWSER_ENGINE' : (CFG.browserEnabled !== true ? 'ACCELERATED_PROXY' : (CFG.leanMode ? 'ACCELERATED_PROXY' : 'BROWSER_ENGINE'));
+    res.json({ ok: true, url: raw, mode, lean: CFG.leanMode, forceBrowser, reason: 'capability_probe_failed', error: e.message });
   }
 });
 
@@ -3492,14 +5365,24 @@ app.post('/api/youtube/resolve', async (req, res) => {
   if (!raw || !youtubeCompat.isYoutubeUrl(raw)) return respondError(res, 400, 'Not a YouTube URL.', 'INVALID_URL');
   const parsed = youtubeCompat.parseYoutubeUrl(raw);
   if (!parsed) return respondError(res, 400, 'No playable video ID found in this URL.', 'YOUTUBE_NO_VIDEO_ID');
-  const check = await youtubeCompat.checkEmbeddable(parsed.videoId, fetchOfficialJson);
-  if (!check.ok) return res.json({ ok: false, code: check.code, videoId: parsed.videoId });
+  let check;
+  try { check = await youtubeCompat.checkEmbeddable(parsed.videoId, app.locals.veyraYoutubeFetch || fetchOfficialJson); }
+  catch { check = { ok: false, code: 'YOUTUBE_UNAVAILABLE' }; }
+  if (!check?.ok) return res.json({ ok: false, code: check?.code || 'YOUTUBE_UNAVAILABLE', videoId: parsed.videoId, kind: parsed.kind, isShortsUrl: parsed.kind === 'shorts', metadataSource: 'youtube-oembed', playbackVerified: false });
   res.json({
     ok: true,
     videoId: parsed.videoId,
+    kind: parsed.kind,
+    isShortsUrl: parsed.kind === 'shorts',
+    startSeconds: parsed.startSeconds,
+    list: parsed.list,
+    index: parsed.index,
+    canonicalUrl: `https://www.youtube.com/watch?v=${encodeURIComponent(parsed.videoId)}`,
     title: check.title,
     authorName: check.authorName,
     thumbnailUrl: check.thumbnailUrl,
+    metadataSource: 'youtube-oembed',
+    playbackVerified: false,
     embedUrl: youtubeCompat.buildEmbedUrl(parsed, req.get('origin') || undefined),
   });
 });
@@ -3530,7 +5413,14 @@ function validateExtensionPackage(pkg) {
   const matches = pkg.matches == null ? [] : Array.isArray(pkg.matches) ? pkg.matches.map(String).slice(0, 30) : [];
   if (matches.some(x => x.length > 120 || /[\r\n]/.test(x))) throw new Error("Invalid extension match pattern.");
   const integrity = crypto.createHash("sha256").update(JSON.stringify({ id, version: String(pkg.version || "1.0.0"), matches, css })).digest("hex");
-  return { schema: "veyra-extension/v1", id, name, version: String(pkg.version || "1.0.0").slice(0, 20), description: String(pkg.description || "").slice(0, 300), author: String(pkg.author || "").slice(0, 100), publisher: String(pkg.publisher || "").slice(0, 100), permissions: ["styles"], matches, files: { "style.css": css }, published: !!pkg.published, verified: true, integrity };
+  return { schema: "veyra-extension/v1", id, name, version: String(pkg.version || "1.0.0").slice(0, 20), description: String(pkg.description || "").slice(0, 300), author: String(pkg.author || "").slice(0, 100), publisher: String(pkg.publisher || "").slice(0, 100), permissions: ["styles"], matches, files: { "style.css": css }, published: !!pkg.published, verified: true, integrity,
+    // Preserve the store catalog metadata (category, tags, rating, install
+    // count, updated date) that the frontend uses to group the store list.
+    category: String(pkg.category || "other").slice(0, 40),
+    tags: Array.isArray(pkg.tags) ? pkg.tags.map(String).slice(0, 8) : [],
+    rating: Number(pkg.rating) >= 0 && Number(pkg.rating) <= 5 ? Number(pkg.rating) : 0,
+    installs: Number(pkg.installs) >= 0 ? Number(pkg.installs) : 0,
+    updated: String(pkg.updated || "").slice(0, 20) };
 }
 function readExtensionStore() {
   let raw = []; try { raw = JSON.parse(fs.readFileSync(EXT_STORE_FILE, "utf8")); } catch { raw = []; }
@@ -3546,26 +5436,47 @@ const vpnErrStatus = code => ({ VPN_DISABLED: 503, VPN_NOT_CONFIGURED: 404, VPN_
 
 
 
-app.get('/health', (req, res) => res.json({ ok: true, uptime: Math.round(process.uptime()), plan: VEYRA_CONFIG.plan.label, time: new Date().toISOString() }));
-app.get('/api/health', (req, res) => res.json({ ok: true, uptime: Math.round(process.uptime()), plan: VEYRA_CONFIG.plan.label, time: new Date().toISOString() }));
+const deployRevision = /^[a-f0-9]{40}$/i.test(process.env.RENDER_GIT_COMMIT || "") ? process.env.RENDER_GIT_COMMIT : "";
+app.get(['/health', '/api/health'], (req, res) => res.set("Cache-Control", "no-store")
+  .json({ ok: true, uptime: Math.round(process.uptime()), plan: VEYRA_CONFIG.plan.label, time: new Date().toISOString(),
+    ...(deployRevision ? { revision: deployRevision } : {}) }));
 
-app.get('/api/vpn/status', (req, res) => {
-  res.json({ ok: true, ...vpnManager.status() });
+let vpnProfileHydration, vpnProfileRefreshAt = 0;
+function loadConfiguredVpnProfiles() {
+  if (!mongoStore.enabled || Date.now() < vpnProfileRefreshAt) return Promise.resolve();
+  if (vpnProfileHydration) return vpnProfileHydration;
+  vpnProfileHydration = (async () => {
+    for (const row of await mongoStore.loadVpnProfiles()) {
+      const profile = vpnManager.parseProfile(row);
+      if (profile && !vpnManager.get(profile.id)) vpnManager.addProfile(profile);
+    }
+    vpnProfileRefreshAt = Date.now() + 30_000;
+  })().finally(() => { vpnProfileHydration = null; });
+  return vpnProfileHydration;
+}
+app.get('/api/vpn/status', async (req, res) => {
+  await loadConfiguredVpnProfiles().catch(() => {});
+  res.set("Cache-Control", "no-store").json({ ok: true, ...vpnManager.status() });
 });
-app.get('/api/vpn/profiles', (req, res) => res.json({ ok: true, profiles: vpnManager.list(), defaultProfile: vpnManager.defaultProfileId || null }));
-app.post('/api/vpn/test', requireAdmin, async (req, res) => {
+app.get('/api/vpn/profiles', async (req, res) => {
+  await loadConfiguredVpnProfiles().catch(() => {});
+  res.set("Cache-Control", "no-store").json({ ok: true, enabled: vpnManager.enabled, profiles: vpnManager.list(), defaultProfile: vpnManager.defaultProfileId || null });
+});
+app.post('/api/vpn/test', async (req, res) => {
   try {
     const result = await vpnManager.test(String(req.body?.profileId || ''));
     res.json({ ok:true, ...result });
   } catch (e) { respondError(res, vpnErrStatus(e.code), e.message, e.code || 'VPN_TEST_ERROR', { profile: e.profile }); }
 });
-app.post('/api/vpn/health', requireAdmin, async (req, res) => {
+app.post('/api/vpn/health', async (req, res) => {
   if (!vpnManager.enabled) return respondError(res, 503, 'Veyra VPN is disabled on this server.', 'VPN_DISABLED');
   res.json({ ok: true, results: await vpnManager.checkAll(), profiles: vpnManager.list() });
 });
-app.post('/api/vpn/connect', requireSessionAccess, async (req, res) => {
+app.post('/api/vpn/connect', async (req, res) => {
   try {
     const sid = normalizeSessionId(req.body?.sessionId || req.body?.sid);
+    if (sessionManager.checkLimit(sid)) return respondError(res, 410, "Session expired.", "SESSION_EXPIRED");
+    const record = sessionRecord(sid);
     const requested = String(req.body?.profileId || '');
     
     
@@ -3573,12 +5484,13 @@ app.post('/api/vpn/connect', requireSessionAccess, async (req, res) => {
     
     const candidate = vpnManager.get(requested);
     if (candidate) await vpnManager.test(candidate.id);
+    if (record.abort.signal.aborted || sessionManager.checkLimit(sid)) return respondError(res, 410, "Session expired.", "SESSION_EXPIRED");
     const result = vpnManager.connect(sid, requested, { region: String(req.body?.region || ''), group: String(req.body?.group || '') });
-    const ps = sessionRecord(sid); ps.vpnProfileId = result.profile?.id || null;
+    record.vpnProfileId = result.profile?.id || null;
     res.json({ ok:true, ...result, note:'Every request from this Veyra session (proxy, crawler and Chromium) now leaves through the VPN exit. If the tunnel drops, the kill switch blocks traffic instead of falling back to the server IP.' });
   } catch (e) { respondError(res, vpnErrStatus(e.code), e.message, e.code || 'VPN_CONNECT_ERROR'); }
 });
-app.post('/api/vpn/disconnect', requireSessionAccess, (req, res) => {
+app.post('/api/vpn/disconnect', (req, res) => {
   try {
     const sid = normalizeSessionId(req.body?.sessionId || req.body?.sid);
     vpnManager.disconnect(sid);
@@ -3586,7 +5498,7 @@ app.post('/api/vpn/disconnect', requireSessionAccess, (req, res) => {
     res.json({ ok:true, connected:false });
   } catch (e) { respondError(res, 400, e.message, e.code || 'VPN_DISCONNECT_ERROR'); }
 });
-app.post('/api/vpn/rotate', requireSessionAccess, (req, res) => {
+app.post('/api/vpn/rotate', (req, res) => {
   try {
     const sid = normalizeSessionId(req.body?.sessionId || req.body?.sid);
     const result = vpnManager.rotate(sid);
@@ -3594,11 +5506,11 @@ app.post('/api/vpn/rotate', requireSessionAccess, (req, res) => {
     res.json({ ok: true, ...result });
   } catch (e) { respondError(res, vpnErrStatus(e.code), e.message, e.code || 'VPN_ROTATE_ERROR'); }
 });
-app.get('/api/vpn/session', requireSessionAccess, (req, res) => {
+app.get('/api/vpn/session', (req, res) => {
   const sid = String(req.query.sid || req.query.sessionId || '');
   res.json({ ok: true, ...vpnManager.sessionInfo(sid) });
 });
-app.get('/api/vpn/ip', requireSessionAccess, async (req, res) => {
+app.get('/api/vpn/ip', async (req, res) => {
   const sid = String(req.query.sid || req.query.sessionId || '');
   try { res.json({ ok: true, ...(await vpnManager.exitIpForSession(sid)) }); }
   catch (e) { respondError(res, vpnErrStatus(e.code) === 400 ? 502 : vpnErrStatus(e.code), e.message, e.code || 'VPN_IP_ERROR'); }
@@ -3607,7 +5519,7 @@ app.get('/api/vpn/ip', requireSessionAccess, async (req, res) => {
 
 
 
-app.get('/api/vpn/list', requireAdmin, async (req, res) => {
+app.get('/api/vpn/list', async (req, res) => {
   try {
     const dbProfiles = mongoStore.enabled ? (await mongoStore.loadVpnProfiles()) : [];
     const envProfiles = vpnManager.list().map(p => ({ ...p, source: 'env' }));
@@ -3621,7 +5533,7 @@ app.get('/api/vpn/list', requireAdmin, async (req, res) => {
   } catch (e) { respondError(res, 500, e.message, 'VPN_LIST_ERROR'); }
 });
 
-app.post('/api/vpn/custom', requireAdmin, async (req, res) => {
+app.post('/api/vpn/custom', async (req, res) => {
   const { name, type, server, username, password, region, config, id } = req.body || {};
   if (!name) return respondError(res, 400, 'VPN name is required', 'VPN_NAME_REQUIRED');
   const validTypes = ['socks5', 'http', 'https', 'wireguard'];
@@ -3661,7 +5573,7 @@ app.post('/api/vpn/custom', requireAdmin, async (req, res) => {
   }
 });
 
-app.delete('/api/vpn/custom/:profileId', requireAdmin, async (req, res) => {
+app.delete('/api/vpn/custom/:profileId', async (req, res) => {
   const pid = String(req.params.profileId || '');
   if (!pid) return respondError(res, 400, 'Profile ID is required', 'VPN_ID_REQUIRED');
   vpnManager.removeProfile(pid);
@@ -3676,34 +5588,86 @@ function sessionInfo(sid, rec) {
   const expiresAt = sessionManager.expiresAt(rec);
   return { sessionId: sid, active: true, createdAt: new Date(rec.createdAt).toISOString(), lastUsed: new Date(rec.lastUsed).toISOString(),
     timeLimitMs: (rec.timeLimitMs ?? sessionManager.timeLimitMs) || null, expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null, remainingMs: sessionManager.remainingMs(rec),
-    idleExpiresInMs: Math.max(0, CFG.sessionIdleTtlMs - (Date.now() - rec.lastUsed)), cookies: rec.cookies.size, requests: rec.requests,
-    serverTime: new Date().toISOString(), incognito: !!rec.incognito, vpn: vpnManager.sessionInfo?.(sid) || null };
+    idleExpiresInMs: Math.max(0, sessionManager.idleTtlMs - (Date.now() - rec.lastUsed)), cookies: rec.cookies.size, requests: rec.requests,
+    serverTime: new Date().toISOString(), guest: !rec.userId, incognito: !!rec.incognito, vpn: vpnManager.sessionInfo?.(sid) || null };
 }
 app.get('/api/sessions', requireAdmin, (req, res) => res.json({ ok: true, ...sessionManager.report(), vpnConnections: vpnManager.status().connections, browser: { sessions: browserEngine.sessions.size, running: !!browserEngine.browser }, failover: failoverController ? failoverController.report() : null, snapshots: snapshotStore ? snapshotStore.report() : null }));
-
+function sessionPolicySummary() {
+  return {
+    ...runtimeSessionPolicy,
+    activeSessions: sessionManager.size,
+    note: 'Changes apply immediately to new sessions. Active-session duration changes require applyExisting=true.'
+  };
+}
+app.get('/api/admin/session-policy', requireAdmin, (req, res) => res.json({ ok: true, policy: sessionPolicySummary() }));
+app.put('/api/admin/session-policy', requireAdmin, (req, res) => {
+  const body = req.body || {};
+  const clamp = (value, min, max, label) => {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n < min || n > max) throw Object.assign(new Error(`${label} must be between ${min} and ${max}.`), { code: 'SESSION_POLICY_INVALID', status: 400 });
+    return Math.round(n);
+  };
+  try {
+    // Inputs are milliseconds so the API remains unambiguous; the panel uses minutes.
+    const guest = clamp(body.guestTimeLimitMs, 0, 7 * 24 * 60 * 60 * 1000, 'Guest session limit');
+    const admin = clamp(body.adminTimeLimitMs, 0, 7 * 24 * 60 * 60 * 1000, 'Admin session limit');
+    const idle = clamp(body.idleTtlMs, 60 * 1000, 24 * 60 * 60 * 1000, 'Idle timeout');
+    const age = clamp(body.maxAgeMs, 10 * 60 * 1000, 7 * 24 * 60 * 60 * 1000, 'Maximum age');
+    const max = clamp(body.maxSessions, 10, 5000, 'Maximum sessions');
+    Object.assign(runtimeSessionPolicy, { guestTimeLimitMs: guest, adminTimeLimitMs: admin, idleTtlMs: idle, maxAgeMs: age, maxSessions: max });
+    sessionManager.timeLimitMs = guest;
+    sessionManager.idleTtlMs = idle;
+    sessionManager.hardTtlMs = age;
+    sessionManager.maxSessions = max;
+    sessionManager.enforceCap();
+    let applied = 0;
+    if (body.applyExisting === true) {
+      for (const rec of sessionManager.sessions.values()) {
+        rec.timeLimitMs = rec.role === 'admin' ? admin : guest;
+        rec.renewedMs = 0;
+        applied += 1;
+      }
+      // Do not leave sessions usable until the next sweep after shortening a policy.
+      void sessionManager.sweep();
+    }
+    serverLog('info', 'SESSION', `Admin updated session policy: guest=${guest}ms admin=${admin}ms idle=${idle}ms age=${age}ms max=${max}${body.applyExisting === true ? `; applied to ${applied} active session(s)` : ''}.`);
+    res.json({ ok: true, policy: sessionPolicySummary(), appliedExisting: applied });
+  } catch (e) { respondError(res, e.status || 400, e.message, e.code || 'SESSION_POLICY_INVALID'); }
+});
 app.post('/api/session', (req, res) => {
   const user = authStore.userFromRequest(req);
   const sid = crypto.randomUUID().replaceAll("-", "");
   const isAdmin = !!(user && authStore.roleFor(user.email) === "admin");
-  const limit = isAdmin ? CFG.adminSessionTimeLimitMs : CFG.sessionTimeLimitMs;
+  const limit = isAdmin ? runtimeSessionPolicy.adminTimeLimitMs : runtimeSessionPolicy.guestTimeLimitMs;
   const rec = sessionManager.create(sid, { timeLimitMs: limit });
   rec.userId = user?.id || null;
   rec.role = isAdmin ? "admin" : "user";
-  // Separate high-entropy capability: session IDs can occur in proxy URLs, while
-  // state-changing/session-inspection APIs require this non-URL credential.
-  rec.accessToken = crypto.randomBytes(32).toString("base64url");
+  
   rec.incognito = req.body?.incognito === true;
-  res.status(201).json({ ok: true, ...sessionInfo(sid, rec), sessionToken: rec.accessToken, user: user ? authStore.publicUser(user) : null });
+  res.status(201).json({ ok: true, ...sessionInfo(sid, rec), user: user ? authStore.publicUser(user) : null });
 });
-app.get('/api/session/:sid', requireSessionAccess, (req, res) => {
+// (Removed) /api/handoff/login, /api/handoff/return and
+// /api/handoff/cookies (bookmarklet + paste cookie import). Sign-in and
+// verification happen inside the fast proxy in the session's own cookie
+// jar; no cookie ever crosses between the user's browser and a Veyra
+// session, or between two Veyra sessions. The session-cookie endpoints
+// below remain: the app uses them to display and clear the session's own
+// jar (devtools cookie panel), never to import foreign cookies.
+app.get('/api/session/:sid', (req, res) => {
   const sid = String(req.params.sid);
   if (sessionManager.checkLimit(sid)) return res.json({ ok: true, sessionId: sid, active: false, expired: true, reason: "SESSION_EXPIRED" });
   const rec = sessionManager.peek(sid);
   if (!rec) return res.json({ ok: true, sessionId: sid, active: false });
   res.json({ ok: true, ...sessionInfo(sid, rec) });
 });
+app.post('/api/session/:sid/heartbeat', (req, res) => {
+  const sid = String(req.params.sid);
+  if (sessionManager.checkLimit(sid)) return respondError(res, 410, "Session expired due to inactivity or its time limit.", "SESSION_EXPIRED");
+  let rec; try { rec = sessionManager.touch(sid); } catch (e) { return respondError(res, e.status || 400, e.message, e.code || "SESSION_ERROR"); }
+  res.json({ ok: true, ...sessionInfo(sid, rec) });
+});
 
-app.get('/api/session/:sid/cookies', requireSessionAccess, (req, res) => {
+app.get('/api/session/:sid/cookies', (req, res) => {
   const sid = String(req.params.sid);
   if (sessionManager.checkLimit(sid)) return respondError(res, 410, "Session expired.", "SESSION_EXPIRED");
   const rec = sessionManager.peek(sid);
@@ -3713,7 +5677,7 @@ app.get('/api/session/:sid/cookies', requireSessionAccess, (req, res) => {
     .map(c => ({ name: c.name, value: c.value, domain: (c.hostOnly ? "" : ".") + c.domain.replace(/^\./, ""), path: c.path, secure: c.secure, expires: c.expiresAt ? new Date(c.expiresAt).toISOString() : "Session", size: c.name.length + String(c.value).length }));
   res.json({ ok: true, cookies });
 });
-app.delete('/api/session/:sid/cookies', requireSessionAccess, (req, res) => {
+app.delete('/api/session/:sid/cookies', (req, res) => {
   const rec = sessionManager.peek(String(req.params.sid));
   if (!rec) return res.json({ ok: true, deleted: 0 });
   const name = String(req.query.name || ""), domain = String(req.query.domain || "").replace(/^\./, "").toLowerCase();
@@ -3721,7 +5685,7 @@ app.delete('/api/session/:sid/cookies', requireSessionAccess, (req, res) => {
   for (const [k, c] of [...rec.cookies]) if ((!name || c.name === name) && (!domain || c.domain.replace(/^\./, "") === domain)) { rec.cookies.delete(k); n += 1; }
   res.json({ ok: true, deleted: n });
 });
-app.post('/api/session/:sid/prefs', requireSessionAccess, (req, res) => {
+app.post('/api/session/:sid/prefs', (req, res) => {
   const sid = String(req.params.sid);
   if (sessionManager.checkLimit(sid)) return respondError(res, 410, "Session expired.", "SESSION_EXPIRED");
   let rec; try { rec = sessionManager.touch(sid); } catch (e) { return respondError(res, e.status || 400, e.message, e.code || "SESSION_ERROR"); }
@@ -3729,8 +5693,8 @@ app.post('/api/session/:sid/prefs', requireSessionAccess, (req, res) => {
   res.json({ ok: true, prefs: rec.prefs, blocked: rec.blocked || 0 });
 });
 const closeSession = (req, res) => { const closed = sessionManager.close(String(req.params.sid)); res.json({ ok: true, closed }); };
-app.delete('/api/session/:sid', requireSessionAccess, closeSession);
-app.post('/api/session/:sid/close', express.text({ type: () => true, limit: '4kb' }), requireSessionAccess, closeSession);
+app.delete('/api/session/:sid', closeSession);
+app.post('/api/session/:sid/close', express.text({ type: () => true, limit: '4kb' }), closeSession);
 
 
 
@@ -3751,22 +5715,156 @@ function requireAdmin(req, res, next) {
   if (!CFG.adminGate || isAdminRequest(req)) return next();
   respondError(res, 403, "This area is for Veyra administrators only.", "ADMIN_REQUIRED");
 }
-app.post('/api/auth/signup', (req, res) => { try { res.status(201).json({ ok: true, ...authStore.signup(req.body || {}, clientIp(req)) }); } catch (e) { authFail(res, e); } });
+function isGateStaffRequest(req) {
+  if (accessGate?.isAdminRequest(req)) return true;
+  const user = authStore.userFromRequest(req);
+  return !!(user && user.email !== authStore.testAdminEmail && authStore.roleFor(user.email) === "admin");
+}
+function requireGateStaff(req, res, next) {
+  res.set("Cache-Control", "no-store");
+  if (isGateStaffRequest(req)) return next();
+  return respondError(res, 403, "This area is for Veyra administrators only.", "ADMIN_REQUIRED");
+}
+app.post("/api/gate/admin/login", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  try { res.json({ ok: true, ...authStore.login(req.body || {}, clientIp(req), { staffOnly: true }) }); }
+  catch (e) { authFail(res, e); }
+});
+app.post('/api/auth/signup', (req, res) => { try { res.status(201).json({ ok: true, ...authStore.signup(req.body || {}, clientIp(req), { allowAdminEnrollment: accessGate.isAdminRequest(req) }) }); } catch (e) { authFail(res, e); } });
 app.post('/api/auth/login', (req, res) => { try { res.json({ ok: true, ...authStore.login(req.body || {}, clientIp(req)) }); } catch (e) { authFail(res, e); } });
 app.get('/api/auth/me', requireUser, (req, res) => {
   const user = req.veyraUser;
   const admin = authStore.roleFor(user.email) === "admin";
-  res.json({ ok: true, user: authStore.publicUser(user), sessionTimeLimitMs: admin ? CFG.adminSessionTimeLimitMs : CFG.sessionTimeLimitMs });
+  res.json({ ok: true, user: authStore.publicUser(user), sessionTimeLimitMs: admin ? runtimeSessionPolicy.adminTimeLimitMs : runtimeSessionPolicy.guestTimeLimitMs });
 });
 app.patch('/api/auth/me', requireUser, (req, res) => { try { res.json({ ok: true, ...authStore.update(req.veyraUser, req.body || {}) }); } catch (e) { authFail(res, e); } });
 app.delete('/api/auth/me', requireUser, (req, res) => { try { authStore.remove(req.veyraUser, req.body?.password); res.json({ ok: true }); } catch (e) { authFail(res, e); } });
 app.post('/api/auth/logout', (req, res) => { const user = authStore.userFromRequest(req); if (user && req.body?.everywhere) authStore.logoutEverywhere(user); res.json({ ok: true }); });
 app.get('/api/auth/data', requireUser, (req, res) => res.json({ ok: true, data: authStore.getData(req.veyraUser), updatedAt: req.veyraUser.dataUpdatedAt || null }));
 app.put('/api/auth/data', requireUser, (req, res) => { try { res.json({ ok: true, ...authStore.setData(req.veyraUser, req.body?.data) }); } catch (e) { authFail(res, e); } });
+// ---------- Veyra Access Gate routes ----------
+function gateRedirectTarget(token) {
+  const base = String(CFG.frontendUrl || "/").replace(/\/$/, "");
+  const sep = base.includes("?") ? "&" : "?";
+  return base === "/" || base === "." ? `/?gate=${encodeURIComponent(token)}` : `${base}${sep}gate=${encodeURIComponent(token)}`;
+}
+app.get("/gate", (req, res) => res.set("Cache-Control", "no-store").status(403).type("html").send(accessGate.enabled ? accessGate.screenHtml() : "<!doctype html><title>Veyra</title>"));
+app.get("/gate/:token", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  if (accessGate.staffOnly) return res.status(403).type("html").send(accessGate.screenHtml());
+  if (!accessGate.enabled) return res.redirect("/");
+  const token = String(req.params.token || "");
+  if (!accessGate.validateEntryToken(token)) {
+    res.setHeader("X-Veyra-Gate", "invalid-token");
+    return res.status(403).type("html").send(accessGate.screenHtml().replace("<title>Veyra — Invite only</title>", "<title>Veyra — Link expired</title>").replace("<h1>Veyra is in early access</h1>", "<h1>This invite link has expired</h1>"));
+  }
+  const sessionToken = accessGate.createSession({ email: "invite-link", origin: "invite-link" });
+  res.setHeader("Set-Cookie", `${accessGate.cookieName}=${encodeURIComponent(sessionToken)}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=${Math.floor(accessGate.sessionTtlMs / 1000)}`);
+  res.redirect(gateRedirectTarget(sessionToken));
+});
+app.get("/api/gate/status", (req, res) => {
+  const unlocked = accessGate.canBrowse(req);
+  const session = unlocked && accessGate.enabled && !accessGate.staffOnly ? accessGate.sessionFromRequest(req) : null;
+  res.set("Cache-Control", "no-store").json({ ok: true, mode: accessPolicy.state.mode, gated: accessGate.enabled, unlocked, waitlistOpen: accessGate.waitlistOpen, email: session?.email || null });
+});
+app.get("/api/gate/config", (req, res) => res.set("Cache-Control", "no-store").json({ ok: true, mode: accessPolicy.state.mode, gated: accessGate.enabled, waitlistOpen: accessGate.waitlistOpen }));
+app.post("/api/gate/waitlist", async (req, res) => {
+  const ip = clientIp(req);
+  if (accessGate.limited(`join:${ip}`, 10, 10 * 60 * 1000)) return respondError(res, 429, "Too many waitlist signups from this network. Try again later.", "GATE_RATE_LIMITED");
+  try {
+    const result = accessGate.joinWaitlist(req.body?.email);
+    if (result.alreadyJoined) return res.json({ ok: true, alreadyJoined: true, entry: result.entry });
+    // Best-effort confirmation email; the queue still works without Resend.
+    await sendGateWaitlistEmail(result.entry);
+    res.status(201).json({ ok: true, entry: result.entry, message: "You're on the list." });
+  } catch (e) { authFail(res, e); }
+});
+app.post("/api/gate/unlock", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  if (accessGate.staffOnly) return respondError(res, 403, "Invites cannot be redeemed while Veyra is locked.", "GATE_LOCKED");
+  const ip = clientIp(req);
+  if (accessGate.limited(`unlock:${ip}`, 20, 10 * 60 * 1000)) return respondError(res, 429, "Too many unlock attempts from this network. Try again later.", "GATE_RATE_LIMITED");
+  try {
+    const { email, sessionToken } = accessGate.unlockWithKey(req.body?.key);
+    res.setHeader("Set-Cookie", `${accessGate.cookieName}=${encodeURIComponent(sessionToken)}; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=${Math.floor(accessGate.sessionTtlMs / 1000)}`);
+    res.json({ ok: true, token: sessionToken, email, redirect: gateRedirectTarget(sessionToken) });
+  } catch (e) { authFail(res, e); }
+});
+app.get("/api/gate/session", (req, res) => {
+  const session = accessGate.sessionFromRequest(req);
+  if (!session) return res.status(403).json({ ok: false, error: "Not unlocked.", code: "GATE_REQUIRED" });
+  res.json({ ok: true, email: session.email, createdAt: session.createdAt, expiresAt: new Date(session.expiresAt).toISOString() });
+});
+app.post("/api/gate/logout", (req, res) => {
+  const header = String(req.get("x-veyra-gate") || "");
+  const cookie = String(req.headers.cookie || "").match(new RegExp(`(?:^|;\s*)${accessGate.cookieName}=([^;]+)`));
+  accessGate.revokeSession(header || (cookie ? decodeURIComponent(cookie[1]) : ""));
+  res.setHeader("Set-Cookie", `${accessGate.cookieName}=; Path=/; HttpOnly; Secure; SameSite=None; Max-Age=0`);
+  res.json({ ok: true });
+});
+app.get("/api/gate/admin/policy", requireGateStaff, (req, res) => res.json({ ok: true, policy: accessPolicy.state, report: accessGate.report() }));
+app.put("/api/gate/admin/policy", requireGateStaff, async (req, res) => {
+  const before = accessPolicy.state;
+  try {
+    const policy = await accessPolicy.update(req.body);
+    if (before !== policy) {
+      if (policy.mode === "staff" && before.mode !== "staff") {
+        for (const socket of castServer?.wss?.clients || []) socket.terminate();
+        for (const socket of wsRelay?.wss?.clients || []) socket.terminate();
+      }
+      serverLog("info", "GATE", `Access policy #${policy.revision}: ${policy.mode}; waitlist ${policy.waitlistOpen ? "open" : "closed"}; test mode ${policy.testMode ? "on" : "off"}.`);
+    }
+    res.json({ ok: true, policy, report: accessGate.report() });
+  } catch (e) { authFail(res, e); }
+});
+app.get("/api/gate/admin/checks", requireGateStaff, (req, res) => {
+  if (!accessPolicy.state.testMode) return respondError(res, 403, "Enable access test mode to run checks.", "ACCESS_TEST_MODE_OFF");
+  const cases = [["Public visitor", {}], ["Invite holder", { invited: true }], ["Administrator", { staff: true }]];
+  res.json({ ok: true, revision: accessPolicy.state.revision, checks: cases.map(([label, role]) => ({ label, ...accessPolicy.decision(role) })) });
+});
+app.get("/api/gate/admin/link", requireGateStaff, (req, res) => {
+  const token = accessGate.currentToken();
+  const origin = `${req.protocol}://${req.get("host")}`;
+  res.json({ ok: true, link: `${origin}/gate/${token}`, token, history: accessGate.tokenHistory(), rotatesEveryMs: accessGate.rotateMs, graceMs: accessGate.graceMs, ownerLinks: [...accessGate.ownerTokens].map(t => `${origin}/gate/${t}`) });
+});
+app.post("/api/gate/admin/rotate", requireGateStaff, (req, res) => {
+  const rotated = accessGate.rotate(true);
+  const origin = `${req.protocol}://${req.get("host")}`;
+  res.json({ ok: true, link: `${origin}/gate/${rotated.current}`, previousLinkStillValid: !!rotated.previous });
+});
+app.get("/api/gate/admin/report", requireGateStaff, (req, res) => res.json({ ok: true, ...accessGate.report() }));
+app.get("/api/gate/admin/waitlist", requireGateStaff, (req, res) => {
+  let entries = accessGate.listWaitlist();
+  const total = entries.length;
+  if (req.query.limit !== undefined) {
+    const offset = Math.max(0, Math.trunc(Number(req.query.offset) || 0));
+    entries = entries.slice(offset, offset + Math.min(100, Math.max(1, Math.trunc(Number(req.query.limit) || 30))));
+  }
+  res.json({ ok: true, total, entries });
+});
+app.post("/api/gate/admin/waitlist/:id/accept", requireGateStaff, async (req, res) => {
+  try {
+    const result = accessGate.acceptEntry(req.params.id);
+    if (result.alreadyAccepted) return res.json({ ok: true, alreadyAccepted: true, entry: result.entry });
+    // Email the access key to the user so the promise on the waitlist screen
+    // ("we will email you an access key") is kept. Best-effort: the key is
+    // still shown to the owner below when email delivery is not configured.
+    const email = result.key && result.entry?.email ? await sendGateKeyEmail(result.entry, result.key, "accepted") : null;
+    res.json({ ok: true, entry: result.entry, accessKey: result.key, email, message: result.key ? "Share this key with the user — it is shown only once." + (email?.sent ? " It has also been emailed to them." : "") : "" });
+  } catch (e) { authFail(res, e); }
+});
+app.post("/api/gate/admin/waitlist/:id/reject", requireGateStaff, (req, res) => { try { const r = accessGate.rejectEntry(req.params.id); res.json({ ok: true, entry: r.entry }); } catch (e) { authFail(res, e); } });
+app.post("/api/gate/admin/waitlist/:id/reissue-key", requireGateStaff, async (req, res) => {
+  try {
+    const r = accessGate.reissueKey(req.params.id);
+    const email = r.key && r.entry?.email ? await sendGateKeyEmail(r.entry, r.key, "reissued") : null;
+    res.json({ ok: true, entry: r.entry, accessKey: r.key, email });
+  } catch (e) { authFail(res, e); }
+});
 app.get('/api/auth/config', (req, res) => {
   const user = authStore.userFromRequest(req);
   const admin = !!(user && authStore.roleFor(user.email) === "admin");
-  res.json({ ok: true, signupEnabled: CFG.authAllowSignup, sessionTimeLimitMs: admin ? CFG.adminSessionTimeLimitMs : CFG.sessionTimeLimitMs, admin: admin || configEditAllowed(req), testMode: CFG.testMode, testAdmin: CFG.testMode ? authStore.getTestAdminCredentials() : null });
+  res.set("Cache-Control", "no-store").json({ ok: true, signupEnabled: CFG.authAllowSignup, signupKeyRequired: !!CFG.authSignupKey, sessionTimeLimitMs: admin ? runtimeSessionPolicy.adminTimeLimitMs : runtimeSessionPolicy.guestTimeLimitMs, admin: admin || configEditAllowed(req), testMode: CFG.testMode && isGateStaffRequest(req) });
 });
 
 
@@ -3777,20 +5875,111 @@ function platformData(user) {
   const p = data.platform && typeof data.platform === "object" ? data.platform : {};
   if (!Array.isArray(p.workspaces)) p.workspaces = [];
   if (!p.billing || typeof p.billing !== "object") p.billing = { status: "required" };
+  // Migration: keys created before hashing stored a 16-char plaintext prefix.
+  // Drop it — only the sha256 hash and last-4 are kept at rest from now on.
+  for (const w of p.workspaces) for (const k of w.keys || []) { if (k && k.prefix) delete k.prefix; }
   return { ...data, platform: p };
 }
-function savePlatformData(user, data) { authStore.setData(user, data); return data.platform; }
+function savePlatformData(user, data) { platformResetKeyIndex(); authStore.setData(user, data); return data.platform; }
 function platformOwner(user) { return authStore.roleFor(user.email) === "admin"; }
-function platformPublicKey(k) { return { id: k.id, name: k.name, prefix: k.prefix, createdAt: k.createdAt, lastUsedAt: k.lastUsedAt || null, revokedAt: k.revokedAt || null, credits: { balanceMicros: Math.max(0, Math.trunc(Number(k.creditsMicros) || 0)), spentMicros: Math.max(0, Math.trunc(Number(k.spentMicros) || 0)) } }; }
+/* ---------- platform API keys: hashed at rest, secret shown exactly once ----------
+   Only a sha256 hash and the last 4 characters of the raw key are persisted; the
+   raw `vyr_live_…` secret is returned once on create/rotate and never stored. */
+function platformHashKey(raw) { return crypto.createHash("sha256").update(String(raw || "")).digest("hex"); }
+function platformPublicKey(k) {
+  // Hourly request buckets for the rolling 24h window — powers the usage
+  // chart in the developer platform without exposing the raw timestamps.
+  const byHour = {};
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  for (const t of (k.usage?.window || [])) {
+    if (Number(t) <= cutoff) continue;
+    const hour = new Date(Number(t)).toISOString().slice(0, 13) + ":00:00Z";
+    byHour[hour] = (byHour[hour] || 0) + 1;
+  }
+  return { id: k.id, name: k.name, last4: k.last4 || k.prefix || null, createdAt: k.createdAt, lastUsedAt: k.lastUsedAt || null, revokedAt: k.revokedAt || null, usage: { requests: k.usage?.requests || 0, last24h: k.usage?.last24h || 0, byHour } };
+}
 function platformPublicWorkspace(w) { return { id: w.id, name: w.name, slug: w.slug, description: w.description || "", createdAt: w.createdAt, keys: (w.keys || []).filter(k => !k.revokedAt).map(platformPublicKey) }; }
 function platformFindWorkspace(data, id) { return data.platform.workspaces.find(x => x.id === String(id || "")); }
 function platformFindKey(workspace, id) { return workspace?.keys?.find(x => x.id === String(id || "")); }
 function platformNewKey(name) {
   const raw = `vyr_live_${crypto.randomBytes(24).toString("base64url")}`;
   const now = new Date().toISOString();
-  return { raw, key: { id: crypto.randomUUID(), name: String(name || "Default key").trim().slice(0, 80) || "Default key", prefix: raw.slice(0, 16), hash: crypto.createHash("sha256").update(raw).digest("hex"), createdAt: now, lastUsedAt: null, revokedAt: null, creditsMicros: CFG.apiKeyInitialCreditsMicros, spentMicros: 0, usage: { requests: 0, last24h: 0 } } };
+  const key = { id: crypto.randomUUID(), name, hash: platformHashKey(raw), last4: raw.slice(-4), createdAt: now, lastUsedAt: null, revokedAt: null, usage: { requests: 0, last24h: 0, window: [] } };
+  return { raw, key };
+}
+function platformCheckName(value, { min = 2, max = 80 } = {}) {
+  const name = String(value || "").replace(/\s+/g, " ").trim();
+  if (name.length < min || name.length > max) return null;
+  if (!/[a-z0-9]/i.test(name)) return null;
+  return name;
 }
 function platformSlug(name) { return String(name || "workspace").toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "workspace"; }
+/* ---------- key lookup index (hash -> owner), rebuilt lazily and on every save ---------- */
+let platformKeyIndex = null, platformKeyIndexAt = 0;
+function platformResetKeyIndex() { platformKeyIndex = null; }
+function platformFindKeyByHash(hash) {
+  if (!platformKeyIndex || Date.now() - platformKeyIndexAt > 30000) {
+    platformKeyIndex = new Map();
+    for (const user of authStore.users.values()) {
+      const workspaces = user.data?.platform?.workspaces;
+      if (!Array.isArray(workspaces)) continue;
+      for (const w of workspaces) for (const k of w.keys || []) {
+        if (k?.hash && !k.revokedAt) platformKeyIndex.set(k.hash, { user, workspace: w, key: k });
+      }
+    }
+    platformKeyIndexAt = Date.now();
+  }
+  return platformKeyIndex.get(String(hash || "")) || null;
+}
+/* ---------- in-memory rate limiting for platform routes ---------- */
+const PLATFORM_RATE_BUCKETS = new Map();
+function platformRateLimited(bucket, max, windowMs) {
+  const now = Date.now();
+  let b = PLATFORM_RATE_BUCKETS.get(bucket);
+  if (!b || now - b.start >= windowMs) { b = { start: now, count: 0 }; PLATFORM_RATE_BUCKETS.set(bucket, b); }
+  b.count += 1;
+  if (PLATFORM_RATE_BUCKETS.size > 20000) {
+    for (const [k, v] of PLATFORM_RATE_BUCKETS) if (now - v.start >= windowMs) PLATFORM_RATE_BUCKETS.delete(k);
+  }
+  return { limited: b.count > max, retryAfterMs: Math.max(1000, windowMs - (now - b.start)) };
+}
+function platformRateLimit({ max, windowMs, scope = "ip" } = {}) {
+  return (req, res, next) => {
+    const id = scope === "key" ? String(req.veyraKey?.id || clientIp(req)) : clientIp(req);
+    // The bucket key carries the budget itself so overlapping limiters (the
+    // platform-wide 120/min plus the stricter per-route waitlist budget) never
+    // share or pollute each other's counters.
+    const r = platformRateLimited(`${scope}:${id}:${max}/${windowMs}`, max, windowMs);
+    if (r.limited) {
+      res.setHeader("Retry-After", String(Math.ceil(r.retryAfterMs / 1000)));
+      return respondError(res, 429, "Too many requests. Slow down and try again shortly.", "PLATFORM_RATE_LIMITED", { retryAfterMs: r.retryAfterMs });
+    }
+    next();
+  };
+}
+/* ---------- API-key auth + usage tracking for the public platform API (/api/v1) ---------- */
+function requirePlatformKey(req, res, next) {
+  const h = String(req.get?.("authorization") || "");
+  const m = /^Bearer\s+(\S+)$/i.exec(h);
+  const raw = m ? m[1] : "";
+  if (!raw.startsWith("vyr_live_")) return respondError(res, 401, "Provide an API key: Authorization: Bearer vyr_live_…", "PLATFORM_KEY_REQUIRED");
+  const found = platformFindKeyByHash(platformHashKey(raw));
+  if (!found) return respondError(res, 401, "That API key is not valid or was revoked.", "PLATFORM_KEY_INVALID");
+  const k = found.key, u = k.usage || (k.usage = { requests: 0, last24h: 0, window: [] });
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  u.window = (Array.isArray(u.window) ? u.window : []).filter(t => Number(t) > cutoff);
+  u.window.push(Date.now());
+  if (u.window.length > 5000) u.window = u.window.slice(-5000);
+  u.requests = (Number(u.requests) || 0) + 1;
+  u.last24h = u.window.length;
+  u.lastUsedAt = new Date().toISOString();
+  k.lastUsedAt = u.lastUsedAt;
+  req.veyraKeyOwner = found.user;
+  req.veyraKeyWorkspace = found.workspace;
+  req.veyraKey = k;
+  try { savePlatformData(found.user, found.user.data || {}); } catch {}
+  next();
+}
 const PLATFORM_PRICING = [
   { id: "owner", name: "Owner", price: 0, unit: "forever", description: "Included for Veyra owners and administrators.", features: ["Unlimited workspaces", "API keys", "Platform documentation"] },
   { id: "developer", name: "Developer", price: 0, unit: "during beta", description: "Free while the API platform is in beta. Billing profile required.", features: ["3 workspaces", "10 API keys per workspace", "Usage dashboard"] },
@@ -3802,6 +5991,40 @@ function readPlatformWaitlist() { try { const rows = JSON.parse(fs.readFileSync(
 function writePlatformWaitlist(rows) { fs.mkdirSync(path.dirname(PLATFORM_WAITLIST_FILE), { recursive: true }); const tmp = `${PLATFORM_WAITLIST_FILE}.tmp`; fs.writeFileSync(tmp, JSON.stringify(rows, null, 2)); fs.renameSync(tmp, PLATFORM_WAITLIST_FILE); if (mongoStore.enabled) void mongoStore.replacePlatformWaitlist(rows); }
 if (mongoStore.enabled) void mongoStore.loadPlatformWaitlist().then(rows => { const local = readPlatformWaitlist(); if (rows.length) writePlatformWaitlist(rows); else if (local.length) void mongoStore.replacePlatformWaitlist(local); }).catch(() => {});
 function publicWaitlistEntry(x) { return { id: x.id, email: x.email, name: x.name || "", plan: x.plan, status: x.status, position: x.position || null, createdAt: x.createdAt, acceptedAt: x.acceptedAt || null, emailStatus: x.emailStatus || "pending" }; }
+/* ---------- gate waitlist emails (Resend-compatible, best-effort) ---------- */
+function gateEmailAppUrl() {
+  return String(process.env.PLATFORM_URL || "https://homekidchud.github.io/VeyraBrowser").replace(/\/$/, "");
+}
+function recordGateEmailStatus(email, status, sent) {
+  try {
+    const entry = accessGate.waitlist.find(x => x.email === email);
+    if (!entry) return;
+    entry.emailStatus = status;
+    entry.emailSentAt = sent ? new Date().toISOString() : (entry.emailSentAt || null);
+    accessGate.save();
+  } catch {}
+}
+async function sendGateWaitlistEmail(entry) {
+  if (!entry?.email) return null;
+  const r = await sendPlatformEmail({
+    to: entry.email,
+    subject: "You're on the Veyra waitlist",
+    html: `<p>Hi there,</p><p>You're in the queue for Veyra early access. We'll email you an access key when a spot opens — no need to do anything else.</p><p><a href="${escapeHtml(gateEmailAppUrl())}">Veyra</a></p><p>— The Veyra team</p>`
+  });
+  recordGateEmailStatus(entry.email, r.status, r.sent);
+  return r;
+}
+async function sendGateKeyEmail(entry, key, reason) {
+  if (!entry?.email || !key) return null;
+  const reissued = reason === "reissued";
+  const r = await sendPlatformEmail({
+    to: entry.email,
+    subject: reissued ? "Your new Veyra access key" : "Your Veyra access key",
+    html: `<p>Hi there,</p><p>${reissued ? "Here is your new Veyra access key:" : "A spot just opened up — your Veyra access key is:"}</p><p><strong style="font-family:ui-monospace,monospace;font-size:16px">${escapeHtml(key)}</strong></p><p>Open <a href="${escapeHtml(gateEmailAppUrl())}">Veyra</a> and paste this key on the invite screen to unlock it. Keep the key private; it is linked to your email address.</p><p>— The Veyra team</p>`
+  });
+  recordGateEmailStatus(entry.email, r.status, r.sent);
+  return r;
+}
 async function sendPlatformEmail({ to, subject, html }) {
   const key = String(process.env.RESEND_API_KEY || "").trim(), from = String(process.env.PLATFORM_EMAIL_FROM || "").trim();
   if (!key || !from) { serverLog("info", "PLATFORM_EMAIL", `Email delivery not configured; would send ${subject} to ${to}`); return { sent: false, status: "not_configured" }; }
@@ -3811,7 +6034,20 @@ async function sendPlatformEmail({ to, subject, html }) {
     return { sent: true, status: "sent" };
   } catch (e) { serverLog("warn", "PLATFORM_EMAIL", `Could not send email to ${to}: ${e.message}`); return { sent: false, status: "failed", error: e.message }; }
 }
-app.post('/api/platform/waitlist', async (req, res) => {
+const { createYouTubeEligibility } = require("./services/youtube-eligibility");
+const youtubeEligibility = createYouTubeEligibility({ key: String(process.env.YOUTUBE_DATA_API_KEY || "").trim(), request: undiciFetch });
+app.get("/api/media/youtube/:id", platformRateLimit({ max: 30, windowMs: 60_000 }), async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  const check = app.locals.veyraYoutubeWatchEligibility || youtubeEligibility;
+  const state = await check(req.params.id);
+  if (state === "invalid") return respondError(res, 400, "Invalid YouTube video ID.", "INVALID_YOUTUBE_ID");
+  res.json({ state, inlineWatch: true });
+});
+/* Rate limits for every developer-platform route: 120 requests/minute per IP for
+   session-authenticated management calls, and a much tighter budget for the public
+   waitlist form so it cannot be used to spam confirmation emails. */
+app.use('/api/platform', platformRateLimit({ max: 120, windowMs: 60 * 1000, scope: "ip" }));
+app.post('/api/platform/waitlist', platformRateLimit({ max: 5, windowMs: 60 * 60 * 1000, scope: "ip" }), async (req, res) => {
   const email = String(req.body?.email || "").trim().toLowerCase(), name = String(req.body?.name || "").trim().slice(0, 100), plan = req.body?.plan === "early_access" ? "early_access" : "developer";
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return respondError(res, 400, "Enter a valid email address.", "WAITLIST_EMAIL_INVALID");
   const rows = readPlatformWaitlist(), existing = rows.find(x => x.email === email);
@@ -3828,21 +6064,11 @@ app.get('/api/platform/waitlist', requireAdmin, (req, res) => { const rows = rea
 app.post('/api/platform/waitlist/:id/accept', requireAdmin, async (req, res) => {
   const rows = readPlatformWaitlist(), x = rows.find(v => v.id === req.params.id); if (!x) return respondError(res, 404, "Waitlist entry not found.", "WAITLIST_NOT_FOUND");
   x.status = "accepted"; x.acceptedAt = new Date().toISOString(); x.emailStatus = "pending"; writePlatformWaitlist(rows);
-  const base = String(process.env.PLATFORM_URL || "https://homekidchud.github.io/VeyraBrowser/dev/platform").replace(/\/$/, ""), checkout = String(process.env.PLATFORM_EARLY_ACCESS_URL || "").trim();
+  const base = String(process.env.PLATFORM_URL || "https://homekidchud.github.io/VeyraBrowser/web/dev/platform").replace(/\/$/, ""), checkout = String(process.env.PLATFORM_EARLY_ACCESS_URL || "").trim();
   const result = await sendPlatformEmail({ to: x.email, subject: "Your Veyra platform access is ready", html: `<p>Hi ${escapeHtml(x.name || "there")},</p><p>Your Veyra Developer Platform access is ready.</p><p><a href="${escapeHtml(base)}">Open the Veyra platform</a> and sign in to create your workspace.</p>${x.plan === "early_access" ? `<p>Early access is <strong>$2.99/month</strong>. ${checkout ? `<a href="${escapeHtml(checkout)}">Continue to secure checkout</a>.` : "A checkout link will be added by the Veyra team."}</p>` : ""}<p>Keep your API keys private and rotate them regularly.</p>` });
   x.emailStatus = result.status; writePlatformWaitlist(rows); res.json({ ok: true, entry: publicWaitlistEntry(x), email: result });
 });
-app.get('/api/platform/pricing', (req, res) => res.json({ ok: true, currency: "USD", plans: PLATFORM_PRICING, api: { searchCostMicros: CFG.apiSearchCostMicros, searchCostUsd: Number((CFG.apiSearchCostMicros / 1e6).toFixed(6)), unit: "per API search" } }));
-app.get('/api/v1/credits', requireApiKey, (req, res) => res.json({ ok: true, ...apiKeyPublicCredits(req.veyraApiKey), key: platformPublicKey(req.veyraApiKey.key) }));
-app.post('/api/v1/credits/grant', requireUser, (req, res) => {
-  if (authStore.roleFor(req.veyraUser.email) !== "admin") return respondError(res, 403, "Only an administrator can grant API credits.", "API_CREDITS_ADMIN_REQUIRED");
-  const raw = String(req.body?.apiKey || "").trim(), found = authStore.findApiKey(raw);
-  if (!found) return respondError(res, 404, "API key not found.", "API_KEY_NOT_FOUND");
-  const micros = Math.trunc(Number(req.body?.micros ?? (Number(req.body?.usd || 0) * 1e6)));
-  if (!Number.isSafeInteger(micros) || micros <= 0 || micros > 1000000000000) return respondError(res, 400, "Grant must be a positive amount of microdollars (maximum $1,000,000).", "API_CREDITS_AMOUNT_INVALID");
-  found.key.creditsMicros = apiKeyCredits(found) + micros; authStore.persistUser(found.user);
-  res.json({ ok: true, credits: apiKeyPublicCredits(found) });
-});
+app.get('/api/platform/pricing', (req, res) => res.json({ ok: true, currency: "USD", plans: PLATFORM_PRICING }));
 app.get('/api/platform/overview', requireUser, (req, res) => {
   const d = platformData(req.veyraUser), owner = platformOwner(req.veyraUser);
   const waitlist = owner ? readPlatformWaitlist() : [];
@@ -3859,15 +6085,16 @@ app.post('/api/platform/billing/setup', requireUser, (req, res) => {
 app.post('/api/platform/workspaces', requireUser, (req, res) => {
   const d = platformData(req.veyraUser), owner = platformOwner(req.veyraUser);
   if (!owner && d.platform.workspaces.length >= 3) return respondError(res, 402, "Your Developer plan allows 3 workspaces. Upgrade to create more.", "PLATFORM_PLAN_LIMIT");
-  const name = String(req.body?.name || "").trim().slice(0, 80);
-  if (name.length < 2) return respondError(res, 400, "Workspace name must be at least 2 characters.", "WORKSPACE_NAME_INVALID");
+  const name = platformCheckName(req.body?.name, { min: 2, max: 80 });
+  if (!name) return respondError(res, 400, "Workspace name must be 2–80 characters and include a letter or digit.", "WORKSPACE_NAME_INVALID");
   const base = platformSlug(name); let slug = base, n = 2; while (d.platform.workspaces.some(w => w.slug === slug)) slug = `${base}-${n++}`;
+  if (!/^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$/.test(slug)) return respondError(res, 400, "Workspace name cannot be turned into a valid slug. Try a different name.", "WORKSPACE_SLUG_INVALID");
   const w = { id: crypto.randomUUID(), name, slug, description: String(req.body?.description || "").trim().slice(0, 240), createdAt: new Date().toISOString(), keys: [] };
   d.platform.workspaces.push(w); savePlatformData(req.veyraUser, d); res.status(201).json({ ok: true, workspace: platformPublicWorkspace(w) });
 });
 app.patch('/api/platform/workspaces/:id', requireUser, (req, res) => {
   const d = platformData(req.veyraUser), w = d.platform.workspaces.find(x => x.id === req.params.id); if (!w) return respondError(res, 404, "Workspace not found.", "WORKSPACE_NOT_FOUND");
-  if (req.body?.name != null) { const name = String(req.body.name).trim().slice(0, 80); if (name.length < 2) return respondError(res, 400, "Workspace name is too short.", "WORKSPACE_NAME_INVALID"); w.name = name; }
+  if (req.body?.name != null) { const name = platformCheckName(req.body.name, { min: 2, max: 80 }); if (!name) return respondError(res, 400, "Workspace name must be 2–80 characters and include a letter or digit.", "WORKSPACE_NAME_INVALID"); w.name = name; }
   if (req.body?.description != null) w.description = String(req.body.description).trim().slice(0, 240);
   savePlatformData(req.veyraUser, d); res.json({ ok: true, workspace: platformPublicWorkspace(w) });
 });
@@ -3889,7 +6116,9 @@ app.post('/api/platform/workspaces/:id/keys', requireUser, (req, res) => {
   const d = platformData(req.veyraUser), w = d.platform.workspaces.find(x => x.id === req.params.id); if (!w) return respondError(res, 404, "Workspace not found.", "WORKSPACE_NOT_FOUND");
   const owner = platformOwner(req.veyraUser); if (!owner && d.platform.billing.status !== "configured") return respondError(res, 402, "Set up billing before creating API keys.", "BILLING_REQUIRED");
   if (!owner && w.keys.filter(k => !k.revokedAt).length >= 10) return respondError(res, 402, "This workspace reached its API key limit.", "PLATFORM_KEY_LIMIT");
-  const created = platformNewKey(req.body?.name); w.keys.push(created.key); savePlatformData(req.veyraUser, d); res.status(201).json({ ok: true, key: created.raw, keyInfo: platformPublicKey(created.key), warning: "Copy this key now. Veyra will not show it again." });
+  const name = req.body?.name != null ? platformCheckName(req.body.name, { min: 2, max: 80 }) : "Default key";
+  if (!name) return respondError(res, 400, "API key name must be 2–80 characters and include a letter or digit.", "API_KEY_NAME_INVALID");
+  const created = platformNewKey(name); w.keys.push(created.key); savePlatformData(req.veyraUser, d); res.status(201).json({ ok: true, key: created.raw, keyInfo: platformPublicKey(created.key), warning: "Copy this key now. Veyra will not show it again." });
 });
 app.get('/api/platform/workspaces/:workspaceId/keys/:keyId', requireUser, (req, res) => {
   const d = platformData(req.veyraUser), w = platformFindWorkspace(d, req.params.workspaceId), k = platformFindKey(w, req.params.keyId);
@@ -3901,24 +6130,139 @@ app.patch('/api/platform/workspaces/:workspaceId/keys/:keyId', requireUser, (req
   const d = platformData(req.veyraUser), w = platformFindWorkspace(d, req.params.workspaceId), k = platformFindKey(w, req.params.keyId);
   if (!w) return respondError(res, 404, "Workspace not found.", "WORKSPACE_NOT_FOUND");
   if (!k || k.revokedAt) return respondError(res, 404, "API key not found.", "API_KEY_NOT_FOUND");
-  if (req.body?.name != null) { const name = String(req.body.name).trim().slice(0, 80); if (name.length < 2) return respondError(res, 400, "Key name is too short.", "API_KEY_NAME_INVALID"); k.name = name; }
+  if (req.body?.name != null) { const name = platformCheckName(req.body.name, { min: 2, max: 80 }); if (!name) return respondError(res, 400, "API key name must be 2–80 characters and include a letter or digit.", "API_KEY_NAME_INVALID"); k.name = name; }
   savePlatformData(req.veyraUser, d); res.json({ ok: true, key: platformPublicKey(k) });
 });
 app.post('/api/platform/workspaces/:workspaceId/keys/:keyId/rotate', requireUser, (req, res) => {
   const d = platformData(req.veyraUser), w = platformFindWorkspace(d, req.params.workspaceId), old = platformFindKey(w, req.params.keyId);
   if (!w) return respondError(res, 404, "Workspace not found.", "WORKSPACE_NOT_FOUND");
   if (!old || old.revokedAt) return respondError(res, 404, "API key not found.", "API_KEY_NOT_FOUND");
+  const name = req.body?.name != null ? platformCheckName(req.body.name, { min: 2, max: 80 }) : old.name;
+  if (!name) return respondError(res, 400, "API key name must be 2–80 characters and include a letter or digit.", "API_KEY_NAME_INVALID");
   old.revokedAt = new Date().toISOString();
-  const created = platformNewKey(req.body?.name || old.name); w.keys.push(created.key); savePlatformData(req.veyraUser, d);
+  const created = platformNewKey(name); w.keys.push(created.key); savePlatformData(req.veyraUser, d);
   res.status(201).json({ ok: true, key: created.raw, keyInfo: platformPublicKey(created.key), replacedKeyId: old.id, warning: "The previous key was revoked. Copy this replacement now; it will not be shown again." });
 });
 app.delete('/api/platform/workspaces/:workspaceId/keys/:keyId', requireUser, (req, res) => {
   const d = platformData(req.veyraUser), w = d.platform.workspaces.find(x => x.id === req.params.workspaceId), k = w?.keys?.find(x => x.id === req.params.keyId); if (!k) return respondError(res, 404, "API key not found.", "API_KEY_NOT_FOUND"); k.revokedAt = new Date().toISOString(); savePlatformData(req.veyraUser, d); res.json({ ok: true, revoked: true });
 });
 
+/* ---------- public platform API (/api/v1): authenticated with API keys ----------
+   These are the endpoints developers call from their own code with
+   `Authorization: Bearer vyr_live_…`. Every call is rate limited per key and
+   counted towards that key's usage (requests total + rolling 24h window). The
+   limiter is IP-scoped because it runs before the key is verified. */
+app.use('/api/v1', platformRateLimit({ max: 120, windowMs: 60 * 1000, scope: "ip" }));
+app.get('/api/v1/me', requirePlatformKey, (req, res) => {
+  const k = req.veyraKey, w = req.veyraKeyWorkspace;
+  res.json({ ok: true, workspace: { id: w.id, name: w.name, slug: w.slug }, key: { id: k.id, name: k.name, last4: k.last4, createdAt: k.createdAt }, usage: { requests: k.usage?.requests || 0, last24h: k.usage?.last24h || 0, lastUsedAt: k.lastUsedAt || null } });
+});
+app.get('/api/v1/usage', requirePlatformKey, (req, res) => {
+  const k = req.veyraKey;
+  const buckets = {};
+  for (const t of (k.usage?.window || [])) {
+    const hour = new Date(Number(t)).toISOString().slice(0, 13) + ":00:00Z";
+    buckets[hour] = (buckets[hour] || 0) + 1;
+  }
+  res.json({ ok: true, keyId: k.id, usage: { requests: k.usage?.requests || 0, last24h: k.usage?.last24h || 0, lastUsedAt: k.lastUsedAt || null }, byHour: buckets });
+});
+
+/* ---------- the expanded public API (/api/v1) ----------
+   Every endpoint below is authenticated with an API key
+   (`Authorization: Bearer vyr_live_…`) unless noted otherwise, rate limited
+   to 120 requests/minute, and counted towards that key's usage. */
+
+// GET /api/v1/status — public (no key): API liveness, version and limits.
+app.get('/api/v1/status', (req, res) => {
+  res.json({ ok: true, api: "veyra", version: VEYRA_VERSION, uptimeSeconds: Math.floor(process.uptime()), rateLimit: { max: 120, windowMs: 60000 }, docs: `${CFG.frontendUrl.replace(/\/+$/, "")}/dev/platform/` });
+});
+
+// GET /api/v1/verify — lightweight key check: identity + usage snapshot.
+app.get('/api/v1/verify', requirePlatformKey, (req, res) => {
+  const k = req.veyraKey, w = req.veyraKeyWorkspace;
+  res.json({ ok: true, valid: true, key: { id: k.id, name: k.name, last4: k.last4, createdAt: k.createdAt }, workspace: { id: w.id, name: w.name, slug: w.slug }, usage: { requests: k.usage?.requests || 0, last24h: k.usage?.last24h || 0 } });
+});
+
+// GET /api/v1/keys — the keys in this key's workspace (public info only).
+app.get('/api/v1/keys', requirePlatformKey, (req, res) => {
+  const w = req.veyraKeyWorkspace;
+  const keys = (w.keys || []).filter(k => !k.revokedAt);
+  res.json({ ok: true, workspace: { id: w.id, slug: w.slug }, total: keys.length, keys: keys.map(platformPublicKey) });
+});
+
+// GET /api/v1/keys/:id — one key's metadata + usage counters.
+app.get('/api/v1/keys/:id', requirePlatformKey, (req, res) => {
+  const w = req.veyraKeyWorkspace, k = platformFindKey(w, String(req.params.id || ""));
+  if (!k) return respondError(res, 404, "API key not found.", "API_KEY_NOT_FOUND");
+  res.json({ ok: true, key: platformPublicKey(k), usage: k.usage || { requests: 0, last24h: 0 } });
+});
+
+// GET /api/v1/usage/hours — hourly request buckets for the rolling window.
+app.get('/api/v1/usage/hours', requirePlatformKey, (req, res) => {
+  const k = req.veyraKey;
+  const buckets = {};
+  for (const t of (k.usage?.window || [])) {
+    const hour = new Date(Number(t)).toISOString().slice(0, 13) + ":00:00Z";
+    buckets[hour] = (buckets[hour] || 0) + 1;
+  }
+  const hours = {};
+  const now = Date.now();
+  for (let i = 23; i >= 0; i--) {
+    const key = new Date(now - i * 3600000).toISOString().slice(0, 13) + ":00:00Z";
+    hours[key] = buckets[key] || 0;
+  }
+  res.json({ ok: true, keyId: k.id, hours, windowHours: 24 });
+});
+
+// GET /api/v1/search?q= — search the Veyra index with an API key.
+app.get('/api/v1/search', requirePlatformKey, (req, res) => {
+  const query = String(req.query.q || "").trim().slice(0, CFG.maxSearchQueryChars);
+  if (!query) return respondError(res, 400, "Provide a search term: ?q=…", "SEARCH_QUERY_REQUIRED");
+  const offset = Math.max(0, Number(req.query.offset || 0) || 0);
+  const limit = Math.min(CFG.maxSearchResults, Math.max(1, Number(req.query.limit || 10) || 10));
+  try {
+    const started = Date.now();
+    const result = localSearch(query, offset, limit);
+    res.json({ ok: true, ...result, provider: "veyra-index", responseTimeMs: Date.now() - started });
+  } catch (e) { respondError(res, 500, e.message, "SEARCH_ERROR"); }
+});
+
+// GET /api/v1/suggest?q= — search suggestions from the Veyra index.
+app.get('/api/v1/suggest', requirePlatformKey, (req, res) => {
+  const q = String(req.query.q || "").trim().slice(0, CFG.maxSearchQueryChars);
+  const prefix = q.toLocaleLowerCase().split(/\s+/).pop() || "";
+  const source = [...termCounts.keys()].filter(term => term.startsWith(prefix));
+  res.json({ ok: true, suggestions: source.sort((a, b) => (termCounts.get(b) || 0) - (termCounts.get(a) || 0) || a.localeCompare(b)).slice(0, 8) });
+});
+
+// POST /api/v1/fetch — fetch any public URL through Veyra's proxy
+// infrastructure (same SSRF guards, DNS checks and caching as the fast
+// proxy) and return the response body as text. Body is capped at 256KB.
+app.post('/api/v1/fetch', requirePlatformKey, async (req, res) => {
+  const url = normalizeUrl(String(req.body?.url || ""));
+  if (!url) return respondError(res, 400, "Provide a public http(s) URL: {\"url\":\"https://example.com\"}", "FETCH_URL_INVALID");
+  if (String(req.body?.format || "text") === "json") {
+    try {
+      const result = await fetchBuffer(url, { sessionId: "", retries: 0, timeout: Math.min(CFG.requestTimeoutMs, 20000), limit: CFG.maxTextBytesPerResource });
+      if (result.truncated) return respondError(res, 422, "The JSON response exceeds the configured size limit.", "FETCH_NOT_JSON");
+      let parsed;
+      try { parsed = JSON.parse(result.body.toString("utf8")); }
+      catch { return respondError(res, 422, "The URL did not return valid JSON.", "FETCH_NOT_JSON"); }
+      return res.json({ ok: true, status: result.status, url, finalUrl: result.finalUrl, contentType: result.contentType, json: parsed });
+    } catch (e) { return respondError(res, 502, `Veyra could not fetch that URL: ${e.message}`, "FETCH_FAILED", { requestId: req.veyraRequestId }); }
+  }
+  try {
+    const result = await fetchBuffer(url, { sessionId: "", retries: 0, timeout: Math.min(CFG.requestTimeoutMs, 20000), limit: 256 * 1024 });
+    const body = result.body ? result.body.toString("utf8") : "";
+    res.json({ ok: true, status: result.status, url, finalUrl: result.finalUrl, contentType: result.contentType, truncated: !!result.truncated, body });
+  } catch (e) { respondError(res, 502, `Veyra could not fetch that URL: ${e.message}`, "FETCH_FAILED", { requestId: req.veyraRequestId }); }
+});
+
 
 app.post('/api/auth/test-login', (req, res) => {
-  if (!CFG.testMode) return res.status(403).json({ error: 'Test mode is disabled', ok: false });
+  res.set("Cache-Control", "no-store");
+  const localFixture = /^test$/i.test(String(process.env.VEYRA_ENV || "")) && /^(::1|127\.0\.0\.1|::ffff:127\.0\.0\.1)$/.test(req.socket?.remoteAddress || "");
+  if (!CFG.testMode || (!isGateStaffRequest(req) && !localFixture)) return res.status(403).json({ error: 'Test mode is disabled', ok: false });
   const creds = authStore.getTestAdminCredentials();
   if (!creds) return res.status(403).json({ error: 'Test admin not available', ok: false });
   try {
@@ -3998,16 +6342,8 @@ function browserSessionOrThrow(browserSid) {
   if (s.proxySessionId) requireLiveProxySession(s.proxySessionId);
   return s;
 }
-function requireBrowserSessionAccess(req, res, next) {
-  try {
-    const browser = browserSessionOrThrow(req.params?.sid);
-    if (!sessionAccessAllowed(req, browser.proxySessionId)) return respondError(res, 403, "This Chromium tab is not available to this request.", "SESSION_ACCESS_DENIED");
-    req.veyraBrowserSession = browser;
-    next();
-  } catch (e) { respondError(res, e.status || 404, e.message, e.code || "BROWSER_SESSION_NOT_FOUND"); }
-}
 
-app.post('/api/browser/session', requireSessionAccess, async (req, res) => {
+app.post('/api/browser/session', async (req, res) => {
   if (!CFG.browserEnabled) return respondError(res, 503, "Chromium browsing is disabled on this server.", "BROWSER_ENGINE_UNAVAILABLE");
   try {
     const proxySessionId = String(req.body?.proxySessionId || req.body?.sessionId || "");
@@ -4036,6 +6372,10 @@ app.post('/api/browser/session', requireSessionAccess, async (req, res) => {
     
     const storageState = sessionManager.getStorageState(proxySessionId);
     const session = await browserEngine.create(tabId, url, jobId, vpnProfile, { proxySessionId, fastStart: !!req.body?.fastStart, storageState });
+    if (sessionManager.checkLimit(proxySessionId) || !sessionManager.has(proxySessionId)) {
+      await browserEngine.stop(session.id);
+      return respondError(res, 410, "Session expired.", "SESSION_EXPIRED");
+    }
     sessionManager.linkBrowser(proxySessionId, session.id);
     
     if (failoverController) failoverController.recordBrowserResult(proxySessionId, true);
@@ -4062,21 +6402,54 @@ app.post('/api/browser/session', requireSessionAccess, async (req, res) => {
   }
 });
 
-app.get('/api/browser/session/:sid', requireBrowserSessionAccess, (req, res) => {
-  try { const s = browserSessionOrThrow(req.params.sid); res.json({ ok: true, session: browserEngine.public(s) }); }
-  catch (e) { respondError(res, e.status || 404, e.message, e.code || "BROWSER_SESSION_NOT_FOUND"); }
-});
-app.post('/api/browser/session/:sid/navigate', requireBrowserSessionAccess, async (req, res) => {
+app.get('/api/browser/session/:sid', async (req, res) => {
   try {
     const s = browserSessionOrThrow(req.params.sid);
-    const url = normalizeUrl(String(req.body?.url || ""));
+    // While the tab sits on a security check, each UI poll re-detects whether
+    // the user has finished it. The moment it clears, the clearance cookies +
+    // user-agent sync into the fast-proxy session and the tab can return to
+    // the (now unlocked) fast proxy.
+    if (s.status === 'VERIFICATION_REQUIRED') {
+      const session = await browserEngine.refreshVerification(req.params.sid);
+      if (session.status === 'NORMAL' && s.proxySessionId) sessionManager.resumeFromVerification(s.proxySessionId);
+      return res.json({ ok: true, session });
+    }
+    const lightweight = req.query.summary === '1';
+    if (s.status === 'NORMAL' && !s.navigationActive && (s.checkAfterInput || s.metadataPending)) await browserEngine.refreshInteractive(s);
+    res.json({ ok: true, session: lightweight ? browserEngine.summary(s) : browserEngine.public(s) });
+  }
+  catch (e) { respondError(res, e.status || 404, e.message, e.code || "BROWSER_SESSION_NOT_FOUND"); }
+});
+app.post('/api/browser/session/:sid/navigate', async (req, res) => {
+  try {
+    const s = browserSessionOrThrow(req.params.sid);
+    const rawTarget = String(req.body?.url || "").trim();
+    const sourceRef = parseSourceScheme(rawTarget);
+    if (sourceRef) {
+      const entry = sourceViewerStore.get(sourceRef.id, sourceRef.link);
+      if (!entry) throw Object.assign(new Error("Source view not found or expired."), { code: "SOURCE_VIEW_NOT_FOUND", status: 404 });
+      s.status = "LOADING"; s.navigationActive = true; s.error = ""; s.verification = null; s.screenshot = null; s.lastUsed = Date.now();
+      try {
+        await s.page.setContent(sourcePage(entry), { waitUntil: "domcontentloaded" });
+        s.canonicalUrl = sourceRef.uri; s.title = `View Source — ${entry.url}`; s.status = "NORMAL";
+        await browserEngine.capture(s, true);
+      } catch (error) {
+        s.status = "ERROR"; s.error = String(error?.message || "Source viewer could not be rendered.").slice(0, 300);
+        throw error;
+      } finally { s.navigationActive = false; s.lastUsed = Date.now(); }
+      return res.json({ ok: true, session: browserEngine.public(s) });
+    }
+    const url = normalizeUrl(rawTarget);
     if (!url) throw Object.assign(new Error("Invalid browser URL."), { code: "INVALID_URL", status: 400 });
     await browserEngine.navigateSession(s, url, { fast: !!req.body?.fastStart });
     
-    if (snapshotStore && s.proxySessionId) {
+    if (snapshotStore && CFG.sessionCacheEnabled && canCacheSession(sessionManager.peek(s.proxySessionId))) {
       try {
         const html = await s.page.content().catch(() => '');
         const title = await s.page.title().catch(() => s.title || '');
+        if (sessionManager.checkLimit(s.proxySessionId) || !canCacheSession(sessionManager.peek(s.proxySessionId))) {
+          return respondError(res, 410, "Session expired.", "SESSION_EXPIRED");
+        }
         snapshotStore.snapshot(s.proxySessionId, {
           html, url: s.canonicalUrl, title, contentType: 'text/html', status: 200, headers: {}, assets: []
         });
@@ -4085,19 +6458,23 @@ app.post('/api/browser/session/:sid/navigate', requireBrowserSessionAccess, asyn
     res.json({ ok: true, session: browserEngine.public(s) });
   } catch (e) { respondError(res, e.status || 502, e.message, e.code || "BROWSER_NAVIGATION_ERROR"); }
 });
-app.post('/api/browser/session/:sid/input', requireBrowserSessionAccess, async (req, res) => {
-  try { browserSessionOrThrow(req.params.sid); const session = await browserEngine.input(req.params.sid, req.body || {}); res.json({ ok: true, session }); }
+app.post('/api/browser/session/:sid/input', async (req, res) => {
+  try {
+    browserSessionOrThrow(req.params.sid);
+    const session = await browserEngine.input(req.params.sid, req.body || {}, { interactive: req.body?.interactive === true });
+    res.json({ ok: true, session });
+  }
   catch (e) { respondError(res, e.status || 502, e.message, e.code || "BROWSER_INPUT_ERROR"); }
 });
-app.post('/api/browser/session/:sid/history', requireBrowserSessionAccess, async (req, res) => {
+app.post('/api/browser/session/:sid/history', async (req, res) => {
   try { browserSessionOrThrow(req.params.sid); const session = await browserEngine.history(req.params.sid, String(req.body?.direction || "reload")); res.json({ ok: true, session }); }
   catch (e) { respondError(res, e.status || 502, e.message, e.code || "BROWSER_HISTORY_ERROR"); }
 });
-app.post('/api/browser/session/:sid/stop', requireBrowserSessionAccess, async (req, res) => {
+app.post('/api/browser/session/:sid/stop', async (req, res) => {
   try { browserSessionOrThrow(req.params.sid); const session = await browserEngine.stopNavigation(req.params.sid); res.json({ ok: true, session }); }
   catch (e) { respondError(res, e.status || 502, e.message, e.code || "BROWSER_STOP_ERROR"); }
 });
-app.delete('/api/browser/session/:sid', requireBrowserSessionAccess, async (req, res) => {
+app.delete('/api/browser/session/:sid', async (req, res) => {
   try {
     const s = browserSessionOrThrow(req.params.sid);
     const owner = s.proxySessionId;
@@ -4106,56 +6483,267 @@ app.delete('/api/browser/session/:sid', requireBrowserSessionAccess, async (req,
     res.json(result);
   } catch (e) { respondError(res, e.status || 404, e.message, e.code || "BROWSER_STOP_ERROR"); }
 });
-app.get('/api/browser/session/:sid/screenshot', requireBrowserSessionAccess, async (req, res) => {
+app.get('/api/browser/session/:sid/screenshot', async (req, res) => {
   try { browserSessionOrThrow(req.params.sid); const image = await browserEngine.screenshot(req.params.sid); if (!image) return res.status(503).type('text/plain').send('Chromium screenshot unavailable.'); res.setHeader('Cache-Control', 'no-store'); res.type('jpeg').send(image); }
   catch (e) { respondError(res, e.status || 404, e.message, e.code || "BROWSER_SCREENSHOT_ERROR"); }
 });
-
-
-app.get('/api/v1/search', requireApiKey, async (req, res) => {
+const { framePreset, serveFrames } = require('./browser/frame-stream');
+app.get('/api/browser/session/:sid/frames', async (req, res) => {
+  const checkLive = () => {
+    const session = browserSessionOrThrow(req.params.sid);
+    if (!session.proxySessionId || req.get('x-veyra-proxy-session') !== session.proxySessionId) {
+      throw Object.assign(new Error('Browser session not found.'), { code: 'BROWSER_SESSION_NOT_FOUND', status: 404 });
+    }
+    return session;
+  };
   try {
-    const query = String(req.query.q || "").trim().slice(0, CFG.maxSearchQueryChars);
-    if (!query) return respondError(res, 400, "A search query is required.", "SEARCH_QUERY_REQUIRED");
-    consumeApiSearchCredit(req.veyraApiKey);
-    const offset = Math.max(0, Number(req.query.offset || 0) || 0);
-    const engine = String(req.query.engine || "").trim().toLowerCase();
-    const selected = new Set(["google", "brave", "bing", "duckduckgo", ""]).has(engine) ? engine : "";
-    const result = await webSearch.search(query, { offset, engine: selected, lang: String(req.query.lang || "en").slice(0, 16) });
-    res.json({ ok: true, ...result, chargedMicros: CFG.apiSearchCostMicros, chargedUsd: Number((CFG.apiSearchCostMicros / 1e6).toFixed(6)), credits: apiKeyPublicCredits(req.veyraApiKey) });
-  } catch (e) { respondError(res, e.status || 502, e.message, e.code || "API_SEARCH_ERROR"); }
+    if (!CFG.browserEnabled) return respondError(res, 503, 'Chromium streaming is disabled.', 'BROWSER_ENGINE_UNAVAILABLE');
+    await serveFrames(res, checkLive(), framePreset(req.query.quality), checkLive);
+  } catch (e) {
+    if (!res.headersSent && !res.destroyed) respondError(res, e.status || 503, 'Chromium frame stream unavailable.', e.code || 'FRAME_STREAM_UNAVAILABLE');
+  }
 });
+
+
 app.get('/api/search', (req, res) => {
   try {
-    const query = String(req.query.q || "").trim().slice(0, CFG.maxSearchQueryChars);
+    const query = String(req.query.q || "").trim();
+    const privacy = searchPrivacy(req.query.privacy), scoped = searchEntry(query).query;
+    if (masksSearchScope(privacy, scoped, parseSiteScope(scoped))) return res.json({ ok: true, status: "filtered", results: [], total: 0 });
     const offset = Math.max(0, Number(req.query.offset || 0) || 0);
-    const limit = Math.min(CFG.maxSearchResults, Math.max(1, Number(req.query.limit || 10) || 10));
+    const limit = Math.min(CFG.maxSearchResults, Math.max(1, Number(req.query.limit || 20) || 20));
     const started = Date.now();
-    const result = localSearch(query, offset, limit);
-    res.json({ ok: true, ...result, provider: "veyra-index", responseTimeMs: Date.now() - started });
+    const result = localSearch(scoped, offset, limit, { region: req.query.region, topical: true, privacy });
+    res.json({ ok: true, ...result, results: annotateMatchBatch(query, result.results, "index"), matchModel: matchModelVersion, provider: "veyra-index", responseTimeMs: Date.now() - started });
   } catch (e) { respondError(res, 500, e.message, "SEARCH_ERROR"); }
 });
 app.get('/api/search/stats', (req, res) => res.json({ ok: true, ...searchIndexStats() }));
-app.get('/api/search/suggest', (req, res) => {
-  const q = String(req.query.q || "").trim().slice(0, CFG.maxSearchQueryChars);
-  const limit = Math.min(12, Math.max(1, Number(req.query.limit || 8) || 8));
-  res.json({ ok: true, suggestions: localSearchSuggestions(q, limit) });
-});
-app.get('/api/search/correct', (req, res) => res.json({ ok: true, ...correctSearchQuery(req.query.q || "") }));
-app.get('/api/search/web', async (req, res) => {
+app.get('/api/search/diagnostics', (req, res) => {
   try {
-    const q = String(req.query.q || "").trim().slice(0, 600);
+    const service = app.locals.veyraWebSearch || webSearch;
+    res.set("Cache-Control", "no-store").json({ ok: true, ...(service.diagnostics?.() || {}) });
+  } catch (error) { respondError(res, 500, error.message, "SEARCH_DIAGNOSTICS_ERROR"); }
+});
+app.get('/api/search/suggest', (req, res) => {
+  const q = typeof req.query.q === "string" ? req.query.q.slice(0, CFG.maxSearchQueryChars) : "";
+  const limit = Math.min(12, Math.max(1, Math.floor(Number(req.query.limit || 8)) || 8));
+  // The shell marks every guest search as private=1 to prevent retention, not
+  // to disable transient reads. Incognito disables autocomplete separately.
+  req.veyraPrivateTraffic = true;
+  const privacy = searchPrivacy(req.query.privacy);
+  const hidden = input => { const { query } = searchEntry(input); return masksSearchScope(privacy === "unfiltered" ? privacy : "blocked", query, parseSiteScope(query)); };
+  res.json({ ok: true, suggestions: req.query.incognito === "1" || hidden(q) ? [] : localSearchSuggestions(q, limit).filter(s => !hidden(s)) });
+});
+app.get('/api/search/correct', (req, res) => {
+  const q = String(req.query.q || "").slice(0, 600), privacy = searchPrivacy(req.query.privacy);
+  const hidden = input => { const { query } = searchEntry(input); return masksSearchScope(privacy === "unfiltered" ? privacy : "blocked", query, parseSiteScope(query)); };
+  const correction = hidden(q) ? {} : correctSearchQuery(q);
+  res.json({ ok: true, ...(hidden(correction.corrected || "") ? { changed: false } : correction) });
+});
+function requestAbortSignal(req, res) {
+  const controller = new AbortController();
+  const abort = () => { if (!res.writableEnded) controller.abort(); };
+  req.once("aborted", abort);
+  res.once("close", abort);
+  return { signal: controller.signal, dispose() { req.removeListener("aborted", abort); res.removeListener("close", abort); } };
+}
+app.get("/api/search/deep", (req, res) => {
+  res.set("Cache-Control", "no-store");
+  return respondError(res, 410, "Deep Search has been retired. Use Web search instead.", "SEARCH_MODE_RETIRED");
+});
+
+app.get('/api/search/web', async (req, res) => {
+  const request = requestAbortSignal(req, res);
+  const isPrivate = req.query.private === "1" || req.query.incognito === "1" || !authStore.userFromRequest(req);
+  if (isPrivate) { req.veyraPrivateTraffic = true; res.set("Cache-Control", "no-store"); }
+  try {
+    const raw = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 600) : "";
+    const { query: q, preferGoogle, domain } = searchEntry(raw);
     if (!q) return res.json({ ok: true, provider: "none", results: [], attempts: [], responseTimeMs: 0 });
     const engine = String(req.query.engine || "").trim().toLowerCase();
-    const validEngine = new Set(["google", "brave", "bing", "duckduckgo", ""]);
-    const selected = validEngine.has(engine) ? engine : "";
-    const offset = Math.max(0, Number(req.query.offset || 0) || 0);
-    const lang = String(req.query.lang || "en").slice(0, 16);
+    const selected = GENERAL_ENGINES.includes(engine) ? engine : "";
+    const offset = Math.max(0, Math.floor(Number(req.query.offset || 0)) || 0);
+    const feed = req.query.feed === "1";
+    const lang = String(req.query.lang || "en").slice(0, 35);
+    const limit = Math.min(CFG.maxSearchResults, Math.max(1, Math.floor(Number(req.query.limit || 20)) || 20));
     const started = Date.now();
-    const result = await webSearch.search(q, { offset, engine: selected, lang });
-    res.json({ ok: true, ...result, source: "web", responseTimeMs: Date.now() - started });
+    const scope = parseSiteScope(q);
+    const privacy = searchPrivacy(req.query.privacy);
+    if (scope.invalid) return res.json({ ok: true, results: [], provider: "none", siteFilter: { invalid: true }, more: false, source: "web", responseTimeMs: Date.now() - started });
+    if (masksSearchScope(privacy, q, scope)) return res.json({ ok: true, status: "filtered", results: [], more: false });
+    const indexOptions = { region: req.query.region, requireTerms: !scope.active, topical: true, privacy };
+    const fromIndex = indexOffset => {
+      const local = localSearch(q, indexOffset, limit, indexOptions);
+      const next = indexOffset + local.results.length;
+      const more = local.results.length > 0 && next < local.total;
+      return { ...local, provider: "veyra-index", results: local.results.map(row => ({ ...row, canonicalUrl: canonicalKey(row.url) || row.url })),
+        nextOffset: more ? WEB_FEED_INDEX_OFFSET + next : null, more };
+    };
+    const sourceLane = sourceSearchEnabled && !selected && req.query.incognito !== "1";
+    const wantsGoogle = !selected && (preferGoogle || req.query.prefer === "google");
+    const homepage = !selected && !offset && !wantsGoogle ? navigationResult(scope) : null;
+    const reply = result => {
+      // Candidate rows are used internally for ranking, not a second public feed.
+      const { candidates: _candidates, ...publicResult } = result;
+      const eligible = result.results.filter(row => allowsSearchResult(privacy, row));
+      const direct = homepage && allowsSearchResult(privacy, homepage) ? homepage : null;
+      const sameHome = row => direct && [row.url, row.canonicalUrl].some(url => {
+        const key = canonicalKey(url);
+        if (!key) return false;
+        const target = new URL(key);
+        return target.pathname === "/" && !target.search && !target.port &&
+          target.hostname.replace(/^www\./, "") === new URL(direct.url).hostname.replace(/^www\./, "");
+      });
+      const ordered = direct ? [direct, ...eligible.filter(row => !sameHome(row))].slice(0, limit) : eligible;
+      let results = annotateMatchBatch(q, sourceLane
+        ? ordered.map(row => ({ ...row, evidence: row.evidence || defaultEvidence(row) })) : ordered, "web");
+      if (!domain || req.query.incognito === "1") results = results.map(({ media, ...row }) => row);
+      return res.json({ ok: true, ...publicResult, results, ...(direct ? { status: "ok", provider: !result.provider || result.provider === "none" ? "veyra-navigation" : result.provider } : {}),
+        ...(wantsGoogle ? { preferredEngine: "google", googleIncluded: results.some(row => row.source === "google" || row.providers?.includes("google")) } : {}),
+        matchModel: matchModelVersion, ...(scope.active ? { total: null, siteFilter: { include: scope.include, exclude: scope.exclude } } : {}), source: "web", responseTimeMs: Date.now() - started });
+    };
+    if (feed && (!Number.isSafeInteger(offset) || offset > WEB_FEED_INDEX_OFFSET + CFG.maxIndexDocs || (offset < WEB_FEED_INDEX_OFFSET && offset % WEB_FEED_STEP))) return respondError(res, 400, "Invalid search feed offset.", "INVALID_SEARCH_OFFSET");
+    if (feed && selected && offset >= WEB_FEED_INDEX_OFFSET) return respondError(res, 400, "Index offsets are not available for an explicit engine.", "INVALID_SEARCH_OFFSET");
+    if (feed && offset >= WEB_FEED_INDEX_OFFSET) return reply(fromIndex(offset - WEB_FEED_INDEX_OFFSET));
+    const evidenceService = app.locals.veyraSourceSearch || sourceSearch;
+    const firstSourcePage = sourceLane && !offset;
+    const references = !selected && !offset ? referenceResults(scope, Math.min(3, limit)) : [];
+    const inScope = row => allowsSearchResult(privacy, row) && canonicalKey(row.url) && allowsSiteUrl(scope, row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl));
+    const [result, discovered] = await Promise.all([
+      (app.locals.veyraWebSearch || webSearch).search(q, { offset, limit, engine: selected, preferGoogle: wantsGoogle, domainBrowse: !!domain, lang, region: req.query.region,
+        signal: request.signal, noCache: isPrivate || !CFG.globalCacheEnabled, feed, reference: true,
+        privateSearch: req.query.incognito === "1" }).catch(error => {
+        if (!firstSourcePage && !references.length && !homepage) throw error;
+        return { provider: "none", results: [], status: "unavailable" };
+      }),
+      firstSourcePage ? evidenceService.discover(scope, { signal: request.signal }).catch(() => []) : []
+    ]);
+    const external = (result.results || []).filter(inScope);
+    if (!isPrivate && (!feed || !offset)) queueNeuralIndexFindings(q, external);
+    let candidates = external;
+    if (discovered.length || references.length) {
+      const merged = new Map(external.map(row => [canonicalKey(row.url), row]));
+      for (const found of discovered.filter(inScope)) {
+        const key = canonicalKey(found.url);
+        const old = merged.get(key);
+        if (!old || old.source === "veyra-crawl") merged.set(key, found);
+        else merged.set(key, { ...old, ...found, providers: [...new Set([...(old.providers || [old.source || old.provider].filter(Boolean)), "veyra-crawl"])] });
+      }
+      for (const reference of references) {
+        if (!merged.has(reference.canonicalUrl)) merged.set(reference.canonicalUrl, reference);
+      }
+      candidates = diversifyWebResults(rankResultsByRelevance(scope.text, [...merged.values()], req.query.region), limit, scope.active);
+    }
+    const provider = result.provider && result.provider !== "none" && external.length ? result.provider :
+      (candidates[0]?.source || result.provider);
+    const enrich = rows => firstSourcePage && rows.length
+      ? evidenceService.enrich(scope, rows, { signal: request.signal }).catch(() => rows) : rows;
+    if (feed && !selected) {
+      const local = fromIndex(0);
+      if (!candidates.length && !result.nextOffset && local.results.length) return reply(local);
+      let results = candidates;
+      if (!offset && !scope.active && candidates.length && limit >= 8 && local.results.length) {
+        const merged = new Map(candidates.map(row => [canonicalKey(row.url), row]));
+        for (const row of local.results.slice(0, 4)) {
+          if (!merged.has(row.canonicalUrl) && isTopicalResult(scope.text, row, { requireTitle: true })) merged.set(row.canonicalUrl, row);
+        }
+        if (merged.size > candidates.length) results = diversifyWebResults(rankResultsByRelevance(scope.text, [...merged.values()], req.query.region), limit);
+      }
+      return reply({ ...result, provider, results: await enrich(results), ...(results.length ? { status: "ok" } : {}),
+        ...(!result.nextOffset && local.results.length ? { nextOffset: WEB_FEED_INDEX_OFFSET, more: true } : {}) });
+    }
+    if (firstSourcePage && !candidates.length && !result.nextOffset) {
+      const local = fromIndex(0);
+      if (local.results.length) return reply({ ...local, more: false, nextOffset: null, status: "ok" });
+    }
+    reply({ ...result, provider, results: await enrich(candidates), ...((firstSourcePage || references.length) && candidates.length ? { status: "ok" } : {}) });
   } catch (e) {
-    respondError(res, 502, `Veyra web search failed: ${e.message}`, "SEARCH_WEB_ERROR");
+    respondError(res, 502, "Veyra web search is temporarily unavailable.", "SEARCH_WEB_ERROR");
+  } finally { request.dispose(); }
+});
+
+// Separate from the public search providers, crawler, general media cache and
+// Fast Proxy. Nothing from a configured catalog enters those pipelines.
+function publisherMediaRequired(req, res, next) {
+  res.set("Cache-Control", "private, no-store");
+  res.set("Referrer-Policy", "no-referrer");
+  if (!publisherMedia || req.query.privacy !== "restricted" || req.query.incognito === "1" || req.query.private === "1") {
+    return respondError(res, 404, "Publisher search is unavailable.", "PUBLISHER_UNAVAILABLE");
   }
+  next();
+}
+const publisherToken = req => /^Bearer\s+(\S+)$/i.exec(req.get("authorization") || "")?.[1] || "";
+app.get("/api/search/publisher/status", publisherMediaRequired, requireUser, (req, res) => {
+  if (!publisherMedia.browserAvailable(req.query.domain)) {
+    return respondError(res, 404, "Publisher search is unavailable.", "PUBLISHER_UNAVAILABLE");
+  }
+  res.json({ ok: true });
+});
+app.post("/api/search/publisher/challenge", publisherMediaRequired, requireUser, (req, res) => {
+  const grant = publisherMedia.issue(req.veyraUser.id, publisherToken(req));
+  if (!grant) return respondError(res, 503, "Publisher search is temporarily unavailable.", "PUBLISHER_UNAVAILABLE");
+  res.json({ ok: true, ...grant });
+});
+app.post("/api/search/publisher/verify", publisherMediaRequired, requireUser, (req, res) => {
+  if (!publisherMedia.accept(req.veyraUser.id, publisherToken(req), req.body?.assertion)) {
+    return respondError(res, 403, "Age verification was not accepted.", "PUBLISHER_AGE_REQUIRED");
+  }
+  res.json({ ok: true });
+});
+app.post("/api/search/publisher", publisherMediaRequired, requireUser, (req, res) => {
+  const result = publisherMedia.search(req.veyraUser.id, publisherToken(req), req.body || {});
+  if (result.status === "age-required") return respondError(res, 403, "Verified adult access is required.", "PUBLISHER_AGE_REQUIRED");
+  if (result.status === "invalid-query") return respondError(res, 400, "Use search:<approved-domain> and optional keywords.", "PUBLISHER_QUERY_INVALID");
+  if (result.status !== "ok") return respondError(res, 404, "Publisher search is unavailable.", "PUBLISHER_UNAVAILABLE");
+  res.json({ ok: true, ...result });
+});
+
+app.get("/api/search/vertical", async (req, res) => {
+  const type = typeof req.query.type === "string" ? req.query.type : "";
+  const { query: q, domain } = searchEntry(typeof req.query.q === "string" ? req.query.q.trim().slice(0, 600) : "");
+  const page = Number(req.query.page ?? 0);
+  const provider = typeof req.query.provider === "string" ? req.query.provider : "";
+  const thumbnailPreview = req.query.preview === "1";
+  const lastPage = lastVerticalPage(type, provider);
+  if ((type !== "all" && !SEARCH_VERTICALS.includes(type)) || !Number.isInteger(page) || page < 0 || page > lastPage || (page > 0 && !provider) || !/^[a-z-]{0,24}$/.test(provider) || (type === "all" && (page || provider)) || (thumbnailPreview && (!["images", "videos"].includes(type) || page || provider))) {
+    return respondError(res, 400, "Invalid search category or page.", "INVALID_SEARCH_CATEGORY");
+  }
+  const request = requestAbortSignal(req, res);
+  try {
+    const signal = AbortSignal.any([request.signal, AbortSignal.timeout(type === "all" ? 12000 : 9000)]);
+    const service = app.locals.veyraVerticalSearch || verticalSearch;
+    const options = { page, provider, lang: req.query.lang, region: req.query.region, signal, noCache: req.veyraPrivateTraffic || req.query.incognito === "1" || !CFG.globalCacheEnabled, preview: type === "all", requireThumbnail: thumbnailPreview, domainBrowse: !!domain, privateSearch: req.query.incognito === "1" };
+    const scope = parseSiteScope(q);
+    const privacy = searchPrivacy(req.query.privacy);
+    if (masksSearchScope(privacy, q, scope)) {
+      const section = category => ({ type: category, provider: "none", status: "filtered", results: [], nextPage: null });
+      return res.json(type === "all" ? { ok: true, type, sections: SEARCH_VERTICALS.map(section) } : { ok: true, ...section(type) });
+    }
+    const withMatches = (section, category) => ({ ...section, results: annotateMatchBatch(q, section.results.filter(row =>
+      allowsSearchResult(privacy, row) && allowsSiteUrl(scope, row.sourcePageUrl || row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl)) &&
+      (category === "images" || allowsSiteUrl(scope, row.url))), category), matchModel: matchModelVersion });
+    if (thumbnailPreview && options.privateSearch) return res.json({ ok: true, type, provider: "none", status: "empty", results: [], nextPage: null });
+    if (type !== "all") {
+      const result = withMatches(await service.search(type, q, options), type);
+      if (!thumbnailPreview) return res.json({ ok: true, ...result });
+      return res.json({ ok: true, type, provider: result.provider, status: result.status,
+        results: result.results.filter(row => row.thumbnail).slice(0, 6), nextPage: null });
+    }
+    let cursor = 0;
+    const sections = Array(SEARCH_VERTICALS.length);
+    await Promise.all(Array.from({ length: 3 }, async () => {
+      while (cursor < SEARCH_VERTICALS.length && !signal.aborted) {
+        const index = cursor++, category = SEARCH_VERTICALS[index];
+        try {
+          const section = withMatches(await service.search(category, q, options), category);
+          sections[index] = { ...section, results: section.results.slice(0, 3) };
+        } catch { sections[index] = { type: category, status: "unavailable", results: [] }; }
+      }
+    }));
+    res.json({ ok: true, type, sections: SEARCH_VERTICALS.map((category, index) => sections[index] || { type: category, status: "unavailable", results: [] }) });
+  } catch {
+    if (!request.signal.aborted) respondError(res, 502, "This search category is temporarily unavailable.", "SEARCH_CATEGORY_ERROR");
+  } finally { request.dispose(); }
 });
 
 app.get('/api/browser/status', (req, res) => res.json({ ok: true, ...browserEngine.status(), failover: failoverController ? failoverController.report() : null, snapshots: snapshotStore ? snapshotStore.report() : null, config: { backend: CFG.browserBackend, enabled: CFG.browserEnabled, headless: CFG.browserHeadless, maxSessions: CFG.maxBrowserSessions, maxPages: CFG.maxBrowserPages, maxContexts: CFG.maxBrowserContexts } }));
@@ -4182,16 +6770,280 @@ app.post('/api/browser/resume-verification', async (req, res) => {
 });
 
 
-const aiAnswerEngine = new AIAnswerEngine();
+const aiIndexRuns = new Map();
+function queueNeuralIndexFindings(query, sources = []) {
+  const crawler = app.locals.veyraNeuralRobotPool || neuralRobotPool;
+  if (!CFG.indexAiFindings || typeof crawler?.startCrawl !== "function") return;
+  const stop = new Set("a an and are as at be but by for from how in is it of on or the to was were what when where which who why with does do did can could should would".split(" "));
+  const queryTokens = unicodeWords(parseSiteScope(query).text).filter(token => !stop.has(token));
+  if (!queryTokens.length) return;
+  const external = (Array.isArray(sources) ? sources : []).filter(source => source && source.extractionStatus !== "local-index" && !["veyra-index", "local-index"].includes(String(source.provider || source.source || "").toLowerCase()));
+  const ranked = rankSearchCandidates(query, external, 20);
+  const relevant = ranked.filter(source => {
+    const words = new Set(unicodeWords(`${source.title || ""} ${source.snippet || source.description || ""} ${source.url || ""}`));
+    return queryTokens.some(token => words.has(token));
+  });
+  const seeds = [...new Set(relevant.map(source => normalizeUrl(source.url || source.canonicalUrl)).filter(Boolean))].slice(0, 6);
+  if (!seeds.length) return;
+  const key = `${String(query || "").toLowerCase().trim()}|${seeds.join(",")}`;
+  const previous = aiIndexRuns.get(key) || 0;
+  if (previous && Date.now() - previous < Math.max(60000, CFG.indexRefreshMs || 60000)) return;
+  aiIndexRuns.set(key, Date.now());
+  const perSeed = Math.max(1, Math.ceil(CFG.indexAiMaxPages / seeds.length));
+  void Promise.resolve().then(() => crawler.startCrawl(seeds, String(query || "").slice(0, CFG.maxSearchQueryChars), {
+    maxDepth: CFG.indexAiMaxDepth, maxPages: perSeed
+  })).then(results => { if (!Array.isArray(results) || !results.length) aiIndexRuns.delete(key); })
+    .catch(e => { aiIndexRuns.delete(key); serverLog("warn", "SEARCH", `Search-result index crawl failed: ${e.message}`); });
+  while (aiIndexRuns.size > 1000) aiIndexRuns.delete(aiIndexRuns.keys().next().value);
+}
+const aiAnswerEngine = new AIAnswerEngine({ acquisitionManager, fallbackRanker: neuralModel,
+  allowNeuralFallback: boolEnv("AI_ANSWER_NEURAL_FALLBACK", true) });
+const wideAnswerDiscovery = boolEnv("AI_ANSWER_WIDE_DISCOVERY", true);
+const wideOverviewUsers = new Set();
+const maxWideOverviews = 4;
+const aiAnswerFeedbackObservations = new Map();
+function trustedAnswerHints(rows, inScope) {
+  const trusted = new Map();
+  for (const row of (Array.isArray(rows) ? rows : []).slice(0, 12)) {
+    const url = verticalResultUrl(row?.url);
+    if (!url || !inScope(row) || trusted.has(url)) continue;
+    const indexed = searchIndex.get(normalizeUrl(url));
+    trusted.set(url, indexed && inScope(indexed) ? { url: indexed.url, title: indexed.title, contentText: indexed.text,
+      provider: "veyra-index", retrievedAt: indexed.indexedAt } : { url });
+  }
+  return [...trusted.values()];
+}
+function rememberAIAnswerForFeedback(id, answer, userId) {
+  const now = Date.now();
+  for (const [key, value] of aiAnswerFeedbackObservations) if (now - value.createdAt > 24 * 60 * 60 * 1000) aiAnswerFeedbackObservations.delete(key);
+  const features = aiAnswerEngine.qualityModel.features({ answer: answer.answer, grounding: answer.grounding, sources: answer.sources, intent: answer.intent });
+  aiAnswerFeedbackObservations.set(id, { features: Array.from(features), createdAt: now, feedbackGiven: false, userId });
+  while (aiAnswerFeedbackObservations.size > 2000) aiAnswerFeedbackObservations.delete(aiAnswerFeedbackObservations.keys().next().value);
+}
+async function persistAIObservation(id, query, results, answer) {
+  if (!mongoStore.enabled) return;
+  const rows = Array.isArray(results) ? results.slice(0, 24) : [];
+  // An unselected source is not necessarily irrelevant. Do not train the
+  // relevance model on its own retrieval/answer decisions as ground truth.
+  await mongoStore.recordAIObservation({ id, query, answer: answer?.answer || "", hasAnswer: !!answer?.hasAnswer, generatedBy: answer?.generatedBy || "", sources: answer?.sources || [], results: rows, pipeline: answer?.pipeline || {}, grounding: answer?.grounding || {} });
+}
 app.post('/api/search/answer', async (req, res) => {
+  const user = authStore.userFromRequest(req);
+  if (req.query.private === "1" || req.query.incognito === "1" || !user) {
+    req.veyraPrivateTraffic = true;
+    return res.set("Cache-Control", "no-store").json({ hasAnswer: false, reason: "AI answers are off in private browsing." });
+  }
+  const routeStartedAt = Date.now();
+  const request = requestAbortSignal(req, res);
+  let wideSlot = false;
   try {
-    const { query, results } = req.body;
+    const { query, preferGoogle } = searchEntry(typeof req.body?.query === "string" ? req.body.query.trim().slice(0, 600) : "");
+    const vertical = req.body?.vertical;
+    const followUp = req.body?.followUp != null;
+    let { results } = req.body || {};
+    let retrievalDiagnostics = null;
     if (!query) return res.json({ hasAnswer: false, reason: 'No query provided' });
-    const answer = await aiAnswerEngine.answer(query, results || []);
+    if (vertical != null && !SEARCH_VERTICALS.includes(vertical)) return respondError(res, 400, "Invalid answer category.", "INVALID_SEARCH_CATEGORY");
+    const scope = parseSiteScope(String(query).trim());
+    const privacy = searchPrivacy(req.body?.privacy);
+    if (scope.invalid) return res.json({ hasAnswer: false, reason: "Use a valid hostname with site:." });
+    if (masksSearchScope(privacy, query, scope)) return res.json({ hasAnswer: false, reason: "The current search filter excludes that scope." });
+    let chatContext, answerQuery = scope.text, discoveryQuery = query;
+    if (followUp) {
+      req.veyraPrivateTraffic = true;
+      const { question, previousQuestion } = req.body.followUp;
+      const valid = (value, max) => typeof value === "string" && value.trim().length > 0 && value.length <= max;
+      if (!scope.text || !valid(question, 200) || (previousQuestion != null && !valid(previousQuestion, 200)) ||
+          parseSiteScope(question).active || (previousQuestion && parseSiteScope(previousQuestion).active)) {
+        return respondError(res, 400, "Ask a question of up to 200 characters. Use the main search bar to change the site filter.", "INVALID_ANSWER_FOLLOWUP");
+      }
+      chatContext = { question: question.trim(), topic: scope.text.slice(0, 120), previousQuestion: previousQuestion?.trim().slice(0, 80) || "" };
+      if ([chatContext.question, chatContext.previousQuestion].some(input => {
+        const { query: q } = searchEntry(input);
+        return masksSearchScope(privacy, q, parseSiteScope(q));
+      })) {
+        return res.json({ hasAnswer: false, reason: "The current search filter excludes that destination.", followUp: true });
+      }
+      // Only use the original search to establish scope. Leading operators
+      // survive discovery's provider-specific length limits.
+      const operators = [...scope.include.map(h => `site:${h}`), ...scope.exclude.map(h => `-site:${h}`)].join(" ");
+      answerQuery = [chatContext.question, chatContext.topic, chatContext.previousQuestion].filter(Boolean).join(" ");
+      discoveryQuery = [operators, chatContext.question, chatContext.topic, chatContext.previousQuestion].filter(Boolean).join(" ");
+      results = null; // Follow-ups discover their own evidence, not client-provided results.
+    }
+    const inScope = row => allowsSearchResult(privacy, row) && allowsSiteUrl(scope, row.url) && (!row.canonicalUrl || allowsSiteUrl(scope, row.canonicalUrl));
+    // The overview identifies its search category. Leave unversioned/legacy
+    // summary callers and the retired conversation UI on their existing path.
+    const source = req.body?.source;
+    const wide = wideAnswerDiscovery && !followUp && !!scope.text &&
+      (vertical ? source === vertical : source === "web" || source === "index");
+    if (wide) {
+      if (wideOverviewUsers.has(user.id) || wideOverviewUsers.size >= maxWideOverviews) {
+        return res.set({ "Retry-After": "2", "Cache-Control": "no-store" }).status(429)
+          .json({ hasAnswer: false, reason: "Veyra AI is busy. Try again in a moment.", diagnosticCode: "http_429" });
+      }
+      wideOverviewUsers.add(user.id);
+      wideSlot = true;
+      const lang = typeof req.body.lang === "string" ? req.body.lang.slice(0, 35) : "en";
+      const region = req.body.region;
+      const options = { lang, region, noCache: !CFG.globalCacheEnabled };
+      const categorySearch = async (category, topic, signal, next) => {
+        const service = app.locals.veyraVerticalSearch || verticalSearch;
+        const section = await service.search(category, topic, { ...options, ...next, signal });
+        const nextProvider = section.nextProvider || section.provider;
+        const continuation = !next && Number.isSafeInteger(section.nextPage) && section.nextPage >= 1 &&
+          section.nextPage <= lastVerticalPage(category, nextProvider) && /^[a-z-]{1,24}$/.test(nextProvider || "")
+          ? { page: section.nextPage, provider: nextProvider } : null;
+        // A media URL or a listing's metadata is not page evidence. Discover
+        // source pages from the selected category and re-check all URL fields.
+        return { status: section.status, continuation, results: (section.results || []).flatMap(row => {
+          const url = verticalResultUrl(row?.sourcePageUrl || row?.url);
+          return url && allowsSearchResult(privacy, row) && inScope({ ...row, url }) ? [{ ...row, url }] : [];
+        }) };
+      };
+      const webLookup = async (topic, signal, next) => {
+        const found = await (app.locals.veyraWebSearch || webSearch).search(topic, {
+          ...options, ...next, signal, limit: Math.min(CFG.maxSearchResults, 20), feed: true, reference: true, preferGoogle
+        });
+        return { ...found, continuation: !next && found.nextOffset === WEB_FEED_STEP ? { offset: WEB_FEED_STEP } : null };
+      };
+      const guarded = lookup => (topic, signal, next) => masksSearchScope(privacy, topic, parseSiteScope(topic))
+        ? { status: "filtered", results: [] } : lookup(topic, signal, next);
+      const crawl = sourceSearchEnabled && !vertical && source === "web" ? guarded(async (topic, signal) => ({
+        results: await (app.locals.veyraSourceSearch || sourceSearch).discover(parseSiteScope(topic), {
+          signal, allowUrl: url => inScope({ url })
+        })
+      })) : null;
+      const { results: discovered, diagnostics } = await discoverAnswerSources({
+        query, scope, vertical, allowSource: inScope, signal: request.signal,
+        seeds: vertical ? [] : trustedAnswerHints(results, inScope).filter(row => source !== "index" || row.provider === "veyra-index"),
+        indexed: vertical ? [] : localSearch(query, 0, answerDiscoveryShortlist, { includeText: true, maxTextChars: 30000,
+          privacy, region, topical: true, requireTerms: true }).results,
+        references: !vertical && source === "web" ? referenceResults(scope, 3) : [],
+        search: vertical ? guarded((q, signal, next) => categorySearch(vertical, q, signal, next)) : source === "web" ? guarded(webLookup) : null,
+        research: !vertical && source === "web" ? guarded((q, signal) => categorySearch("research", q, signal)) : null,
+        crawl
+      });
+      results = discovered;
+      retrievalDiagnostics = { ...diagnostics, ...(vertical ? { vertical } : {}) };
+      if (!results.length && diagnostics.batches.some(batch => ["unavailable", "cancelled"].includes(batch.status))) {
+        return res.json({ hasAnswer: false, reason: "Source discovery is temporarily unavailable.", diagnosticCode: "provider_error",
+          ...(vertical ? { vertical } : {}), pipeline: { sourceRetrieval: retrievalDiagnostics } });
+      }
+    } else if (vertical) {
+      const service = app.locals.veyraVerticalSearch || verticalSearch;
+      const options = {
+        signal: AbortSignal.any([request.signal, AbortSignal.timeout(7500)]), lang: req.body.lang, region: req.body.region,
+        noCache: followUp || !CFG.globalCacheEnabled
+      };
+      // Use server-discovered source links only. A product price, image,
+      // video description, or research listing is not verified page evidence.
+      const distinctSources = new Map();
+      const addCategorySources = section => {
+        for (const row of section.results) {
+          const url = verticalResultUrl(row?.sourcePageUrl || row?.url);
+          if (!url || !inScope({ ...row, url }) || distinctSources.has(url)) continue;
+          distinctSources.set(url, { url, provider: row.provider });
+          if (distinctSources.size === 6) break;
+        }
+      };
+      let section = await service.search(vertical, discoveryQuery, options);
+      addCategorySources(section);
+      // A conversational question may be phrased differently from indexed
+      // listing titles. If it finds nothing, read pages for the original topic.
+      if (followUp && !distinctSources.size && !options.signal.aborted) {
+        section = await service.search(vertical, query, options);
+        addCategorySources(section);
+      }
+      results = [...distinctSources.values()];
+      retrievalDiagnostics = { vertical, provider: section.provider, candidates: results.length };
+      if (!results.length) return res.json({ hasAnswer: false, reason: "No source pages are available in this category to support an answer.", vertical, ...(followUp ? { followUp: true } : {}) });
+    } else if (Array.isArray(results) && results.length) {
+      // Client results are URL hints only. Read the server's indexed copy or
+      // the source page itself rather than citing client-supplied prose.
+      results = trustedAnswerHints(results, inScope);
+    } else {
+      const normalizedQuery = discoveryQuery.slice(0, CFG.maxSearchQueryChars);
+      const localSearchStartedAt = Date.now();
+      const local = localSearch(discoveryQuery, 0, Math.min(4, CFG.maxSearchResults), { includeText: true, maxTextChars: 30000, privacy });
+      const localSearchMs = Date.now() - localSearchStartedAt;
+      const externalDiscoveryStartedAt = Date.now();
+      let discovered = { pages: [], metrics: { candidates: 0, fetched: 0, extracted: 0, failed: 0 }, provider: "none", attempts: [] };
+      try { if (!(followUp && req.body.source === "index")) discovered = await acquisitionManager.searchFirst(normalizedQuery, async (q, opts) => {
+        const result = await (app.locals.veyraWebSearch || webSearch).search(q, followUp ? { ...opts, noCache: true, region: req.body.region } : opts);
+        return { ...result, results: (result.results || []).filter(inScope),
+          ...(Array.isArray(result.candidates) ? { candidates: result.candidates.filter(inScope) } : {}) };
+      }, { limit: CFG.maxSearchResults, fetchLimit: Math.min(8, CFG.maxSearchResults), signal: request.signal, deadlineMs: 8000,
+        noCache: followUp, lang: followUp && typeof req.body.lang === "string" ? req.body.lang.slice(0, 35) : "en" }); }
+      catch { if (!followUp) serverLog("warn", "SEARCH", "Search-to-answer external discovery failed; continuing with local-index candidates."); }
+      const externalDiscoveries = (discovered.candidates || []).filter(inScope);
+      if (!followUp) queueNeuralIndexFindings(normalizedQuery, externalDiscoveries);
+      const combined = new Map();
+      const add = candidate => {
+        const key = normalizeUrl(candidate.canonicalUrl || candidate.url); if (!key) return;
+        const existing = combined.get(key);
+        if (!existing) { combined.set(key, { ...candidate, canonicalUrl: key, providers: [...new Set(candidate.providers || [candidate.provider].filter(Boolean))] }); return; }
+        const providers = [...new Set([...(existing.providers || []), ...(candidate.providers || []), candidate.provider].filter(Boolean))];
+        combined.set(key, { ...existing, ...candidate, canonicalUrl: key, contentText: candidate.contentText || existing.contentText || "", providers, source: candidate.source || existing.source });
+      };
+      for (const row of local.results) add({ ...row, provider: "veyra-index", retrievedAt: row.indexedAt, sourceIdentity: row.domain, fetchStatus: "indexed", extractionStatus: "local-index" });
+      for (const page of discovered.pages) {
+        if (["challenge", "consent", "empty"].includes(page.extractionStatus) || String(page.text || "").trim().length < 80) continue;
+        add({ url: page.url, canonicalUrl: page.canonical, title: page.title, snippet: page.description || page.text.slice(0, 600), contentText: page.text, provider: page.source?.provider || page.source?.source, providers: page.source?.providers || [], source: page.source, sourceIdentity: new URL(page.url).hostname.replace(/^www\./, ""), retrievedAt: page.fetchedAt, publishedAt: page.publishedAt, fetchStatus: "fetched", extractionStatus: page.extractionStatus });
+      }
+      results = [...combined.values()].filter(inScope);
+      retrievalDiagnostics = { localCandidates: local.results.length, localSearchMs, externalDiscoveryMs: Date.now() - externalDiscoveryStartedAt, external: discovered.metrics, providers: discovered.attempts || [], mergedCandidates: results.length, webSearchResults: externalDiscoveries.slice(0, CFG.maxSearchResults).map(row => ({ url: row.url, title: row.title || "", snippet: String(row.snippet || row.description || "").slice(0, 700), provider: row.provider || "", providers: row.providers || [] })).filter(row => row.url) };
+    }
+    const answer = await (app.locals.veyraAnswerEngine || aiAnswerEngine).answer(answerQuery, results || [], {
+      signal: request.signal, retrievalDiagnostics, requirePageEvidence: !!vertical, vertical, chatContext, noCache: followUp,
+      ...(wide ? { requireReadableEvidence: true, indexOnly: source === "index", evidenceLimit: 12 } : {}),
+      ...(scope.active || privacy !== "unfiltered" ? { allowSource: inScope } : {})
+    });
+    if (vertical) answer.vertical = vertical;
+    if ((scope.active || privacy !== "unfiltered") && (answer.sources || []).some(row => !inScope(row))) return res.json({ hasAnswer: false, reason: "An answer could not be grounded within the requested site." });
+    if (retrievalDiagnostics?.webSearchResults) answer.searchResults = retrievalDiagnostics.webSearchResults;
+    const routeResponseTimeMs = Date.now() - routeStartedAt;
+    answer.responseTimeMs = routeResponseTimeMs;
+    answer.pipeline = { ...(answer.pipeline || {}), answerGenerationMs: answer.pipeline?.latencyMs ?? null, responseTimeMs: routeResponseTimeMs };
+    if (followUp) answer.followUp = true;
+    if (answer.hasAnswer && !followUp) {
+      const observationId = `obs_${crypto.randomBytes(18).toString("base64url")}`;
+      answer.observationId = observationId;
+      rememberAIAnswerForFeedback(observationId, answer, user.id);
+      if (!vertical) {
+        // Persist discovery metadata and cited passages, not copies of all the
+        // index text sent to synthesis for this overview.
+        const observationResults = wide ? results.map(({ contentText, ...metadata }) => metadata) : results || [];
+        void persistAIObservation(observationId, query, observationResults, answer).catch(e => serverLog("warn", "AI", `AI observation persistence failed: ${e.message}`));
+      }
+    }
     res.json(answer);
-  } catch (e) { res.json({ hasAnswer: false, reason: e.message }); }
+  } catch (e) {
+    if (!request.signal.aborted) res.json({ hasAnswer: false, reason: "Answer retrieval or synthesis failed.", code: /^[A-Z0-9_:-]{1,64}$/i.test(String(e?.code || "")) ? String(e.code) : "ANSWER_PIPELINE_ERROR" });
+  } finally {
+    if (wideSlot) wideOverviewUsers.delete(user.id);
+    request.dispose();
+  }
 });
-app.get('/api/answer/status', (req, res) => res.json(aiAnswerEngine.report()));
+app.post("/api/search/answer/feedback", async (req, res) => {
+  const user = authStore.userFromRequest(req);
+  if (req.query.private === "1" || !user) return respondError(res, 401, "Sign in to submit answer feedback.", "ANSWER_FEEDBACK_AUTH_REQUIRED");
+  const observationId = String(req.body?.observationId || "");
+  const rating = String(req.body?.rating || "").toLowerCase();
+  if (!/^obs_[A-Za-z0-9_-]{20,40}$/.test(observationId) || !["helpful", "unhelpful"].includes(rating)) return res.status(400).json({ ok: false, error: "A valid observationId and helpful/unhelpful rating are required." });
+  const observation = aiAnswerFeedbackObservations.get(observationId);
+  if (!observation || observation.userId !== user.id) return res.status(410).json({ ok: false, error: "This answer feedback token has expired or is unknown." });
+  if (observation.feedbackGiven) return res.status(409).json({ ok: false, error: "Feedback was already recorded for this answer." });
+  const training = aiAnswerEngine.qualityModel.train(observation.features, rating === "helpful");
+  observation.feedbackGiven = true;
+  const recordId = `af_${observationId.slice(4)}`;
+  void mongoStore.recordAIAnswerFeedback({ id: recordId, observationId, rating, scoreBefore: training.before, scoreAfter: training.after, step: training.step, features: observation.features }).catch(error => serverLog("warn", "AI", `Answer feedback persistence failed: ${error.message}`));
+  void mongoStore.saveAINeuralModel("answer-quality-v1", aiAnswerEngine.qualityModel.serialize()).catch(error => serverLog("warn", "AI", `Answer-quality model persistence failed: ${error.message}`));
+  res.json({ ok: true, trained: true, rating, scoreBefore: Math.round(training.before * 1000) / 1000, scoreAfter: Math.round(training.after * 1000) / 1000, optimizer: "AdamW", trainingExamples: aiAnswerEngine.qualityModel.examples, calibrated: false });
+});
+app.get('/api/answer/status', (req, res) => res.json({ ...aiAnswerEngine.report(),
+  sourceDiscovery: { strategy: wideAnswerDiscovery ? answerDiscoveryStrategy : "legacy", shortlistLimit: wideAnswerDiscovery ? answerDiscoveryShortlist : null }
+}));
 
 
 
@@ -4347,7 +7199,9 @@ function extractWarmUrls(html, base, sid) {
   const out = new Map();
   const add = (raw, priority = 20, type = "asset") => {
     const u = resolveResource(raw, base);
-    if (!u) return;
+    // Runtime tile/asset placeholders aren't real fetch targets. Filter both
+    // raw and percent-encoded forms before preloading or server-side warming.
+    if (!u || /(?:\{[a-z][a-z0-9_]*\}|%7b[a-z][a-z0-9_]*%7d)/i.test(u)) return;
     const safeType = warmTypeForUrl(u, type);
     const current = out.get(u);
     if (!current || priority > current.priority) out.set(u, { url: u, priority, type: safeType });
@@ -4391,7 +7245,7 @@ function extractWarmUrls(html, base, sid) {
 }
 
 async function warmPageResources(html, base, sid, externalSignal = null) {
-  if (CFG.proxyWarmLimit <= 0 || !html || !base) return;
+  if (CFG.proxyWarmLimit <= 0 || !html || !base || !CFG.sessionCacheEnabled || !canCacheSession(sessionManager.peek(sid))) return;
   const candidates = extractWarmUrls(html, base, sid);
   if (!candidates.length) return;
 
@@ -4521,7 +7375,7 @@ function forwardProxyBrowserHeaders(req, targetUrl, sourceUrl, mode, baseHeaders
       const value = req.get(name);
       if (value) out[name] = String(value).slice(0, 20000);
     }
-    for (const name of ["if-none-match", "if-modified-since", "if-match", "if-unmodified-since", "sec-purpose"]) {
+    for (const name of ["if-none-match", "if-modified-since", "if-match", "if-unmodified-since", "sec-purpose", "last-event-id"]) {
       const value = req.get(name);
       if (value) out[name] = String(value).slice(0, 4000);
     }
@@ -4558,6 +7412,67 @@ function proxyRefererCanonical(req) {
   return normalizeUrl(raw);
 }
 
+function isYoutubeHost(hostname) {
+  const h = String(hostname || "").toLowerCase().replace(/^www\./, "");
+  return h === "youtube.com" || h === "m.youtube.com" || h === "music.youtube.com";
+}
+
+// YouTube commonly redirects m.youtube.com to www.youtube.com at the edge.
+// That redirect is valid upstream, but exposing it as Veyra's virtual URL
+// makes mobile navigation and relative app routes escape the intended view.
+function virtualPageUrl(requestedUrl, finalUrl) {
+  const requested = normalizeUrl(requestedUrl);
+  const final = normalizeUrl(finalUrl || requestedUrl);
+  if (!requested || !final) return final || requested;
+  try {
+    const from = new URL(requested), to = new URL(final);
+    if (from.hostname.toLowerCase() === "m.youtube.com" && isYoutubeHost(to.hostname)) {
+      to.hostname = "m.youtube.com";
+      return to.href;
+    }
+  } catch {}
+  return final;
+}
+
+function shouldWarmPageResources(url) {
+  try {
+    const host = new URL(url).hostname;
+    return !isYoutubeHost(host) || CFG.youtubeWarmResources;
+  } catch {
+    return true;
+  }
+}
+
+function shouldSkipYoutubeStaticJsRewrite(url, contentType) {
+  if (!CFG.youtubeSkipStaticJsRewrite || !/javascript|ecmascript/i.test(String(contentType || ""))) return false;
+  try {
+    const u = new URL(url);
+    return isYoutubeHost(u.hostname) && (/^\/s\//i.test(u.pathname) || /^\/player\//i.test(u.pathname));
+  } catch {
+    return false;
+  }
+}
+
+function shouldDirectYoutubeStaticAsset(url, contentType) {
+  if (!CFG.youtubeDirectStaticAssets || !/javascript|ecmascript|text\/css/i.test(String(contentType || ""))) return false;
+  try {
+    const u = new URL(url);
+    return isYoutubeHost(u.hostname) && (/^\/s\//i.test(u.pathname) || /^\/player\//i.test(u.pathname));
+  } catch {
+    return false;
+  }
+}
+
+function isDirectYoutubeStaticUrl(url) {
+  if (!CFG.youtubeDirectStaticAssets) return false;
+  try {
+    const u = new URL(url);
+    return isYoutubeHost(u.hostname) && (/^\/s\//i.test(u.pathname) || /^\/player\//i.test(u.pathname));
+  } catch {
+    return false;
+  }
+}
+
 function proxyAcceptForResource(req, mode) {
   if (req.get("Accept")) return String(req.get("Accept")).slice(0, 1000);
   return mode === "view"
@@ -4579,20 +7494,20 @@ function looksLikeApiResource(url, accept = "", method = "GET") {
 
 
 
+function isProxyEventStream(type) { return /^text\/event-stream(?:\s*;|$)/i.test(String(type || "").trim()); }
 async function streamOversizeResponse(req, res, result, ctx) {
-  let handle = result.stream ? result.stream.take() : null;
-  if (!handle) {
-    
-    
-    const again = await fetchBuffer(ctx.canonical, { method: ctx.method, headers: ctx.headers, body: ctx.body, referrer: ctx.referrer, sessionId: ctx.sid, retries: 0, limit: 0, limitForContentType: () => 0, streamOversize: true });
-    handle = again.stream ? again.stream.take() : null;
-    if (!handle) return respondError(res, 502, "Veyra could not stream this resource.", "PROXY_STREAM_ERROR");
-    result = again;
-  }
+  const handle = result.stream?.take();
+  if (!handle) return respondError(res, 502, "Veyra could not stream this resource.", "PROXY_STREAM_ERROR");
   const type = result.contentType || "application/octet-stream";
+  const eventStream = !ctx.download && isProxyEventStream(type);
   res.setHeader("content-type", type);
-  res.setHeader("cache-control", ctx.download ? "no-store" : "public, max-age=60");
-  res.setHeader("x-content-type-options", "nosniff");
+  res.setHeader("cache-control", "no-store");
+  if (eventStream) res.setHeader("X-Accel-Buffering", "no");
+  // Mirror the upstream's nosniff decision instead of forcing it on (see
+  // fetchBuffer's xContentTypeOptions note); the shield middleware may
+  // have pre-set it, so remove it when the upstream did not send it.
+  if (result.xContentTypeOptions) res.setHeader("x-content-type-options", result.xContentTypeOptions);
+  else res.removeHeader("x-content-type-options");
   res.setHeader("referrer-policy", "no-referrer");
   if (ctx.download) res.setHeader("content-disposition", `attachment; filename="${safeDownloadFilename(result.finalUrl || ctx.canonical, type)}"`);
   if (result.contentRange) res.setHeader("content-range", result.contentRange);
@@ -4604,60 +7519,152 @@ async function streamOversizeResponse(req, res, result, ctx) {
   if (result.contentLength) res.setHeader("content-length", result.contentLength);
   if (result.etag) res.setHeader("ETag", result.etag);
   if (result.lastModified) res.setHeader("Last-Modified", result.lastModified);
+  const retryAfter = proxyRetryAfter(result);
+  if (retryAfter) res.setHeader("Retry-After", retryAfter);
+  if (result.allow) res.setHeader("Allow", result.allow);
   res.setHeader("X-Veyra-Canonical-URL", result.finalUrl || ctx.canonical);
   res.setHeader("X-Veyra-Session-ID", ctx.sid);
   res.setHeader("X-Veyra-Content-Type", type);
   res.setHeader("X-Veyra-Proxy-Mode", "resource-stream");
-  res.status(result.status >= 300 && result.status < 400 ? 200 : result.status);
+  res.status(result.status);
   let closed = false;
-  res.on("close", () => { if (!res.writableFinished) { closed = true; try { handle.reader?.cancel().catch(() => {}); } catch {} } });
-  const write = (buf) => new Promise((resolve) => { if (closed) return resolve(); if (res.write(buf)) resolve(); else res.once("drain", resolve); });
+  const stopReading = () => { closed = true; try { handle.reader?.cancel().catch(() => {}); } catch {} };
+  const abort = () => { stopReading(); if (!res.writableEnded) res.destroy(); };
+  const onClose = () => { if (!res.writableFinished) stopReading(); };
+  const signal = ctx.record.abort.signal;
+  if (signal.aborted) { stopReading(); return sendSessionExpired(req, res, "resource", ctx.sid); }
+  signal.addEventListener("abort", abort, { once: true });
+  res.on("close", onClose);
+  let sentBytes = 0;
+  const write = buf => new Promise(resolve => {
+    if (closed || res.write(buf)) return resolve();
+    const done = () => { res.off("drain", done); res.off("close", done); resolve(); };
+    res.once("drain", done); res.once("close", done);
+  });
+  const writeChunk = async chunk => {
+    if (ctx.download && sentBytes + chunk.length > CFG.maxDownloadBytes) {
+      stopReading();
+      if (res.headersSent) res.destroy();
+      else {
+        res.removeHeader("Content-Disposition");
+        res.removeHeader("Content-Length");
+        res.removeHeader("Content-Range");
+        res.removeHeader("Content-Type");
+        respondError(res, 413, "The upstream response exceeds Veyra's safety limit.", "RESPONSE_TOO_LARGE");
+      }
+      return;
+    }
+    sentBytes += chunk.length;
+    await write(chunk);
+  };
   try {
-    for (const chunk of handle.head) await write(chunk);
+    if (eventStream) res.flushHeaders();
+    for (const chunk of handle.head) {
+      if (closed) break;
+      await writeChunk(chunk);
+    }
     if (handle.reader) {
       while (!closed) {
-        const { done, value } = await withTimeout(handle.reader.read(), CFG.bodyTimeoutMs, "Response body timed out.");
+        const { done, value } = await withTimeout(handle.reader.read(), ctx.bodyTimeoutMs, "Response body timed out.");
         if (done) break;
-        await write(Buffer.from(value));
+        await writeChunk(Buffer.from(value));
       }
     }
   } catch {
-    try { handle.reader?.cancel().catch(() => {}); } catch {}
+    stopReading();
     if (!res.writableEnded) res.destroy();
     return;
+  } finally {
+    signal.removeEventListener("abort", abort);
+    res.off("close", onClose);
   }
-  if (!res.writableEnded) res.end();
+  if (!res.writableEnded && !res.destroyed) res.end();
 }
 
 
 
 
-const PROXY_OWN_PARAMS = new Set(["url", "target", "u", "sid", "from", "download"]);
+const PROXY_OWN_PARAMS = new Set(["url", "target", "u", "sid", "from", "download", "veyra_popup"]);
 function mergeStrayProxyParams(req, canonical) {
   if (!canonical || !req.originalUrl) return canonical;
   let extra;
   try { extra = new URL(req.originalUrl, "http://x").searchParams; } catch { return canonical; }
   let target; try { target = new URL(canonical); } catch { return canonical; }
+  const included = new Map();
+  for (const [name, value] of target.searchParams) {
+    const id = JSON.stringify([name, value]);
+    included.set(id, (included.get(id) || 0) + 1);
+  }
   let changed = false;
   for (const [k, v] of extra) {
     if (PROXY_OWN_PARAMS.has(k) || /^__veyra/i.test(k)) continue;
-    if (target.searchParams.getAll(k).includes(v)) continue;
-    target.searchParams.set(k, v); changed = true;
+    const id = JSON.stringify([k, v]);
+    const count = included.get(id) || 0;
+    if (count) { included.set(id, count - 1); continue; }
+    target.searchParams.append(k, v);
+    changed = true;
   }
   return changed ? target.href : canonical;
 }
 
-async function proxyRequest(req, res, mode) {
-  const canonical = mergeStrayProxyParams(req, firstValidUrl([req.query.url, req.query.target, req.query.u], req.get('Origin') || undefined)) || proxyRefererCanonical(req);
-  const download = String(req.query.download || "") === "1";
+// Compress rewritten text responses (HTML/CSS/JS/JSON) on the way to the
+// client. Rewritten pages are routinely hundreds of KB and were previously
+// served uncompressed; brotli/gzip cuts the bytes on the wire by ~70-85%,
+// which dominates time-to-first-paint for the fast-proxy iframe on slow links.
+// Undici already decompresses upstream responses, so this only affects the
+// server->client hop.
+const PROXY_COMPRESS_MIN_BYTES = 1024;
+function proxyCompressibleContentType(contentType) {
+  return /text\/html|text\/css|text\/plain|text\/xml|javascript|ecmascript|json|svg|x-component/i.test(String(contentType || ""));
+}
+const gzipAsync = (buf, opts) => new Promise((resolve, reject) => zlib.gzip(buf, opts, (err, out) => (err ? reject(err) : resolve(out))));
+const brotliAsync = (buf, params) => new Promise((resolve, reject) => zlib.brotliCompress(buf, params, (err, out) => (err ? reject(err) : resolve(out))));
+async function maybeCompressProxyPayload(req, payload, contentType) {
+  if (!payload || !Buffer.isBuffer(payload) || payload.length < PROXY_COMPRESS_MIN_BYTES) return null;
+  if (!proxyCompressibleContentType(contentType)) return null;
+  const coding = express.request.acceptsEncodings.call(req, "br", "gzip", "identity");
+  if (coding === "br") {
+    const body = await brotliAsync(payload, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 4 } }).catch(() => null);
+    if (body && body.length < payload.length) return { body, encoding: "br" };
+  }
+  if (coding === "gzip") {
+    const body = await gzipAsync(payload, { level: 5 }).catch(() => null);
+    if (body && body.length < payload.length) return { body, encoding: "gzip" };
+  }
+  return null;
+}
+async function proxyRequest(req, res, mode, { formRouting, download: downloadOption = false, forceDownload = false } = {}) {
+  const query = formRouting || req.query;
+  const sid = normalizeSessionId(query.sid);
+  req.veyraPrivateTraffic = !canCacheSession(sessionManager.peek(sid));
+  res.setHeader("Cache-Control", "no-store");
+  if (sessionManager.checkLimit(sid)) return sendSessionExpired(req, res, mode, sid);
+  // Resource URLs are transport addresses, not crawler deduplication keys.
+  // Keep their encoded query and order (e.g. signed media playlist URLs).
+  const preserveQuery = mode === "resource";
+  const canonical = formRouting?.url || mergeStrayProxyParams(req, firstValidUrl([query.url, query.target, query.u], req.get('Origin') || undefined, { preserveQuery })) || proxyRefererCanonical(req);
+  const download = downloadOption === true || forceDownload || String(query.download || "") === "1";
   if (!canonical) return respondError(res, 400, "Missing or invalid public HTTP(S) URL.", "INVALID_URL");
   await assertPublicUrl(canonical);
   const accept = proxyAcceptForResource(req, mode);
   const method = req.method.toUpperCase();
   const mediaRequest = mode === "resource" && (
-    !!req.get("Range") || /video|audio/i.test(accept) || /googlevideo\.com/i.test(canonical) || /videoplayback/i.test(canonical)
+    !!req.get("Range") || /video|audio|mpegurl/i.test(accept) || /^(?:video|audio)$/i.test(req.get("Sec-Fetch-Dest") || "")
+    || /\.m3u8(?:$|[?#])/i.test(canonical) || /googlevideo\.com/i.test(canonical) || /videoplayback/i.test(canonical)
   );
   if (!safeMethod(method)) return respondError(res, 405, "Unsupported proxy method.", "PROXY_METHOD_NOT_ALLOWED");
+  // The 302 redirect is only safe for native-tab requests (same-origin). In
+  // the fast-proxy iframe a cross-origin redirect to YouTube's CDN is blocked
+  // by the browser, leaving scripts at HTTP 0 and the page stuck on its
+  // skeleton. Only emit the redirect when Veyra is not the Referer origin.
+  const refererOrigin = (() => { try { const r = String(req.get("Referer") || ""); return r ? new URL(r).origin : ""; } catch { return ""; } })();
+  const ytDirectRefererOk = refererOrigin && refererOrigin === (() => { try { return new URL(canonical).origin; } catch { return ""; } })();
+  if (mode === "resource" && !download && (method === "GET" || method === "HEAD") && isDirectYoutubeStaticUrl(canonical) && ytDirectRefererOk) {
+    res.setHeader("location", canonical);
+    res.setHeader("cache-control", req.veyraPrivateTraffic ? "no-store" : "public, max-age=300");
+    res.setHeader("x-veyra-direct-asset", "youtube-cdn");
+    return res.status(302).end();
+  }
   const body = method === "GET" || method === "HEAD" ? undefined : (() => {
     if (Buffer.isBuffer(req.body)) return req.body.length ? req.body : undefined;
     if (req.is("application/x-www-form-urlencoded")) return new URLSearchParams(req.body || {}).toString();
@@ -4665,11 +7672,9 @@ async function proxyRequest(req, res, mode) {
     return typeof req.body === "string" ? req.body : undefined;
   })();
   if (body && Buffer.byteLength(body) > CFG.maxProxyBodyBytes) return respondError(res, 413, "Proxy request body is too large.", "PROXY_BODY_TOO_LARGE");
-  const sourceUrl = (() => { try { const u = new URL(String(req.query.from || "")); return /^https?:$/.test(u.protocol) ? u.href : ""; } catch { return ""; } })();
+  const sourceUrl = (() => { try { const u = new URL(String(query.from || "")); return /^https?:$/.test(u.protocol) ? u.href : ""; } catch { return ""; } })();
   const referrer = sourceUrl || "";
   const sourceOrigin = sourceUrl ? new URL(sourceUrl).origin : "";
-  const sid = normalizeSessionId(req.query.sid);
-  const bridgeToken = /^[A-Za-z0-9_-]{16,128}$/.test(String(req.query.bridge || "")) ? String(req.query.bridge) : "";
   if (sessionManager.checkLimit(sid)) return sendSessionExpired(req, res, mode, sid);
   
   
@@ -4686,7 +7691,8 @@ async function proxyRequest(req, res, mode) {
       }
     } catch {}
   }
-  { const rec = sessionManager.touch(sid); const exp = sessionManager.expiresAt(rec); if (exp) res.setHeader("X-Veyra-Session-Expires", new Date(exp).toISOString());
+  const record = sessionManager.touch(sid);
+  { const rec = record; const exp = sessionManager.expiresAt(rec); if (exp) res.setHeader("X-Veyra-Session-Expires", new Date(exp).toISOString());
     
     if (rec.prefs?.blockTrackers && isTrackerHost(new URL(canonical).hostname)) {
       rec.blocked = (rec.blocked || 0) + 1;
@@ -4694,6 +7700,23 @@ async function proxyRequest(req, res, mode) {
       if (mode === "view") return res.status(200).type("html").send("<!doctype html><title></title>");
       return res.status(204).end();
     } }
+  // --- Escaped-path serving for top-level pages ---------------------------
+  // Location is [LegacyUnforgeable] in every browser, so no in-page shim can
+  // make location.pathname report the site's real path while the page lives
+  // at /api/view. Apps that parse their own URL (MSN Casual Games extracts
+  // the game ID from /<locale>/play/games/<slug>/cg-<id>) then hydrate
+  // without their content id and render a blank shell. Send top-level
+  // navigations to the escaped path form (origin + the site's real path +
+  // search): the escaped-path middleware resolves those back onto the real
+  // site, and the page's own code sees its true pathname natively. The
+  // target travels in __veyra_url/__veyra_sid params (stripped from the
+  // resolved target by resolveEscapedTarget), so the context survives even
+  // when third-party cookies are blocked.
+  if (mode === "view" && method === "GET" && !download && req.path === "/api/view") {
+    const escaped = escapedPathFor(canonical);
+    const liveSid = liveSessionId(sid);
+    if (escaped && liveSid && documentNavigation(req)) return markEscapedNavigation(req, res, escaped, liveSid);
+  }
   const headers = forwardProxyBrowserHeaders(req, canonical, sourceUrl, mode, {
     accept,
     
@@ -4706,102 +7729,217 @@ async function proxyRequest(req, res, mode) {
     ...(req.get("Range") ? { range: String(req.get("Range")).slice(0, 200) } : {}),
     ...(referrer ? { referer: referrer } : {}),
     
-    ...(sourceOrigin && method !== "GET" && method !== "HEAD" ? { origin: sourceOrigin } : {})
+    // Origin for site API calls: on the real site, a cross-origin XHR/fetch
+    // always carries the page's Origin (PolyTrack's vps.kodub.com backend
+    // 403s the request without it, hanging the game on its loading screen).
+    // Through the proxy the call is same-origin, so the browser sends no
+    // Origin on GET — synthesize what the real site would have sent
+    // whenever the target lives on another origin, and rewrite any Origin
+    // the browser did attach (it names the proxy origin, not the site).
+    ...(sourceOrigin && (() => {
+      let targetOrigin = "";
+      try { targetOrigin = new URL(canonical).origin; } catch {}
+      const browserSentOrigin = !!String(req.get("Origin") || "").trim();
+      const xhrLike = String(req.get("Sec-Fetch-Dest") || "").toLowerCase() === "empty";
+      const crossOriginCall = !!targetOrigin && sourceOrigin !== targetOrigin;
+      return method !== "GET" && method !== "HEAD" || browserSentOrigin || (xhrLike && crossOriginCall);
+    })() ? { origin: sourceOrigin } : {})
   });
   const limitForContentType = (ct) => {
     const type = String(ct || "").toLowerCase();
-    if (type.includes("text/html") || type.includes("application/xhtml") || type.includes("text/css") || /javascript|ecmascript|json|xml|x-component|react-server/i.test(type)) return CFG.maxProxyTextBytes;
+    if (isHlsPlaylistType(type) || type.includes("text/html") || type.includes("application/xhtml") || type.includes("text/css") || /javascript|ecmascript|json|xml|x-component|react-server/i.test(type)) return CFG.maxProxyTextBytes;
     if (type.startsWith("image/") || type.includes("svg")) return CFG.maxProxyImageBytes;
     if (type.startsWith("video/") || type.startsWith("audio/") || type.includes("application/pdf")) return CFG.maxProxyMediaBytes;
     return CFG.maxProxyOtherBytes;
   };
   try {
-    const browserKey = `${method} ${canonical}|ref=${referrer}|sid=${sid}|range=${headers.range || ""}|body=${body ? require("crypto").createHash("sha1").update(body).digest("hex") : ""}`;
     const browserPriority = mode === "view" ? 1000 : (looksLikeApiResource(canonical, accept, method) ? 980 : (/css|javascript|font|svg/i.test(accept) ? 900 : /image/i.test(accept) ? 800 : 700));
     const isNextRsc = /text\/x-component|text\/x-react-server-components/i.test(String(accept || "")) || !!req.get("RSC") || !!req.get("Next-Router-State-Tree") || !!req.get("Next-Action") || !!req.get("Next-Url");
     const requestLimit = mediaRequest ? CFG.maxProxyMediaBytes : (looksLikeApiResource(canonical, accept, method) || isNextRsc ? CFG.proxyApiBodyBytes : CFG.maxProxyBodyBytes);
-    const retries = mediaRequest ? 1 : (looksLikeApiResource(canonical, accept, method) || isNextRsc ? CFG.proxyApiRetries : CFG.maxRetries);
-    const requestUserAgent = req.get("User-Agent") ? String(req.get("User-Agent")).slice(0, 2000) : "";
-    const hasAuthorization = !!req.get("Authorization");
-    const result = await browserScheduler.request(browserKey, () => fetchCached(canonical, { method, headers, body, referrer, sessionId: sid, requestId: req.veyraRequestId, userAgent: requestUserAgent || undefined, limit: requestLimit, retries, limitForContentType, noCache: method !== "GET" || mediaRequest || hasAuthorization || isNextRsc, timeout: mediaRequest ? CFG.mediaRequestTimeoutMs : CFG.requestTimeoutMs, bodyTimeoutMs: mediaRequest ? CFG.mediaBodyTimeoutMs : CFG.bodyTimeoutMs, streamOversize: mode === "resource" }), { priority: browserPriority + (mediaRequest ? 30 : 0), host: hostOf(canonical), url: canonical });
+    // googlevideo URLs are signed and commonly IP-bound. Retrying a 403
+    // cannot change that decision and only doubles queue pressure.
+    const signedYoutubeMedia = mediaRequest && /(?:googlevideo\.com|videoplayback)/i.test(canonical);
+    const retries = signedYoutubeMedia || !["GET", "HEAD", "OPTIONS"].includes(method) ? 0 : (mediaRequest ? 1 : (looksLikeApiResource(canonical, accept, method) || isNextRsc ? CFG.proxyApiRetries : CFG.maxRetries));
+    const requestUserAgent = (req.get("User-Agent") ? String(req.get("User-Agent")).slice(0, 2000) : "");
+    // m.youtube.com must be fetched with a mobile UA. Otherwise YouTube serves the
+    // desktop build, its client JS sees the mobile URL + desktop build mismatch and
+    // appends ?app=desktop&themeRefresh=1, Veyra's virtualPageUrl pins the URL back to
+    // m.youtube.com, and the page reloads forever on its skeleton.
+    const mobileYoutubeRequest = (() => { try { return /^m\.youtube\.com$/i.test(new URL(canonical).hostname); } catch { return false; } })();
+    const effectiveUserAgent = mobileYoutubeRequest ? "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36" : (sessionManager.chromiumUaFor(sid, canonical) || requestUserAgent);
+    const hasAuthorization = hasCredentialRequestHeaders(headers);
+    const bodyTimeoutMs = mediaRequest ? CFG.mediaBodyTimeoutMs : CFG.bodyTimeoutMs;
+    const result = await browserScheduler.request(null, () => {
+      if (record.abort.signal.aborted || sessionManager.checkLimit(sid)) throw Object.assign(new Error("Session deleted."), { code: "SESSION_EXPIRED" });
+      return fetchCached(canonical, { method, headers, body, referrer, preserveQuery, sessionId: sid, requestId: req.veyraRequestId, userAgent: effectiveUserAgent || undefined, limit: requestLimit, retries, limitForContentType, noCache: download || method !== "GET" || mediaRequest || hasAuthorization || isNextRsc, timeout: mediaRequest ? CFG.mediaRequestTimeoutMs : CFG.requestTimeoutMs, bodyTimeoutMs, streamOversize: mode === "resource", passthroughBinary: mode === "resource" && !download && CFG.proxyPassthroughBinary, passthroughEventStream: mode === "resource" && !download });
+    }, { priority: browserPriority + (mediaRequest ? 30 : 0), host: hostOf(canonical), signal: record.abort.signal });
   
   
   
   const streamable = mode === "resource" || !/html|xhtml/i.test(String(result.contentType || ""));
-  if (result.tooLarge && streamable && CFG.proxyStreamOversize && !(download && result.bytes > CFG.maxDownloadBytes)) {
+  // Stream binary resources straight through — no full-resource buffering.
+  const eventStream = mode === "resource" && !download && isProxyEventStream(result.contentType);
+  const streamNow = result.stream && (result.tooLarge || result.passthrough) && streamable
+    && (CFG.proxyStreamOversize || eventStream) && !(download && result.bytes > CFG.maxDownloadBytes);
+  if (streamNow) {
     if (/javascript|ecmascript/i.test(result.contentType || "")) noteScriptDir(sid, result.finalUrl || canonical);
-    return streamOversizeResponse(req, res, result, { canonical, method, headers, body, referrer, sid, download });
+    return streamOversizeResponse(req, res, result, { canonical, sid, download, record, bodyTimeoutMs: eventStream ? Math.max(bodyTimeoutMs, 60_000) : bodyTimeoutMs });
   }
   if (result.stream) result.stream.cancel();
   if (result.tooLarge || (download && result.bytes > CFG.maxDownloadBytes)) return respondError(res, 413, "The upstream response exceeds Veyra's safety limit.", "RESPONSE_TOO_LARGE");
   const responseCacheControl = String(result.cacheControl || "").toLowerCase();
+  const retryAfter = proxyRetryAfter(result);
+  if (retryAfter) res.setHeader("Retry-After", retryAfter);
+  if (result.allow) res.setHeader("Allow", result.allow);
   const responseVary = String(result.vary || "").toLowerCase();
-  const requestHasAuth = !!req.get("Authorization");
+  const requestHasAuth = hasAuthorization;
   const privateResponse = /(?:^|[\s,])(?:private|no-store)(?:[=\s,]|$)/i.test(responseCacheControl) || /(?:^|[\s,])cookie(?:[\s,]|$)/i.test(responseVary);
   const staticResource = mode === "resource" && !download && !result.setCookieHeader && !requestHasAuth && !privateResponse && !cookieHeader(sid, canonical) && /^(?:text\/css|application\/(?:javascript|x-javascript)|text\/javascript|image\/|font\/)/i.test(result.contentType || "");
   const upstreamHeaders = {
     "content-type": result.contentType || (mode === "view" ? "text/html; charset=utf-8" : "application/octet-stream"),
-    "cache-control": download ? "no-store" : mode === "view" ? "no-store" : staticResource ? "public, max-age=60, stale-while-revalidate=300" : "public, max-age=15",
+    "cache-control": req.veyraPrivateTraffic || download || !staticResource ? "no-store" : "private, max-age=60",
     ...(download ? { "content-disposition": `attachment; filename="${safeDownloadFilename(result.finalUrl || canonical, result.contentType)}"` } : {}),
-    "x-content-type-options": "nosniff",
+    // Mirror the upstream's own nosniff decision instead of forcing it on:
+    // CDNs that serve scripts as binary/octet-stream without nosniff rely on
+    // the browser executing them anyway (see fetchBuffer's note).
+    ...(result.xContentTypeOptions ? { "x-content-type-options": result.xContentTypeOptions } : {}),
     "referrer-policy": mode === "view" ? "same-origin" : "no-referrer",
+    ...(result.allow ? { allow: result.allow } : {}),
     ...(result.contentRange ? { "content-range": result.contentRange } : {}),
     ...(result.acceptRanges ? { "accept-ranges": result.acceptRanges } : {})
   };
-  const challenge = mode === "view" ? detectChallenge(result.body.toString("utf8"), result.contentType, result.status, { server: result.serverHeader, "cf-mitigated": result.cfMitigated, finalUrl: result.finalUrl }) : null;
+  const partial = result.status === 206 || !!result.contentRange;
+  const mayTransform = !download && !partial && method !== "HEAD" && ![204, 205, 304].includes(result.status);
+  const challenge = mode === "view" && mayTransform ? detectChallenge(result.body.toString("utf8"), result.contentType, result.status, { server: result.serverHeader, "cf-mitigated": result.cfMitigated, finalUrl: result.finalUrl }) : null;
   if (challenge) {
-    res.setHeader("X-Veyra-Challenge", "true");
+    // Google's captcha wall can never be completed through a proxy, so it
+    // keeps its card (with the alternative-search links). Every other
+    // security/bot-verification page is passed through as-is: the site's own
+    // check runs in the fast-proxy frame — Veyra neither solves nor weakens
+    // it — and when the site's check passes and redirects, the fast proxy
+    // follows the redirect and the site loads fully instead of being
+    // replaced by an interstitial card.
+    if (challenge.type === "unusual-traffic") {
+      res.setHeader("X-Veyra-Challenge", "true");
+      res.setHeader("X-Veyra-Canonical-URL", canonical);
+      return res.status(200).type("html").send(challengeFallbackHtml(canonical, challenge, sid, requestOrigin(req)));
+    }
+    res.setHeader("X-Veyra-Challenge", String(challenge.type || "security-verification"));
+  }
+  if (mode === "view" && mayTransform && /html/i.test(result.contentType) && googleProxySearchQuery(canonical) &&
+      googleProxySearchQuery(result.finalUrl || canonical) &&
+      /<a\b[^>]*href=["'](?:https:\/\/(?:www\.)?google\.(?:com|co\.uk|co\.in))?\/httpservice\/retry\/enablejs(?:[?"'])/i.test(result.body.toString("utf8", 0, 30000))) {
+    res.setHeader("X-Veyra-Challenge", "google-search-interstitial");
     res.setHeader("X-Veyra-Canonical-URL", canonical);
-    return res.status(200).type("html").send(challengeFallbackHtml(canonical, challenge, sid, bridgeToken));
+    return res.status(200).type("html").send(challengeFallbackHtml(canonical, { type: "google-search-interstitial" }, sid, requestOrigin(req)));
+  }
+  // Same safety fix as the early 302: only redirect when the Referer origin
+  // matches YouTube itself (native tab). Fast-proxy iframes must receive the
+  // bundle inline so cross-origin redirects are not blocked.
+  const ytDirectRefererOk = (() => { try { const r = String(req.get("Referer") || ""); return r ? new URL(r).origin === new URL(result.finalUrl || canonical).origin : false; } catch { return false; } })();
+  if (mode === "resource" && !download && result.status >= 200 && result.status < 300 && shouldDirectYoutubeStaticAsset(result.finalUrl || canonical, result.contentType) && ytDirectRefererOk) {
+    res.setHeader("location", result.finalUrl || canonical);
+    res.setHeader("cache-control", req.veyraPrivateTraffic ? "no-store" : "public, max-age=300");
+    res.setHeader("x-veyra-direct-asset", "youtube-cdn");
+    return res.status(302).end();
   }
   if (mode === "resource" && /javascript|ecmascript/i.test(result.contentType || "")) noteScriptDir(sid, result.finalUrl || canonical);
   let payload = result.body;
   let fullPageEnhanced = false;
   try {
-    if (!download && mode === "view" && (/html|xhtml|^$/.test(result.contentType.toLowerCase()))) {
+    if (mayTransform && mode === "view" && (/html|xhtml|^$/.test(result.contentType.toLowerCase()))) {
       
       
       
       
       
       
-      const enhanced = fullPage.enhanceFullPage(payload.toString("utf8"), result.finalUrl || canonical);
+      const pageUrl = virtualPageUrl(canonical, result.finalUrl || canonical);
+      const html = payload.toString("utf8");
+      const enhanced = fullPage.enhanceFullPage(html, pageUrl);
       if (enhanced.enhanced) { payload = Buffer.from(enhanced.html, "utf8"); fullPageEnhanced = true; }
-      payload = Buffer.from(await rewriteOffThread("rewriteHtml", payload.toString("utf8"), [result.finalUrl || canonical, sid, bridgeToken], rewriteHtml), "utf8");
+      let watchPlayer = null;
+      if (req.query.__veyra_youtube_inline === "1" && method === "GET" && result.status === 200
+        && !result.truncated && !challenge && !record.incognito && liveSessionId(sid)
+        && !vpnManager.requiresVpnForSession(sid) && documentNavigation(req)) {
+        const requestedVideo = watchVideo(canonical);
+        const finalVideo = watchVideo(result.finalUrl || canonical);
+        if (requestedVideo && finalVideo?.videoId === requestedVideo.videoId && !youtubeCompat.classifyWatchPageBlock(html)) {
+          const check = app.locals.veyraYoutubeWatchEligibility || youtubeEligibility;
+          if (await check(requestedVideo.videoId) === "ready" && !res.destroyed && !record.abort.signal.aborted
+            && !vpnManager.requiresVpnForSession(sid)) watchPlayer = requestedVideo;
+        }
+      }
+      const rewritten = await rewriteOffThread("rewriteHtml", payload.toString("utf8"), [pageUrl, sid, watchPlayer], rewriteHtml);
+      payload = Buffer.from(challenge ? rewritten : announceProxyStatus(rewritten, result.status, pageUrl, sid), "utf8");
     }
-    else if (!download && mode === "resource" && result.contentType.toLowerCase().includes("text/css")) payload = Buffer.from(await rewriteOffThread("rewriteCss", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteCssText), "utf8");
-    else if (!download && mode === "resource" && /javascript|ecmascript/.test(result.contentType.toLowerCase())) payload = Buffer.from(await rewriteOffThread("rewriteJs", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteJsText), "utf8");
-    else if (!download && mode === "resource" && /mpegurl|dash\+xml/i.test(result.contentType.toLowerCase())) payload = Buffer.from(rewriteMediaManifest(payload.toString("utf8"), result.finalUrl || canonical, sid), "utf8");
+    else if (mayTransform && mode === "resource" && result.contentType.toLowerCase().includes("text/css")) payload = Buffer.from(await rewriteOffThread("rewriteCss", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteCssText), "utf8");
+    else if (mayTransform && mode === "resource" && /javascript|ecmascript/.test(result.contentType.toLowerCase()) && !shouldSkipYoutubeStaticJsRewrite(result.finalUrl || canonical, result.contentType)) {
+      payload = Buffer.from(await rewriteOffThread("rewriteJs", payload.toString("utf8"), [result.finalUrl || canonical, sid], rewriteJsText), "utf8");
+      // Worker scripts (physics/AI simulation bundles) resolve their own
+      // subresources (importScripts, WASM) against the proxy URL, which 404s
+      // on the proxy origin. Prepend the worker-scope prelude so worker-side
+      // fetch/XHR/importScripts re-anchor onto the real site.
+      const workerDest = /^(?:worker|sharedworker)$/.test(String(req.get("Sec-Fetch-Dest") || "").toLowerCase());
+      if (workerDest) payload = Buffer.from(workerScopePrelude(result.finalUrl || canonical, sid) + payload.toString("utf8"), "utf8");
+    }
+    else if (mayTransform && method === "GET" && mode === "resource" && result.status === 200
+      && (isHlsPlaylistType(result.contentType) || /dash\+xml/i.test(result.contentType))) {
+      payload = Buffer.from(rewriteMediaManifest(payload.toString("utf8"), result.finalUrl || canonical, sid), "utf8");
+    }
   } catch (rewriteErr) {
     
     
     
     
-    recordRewriteFailure(result.finalUrl || canonical, mode, rewriteErr);
+    if (!req.veyraPrivateTraffic) recordRewriteFailure(result.finalUrl || canonical, mode, rewriteErr);
     payload = result.body;
   }
+  if (mayTransform && method === "GET" && proxyCompressibleContentType(result.contentType || (mode === "view" ? "text/html" : ""))) {
+    res.vary("Accept-Encoding");
+    const compressed = await maybeCompressProxyPayload(req, payload, result.contentType || (mode === "view" ? "text/html" : "")).catch(() => null);
+    if (compressed) {
+      payload = compressed.body;
+      res.setHeader("content-encoding", compressed.encoding);
+    }
+  }
   for (const [k,v] of Object.entries(upstreamHeaders)) if (v) res.setHeader(k, v);
-  res.setHeader("X-Veyra-Canonical-URL", result.finalUrl || canonical);
+  // The global shield middleware pre-set nosniff on every response. Proxied
+  // resources must mirror the UPSTREAM's decision instead: CDNs serving
+  // scripts as binary/octet-stream without nosniff rely on the browser
+  // executing them anyway, and forcing nosniff makes Chrome refuse them.
+  if (!result.xContentTypeOptions) res.removeHeader("x-content-type-options");
+  const exposedCanonical = mode === "view" ? virtualPageUrl(canonical, result.finalUrl || canonical) : (result.finalUrl || canonical);
+  if (record.abort.signal.aborted || sessionManager.checkLimit(sid)) return sendSessionExpired(req, res, mode, sid);
+  res.setHeader("X-Veyra-Canonical-URL", exposedCanonical);
   res.setHeader("X-Veyra-Session-ID", sid);
   res.setHeader("X-Veyra-Content-Type", result.contentType || "application/octet-stream");
   res.setHeader("X-Veyra-Proxy-Mode", mode);
   if (fullPageEnhanced) res.setHeader("X-Veyra-Full-Page", "1");
   if (result.etag) res.setHeader("ETag", result.etag);
   if (result.lastModified) res.setHeader("Last-Modified", result.lastModified);
-  const outputStatus = (result.status >= 300 && result.status < 400) ? 200 : result.status;
   const transformedText = (mode === "view" && /html|xhtml|^$/i.test(result.contentType || "")) || (mode === "resource" && /(?:text\/css|javascript|ecmascript)/i.test(result.contentType || ""));
+  if (method === "HEAD") {
+    // The GET representation may be rewritten. Preserve the origin's size
+    // only when it describes the same representation this proxy would serve.
+    if ((download || partial || !transformedText) && /^\d+$/.test(result.contentLength || "") && ![204, 205, 304].includes(result.status)) res.setHeader("Content-Length", result.contentLength);
+    return res.status(result.status).end();
+  }
   
   
   if (!transformedText && !result.truncated) {
     const outLength = payload && payload.length ? payload.length : Number(result.contentLength) || 0;
     if (outLength) res.setHeader("content-length", outLength);
   }
-  res.status(outputStatus).send(payload);
-  if (mode === "view" && !result.truncated && !result.tooLarge && /html|xhtml|^$/i.test(result.contentType || "")) {
-    void warmPageResources(result.body.toString("utf8"), result.finalUrl || canonical, sid);
+  res.status(result.status).send(payload);
+  if (mode === "view" && !req.veyraPrivateTraffic && CFG.sessionCacheEnabled && !result.truncated && !result.tooLarge && /html|xhtml|^$/i.test(result.contentType || "")) {
+    if (shouldWarmPageResources(result.finalUrl || canonical)) {
+      void warmPageResources(result.body.toString("utf8"), result.finalUrl || canonical, sid);
+    }
   }
-  } finally {
-    
+  } catch (error) {
+    if (!res.headersSent && (record.abort.signal.aborted || error.code === "SESSION_EXPIRED")) return sendSessionExpired(req, res, mode, sid);
+    throw error;
   }
 }
 
@@ -4814,27 +7952,23 @@ app.get("/api/form-get/:target/:sid", async (req, res) => {
     
     
     
-    for (const [key, value] of Object.entries(req.query || {})) {
-      const values = Array.isArray(value) ? value : [value];
-      for (const item of values) {
-        if (typeof item === "string") u.searchParams.append(String(key), item);
-      }
-    }
-    req.query.url = u.href;
-    req.query.sid = normalizeSessionId(decodePathToken(req.params.sid || ""));
-    const referer = proxyRefererCanonical(req);
-    if (referer) req.query.from = referer;
-    await proxyRequest(req, res, "view");
+    const incoming = new URL(req.originalUrl, "http://veyra.invalid").searchParams;
+    for (const [key, value] of incoming) u.searchParams.append(key, value);
+    await proxyRequest(req, res, "view", { formRouting: {
+      url: u.href,
+      sid: decodePathToken(req.params.sid || ""),
+      from: proxiedPageFromReferer(req)?.pageUrl || ""
+    } });
   } catch (e) {
     respondError(res, 502, `Veyra could not submit this form: ${e.message}`, "PROXY_FORM_GET_ERROR", { requestId: req.veyraRequestId });
   }
 });
-app.get("/api/view", async (req, res) => { try { await proxyRequest(req, res, "view"); } catch (e) {
+app.get("/api/view", async (req, res) => { try { await proxyViewGet(req, res); } catch (e) {
   
   
   const snapSid = normalizeSessionId(req.query.sid);
   const snapUrl = mergeStrayProxyParams(req, firstValidUrl([req.query.url, req.query.target, req.query.u], req.get('Origin') || undefined)) || proxyRefererCanonical(req);
-  if (snapshotStore && snapSid && snapUrl) {
+  if (snapshotStore && CFG.sessionCacheEnabled && canCacheSession(sessionManager.peek(snapSid)) && !sessionManager.checkLimit(snapSid) && snapUrl) {
     const snap = await snapshotStore.get(snapSid, snapUrl);
     if (snap) {
       res.setHeader("X-Veyra-Snapshot", "1");
@@ -4847,18 +7981,41 @@ app.get("/api/view", async (req, res) => { try { await proxyRequest(req, res, "v
   const message = e.upstreamMessage || e.message;
   const upstreamCode = e.upstreamCode || networkErrorCode(e) || null;
   const publicCode = e.code === "VPN_KILL_SWITCH" ? "VPN_KILL_SWITCH" : /^UPSTREAM_[A-Z0-9_]+$/.test(String(e.code || "")) ? e.code : "PROXY_VIEW_ERROR";
-  serverLog("warn", "PROXY", `View failed for ${sanitizeLogUrl(req.query?.url || "")} — ${message}`, { requestId: req.veyraRequestId, code: publicCode, upstreamCode, upstreamPhase: e.upstreamPhase || null, targetHost: e.upstreamHost || hostOf(req.query?.url || "") });
+  if (!req.veyraPrivateTraffic) serverLog("warn", "PROXY", `View failed for ${sanitizeLogUrl(req.query?.url || "")} — ${message}`, { requestId: req.veyraRequestId, code: publicCode, upstreamCode, upstreamPhase: e.upstreamPhase || null, targetHost: e.upstreamHost || hostOf(req.query?.url || "") });
   respondError(res, e.code === "VPN_KILL_SWITCH" ? 503 : 502, `Veyra could not load this page: ${message}`, publicCode, { requestId: req.veyraRequestId, legacyCode: "PROXY_VIEW_ERROR", upstreamCode, upstreamPhase: e.upstreamPhase || null });
 } });
-app.post("/api/view", async (req, res) => { try { await proxyRequest(req, res, "view"); } catch (e) { respondError(res, 502, `Veyra could not submit this form: ${e.message}`, "PROXY_FORM_ERROR", { requestId: req.veyraRequestId }); } });
+// A proxied page can issue any normal HTTP request through fetch/XHR. Keep the
+// view and resource lanes method-complete so direct API callers and browser
+// runtime requests behave identically (including PUT/PATCH/DELETE/HEAD).
+const proxyMethods = ["get", "post", "put", "patch", "delete", "head"];
+for (const method of proxyMethods) {
+  if (method === "get") continue; // GET /api/view has the snapshot fallback above.
+  app[method]("/api/view", async (req, res) => {
+    try { await proxyRequest(req, res, "view"); }
+    catch (e) {
+      const message = method === "post" ? `Veyra could not submit this form: ${e.message}` : `Veyra view ${method.toUpperCase()} request failed: ${e.message}`;
+      respondError(res, 502, message, method === "post" ? "PROXY_FORM_ERROR" : "PROXY_VIEW_METHOD_ERROR", { requestId: req.veyraRequestId });
+    }
+  });
+}
 app.get("/api/resource", async (req, res) => { try { await proxyRequest(req, res, "resource"); } catch (e) {
   const upstreamCode = e.upstreamCode || networkErrorCode(e) || null;
   const code = /^UPSTREAM_[A-Z0-9_]+$/.test(String(e.code || "")) ? e.code : "PROXY_RESOURCE_ERROR";
   respondError(res, e.code === "VPN_KILL_SWITCH" ? 503 : 502, `Veyra resource error: ${e.upstreamMessage || e.message}`, code, { requestId: req.veyraRequestId, upstreamCode, upstreamPhase: e.upstreamPhase || null, targetHost: e.upstreamHost || hostOf(req.query?.url || "") });
 } });
-app.get("/api/download", async (req, res) => { try { req.query.download = "1"; await proxyRequest(req, res, "resource"); } catch (e) { respondError(res, 502, `Veyra download error: ${e.message}`, "DOWNLOAD_ERROR", { requestId: req.veyraRequestId }); } });
+app.get("/api/download", async (req, res) => { try { await proxyRequest(req, res, "resource", { download: true }); } catch (e) { if (!res.headersSent) respondError(res, 502, `Veyra download error: ${e.message}`, "DOWNLOAD_ERROR", { requestId: req.veyraRequestId }); } });
 app.post("/api/resource", async (req, res) => { try { await proxyRequest(req, res, "resource"); } catch (e) { respondError(res, 502, `Veyra resource request failed: ${e.message}`, "PROXY_RESOURCE_POST_ERROR", { requestId: req.veyraRequestId }); } });
-for (const method of ["put","patch","delete","head","options"]) app[method]("/api/resource", async (req,res)=>{ try { await proxyRequest(req,res,"resource"); } catch(e) { respondError(res,502,`Veyra resource ${method.toUpperCase()} request failed: ${e.message}`,"PROXY_RESOURCE_METHOD_ERROR",{requestId:req.veyraRequestId}); } });
+for (const method of ["put","patch","delete","head"]) app[method]("/api/resource", async (req,res)=>{ try { await proxyRequest(req,res,"resource"); } catch(e) { respondError(res,502,`Veyra resource ${method.toUpperCase()} request failed: ${e.message}`,"PROXY_RESOURCE_METHOD_ERROR",{requestId:req.veyraRequestId}); } });
+app.options(["/api/view", "/api/resource"], async (req, res) => {
+  // Browser CORS preflight is for Veyra itself; do not send its
+  // Access-Control-* headers to the target site. A bare OPTIONS request is
+  // an actual upstream request and should follow the same proxy contract as
+  // GET/POST/PUT/PATCH/DELETE.
+  if (req.get("Access-Control-Request-Method")) return res.status(204).end();
+  const mode = req.path === "/api/view" ? "view" : "resource";
+  try { await proxyRequest(req, res, mode); }
+  catch (e) { respondError(res, 502, `Veyra ${mode} OPTIONS request failed: ${e.message}`, "PROXY_OPTIONS_ERROR", { requestId: req.veyraRequestId }); }
+});
 
 const OPEN_ENGINE_MODES = new Set(["auto", "proxy", "crawler", "exhaustive", "browser", "combined"]);
 function normalizeOpenEngineMode(value) {
@@ -4869,41 +8026,67 @@ function shouldStartCrawlerForEngineMode(mode) {
   return mode === "auto" || mode === "crawler" || mode === "exhaustive" || mode === "combined";
 }
 
+function openJobResponse(job, engineMode) {
+  const state = job.started ? "running" : "queued";
+  return { jobId: job.id, url: job.root, viewUrl: makeViewUrl(job.root), state, scheduler: state,
+    queuePosition: job.queuePosition || 0, engineMode, crawlerEnabled: true };
+}
 app.post("/api/open", async (req, res) => {
   try {
     const root = normalizeUrl(String(req.body?.url || "")); if (!root) return respondError(res, 400, "Please provide a valid public HTTP(S) URL.", "INVALID_URL");
-    await assertPublicUrl(root);
+    const openSid = String(req.body?.sessionId || req.body?.sid || "");
     const engineMode = normalizeOpenEngineMode(req.body?.engineMode);
+    if (openSid && sessionManager.checkLimit(openSid)) return respondError(res, 410, "This Veyra session reached its time limit and was deleted.", "SESSION_EXPIRED");
+    if (openSid && !canCacheSession(sessionManager.peek(openSid))) {
+      req.veyraPrivateTraffic = true;
+      return res.set("Cache-Control", "no-store").json({ ok: true, jobId: null, state: "disabled", engineMode, crawlerEnabled: false });
+    }
+    await assertPublicUrl(root);
     const crawlerEnabled = shouldStartCrawlerForEngineMode(engineMode);
     const oldId = activeByRoot.get(root); const old = oldId && jobs.get(oldId);
-    const wantsPageAccelerator = engineMode !== "exhaustive";
-    
-    
-    
-    if (crawlerEnabled && old && !old.done && !old.stopRequested && (!CFG.crawlerPageAccelerator || old.pageAccelerator)) return res.status(202).json({ jobId: old.id, url: root, viewUrl: makeViewUrl(root), engineMode, crawlerEnabled: true });
+    const pageAccelerator = engineMode !== "exhaustive" && CFG.crawlerPageAccelerator;
+    if (crawlerEnabled && old && !old.done && !old.stopRequested && old.pageAccelerator === pageAccelerator) return res.status(202).json(openJobResponse(old, engineMode));
     if (crawlerEnabled && !old && mongoStore.enabled && engineMode !== "exhaustive") {
       const cached = await mongoStore.getLatestCrawlSummary(root);
       if (cached) return res.status(200).json({ ok: true, jobId: null, url: root, viewUrl: makeViewUrl(root), state: "cached", cached: true, cachedAt: cached.finishedAt || cached.createdAt || null, counts: cached.counts || {}, engineMode, crawlerEnabled: true });
     }
-    const openSid = String(req.body?.sessionId || req.body?.sid || "");
     if (openSid && sessionManager.checkLimit(openSid)) return respondError(res, 410, "This Veyra session reached its time limit and was deleted.", "SESSION_EXPIRED");
     if (!crawlerEnabled) return res.status(200).json({ ok: true, jobId: null, url: root, viewUrl: makeViewUrl(root), state: "disabled", engineMode, crawlerEnabled: false });
     
     
-    const fullSiteCrawl = engineMode === "exhaustive";
-    const job = createJob(root, { pageAccelerator: !fullSiteCrawl && CFG.crawlerPageAccelerator });
+    const job = createJob(root, { pageAccelerator });
     if (/^[A-Za-z0-9_-]{16,80}$/.test(openSid)) job.sessionId = openSid;
     let state;
     try { state = scheduleCrawl(job); } catch (e) { return respondError(res, 503, e.message, e.code || "CRAWLER_CAPACITY_BUSY", { maxActiveJobs: effectiveMaxActiveJobs(), queued: crawlQueue.length }); }
     jobs.set(job.id, job); activeByRoot.set(root, job.id);
     jobLog(job, "info", state === "running" ? "Background crawl started." : `Background crawl queued (position ${job.queuePosition}).`);
-    res.status(202).json({ jobId: job.id, url: root, viewUrl: makeViewUrl(root), state: "queued", scheduler: state, queuePosition: job.queuePosition || 0, engineMode, crawlerEnabled: true });
+    res.status(202).json(openJobResponse(job, engineMode));
   } catch (e) { respondError(res, 400, e.message, "OPEN_FAILED"); }
 });
 
 app.get("/api/crawl/:id", (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); res.json(publicJob(j)); });
-app.post("/api/crawl/:id/stop", (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); if (!j.started && !j.done) { dequeueCrawl(j); j.stopRequested = true; j.stopReason = "user"; j.done = true; j.finishedAt = now(); j.status = "stopped"; j.statusText = "Removed from queue."; return res.json(publicJob(j)); } j.stopRequested = true; j.stopReason = "user"; j.status = "stopping"; j.statusText = "Stopping…"; j.controller.abort(); jobLog(j, "warn", "Stop requested."); res.json({ ok: true }); });
-app.get("/api/crawl/:id/robots", requireAdmin, (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); if (!j.robotPool) return res.json({ summary: { logicalRobots: j.robotFleet || CFG.logicalRobots, activeRobots: 0, multitaskingRobots: 0, idleRobots: j.robotFleet || CFG.logicalRobots, queuedRobotTasks: 0, globalPageQueue: j.pageFrontier.size, globalResourceQueue: j.resourceFrontier.size, networkActive: fetchSemaphore.active, networkLimit: CFG.maxActiveFetches, helpRequests: 0, helpAccepted: 0, helpDeclined: 0, helpGiven: 0 }, robots: [], events: [] }); const limit = Math.min(100, Math.max(1, Number(req.query.limit || 48) || 48)); res.json(j.robotPool.report(limit)); });
+app.post("/api/crawl/:id/stop", (req, res) => {
+  const j = jobs.get(req.params.id);
+  if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND");
+  if (j.done || j.stopRequested) return res.json({ ok: true });
+  j.stopRequested = true;
+  j.stopReason = "user";
+  j.controller.abort();
+  if (!j.started) {
+    dequeueCrawl(j); j.done = true; j.finishedAt = now(); j.status = "stopped"; j.statusText = "Removed from queue.";
+    return res.json(publicJob(j));
+  }
+  j.status = "stopping"; j.statusText = "Stopping…"; jobLog(j, "warn", "Stop requested.");
+  res.json({ ok: true });
+});
+app.get("/api/crawl/:id/robots", requireAdmin, (req, res) => {
+  const j = jobs.get(req.params.id);
+  if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND");
+  const limit = Math.min(100, Math.max(1, Number(req.query.limit || 48) || 48));
+  if (j.robotPool) return res.json(j.robotPool.report(limit));
+  if (j.finalRobotReport) return res.json({ ...j.finalRobotReport, robots: j.finalRobotReport.robots.slice(0, limit) });
+  res.json({ summary: { logicalRobots: j.robotFleet || CFG.logicalRobots, activeRobots: 0, multitaskingRobots: 0, idleRobots: j.robotFleet || CFG.logicalRobots, queuedRobotTasks: 0, globalPageQueue: j.pageFrontier.size, globalResourceQueue: j.resourceFrontier.size, networkActive: fetchSemaphore.active, networkLimit: CFG.maxActiveFetches, helpRequests: 0, helpAccepted: 0, helpDeclined: 0, helpGiven: 0 }, robots: [], events: [] });
+});
 app.get("/api/crawl/:id/resources", (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); res.json({ resources: j.resources.map(r => ({ id: r.id, url: r.url, requestedUrl: r.requestedUrl, type: r.type, status: r.status, contentType: r.contentType, bytes: r.bytes, bytesLabel: r.bytesLabel, truncated: r.truncated, sourceId: r.sourceId })) }); });
 app.get("/api/crawl/:id/source/:resourceId", async (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); const id = Number(req.params.resourceId); const r = j.resources[id]; if (!r) return respondError(res, 404, "Resource not found.", "RESOURCE_NOT_FOUND"); res.json({ id: r.id, url: r.url, type: r.type, source: await sourceStore.read(j, r) }); });
 app.get("/api/crawl/:id/links", (req, res) => { const j = jobs.get(req.params.id); if (!j) return respondError(res, 404, "Job not found.", "JOB_NOT_FOUND"); const offset = Math.max(0, Number(req.query.offset || 0) || 0); const limit = Math.min(10000, Math.max(1, Number(req.query.limit || 1000) || 1000)); res.json({ total: j.links.length, offset, limit, links: j.links.slice(offset, offset + limit) }); });
@@ -4981,7 +8164,7 @@ const STATUS_VAR_DEFS = [
   { group: "Frontend / CORS", key: "frontendOrigin", label: "Allowed frontend origin(s)", kind: "csv", names: ["FRONTEND_ORIGIN"], fallback: ["*"] },
   { group: "Frontend / CORS", key: "publicApiOrigin", label: "Public API origin (for rewritten pages)", kind: "string", names: ["PUBLIC_API_ORIGIN"], fallback: "" },
   { group: "Frontend / CORS", key: "userAgent", label: "Crawler user agent", kind: "string", names: ["VEYRA_USER_AGENT"], fallback: "VeyraBrowseCrawler/8.0 (+https://github.com/)" },
-  { group: "Crawler concurrency", key: "logicalRobots", label: "Logical crawler robots", kind: "number", names: ["CRAWLER_ROBOTS"], fallback: 10000, min: 1, max: 10000 },
+  { group: "Crawler concurrency", key: "logicalRobots", label: "Logical crawler robots", kind: "number", names: ["CRAWLER_ROBOTS"], fallback: 12000, min: 1, max: 20000 },
   { group: "Robot mesh", key: "robotWorksetSize", label: "Robot workset size", kind: "number", names: ["ROBOT_WORKSET_SIZE"], fallback: 10000, min: 8, max: 10000 },
   { group: "Robot mesh", key: "robotQueueCapacity", label: "Robot local queue capacity", kind: "number", names: ["ROBOT_QUEUE_CAPACITY"], fallback: 8, min: 2, max: 32 },
   { group: "Robot mesh", key: "robotStealBatch", label: "Help steal batch", kind: "number", names: ["ROBOT_STEAL_BATCH"], fallback: 4, min: 1, max: 8 },
@@ -5082,6 +8265,9 @@ const STATUS_VAR_DEFS = [
   { group: "Network / retries", key: "sitemapTimeoutMs", label: "Sitemap timeout (ms)", kind: "number", names: ["SITEMAP_TIMEOUT_MS"], fallback: 12000, min: 1000, max: 60000 },
   { group: "Network / retries", key: "maxSitemapFiles", label: "Max sitemap files", kind: "number", names: ["MAX_SITEMAP_FILES"], fallback: 50, min: 1, max: 1000 },
   { group: "Network / retries", key: "maxSitemapUrls", label: "Max sitemap URLs", kind: "number", names: ["MAX_SITEMAP_URLS"], fallback: 50000, min: 100, max: 500000 },
+  { group: "Cache & logs", key: "sessionCacheEnabled", label: "Session cache", kind: "bool", names: ["SESSION_CACHE_ENABLED"], fallback: true },
+  { group: "Cache & logs", key: "globalCacheEnabled", label: "Global cache", kind: "bool", names: ["GLOBAL_CACHE_ENABLED"], fallback: true },
+  { group: "Cache & logs", key: "mongoSharedCache", label: "MongoDB backing for the global proxy cache", kind: "bool", names: ["MONGODB_SHARED_CACHE"], fallback: true },
   { group: "Cache & logs", key: "proxyCacheMs", label: "Proxy cache TTL (ms)", kind: "number", names: ["CACHE_TTL_MS"], fallback: 10000, min: 0, max: 300000 },
   { group: "Cache & logs", key: "maxCacheBodyBytes", label: "Max cached response body bytes", kind: "number", names: ["MAX_CACHE_BODY_BYTES"], fallback: 4 * 1024 * 1024, min: 64 * 1024, max: 16 * 1024 * 1024 },
   { group: "Proxy sessions", key: "proxySessionTtlMs", label: "Proxy session TTL (ms)", kind: "number", names: ["PROXY_SESSION_TTL_MS"], fallback: 30 * 60 * 1000, min: 60 * 1000, max: 24 * 60 * 60 * 1000 },
@@ -5119,6 +8305,9 @@ const STATUS_VAR_DEFS = [
   { group: "Search index", key: "maxSearchQueryTerms", label: "Max search query terms", kind: "number", names: ["MAX_SEARCH_QUERY_TERMS"], fallback: 20, min: 1, max: 64 },
   { group: "Search index", key: "indexSeeds", label: "Index seed URLs", kind: "csv", names: ["INDEX_SEEDS"], fallback: [] },
   { group: "Search index", key: "indexSeedCrawl", label: "Auto-crawl index seeds", kind: "bool", names: ["INDEX_SEED_CRAWL"], fallback: true },
+  { group: "Search index", key: "indexAiFindings", label: "Index AI-selected findings", kind: "bool", names: ["INDEX_AI_FINDINGS"], fallback: true },
+  { group: "Search index", key: "indexAiMaxPages", label: "AI finding crawl page budget", kind: "number", names: ["INDEX_AI_MAX_PAGES"], fallback: 24, min: 1, max: 100 },
+  { group: "Search index", key: "indexAiMaxDepth", label: "AI finding crawl depth", kind: "number", names: ["INDEX_AI_MAX_DEPTH"], fallback: 2, min: 0, max: 5 },
   { group: "Search index", key: "indexRefreshMs", label: "Index refresh interval (ms)", kind: "number", names: ["INDEX_REFRESH_MS"], fallback: 6 * 60 * 60 * 1000, min: 0, max: 30 * 24 * 60 * 60 * 1000 },
   { group: "Search index", key: "indexSnapshotEnabled", label: "Index snapshot enabled", kind: "bool", names: ["INDEX_SNAPSHOT_ENABLED"], fallback: false },
   { group: "Search index", key: "indexSnapshotPath", label: "Index snapshot path", kind: "string", names: ["INDEX_SNAPSHOT_PATH"], fallback: "/tmp/veyra-search-index.json" },
@@ -5407,71 +8596,96 @@ app.get("/api/debug/system", requireAdmin, (req, res) => {
 
 
 
-const neuralRobotPool = new NeuralRobotPool({ maxWorkers: 8, neuralModel, log: (level, source, msg) => serverLog(level, source, msg) });
-app.get("/api/neural/stats", (req, res) => res.json({ ok: true, mongo: mongoStore.status(), model: neuralModel.report(), trainer: neuralTrainer.report() }));
+const neuralRobotPool = new NeuralRobotPool({
+  maxWorkers: 8,
+  neuralModel,
+  onCrawlObservation: observePublicCrawl,
+  fetchPage: async (url, opts = {}) => acquisitionManager.fetch(url, {
+    engine: "neural-crawler", timeoutMs: Math.min(CFG.requestTimeoutMs, Math.max(1000, Number(opts.timeoutMs) || CFG.requestTimeoutMs)),
+    maxBytes: Math.min(CFG.maxProxyTextBytes, Math.max(65536, Number(opts.maxBytes) || CFG.maxProxyTextBytes)), retries: 0,
+    skipRobots: new URL(url).pathname.toLowerCase() === "/robots.txt",
+    observeCrawlResponses: learnFromPublicCrawls
+  }),
+  log: (level, source, msg) => serverLog(level, source, msg),
+  onPageFound: page => indexNeuralPage(page, page?.query || "")
+});
+app.get("/api/neural/stats", (req, res) => res.json({ ok: true, mongo: mongoStore.status(), model: neuralModel.report(), trainer: { ...neuralTrainer.report(), publicCrawlTraining: learnFromPublicCrawls } }));
 app.post("/api/neural/feedback", async (req, res) => {
+  if (!trainingUrl(req.body?.url) || typeof req.body?.positive !== "boolean" || req.body?.accepted === false) {
+    return res.status(400).json({ ok: false, error: "A public HTTP(S) URL and a boolean feedback value are required." });
+  }
   const accepted = await neuralTrainer.enqueuePersistent({
     url: req.body?.url,
     positive: req.body?.positive,
     weight: req.body?.weight,
-    context: req.body?.context,
-    accepted: req.body?.accepted
+    source: "browser-feedback"
   });
-  if (!accepted) return res.status(400).json({ ok: false, error: "A public http(s) URL is required." });
+  if (!accepted) return res.status(429).json({ ok: false, error: "The training queue is full. Try again later." });
   res.json({ ok: true, queued: neuralTrainer.report().queueSize, durable: mongoStore.connected });
 });
-app.post("/api/neural/reset", requireAdmin, (req, res) => { neuralTrainer.queue.length = 0; neuralModel.reset(); neuralModel.save(); res.json({ ok: true }); });
-app.get("/api/robots/status", requireAdmin, (req, res) => res.json(neuralRobotPool.report()));
-app.get("/api/robots/log", requireAdmin, (req, res) => res.json(neuralRobotPool.getLog(Math.min(100, Number(req.query.limit) || 50))));
-app.post("/api/robots/crawl", requireUser, async (req, res) => {
+function requireNeuralOperator(req, res, next) {
+  res.set("Cache-Control", "no-store");
+  if (isAdminRequest(req)) return next();
+  return respondError(res, 403, "Only Veyra administrators can manage the neural crawler and model.", "ADMIN_REQUIRED");
+}
+app.post("/api/neural/reset", requireNeuralOperator, (req, res) => { neuralTrainer.queue.length = 0; neuralModel.reset(); neuralModel.save(); res.json({ ok: true }); });
+app.get("/api/robots/status", requireNeuralOperator, (req, res) => res.json(neuralRobotPool.report()));
+app.get("/api/robots/log", requireNeuralOperator, (req, res) => res.json(neuralRobotPool.getLog(Math.min(100, Number(req.query.limit) || 50))));
+app.post("/api/robots/crawl", async (req, res) => {
   try {
-    const seeds = (Array.isArray(req.body?.seeds) ? req.body.seeds : (req.body?.seed ? [req.body.seed] : [])).slice(0, 3);
+    const seeds = req.body.seeds || (req.body.seed ? [req.body.seed] : []);
     if (!seeds.length) return res.status(400).json({ error: "No seed URLs provided" });
-    for (const seed of seeds) await assertPublicUrl(String(seed));
-    const query = String(req.body?.query || "").slice(0, 500);
-    const opts = {
-      maxDepth: Math.max(0, Math.min(2, Number(req.body?.maxDepth) || 2)),
-      maxPages: Math.max(1, Math.min(20, Number(req.body?.maxPages) || 20)),
-      maxLinksPerPage: 20
-    };
+    const query = req.body.query || "";
+    const opts = { maxDepth: Number(req.body.maxDepth ?? 3), maxPages: Number(req.body.maxPages ?? 50) };
     const result = await neuralRobotPool.startCrawl(seeds, query, opts);
-    res.json({ ok: true, results: result, limits: opts });
-  } catch (e) { res.status(400).json({ ok: false, error: e.message, code: "CRAWL_REJECTED" }); }
+    res.json({ ok: true, results: result });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+app.post("/api/neural/index", async (req, res) => {
+  try {
+    const seeds = req.body?.seeds || (req.body?.seed ? [req.body.seed] : []);
+    if (!Array.isArray(seeds) || !seeds.length) return res.status(400).json({ ok: false, error: "No seed URLs provided" });
+    const query = String(req.body?.query || "").slice(0, CFG.maxSearchQueryChars);
+    const maxPages = Math.min(CFG.indexAiMaxPages, Math.max(1, Number(req.body?.maxPages) || CFG.indexAiMaxPages));
+    const requestedDepth = req.body?.maxDepth == null ? CFG.indexAiMaxDepth : Number(req.body.maxDepth);
+    const maxDepth = Number.isInteger(requestedDepth) ? Math.min(CFG.indexAiMaxDepth, Math.max(0, requestedDepth)) : CFG.indexAiMaxDepth;
+    const normalized = [...new Set(seeds.map(seed => normalizeUrl(seed)).filter(Boolean))].slice(0, 8);
+    if (!normalized.length) return res.status(400).json({ ok: false, error: "No public HTTP(S) seed URLs provided" });
+    const result = await neuralRobotPool.startCrawl(normalized, query, { maxPages: Math.ceil(maxPages / normalized.length), maxDepth });
+    res.json({ ok: true, indexed: true, provider: "veyra-index", seeds: normalized.length, results: result.map(x => ({ seed: x.seed, status: x.status, stats: x.result?.stats || null, error: x.error || null })), index: searchIndexStats() });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 app.post("/api/robots/feedback", async (req, res) => {
   try {
-    const accepted = await neuralTrainer.enqueuePersistent({ url: req.body.url, positive: !!req.body.clicked, weight: req.body.relevance || 0.5, context: { type: "html", source: "robot" } });
-    if (!accepted) return res.status(400).json({ ok: false, error: "A public http(s) URL is required." });
+    if (!trainingUrl(req.body?.url) || typeof req.body?.clicked !== "boolean") {
+      return res.status(400).json({ ok: false, error: "A public HTTP(S) URL and a boolean click value are required." });
+    }
+    const accepted = await neuralTrainer.enqueuePersistent({ url: req.body.url, positive: req.body.clicked, weight: req.body.relevance || 0.5, source: "robot-feedback" });
+    if (!accepted) return res.status(429).json({ ok: false, error: "The training queue is full. Try again later." });
     res.json({ ok: true, queued: neuralTrainer.report().queueSize, durable: mongoStore.connected });
   }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
-app.post("/api/robots/reset", requireAdmin, (req, res) => { neuralRobotPool.resetAll(); res.json({ ok: true }); });
+app.post("/api/robots/reset", requireNeuralOperator, (req, res) => { neuralRobotPool.resetAll(); res.json({ ok: true }); });
 
 
 
-const challengeSolver = new ChallengeSolver({ log: (level, source, msg) => serverLog(level, source, msg) });
-app.get("/api/challenge/status", (req, res) => res.json(challengeSolver.report()));
-app.post("/api/challenge/solve", requireAdmin, async (req, res) => {
-  try {
-    const { url, html, statusCode } = req.body || {};
-    if (!url) return res.status(400).json({ error: "URL required" });
-    await assertPublicUrl(String(url));
-    const type = challengeSolver.detectChallengeType(String(html || ""));
-    // Challenge JavaScript is never evaluated or fetched from this endpoint. It is
-    // deliberately a diagnostic that directs a signed-in administrator to a user-assisted browser flow.
-    res.status(409).json({ ok: false, code: "CHALLENGE_USER_ASSISTED", challengeType: type, error: "Automatic challenge solving is disabled. Open the page in Chromium and complete the site's own verification." });
-  } catch (e) { res.status(400).json({ ok: false, error: e.message, code: "CHALLENGE_REJECTED" }); }
+app.get("/api/challenge/status", (req, res) => res.json({
+  status: "disabled", detectionEnabled: true, cookieDomains: 0, totalCookies: 0, challengeCacheSize: 0
+}));
+app.post("/api/challenge/solve", (req, res) => {
+  return respondError(res, 410, "Automatic challenge solving is disabled. Complete the security check on the original site.", "CHALLENGE_SOLVER_DISABLED");
 });
 app.get("/api/challenge/check", (req, res) => {
   const html = req.query.html || "";
   const statusCode = Number(req.query.statusCode) || 200;
-  res.json({ isChallenge: challengeSolver.isChallengePage(html, statusCode), type: challengeSolver.detectChallengeType(html) });
+  res.json({ isChallenge: isChallengePage(html, statusCode), type: detectChallengeType(html) });
 });
 
 
 
 let castServer = null;
+let wsRelay = null;
 
 
 
@@ -5488,12 +8702,14 @@ app.post("/api/cast/create", (req, res) => {
 app.get("/api/cast/poll/:sessionId", (req, res) => {
   if (!castServer) return res.status(503).json({ error: "Cast server not available" });
   const msgs = castServer.pollSession(req.params.sessionId);
+  if (msgs === null) return res.status(404).json({ ok: false, error: "Cast session not found", code: "CAST_SESSION_NOT_FOUND" });
   res.json({ ok: true, messages: msgs });
 });
 app.post("/api/cast/push/:sessionId", (req, res) => {
   if (!castServer) return res.status(503).json({ error: "Cast server not available" });
-  castServer.pushToPoll(req.params.sessionId, req.body);
-  res.json({ ok: true });
+  const result = castServer.browserPush(req.params.sessionId, req.body);
+  if (!result.ok) return res.status(404).json(result);
+  res.json(result);
 });
 app.post("/api/cast/send/:sessionId", (req, res) => {
   if (!castServer) return res.status(503).json({ error: "Cast server not available" });
@@ -5594,35 +8810,34 @@ app.get("/status", (req, res, next) => {
 });
 app.get("/status", (req, res) => res.type("html").send(statusPage()));
 
-function consolePage() {
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Veyra Console</title><style>body{margin:0;background:#0e1116;color:#e7edf5;font:13px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace}header{padding:16px 20px;border-bottom:1px solid #2a313b;position:sticky;top:0;background:#11151b}h1{font:700 18px system-ui;margin:0 0 8px}.bar{display:flex;gap:8px;flex-wrap:wrap}select,button{background:#1a2029;color:#dce5ef;border:1px solid #343d49;border-radius:7px;padding:7px 9px}main{padding:16px 20px}.log{display:grid;grid-template-columns:155px 72px 72px 1fr;gap:10px;padding:7px 8px;border-bottom:1px solid #181e26;white-space:pre-wrap;word-break:break-word}.SERVER{background:#121821}.BROWSER{background:#11171b}.err{color:#ff9f9f}.warn{color:#e9c36f}.info{color:#a9c8f0}.debug{color:#8f9aaa}@media(max-width:800px){.log{grid-template-columns:1fr}.log span{display:block}}</style></head><body><header><h1>Veyra — /console</h1><div class="bar"><select id="source"><option>all</option><option>browser</option><option>server</option></select><select id="level"><option>all</option><option>error</option><option>warn</option><option>info</option><option>debug</option></select><button id="refresh">Refresh</button><button id="auto">Auto: on</button></div></header><main id="log">Loading…</main><script>let on=true;async function load(){try{const s=document.getElementById('source').value,l=document.getElementById('level').value;const r=await fetch('/api/debug/logs?source='+encodeURIComponent(s)+'&level='+encodeURIComponent(l)+'&limit=500');const b=await r.json();document.getElementById('log').innerHTML=(b.logs||[]).map(x=>'<div class="log '+(x.source||'')+'"><span>'+esc(x.time||'')+'</span><span>'+esc(x.source||'')+'</span><span class="'+esc(x.level||'')+'">'+esc(x.level||'')+'</span><span>'+esc(x.message||'')+' '+esc(x.requestId||'')+'</span></div>').join('')||'<p>No logs.</p>'}catch(e){document.getElementById('log').textContent=e.message}}function esc(s){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]) )}document.getElementById('refresh').onclick=load;document.getElementById('source').onchange=load;document.getElementById('level').onchange=load;document.getElementById('auto').onclick=()=>{on=!on;document.getElementById('auto').textContent='Auto: '+(on?'on':'off')};load();setInterval(()=>on&&load(),2000);</script></body></html>`;
+app.get("/console", (req, res) => res.set("Cache-Control", "no-store").type("html").send(renderConsolePage()));
+
+
+
+
+
+
+function proxyRoutingPair(url, session) {
+  const sid = liveSessionId(session);
+  const pageUrl = sid && typeof url === "string" && normalizeUrl(url);
+  return pageUrl ? { pageUrl, sid } : null;
 }
-app.get("/console", (req, res) => res.type("html").send(consolePage()));
-
-
-
-
-
-
-function proxiedPageFromCookie(req) {
-  const m = String(req.get("Cookie") || "").match(/(?:^|;\s*)veyra_ctx=([^;]+)/);
-  if (!m) return null;
-  const [page, sid] = m[1].split("|").map(x => { try { return decodeURIComponent(x); } catch { return ""; } });
-  const pageUrl = normalizeUrl(page || "");
-  return pageUrl ? { pageUrl, sid: sid || "" } : null;
-}
-function proxiedPageFromReferer(req, { allowCookie = true } = {}) {
+function proxiedPageFromReferer(req) {
   const raw = String(req.get("Referer") || "");
-  const fromCookie = () => allowCookie ? proxiedPageFromCookie(req) : null;
-  if (!raw) return fromCookie();
+  if (!raw) return null;
   try {
     const r = new URL(raw);
-    if (!/^[/]api[/](view|resource|form-get)/.test(r.pathname)) return fromCookie();
-    let page = r.searchParams.get("url") || r.searchParams.get("target") || r.searchParams.get("u") || "";
-    if (!page && r.pathname.startsWith("/api/form-get/")) page = decodePathToken(r.pathname.split("/")[3] || "");
-    const pageUrl = normalizeUrl(page);
-    if (!pageUrl) return null;
-    return { pageUrl, sid: r.searchParams.get("sid") || (r.pathname.startsWith("/api/form-get/") ? decodePathToken(r.pathname.split("/")[4] || "") : "") };
+    if (r.origin !== requestOrigin(req)) return null;
+    const q = r.searchParams;
+    if (r.pathname.startsWith("/api/form-get/")) {
+      const [, , , target, sid] = r.pathname.split("/");
+      return proxyRoutingPair(decodePathToken(target || ""), decodePathToken(sid || ""));
+    }
+    if (r.pathname === "/api/view" || r.pathname === "/api/resource") {
+      return proxyRoutingPair(q.get("url") || q.get("target") || q.get("u"), q.get("sid"));
+    }
+    return proxyRoutingPair(q.get("__veyra_url"), q.get("__veyra_sid"))
+      || proxyRoutingPair(q.get("url"), q.get("sid"));
   } catch { return null; }
 }
 
@@ -5631,15 +8846,16 @@ function proxiedPageFromReferer(req, { allowCookie = true } = {}) {
 
 const scriptDirsBySession = new Map();
 function noteScriptDir(sid, url) {
-  if (!sid) return;
+  if (!sessionManager.has(sid) || sessionManager.checkLimit(sid)) return;
   let dir; try { const u = new URL(url); dir = u.origin + u.pathname.replace(/[^/]*$/, ""); } catch { return; }
   const list = (scriptDirsBySession.get(sid) || []).filter(d => d !== dir);
   list.unshift(dir); if (list.length > 8) list.length = 8;
   scriptDirsBySession.delete(sid); scriptDirsBySession.set(sid, list);
   while (scriptDirsBySession.size > 2000) scriptDirsBySession.delete(scriptDirsBySession.keys().next().value);
 }
-async function resolveEscapedChunk(sid, relative) {
-  const dirs = scriptDirsBySession.get(sid) || [];
+async function resolveEscapedChunk(sid, relative, pageUrl) {
+  const origin = new URL(pageUrl).origin;
+  const dirs = (scriptDirsBySession.get(sid) || []).filter(dir => new URL(dir).origin === origin);
   for (const dir of dirs.slice(0, 6)) {
     let candidate; try { candidate = normalizeUrl(new URL(relative, dir).href); } catch { continue; }
     if (!candidate) continue;
@@ -5649,6 +8865,74 @@ async function resolveEscapedChunk(sid, relative) {
     } catch {}
   }
   return null;
+}
+// Multiple tabs can share a session. Recover only complete routing pairs
+// from this request or its own referer, never another tab's last page.
+function liveSessionId(value) {
+  const sid = String(value || "").trim();
+  return /^[A-Za-z0-9_-]{16,80}$/.test(sid) && !sessionManager.isTerminated(sid) && sessionManager.has(sid) ? sid : "";
+}
+function escapedPageContext(req, { allowLegacyQuery = true } = {}) {
+  const q = req.query || {};
+  return proxyRoutingPair(q.__veyra_url, q.__veyra_sid)
+    || proxiedPageFromReferer(req)
+    || (allowLegacyQuery ? proxyRoutingPair(q.url, q.sid) : null);
+}
+// Orphaned subresources: pages loaded inside the app's sandboxed third-party
+// iframe send asset requests with an origin-only Referer and no cookies
+// (Chrome blocks third-party iframe cookies), so no session context can be
+// recovered from the request itself and the asset 404s — YouTube's
+// dynamically-injected chunks are the canonical case. Remember the last
+// page each client resolved, and resolve these orphaned requests against it
+// as a GUEST fetch: a fresh guest session per request (empty sid), no
+// session cookies, so nothing leaks across sessions or clients.
+const clientLastResolvedPage = new Map();
+function noteClientResolvedPage(req, pageUrl, sid) {
+  const key = String(req.ip || "");
+  if (!key || !sid) return;
+  const rec = sessionManager.peek(sid);
+  if (!rec || sessionManager.checkLimit(sid)) return;
+  // Never retain a private page at IP scope. A short-lived YouTube origin
+  // hint is enough for its cookie-less public app bundles, not its video URL.
+  let url;
+  try { url = new URL(pageUrl); } catch { return; }
+  if (rec.incognito || !isYoutubeHost(url.hostname)) return;
+  clientLastResolvedPage.delete(key);
+  clientLastResolvedPage.set(key, { origin: url.origin, sid, expires: Date.now() + 15_000 });
+  while (clientLastResolvedPage.size > 4000) clientLastResolvedPage.delete(clientLastResolvedPage.keys().next().value);
+}
+function orphanedPageContext(req) {
+  const key = String(req.ip || "");
+  const context = clientLastResolvedPage.get(key);
+  if (!context) return null;
+  if (Date.now() >= context.expires || !liveSessionId(context.sid)) {
+    clientLastResolvedPage.delete(key);
+    return null;
+  }
+  if (!/^\/s\/(?:desktop|player)\//.test(req.path || "") || !/\.(?:m?js|css)$/i.test(req.path)) return null;
+  return { pageUrl: context.origin + "/", sid: "" };
+}
+// Resolve an escaped (path-based) request path onto the real site URL. The
+// site copies its own query string when it builds links, and the runtime's
+// escaped URLs keep Veyra's routing params in it — strip the ones that
+// belong to Veyra (a live session id / from marker) so the real target URL
+// does not inherit them.
+function resolveEscapedTarget(escaped, pageUrl) {
+  try {
+    const parsed = new URL(escaped, "http://veyra.escaped.invalid");
+    if (parsed.search) {
+      const popupRoute = parsed.searchParams.has("__veyra_url") && parsed.searchParams.has("__veyra_sid");
+      const strip = new Set([...parsed.searchParams.keys()].filter(k => /^__veyra/i.test(k) || (popupRoute && k === "veyra_popup")
+        || ((k === "sid" || k === "from") && liveSessionId(parsed.searchParams.get(k)))));
+      if (strip.size) {
+        parsed.search = parsed.search.slice(1).split("&").filter(value => {
+          try { return !strip.has(decodeURIComponent(value.split("=")[0].replace(/\+/g, " "))); }
+          catch { return true; }
+        }).join("&");
+      }
+    }
+    return normalizeUrl(new URL(parsed.pathname + parsed.search + parsed.hash, pageUrl).href);
+  } catch { return null; }
 }
 const VEYRA_API_ROUTES = new Set(["view", "resource", "download", "form-get", "open", "crawl", "search", "suggest", "browser", "debug", "session", "sessions", "config", "vpn", "extensions", "status", "health"]);
 app.use(async (req, res, next) => {
@@ -5667,22 +8951,58 @@ app.use(async (req, res, next) => {
   
   
   
-  const dest = String(req.get("Sec-Fetch-Dest") || "").toLowerCase();
-  const topLevel = dest === "document" || (!dest && /text\/html/i.test(String(req.get("Accept") || "")) && !req.get("Referer"));
+  const isDocument = documentNavigation(req);
   const reserved = isReservedOriginPath(req.path);
-  const ctx = proxiedPageFromReferer(req, { allowCookie: !topLevel && !reserved && !shield.isPreviewBot(req.get("User-Agent")) });
+  let ctx = escapedPageContext(req, { allowLegacyQuery: !reserved });
+  // Orphaned subresource fallback: remember the page this client last
+  // resolved so cookie-less, origin-only-referer asset requests can still
+  // be resolved (as guest fetches) instead of 404ing.
+  if (ctx && isDocument) noteClientResolvedPage(req, ctx.pageUrl, ctx.sid);
+  if (!ctx && !isDocument && !reserved) ctx = orphanedPageContext(req);
   if (!ctx) return next();
   let target = null;
-  if (escaped !== req.originalUrl && /[.](m?js|css|wasm|json|map)([?#]|$)/i.test(req.path)) target = await resolveEscapedChunk(ctx.sid, escaped);
-  if (!target) { try { target = normalizeUrl(new URL(escaped, ctx.pageUrl).href); } catch { target = null; } }
+  if (escaped !== req.originalUrl && /[.](m?js|css|wasm|json|map)([?#]|$)/i.test(req.path)) target = await resolveEscapedChunk(ctx.sid, escaped, ctx.pageUrl);
+  if (!target) target = resolveEscapedTarget(escaped, ctx.pageUrl);
   if (!target) return next();
-  const mode = dest === "document" || dest === "iframe" || dest === "frame" ? "view" : "resource";
-  Object.defineProperty(req, "query", { value: { url: target, sid: ctx.sid, from: ctx.pageUrl }, writable: true, configurable: true });
-  try { await proxyRequest(req, res, mode); }
-  catch (e) { respondError(res, 502, `Veyra resource error: ${e.message}`, "PROXY_RELATIVE_FALLBACK_ERROR", { requestId: req.veyraRequestId }); }
+  const mode = isDocument ? "view" : "resource";
+  // Mark referer-only navigations before returning HTML. Browsers can start
+  // loading relative assets before any injected runtime updates the URL.
+  const mark = isDocument && req.method === "GET" && !req.query?.__veyra_url && !req.query?.__veyra_sid && escapedPathFor(target);
+  if (mark && ctx.sid) return markEscapedNavigation(req, res, mark, ctx.sid);
+  const exact = isDocument && req.query?.__veyra_youtube_inline === "1"
+    ? proxyRoutingPair(req.query?.__veyra_url, req.query?.__veyra_sid) : null;
+  const exactVideo = exact && watchVideo(exact.pageUrl);
+  const inline = exactVideo && watchVideo(target)?.videoId === exactVideo.videoId ? "1" : undefined;
+  Object.defineProperty(req, "query", { value: { url: target, sid: ctx.sid, from: ctx.pageUrl, __veyra_youtube_inline: inline }, writable: true, configurable: true });
+  try {
+    if (mode === "view" && req.method === "GET") await proxyViewGet(req, res);
+    else await proxyRequest(req, res, mode);
+  } catch (e) {
+    if (res.headersSent) return next(e);
+    const isView = mode === "view";
+    respondError(res, e.code === "VPN_KILL_SWITCH" ? 503 : 502,
+      `${isView ? "Veyra could not load this page" : "Veyra resource error"}: ${e.upstreamMessage || e.message}`,
+      isView && /^UPSTREAM_[A-Z0-9_]+$/.test(String(e.code || "")) ? e.code : "PROXY_RELATIVE_FALLBACK_ERROR",
+      { requestId: req.veyraRequestId, upstreamCode: e.upstreamCode || networkErrorCode(e) || null });
+  }
 });
-
-
+// User-facing search links on the API hostname are not API endpoints.
+// Try proxy recovery first so an upstream site's own /search stays in its tab.
+app.get(["/search", "/browse"], (req, res, next) => {
+  const destination = String(req.get("Sec-Fetch-Dest") || "").toLowerCase();
+  if ((destination && destination !== "document") || !documentNavigation(req)) return next();
+  if (Object.hasOwn(req.query, "__veyra_url") || Object.hasOwn(req.query, "__veyra_sid") || proxiedPageFromReferer(req)) return next();
+  const q = typeof req.query.q === "string" ? req.query.q.trim().slice(0, 600) : "";
+  if (/^\/browse\/?$/i.test(req.path) && !q) return next();
+  let target;
+  try { target = new URL(CFG.frontendUrl); } catch { return next(); }
+  if (!/^https?:$/.test(target.protocol) || target.origin === requestOrigin(req)) return next();
+  target.searchParams.set("veyra_route", "search");
+  if (q) target.searchParams.set("q", q);
+  if (["web", "index", ...SEARCH_VERTICALS].includes(req.query.type)) target.searchParams.set("type", req.query.type);
+  if (req.query.incognito === "1") target.searchParams.set("incognito", "1");
+  return res.set({ "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" }).redirect(302, target.href);
+});
 
 app.use((req, res, next) => {
   if (res.headersSent) return next();
@@ -5694,6 +9014,14 @@ app.use((req, res, next) => {
 app.use((err, req, res, next) => {
   if (res.headersSent) return next(err);
   const isApi = req.path.startsWith("/api/") || req.path === "/health";
+  if (err.type === "entity.parse.failed" && err.status === 400) {
+    if (isApi) return respondError(res, 400, "Malformed request body.", "INVALID_REQUEST_BODY", { requestId: req.veyraRequestId });
+    return res.status(400).type("text/plain").send("Malformed request body.");
+  }
+  if (err.type === "entity.too.large" && err.status === 413) {
+    if (isApi) return respondError(res, 413, "Request body exceeds Veyra's size limit.", "REQUEST_BODY_TOO_LARGE", { requestId: req.veyraRequestId });
+    return res.status(413).type("text/plain").send("Request body too large.");
+  }
   serverLog("error", "HTTP", err.stack || err.message || String(err), { requestId: req.veyraRequestId });
   if (isApi) return respondError(res, 500, "Veyra encountered an internal server error.", "INTERNAL_ERROR", { requestId: req.veyraRequestId });
   res.status(500).type("text/plain").send("Veyra server error.");
@@ -5724,9 +9052,11 @@ async function hydrateNeuralFromMongo() {
   try {
     const snapshot = await mongoStore.loadNeuralModel("relevance-v1");
     if (snapshot && neuralModel.loadData(snapshot)) modelLoaded = true;
-    const queued = await mongoStore.loadQueuedNeuralFeedback(neuralTrainer.maxQueue);
+    const qualitySnapshot = await mongoStore.loadNeuralModel("answer-quality-v1");
+    const qualityLoaded = !!(qualitySnapshot && aiAnswerEngine.qualityModel.loadData(qualitySnapshot));
+    const queued = await mongoStore.loadQueuedNeuralFeedback(neuralTrainer.maxQueue, { publicCrawlTraining: learnFromPublicCrawls });
     for (const item of queued) if (neuralTrainer.enqueue(item)) feedbackLoaded += 1;
-    if (modelLoaded || feedbackLoaded) serverLog("info", "NEURAL", `Hydrated model=${modelLoaded} and ${feedbackLoaded} queued feedback event(s) from MongoDB.`);
+    if (modelLoaded || feedbackLoaded || qualityLoaded) serverLog("info", "NEURAL", `Hydrated relevance=${modelLoaded}, answer-quality=${qualityLoaded}, queued feedback=${feedbackLoaded} from MongoDB.`);
   } catch (e) { serverLog("warn", "NEURAL", `Mongo neural hydration skipped: ${e.message}`); }
   return { model: modelLoaded, feedback: feedbackLoaded };
 }
@@ -5750,26 +9080,39 @@ function startVeyraServer() {
 
       if (mongoStore.enabled) {
         try {
-          const dbProfiles = await mongoStore.loadVpnProfiles();
-          let loaded = 0;
-          for (const p of dbProfiles) {
-            const candidate = vpnManager.parseProfile(p);
-            if (candidate && !vpnManager.profiles.has(candidate.id)) {
-              vpnManager.addProfile(candidate);
-              loaded++;
-            }
-          }
-          serverLog('info', 'VPN', `Loaded ${loaded} VPN profile(s) from MongoDB.`);
+          await loadConfiguredVpnProfiles();
         } catch (e) { serverLog('warn', 'VPN', `Failed to load VPN profiles from MongoDB: ${e.message}`); }
       }
       await hydrateSearchFromMongo();
       serverLog("info", "SYSTEM", "Persistence hydration completed.");
+      if (boolEnv("INDEX_REFERENCE_BOOTSTRAP", process.env.RENDER === "true") && CFG.indexSeedCrawl && !sessionManager.sleeping) {
+        // A small deployment-time baseline, independent of guest searches.
+        // The existing public crawler enforces robots, URL safety and noindex.
+        const sources = [
+          "https://docs.python.org/3/tutorial/datastructures.html",
+          "https://pandas.pydata.org/docs/reference/index.html",
+          "https://developer.mozilla.org/en-US/docs/Web/JavaScript",
+          "https://www.indianrail.gov.in/enquiry/StaticPages/StaticEnquiry.jsp?StaticPage=index.html",
+          "https://www.india.gov.in/services/details/passport-seva-apply-for-ordinary-passport",
+          "https://www.isro.gov.in/LaunchMissions.html",
+          "https://www.tajmahal.gov.in/"
+        ].filter(url => !searchIndex.has(normalizeUrl(url)));
+        // One short crawl per source, sequential to leave workers for user requests.
+        void (async () => {
+          for (const url of sources) await neuralRobotPool.startCrawl([url], "", { maxDepth: 1, maxPages: 5 });
+        })().catch(error => serverLog("warn", "SEARCH", `Reference bootstrap skipped: ${error.message}`));
+      }
     } catch (err) {
       serverLog("warn", "SYSTEM", `Persistence hydration skipped: ${err.stack || err}`);
     }
     };
     const startServer = () => {
       httpServer = app.listen(PORT, "0.0.0.0", () => {
+      // Keep client keep-alive connections open much longer than Node's 5 s
+      // default so the browser reuses one warm TCP/TLS connection across
+      // navigations and API calls instead of re-handshaking each time.
+      httpServer.keepAliveTimeout = 65000;
+      httpServer.headersTimeout = 70000;
       serverLog("info", "SYSTEM", `Veyra server listening on ${PORT}`);
       serverLog("info", "CONFIG", `Plan ${VEYRA_CONFIG.plan.label} (${CFG.plan}, ${VEYRA_CONFIG.plan.ramMb}MB / ${VEYRA_CONFIG.plan.cpu} CPU, via ${VEYRA_CONFIG.planSource}) — ${CFG.maxActiveJobs} crawlers × ${CFG.maxActiveFetches} fetches, ${CFG.parseWorkers} parse workers, ${CFG.maxProxySessions} sessions, ${CFG.maxBrowserSessions} browser sessions.`);
       serverLog("info", "MONGO", mongoStore.status().configured ? `MongoDB configured (${CFG.mongoDb}); persistence/cache is fail-open.` : "MongoDB not configured; using local/ephemeral persistence where applicable.");
@@ -5780,9 +9123,28 @@ function startVeyraServer() {
       
       
       try {
-        castServer = new CastServer(httpServer, (level, source, msg) => serverLog(level, source, msg), { frontendUrl: CFG.frontendUrl });
+        castServer = new CastServer(httpServer, (level, source, msg) => serverLog(level, source, msg), { frontendUrl: CFG.frontendUrl, allowUpgrade: () => accessPolicy.loaded && !accessGate.staffOnly });
         serverLog("info", "CAST", `Cast server upgraded to ${castServer.useWebSocket ? "WebSocket" : "HTTP polling"} mode`);
       } catch (e) { serverLog("warn", "CAST", `Cast WebSocket upgrade kept polling mode: ${e.message}`); }
+      try {
+        // WebSocket relay for the fast proxy (poxel.io, games, chat) — proxied via
+        // the session's VPN exit and cookie jar, so real-time apps work without
+        // Chromium. Shares the same HTTP server as the cast server.
+        wsRelay = new WsRelay({
+          log: (level, source, msg) => serverLog(level, source, msg),
+          allowUpgrade: () => accessPolicy.loaded && !accessGate.staffOnly,
+          sessionManager: { checkLimit: sid => sessionManager.checkLimit(sid), touch: sid => sessionManager.touch(sid) },
+          vpnManager,
+          forwardHeaders: ({ sid, target }) => {
+            try {
+              const cookies = cookieHeader(sid, target);
+              return cookies ? { cookie: cookies } : {};
+            } catch { return {}; }
+          },
+        });
+        const attached = wsRelay.attach(httpServer);
+        serverLog("info", "WS-RELAY", `WebSocket relay ${attached ? "attached at /ws/relay" : "unavailable (ws library missing)"}.`);
+      } catch (e) { serverLog("warn", "WS-RELAY", `WebSocket relay not attached: ${e.message}`); }
       });
       httpServer.once("error", err => {
         serverLog("error", "SYSTEM", `HTTP listener failed: ${err.stack || err}`);
@@ -5803,6 +9165,7 @@ function startVeyraServer() {
         workerPool?.close(),
         browserEngine.shedIdle(0).then(() => browserEngine.browser?.close()),
         DIRECT_HTTP_AGENT.close(),
+        GOOGLE_ACCOUNTS_HTTPS_AGENT.destroy(),
         mongoStore.close()
       ]);
       process.exit(0);
@@ -5821,10 +9184,10 @@ if (require.main === module) startVeyraServer();
 
 
 const __workerOps = {
-  rewriteHtml: (text, base, sid) => rewriteHtml(text, base, sid),
+  rewriteHtml: (text, base, sid, watchPlayer) => rewriteHtml(text, base, sid, watchPlayer),
   rewriteCss: (text, base, sid) => rewriteCssText(text, base, sid),
   rewriteJs: (text, base, sid) => rewriteJsText(text, base, sid),
   discover: (text, kind, base, contentType) => collectDiscovery(text, kind, base, contentType)
 };
 
-module.exports = { app, mongoStore, mergeStrayProxyParams, detectChallenge, CFG, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions, normalizeOpenEngineMode, shouldStartCrawlerForEngineMode, startVeyraServer };
+module.exports = { app, get accessGate() { return accessGate; }, mongoStore, mergeStrayProxyParams, detectChallenge, maybeCompressProxyPayload, proxyCompressibleContentType, CFG, browserCapabilitySignals, canRenderHtmlWithBrowser, renderHtmlWithBrowser, __workerOps, sessionManager, vpnManager, workerPool, scheduleCrawl, crawlQueue, activeCrawlCount, effectiveMaxActiveJobs, sweepAbandonedCrawls, createJob, jobs, collectDiscovery, VEYRA_CONFIG, Semaphore, normalizeUrl, resolveNavigation, resolveResource, makeViewUrl, makeResourceUrl, rewriteHtml, rewriteCssText, rewriteJsText, rewriteMediaManifest, injectRuntime, detectChallenge, PriorityFrontier, BrowserTaskScheduler, CooperativeRobotPool, robotsAllowed, crawlPriority, crawlLimitForContentType, tokenizeSearch, parseSearchQuery, localSearch, searchIndexStats, indexDocument, localSearchSuggestions, normalizeOpenEngineMode, shouldStartCrawlerForEngineMode, startVeyraServer, cacheSafeUrl, cacheSafeResponse, fetchBuffer, escapedPageContext, escapedPathFor, liveSessionId, resolveEscapedTarget, workerScopePrelude, noteClientResolvedPage, orphanedPageContext, DIRECT_HTTP_AGENT, UPSTREAM_MAX_HEADER_BYTES: require("./network/header-cap").UPSTREAM_MAX_HEADER_BYTES };

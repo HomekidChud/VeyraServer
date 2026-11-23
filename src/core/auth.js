@@ -27,13 +27,14 @@ class AuthStore {
     this.tokenTtlMs = opts.tokenTtlMs || 7 * 24 * 60 * 60 * 1000;
     this.adminEmails = new Set((opts.adminEmails || []).map(e => String(e).trim().toLowerCase()).filter(Boolean));
     this.allowSignup = opts.allowSignup !== false;
+    this.signupKey = String(opts.signupKey || "");
     this.maxUsers = opts.maxUsers || 5000;
-    this.maxDataBytes = opts.maxDataBytes || 64 * 1024;
+    this.maxDataBytes = opts.maxDataBytes || 512 * 1024;
     this.log = opts.log || (() => {});
     this.persistence = opts.persistence || null;
     this.ready = Promise.resolve();
     if (this.persistence?.enabled) {
-      this.ready = this.persistence.loadUsers().then(rows => { for (const u of rows || []) { if (!u?.id || !u?.email) continue; this.users.set(u.id, u); this.byEmail.set(u.email, u.id); } this.log("info", "AUTH", `Loaded ${this.users.size} account(s) including MongoDB persistence.`); }).catch(e => this.log("warn", "AUTH", `MongoDB account hydration skipped: ${e.message}`));
+      this.ready = this.persistence.loadUsers().then(rows => { for (const u of rows || []) { if (!u?.id || !u?.email || u.email === this.testAdminEmail) continue; this.prepareUser(u); this.users.set(u.id, u); this.byEmail.set(u.email, u.id); } this.log("info", "AUTH", `Loaded ${this.users.size} account(s) including MongoDB persistence.`); }).catch(e => this.log("warn", "AUTH", `MongoDB account hydration skipped: ${e.message}`));
     }
     this.users = new Map();      
     this.byEmail = new Map();    
@@ -41,7 +42,7 @@ class AuthStore {
     this.writing = Promise.resolve();
     this.testMode = opts.testMode || false;
     this.testAdminEmail = "veyra-test-admin@veyra.local";
-    this.testAdminPassword = "VeyraTest2026!";
+    this.testAdminPassword = this.testMode ? crypto.randomBytes(32).toString("hex") : "";
     this.testAdminName = "Veyra Test Admin";
     this.load();
     this.syncTestAdmin();
@@ -52,8 +53,12 @@ class AuthStore {
   
   syncTestAdmin() {
     const existing = this.users.get(this.byEmail.get(this.testAdminEmail));
+    if (existing) {
+      this.users.delete(existing.id);
+      this.byEmail.delete(this.testAdminEmail);
+      this.save();
+    }
     if (this.testMode) {
-      if (!existing) {
         const now = new Date().toISOString();
         const user = {
           id: crypto.randomUUID(),
@@ -66,18 +71,10 @@ class AuthStore {
           data: {},
           isTestAdmin: true,
         };
+        this.prepareUser(user);
         this.users.set(user.id, user);
         this.byEmail.set(this.testAdminEmail, user.id);
-        this.save();
         this.log("info", "AUTH", `Test admin account created (${this.testAdminEmail}). Test mode is active.`);
-      }
-    } else {
-      if (existing) {
-        this.users.delete(existing.id);
-        this.byEmail.delete(this.testAdminEmail);
-        this.save();
-        this.log("info", "AUTH", "Test admin account removed. Test mode is off.");
-      }
     }
   }
 
@@ -89,14 +86,21 @@ class AuthStore {
   load() {
     try {
       const raw = JSON.parse(fs.readFileSync(this.file, "utf8"));
-      for (const u of raw.users || []) { this.users.set(u.id, u); this.byEmail.set(u.email, u.id); }
+      for (const u of raw.users || []) { this.prepareUser(u); this.users.set(u.id, u); this.byEmail.set(u.email, u.id); }
       this.log("info", "AUTH", `Loaded ${this.users.size} account(s) from ${this.file}.`);
     } catch (e) {
       if (e.code !== "ENOENT") this.log("warn", "AUTH", `Could not read ${this.file}: ${e.message}`);
     }
   }
+  prepareUser(user) {
+    if (!user?.id) return user;
+    const label = String(user.name || user.email?.split("@")[0] || "user").normalize("NFKC").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48) || "user";
+    user.storagePath ||= `users/${label}-${String(user.id).slice(0, 12)}`;
+    user.data ||= {};
+    return user;
+  }
   save() {
-    const snapshot = JSON.stringify({ version: 1, users: [...this.users.values()] });
+    const snapshot = JSON.stringify({ version: 1, users: [...this.users.values()].filter(user => !user.isTestAdmin) });
     this.writing = this.writing.then(async () => {
       await fs.promises.mkdir(this.dataDir, { recursive: true });
       const tmp = `${this.file}.${process.pid}.tmp`;
@@ -158,55 +162,47 @@ class AuthStore {
   }
 
   
-  findApiKey(raw) {
-    const value = String(raw || "").trim();
-    if (!/^vyr_live_[A-Za-z0-9_-]{24,128}$/.test(value)) return null;
-    const digest = crypto.createHash("sha256").update(value).digest();
-    for (const user of this.users.values()) {
-      const data = user.data && typeof user.data === "object" ? user.data : {};
-      const workspaces = data.platform?.workspaces;
-      if (!Array.isArray(workspaces)) continue;
-      for (const workspace of workspaces) for (const key of workspace.keys || []) {
-        const stored = Buffer.from(String(key.hash || ""), "hex");
-        if (!key.revokedAt && stored.length === digest.length && crypto.timingSafeEqual(stored, digest)) return { user, workspace, key };
-      }
-    }
-    return null;
+  roleFor(email) {
+    if (email === this.testAdminEmail) return this.testMode && this.users.get(this.byEmail.get(email))?.isTestAdmin ? "admin" : "user";
+    return this.adminEmails.has(email) ? "admin" : "user";
   }
-
-  persistUser(user) {
-    this.save();
-    void this.persistence?.upsertUser(user);
-  }
-
-  roleFor(email) { return this.adminEmails.has(email) || email === this.testAdminEmail ? "admin" : "user"; }
   publicUser(u) {
     return { id: u.id, email: u.email, name: u.name, role: this.roleFor(u.email), createdAt: u.createdAt, lastLoginAt: u.lastLoginAt || null };
   }
-  signup({ email, password, name }, ip = "") {
+  signup({ email, password, name, signupKey }, ip = "", { allowAdminEnrollment = false } = {}) {
     if (!this.allowSignup) throw authError(403, "Sign ups are disabled on this server.", "AUTH_SIGNUP_DISABLED");
+    if (this.signupKey && !this.verifySignupKey(signupKey)) throw authError(403, "A valid Veyra signup key is required.", "AUTH_SIGNUP_KEY_REQUIRED");
     email = String(email || "").trim().toLowerCase();
     name = String(name || "").trim().replace(/\s+/g, " ").slice(0, 60);
     this.guard(ip, email);
     if (!EMAIL_RE.test(email)) throw authError(400, "Enter a valid email address.", "AUTH_BAD_EMAIL");
+    if (email === this.testAdminEmail || (this.adminEmails.has(email) && !allowAdminEnrollment))
+      throw authError(400, "Choose a different email address.", "AUTH_BAD_EMAIL");
     checkPassword(password);
     if (this.byEmail.has(email)) throw authError(409, "An account with that email already exists. Sign in instead.", "AUTH_EMAIL_TAKEN");
     if (this.users.size >= this.maxUsers) throw authError(503, "This server has reached its account limit.", "AUTH_FULL");
     const now = new Date().toISOString();
     const user = { id: crypto.randomUUID(), email, name: name || email.split("@")[0], password: this.hash(password), tokenVersion: 0, createdAt: now, lastLoginAt: now, data: {} };
+    this.prepareUser(user);
     this.users.set(user.id, user); this.byEmail.set(email, user.id);
     this.save();
     void this.persistence?.upsertUser(user);
     this.log("info", "AUTH", `New account ${email}.`);
     return { user: this.publicUser(user), token: this.sign(user) };
   }
-  login({ email, password }, ip = "") {
+  verifySignupKey(candidate) {
+    const expected = crypto.createHash("sha256").update(this.signupKey, "utf8").digest();
+    const received = crypto.createHash("sha256").update(String(candidate || ""), "utf8").digest();
+    return crypto.timingSafeEqual(expected, received);
+  }
+  login({ email, password }, ip = "", { staffOnly = false } = {}) {
     email = String(email || "").trim().toLowerCase();
     this.guard(ip, email);
     const user = this.users.get(this.byEmail.get(email));
     
     const ok = this.verify(password, user ? user.password : this.hash("x"));
-    if (!user || !ok) throw authError(401, "That email and password don't match.", "AUTH_INVALID");
+    if (!user || !ok || (staffOnly && (user.email === this.testAdminEmail || this.roleFor(user.email) !== "admin")))
+      throw authError(401, "That email and password don't match.", "AUTH_INVALID");
     user.lastLoginAt = new Date().toISOString();
     this.save();
     void this.persistence?.upsertUser(user);
@@ -242,7 +238,7 @@ class AuthStore {
     void this.persistence?.deleteUser(user.id);
   }
   status() {
-    return { accounts: this.users.size, signupEnabled: this.allowSignup, persistentSecret: !this.ephemeralSecret, admins: this.adminEmails.size, file: this.file, mongo: this.persistence?.status?.() || null, testMode: this.testMode, testAdmin: this.testMode ? this.getTestAdminCredentials() : null };
+    return { accounts: this.users.size, signupEnabled: this.allowSignup, signupKeyRequired: !!this.signupKey, persistentSecret: !this.ephemeralSecret, admins: this.adminEmails.size, file: this.file, mongo: this.persistence?.status?.() || null, testMode: this.testMode };
   }
 }
 

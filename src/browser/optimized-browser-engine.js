@@ -11,6 +11,7 @@
  */
 
 const crypto = require('crypto');
+const { followPopupWhenReady, restoreAfterClose } = require('./popup-follow');
 const fs = require('fs');
 
 function id(prefix = 'b') { return `${prefix}_${crypto.randomBytes(12).toString('base64url')}`; }
@@ -405,7 +406,7 @@ class OptimizedBrowserEngine {
       void req.allHeaders?.().then(h => { row.requestHeaders = sanitizeRequestWarmHeaders(h); }).catch(() => {});
     });
     page.on('framenavigated', frame => {
-      if (frame === page.mainFrame()) {
+      if (page === session.page && frame === page.mainFrame()) {
         session.canonicalUrl = safeUrl(frame.url()) || session.canonicalUrl;
         session.lastUsed = Date.now();
       }
@@ -428,9 +429,19 @@ class OptimizedBrowserEngine {
       }
       session.pages.add(popup);
       this.attachPage(session, popup);
+      // The streamed surface and all input target session.page: follow the
+      // popup so a window the site actually needs (OAuth, launcher, auth) is
+      // visible and clickable instead of opening invisibly in the background.
+      followPopupWhenReady(session, page, popup);
       this.pushConsole(session, 'info', `Popup opened: ${sanitizeUrl(popup.url()) || 'new page'}`);
     });
-    page.on('close', () => session.pages.delete(page));
+    page.on('close', () => {
+      // When the active page closes (an auth popup finishing), hand control
+      // back to the opener instead of leaving session.page on a dead page.
+      const wasActive = session.page === page;
+      const next = restoreAfterClose(session, page);
+      if (wasActive && next) this.pushConsole(session, 'info', `Popup closed; back on ${sanitizeUrl(next.url()) || 'the previous page'}.`);
+    });
   }
 
   pushConsole(session, level, message) {
@@ -523,7 +534,7 @@ class OptimizedBrowserEngine {
       const url = page.url();
       const title = await page.title().catch(() => '');
       const text = await page.locator('body').innerText({ timeout: 1500 }).catch(() => '');
-      const signal = /captcha|verify you are human|security verification|attention required|just a moment|checking your browser|challenge/i;
+      const signal = /captcha|verify you are human|security verification|attention required|just a moment|checking your browser|challenge|robot check failed|couldn['’]t confirm.{0,80}robot|session wasn['’]t started/i;
       if (signal.test(url) || signal.test(title) || signal.test(text.slice(0, 12000))) return { url, title: String(title).slice(0, 200) };
     } catch {}
     return null;

@@ -1,5 +1,6 @@
 "use strict";
 
+const { setMaxListeners } = require("node:events");
 
 
 
@@ -14,7 +15,7 @@
 class SessionManager {
   constructor(opts = {}) {
     this.maxSessions = opts.maxSessions || 500;
-    this.idleTtlMs = opts.idleTtlMs || 30 * 60 * 1000;
+    this.idleTtlMs = opts.idleTtlMs || 60 * 1000;
     this.hardTtlMs = opts.hardTtlMs || 24 * 60 * 60 * 1000;
     this.maxCookieBytes = opts.maxCookieBytes || 128 * 1024;
     
@@ -79,7 +80,9 @@ class SessionManager {
         err.code = "SESSION_EXPIRED"; err.status = 410;
         throw err;
       }
-      rec = { id: sid, createdAt: t, lastUsed: t, cookies: new Map(), vpnProfileId: null, browserSessions: new Set(), requests: 0, bytesOut: 0 };
+      rec = { id: sid, createdAt: t, lastUsed: t, cookies: new Map(), chromiumUaByHost: new Map(), vpnProfileId: null, browserSessions: new Set(), requests: 0, bytesOut: 0, abort: new AbortController() };
+      // One signal can cover many concurrent page subresources.
+      setMaxListeners(0, rec.abort.signal);
       this.sessions.set(sid, rec);
       this.stats.created += 1;
       this.enforceCap();
@@ -134,6 +137,7 @@ class SessionManager {
     const rec = this.sessions.get(sid);
     const limit = rec?.timeLimitMs ?? this.timeLimitMs;
     if (rec && limit && this.now() - rec.createdAt >= limit + (rec.renewedMs || 0)) { this.expire(sid, "limit"); return true; }
+    if (rec && (this.now() - rec.lastUsed > this.idleTtlMs || this.now() - rec.createdAt > this.hardTtlMs)) { this.expire(sid, "idle"); return true; }
     return false;
   }
   tombstone(sid) {
@@ -171,7 +175,7 @@ class SessionManager {
   
   
   pauseForVerification(sid, reason = 'challenge') {
-    if (!sid) return;
+    if (!this.sessions.has(sid)) return;
     this.pausedSessions.set(sid, { until: 0, reason, startedAt: this.now() });
     this.log("info", "SESSION", `Session ${sid.slice(0, 8)}… paused for verification (${reason}). Expiry suspended.`);
   }
@@ -195,7 +199,7 @@ class SessionManager {
 
   
   
-  importPlaywrightCookies(sid, cookies) {
+  importPlaywrightCookies(sid, cookies, userAgent = '') {
     if (!sid || !Array.isArray(cookies)) return;
     const rec = this.sessions.get(sid);
     if (!rec) return;
@@ -213,8 +217,36 @@ class SessionManager {
         httpOnly: !!c.httpOnly,
         sameSite: c.sameSite || 'Lax'
       });
+      // Remember which user-agent real Chromium used on this host. Security
+      // clearance cookies (cf_clearance & friends) are validated against the
+      // IP + user-agent that solved the check, so the fast proxy must replay
+      // the exact same UA for those hosts.
+      if (userAgent) {
+        const host = String(c.domain || '').replace(/^\./, '').toLowerCase();
+        if (host) rec.chromiumUaByHost.set(host, String(userAgent).slice(0, 500));
+      }
+    }
+    while (rec.chromiumUaByHost.size > 64) {
+      const oldest = rec.chromiumUaByHost.keys().next().value;
+      if (!oldest) break;
+      rec.chromiumUaByHost.delete(oldest);
     }
     this.trimCookies(rec);
+  }
+
+  // The user-agent real Chromium used when the user passed a security check
+  // on this host (empty when the session never verified there).
+  chromiumUaFor(sid, url) {
+    const rec = this.sessions.get(sid);
+    if (!rec || !rec.chromiumUaByHost?.size) return '';
+    try {
+      const host = new URL(url).hostname.toLowerCase();
+      for (const [domain, ua] of rec.chromiumUaByHost) {
+        const d = String(domain).toLowerCase();
+        if (host === d || host.endsWith(`.${d}`)) return ua;
+      }
+    } catch {}
+    return '';
   }
   
   exportPlaywrightCookies(sid) {
@@ -241,13 +273,15 @@ class SessionManager {
     this.sessions.delete(sid);
     
     this.pausedSessions.delete(sid);
-    if (reason === "limit" || reason === "client") this.tombstone(sid);
+    this.tombstone(sid);
+    rec.abort.abort();
     if (reason === "limit") this.stats.expiredLimit += 1;
     else if (reason === "idle") this.stats.expiredIdle += 1;
     else if (reason === "cap") this.stats.expiredCap += 1;
     else if (reason === "pressure") this.stats.expiredPressure += 1;
     else if (reason === "client") this.stats.closedByClient += 1;
     rec.cookies.clear();
+    rec.chromiumUaByHost.clear();
     for (const fn of this.hooks.expire) { try { const r = fn(sid, rec, reason); if (r?.catch) r.catch(() => {}); } catch {} }
     return true;
   }
@@ -267,7 +301,7 @@ class SessionManager {
     
     for (const [sid, rec] of this.sessions) {
       if (this.isPaused(sid)) continue; 
-      if (t - rec.lastUsed <= this.idleTtlMs && t - rec.createdAt <= this.hardTtlMs) break;
+      if (t - rec.lastUsed <= this.idleTtlMs && t - rec.createdAt <= this.hardTtlMs) continue;
       this.expire(sid, "idle"); n += 1;
     }
     if (!this.sleeping && this.serverIdleMs > 0 && t - this.lastActivity > this.serverIdleMs) {
@@ -301,7 +335,7 @@ class SessionManager {
       active: this.sessions.size, max: this.maxSessions, timeLimitMs: this.timeLimitMs, tombstones: this.tombstones.size, idleTtlMs: this.idleTtlMs, hardTtlMs: this.hardTtlMs,
       cookies, browserSessions: browsers, oldestSessionAgeMs: oldest,
       sleeping: this.sleeping, serverIdleMs: this.serverIdleMs, idleForMs: t - this.lastActivity, stats: { ...this.stats },
-      sessions: [...this.sessions.entries()].slice(-100).reverse().map(([id, rec]) => ({ id: id.slice(0, 8) + "…", ageMs: t - rec.createdAt, remainingMs: this.remainingMs(rec), timeLimitMs: rec.timeLimitMs ?? this.timeLimitMs, requests: rec.requests || 0, cookies: rec.cookies.size, browserSessions: rec.browserSessions.size, userId: rec.userId ? String(rec.userId).slice(0, 8) : null, paused: this.isPaused(id) })),
+      sessions: [...this.sessions.entries()].slice(-100).reverse().map(([id, rec]) => ({ id: id.slice(0, 8) + "…", sessionId: id, role: rec.role || "user", ageMs: t - rec.createdAt, remainingMs: this.remainingMs(rec), timeLimitMs: rec.timeLimitMs ?? this.timeLimitMs, requests: rec.requests || 0, cookies: rec.cookies.size, browserSessions: rec.browserSessions.size, userId: rec.userId ? String(rec.userId).slice(0, 8) : null, paused: this.isPaused(id) })),
       pausedSessions: this.pausedSessions.size
     };
   }

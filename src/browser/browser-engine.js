@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const { followPopupWhenReady, restoreAfterClose } = require('./popup-follow');
 const fs = require('fs');
 
 function id(prefix = 'b') { return `${prefix}_${crypto.randomBytes(12).toString('base64url')}`; }
@@ -42,6 +43,7 @@ class BrowserEngine {
     this.vpnManager = vpnManager;
     this.browser = null;
     this.playwright = null;
+    this.backend = 'local';
     this.sessions = new Map();
     this.startPromise = null;
     this.creatingSessions = 0;
@@ -77,13 +79,110 @@ class BrowserEngine {
     
   }
 
+  // Export a Chromium session's cookies (and its exact user-agent) into the
+  // linked fast-proxy session. Called on navigation, on session close, and —
+  // critically — when a security verification clears: the clearance cookies
+  // the user just earned in real Chromium carry over to the fast proxy, and
+  // the proxy then sends the SAME user-agent the check was solved with.
+  async #exportSessionState(session) {
+    if (!this.onStorageState || !session?.proxySessionId) return;
+    try {
+      const state = await session.context.storageState();
+      const ua = await session.page.evaluate(() => navigator.userAgent).catch(() => '');
+      this.onStorageState(session.proxySessionId, state, ua || '');
+    } catch {}
+  }
+
+  // Re-check a session parked in VERIFICATION_REQUIRED. The fast-proxy UI
+  // polls GET /api/browser/session/:id; this lets the server notice the
+  // moment the user finishes the check (even when the page self-redirects
+  // with no further input events), flip the status back to NORMAL, and sync
+  // the freshly-earned cookies into the proxy session.
+  async refreshVerification(sid) {
+    const s = this.get(sid);
+    if (s.status !== 'VERIFICATION_REQUIRED') return this.public(s);
+    const challenge = await this.detectVerification(s.page);
+    if (!challenge) {
+      s.status = 'NORMAL';
+      s.verification = null;
+      s.canonicalUrl = safeUrl(s.page.url()) || s.canonicalUrl;
+      s.title = await s.page.title().catch(() => s.title || '');
+      await this.capture(s, true);
+      await this.#exportSessionState(s);
+    }
+    return this.public(s);
+  }
+
+  // Connect to an external Chromium host over the Chrome DevTools Protocol.
+  // Supports ws(s):// endpoints (Browserless, Browserbase, Steel, chrome
+  // --remote-debugging-port) and http(s):// endpoints that expose /json/version.
+  async connectRemote() {
+    const raw = String(this.cfg.browserBackendUrl || '').trim();
+    if (!raw) return null;
+    let endpoint = raw;
+    try {
+      if (/^https?:\/\//i.test(raw)) {
+        // Append /json/version to the path while keeping any query string
+        // (providers like Browserless put the token in ?token=...).
+        const discovery = new URL(raw);
+        discovery.pathname = (discovery.pathname.replace(/\/+$/, '') || '') + '/json/version';
+        const info = await fetch(discovery.href, { signal: AbortSignal.timeout(10 * 1000) });
+        if (!info.ok) throw new Error(`CDP discovery returned HTTP ${info.status}`);
+        const meta = await info.json();
+        const ws = meta.webSocketDebuggerUrl || meta.webSocketUrl || '';
+        if (!ws) throw new Error('CDP discovery response had no websocket endpoint');
+        endpoint = ws;
+      }
+    } catch (e) {
+      this.log('warn', 'BROWSER', `Remote Chromium discovery failed (${e.message}); falling back to local launch.`);
+      return null;
+    }
+    try {
+      const browser = await this.playwright.chromium.connectOverCDP(endpoint, {
+        timeout: Math.max(5 * 1000, Number(this.cfg.browserBackendConnectTimeoutMs) || 30 * 1000)
+      });
+      this.browser = browser;
+      this.backend = 'remote-cdp';
+      const disconnected = browser;
+      disconnected.on?.('disconnected', () => {
+        if (this.browser !== disconnected) return;
+        const lost = [...this.sessions.values()];
+        this.browser = null;
+        this.playwright = null;
+        this.sessions.clear();
+        for (const session of lost) {
+          session.status = 'ERROR';
+          session.error = 'Remote Chromium disconnected.';
+          if (this.onCrash) try { this.onCrash(session, 'browser_disconnect'); } catch {}
+        }
+        this.log('warn', 'BROWSER', `Remote Chromium disconnected; cleared ${lost.length} browser session(s).`);
+      });
+      this.log('info', 'BROWSER', 'Chromium engine connected to remote provider over CDP.');
+      return browser;
+    } catch (e) {
+      this.log('warn', 'BROWSER', `Remote Chromium connect failed (${e.message}); falling back to local launch.`);
+      return null;
+    }
+  }
+
   async ensureBrowser() {
+    if (this.cfg.browserEnabled === false) {
+      throw Object.assign(new Error('Chromium is disabled. Set VEYRA_CHROMIUM_ENABLED=true to opt in.'), { code: 'BROWSER_ENGINE_UNAVAILABLE' });
+    }
     if (this.browser) return this.browser;
     if (this.startPromise) return this.startPromise;
     this.startPromise = (async () => {
       try {
         if (this.cfg.playwrightBrowsersPath != null) process.env.PLAYWRIGHT_BROWSERS_PATH = String(this.cfg.playwrightBrowsersPath);
         this.playwright = require('playwright');
+        // Remote Chromium over CDP: run the browser OUTSIDE this server on a
+        // dedicated browser provider (Browserless, Browserbase, Steel, a
+        // self-hosted Chrome, ...). This keeps Render's CPU/RAM free for the
+        // proxy lane and makes the browser lane dramatically faster.
+        if (this.cfg.browserBackend === 'remote' && this.cfg.browserBackendUrl) {
+          const connected = await this.connectRemote();
+          if (connected) return connected;
+        }
         let executable = '';
         try { executable = this.playwright.chromium.executablePath(); } catch {}
         if (!executable || !fs.existsSync(executable)) {
@@ -205,6 +304,15 @@ class BrowserEngine {
         viewport: { width: 1365, height: 820 },
         serviceWorkers: 'allow'
       };
+      // Sites like MSN bot-wall the default "HeadlessChrome/x.y" user agent and
+      // redirect to sign-in walls. Present the real desktop Chrome identity
+      // (version taken from the launched browser) so streamed pages behave like
+      // a normal visitor.
+      try {
+        const version = (await browser.version()) || '';
+        const major = /^(\d+)/.exec(version)?.[1];
+        if (major) contextOptions.userAgent = `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`;
+      } catch {}
       if (vpnProfile?.proxy) {
         contextOptions.proxy = { ...vpnProfile.proxy };
         const hints = vpnProfile.contextHints || {};
@@ -320,7 +428,7 @@ class BrowserEngine {
       void req.allHeaders?.().then(h => { row.requestHeaders = sanitizeRequestWarmHeaders(h); }).catch(() => {});
     });
     page.on('framenavigated', frame => {
-      if (frame === page.mainFrame()) {
+      if (page === session.page && frame === page.mainFrame()) {
         session.canonicalUrl = safeUrl(frame.url()) || session.canonicalUrl;
         session.lastUsed = Date.now();
       }
@@ -343,9 +451,19 @@ class BrowserEngine {
       }
       session.pages.add(popup);
       this.attachPage(session, popup);
+      // The streamed surface and all input target session.page: follow the
+      // popup so a window the site actually needs (OAuth, launcher, auth) is
+      // visible and clickable instead of opening invisibly in the background.
+      followPopupWhenReady(session, page, popup);
       this.pushConsole(session, 'info', `Popup opened: ${sanitizeUrl(popup.url()) || 'new page'}`);
     });
-    page.on('close', () => session.pages.delete(page));
+    page.on('close', () => {
+      // When the active page closes (an auth popup finishing), hand control
+      // back to the opener instead of leaving session.page on a dead page.
+      const wasActive = session.page === page;
+      const next = restoreAfterClose(session, page);
+      if (wasActive && next) this.pushConsole(session, 'info', `Popup closed; back on ${sanitizeUrl(next.url()) || 'the previous page'}.`);
+    });
   }
 
   pushConsole(session, level, message) {
@@ -405,13 +523,7 @@ class BrowserEngine {
       }
       if (response && response.status() >= 400 && !challenge) session.error = `HTTP ${response.status()}`;
       await this.capture(session, true);
-      
-      if (this.onStorageState && session.proxySessionId) {
-        try {
-          const state = await session.context.storageState();
-          this.onStorageState(session.proxySessionId, state);
-        } catch {}
-      }
+      await this.#exportSessionState(session);
       return this.public(session);
     } catch (e) {
       session.status = 'ERROR';
@@ -440,7 +552,7 @@ class BrowserEngine {
       const url = page.url();
       const title = await page.title().catch(() => '');
       const text = await page.locator('body').innerText({ timeout: 1500 }).catch(() => '');
-      const signal = /captcha|verify you are human|security verification|attention required|just a moment|checking your browser|challenge/i;
+      const signal = /captcha|verify you are human|security verification|attention required|just a moment|checking your browser|challenge|robot check failed|couldn['’]t confirm.{0,80}robot|session wasn['’]t started/i;
       if (signal.test(url) || signal.test(title) || signal.test(text.slice(0, 12000))) return { url, title: String(title).slice(0, 200) };
     } catch {}
     return null;
@@ -462,16 +574,18 @@ class BrowserEngine {
     }
   }
 
-  async input(sid, action) {
+  async input(sid, action, { interactive = false } = {}) {
     const s = this.get(sid), p = s.page;
     if (s.status === 'CLOSED') throw new Error('Browser session is closed.');
     s.lastUsed = Date.now();
+    const wasVerifying = s.status === 'VERIFICATION_REQUIRED';
     const kind = String(action?.type || '');
+    const live = interactive && s.frameLease?.active && s.status === 'NORMAL' && !s.navigationActive;
     
     
     
     if (kind === 'click') {
-      await p.mouse.move(Number(action.x) || 0, Number(action.y) || 0, { steps: 5 });
+      await p.mouse.move(Number(action.x) || 0, Number(action.y) || 0, { steps: live ? 1 : 5 });
       await p.mouse.click(Number(action.x) || 0, Number(action.y) || 0, { button: action.button || 'left' });
     }
     else if (kind === 'dblclick') await p.mouse.dblclick(Number(action.x) || 0, Number(action.y) || 0);
@@ -480,6 +594,12 @@ class BrowserEngine {
     else if (kind === 'key') await p.keyboard.press(String(action.key || '').slice(0, 100));
     else if (kind === 'hover') await p.mouse.move(Number(action.x) || 0, Number(action.y) || 0, { steps: 5 });
     else throw new Error('Unsupported browser input action.');
+    if (live) {
+      // Render updates come from screencast events. Avoid a timed sleep,
+      // screenshot and repeated metadata reads for each input.
+      s.checkAfterInput = true;
+      return this.summary(s);
+    }
     
     
     
@@ -490,6 +610,9 @@ class BrowserEngine {
     s.status = challenge ? 'VERIFICATION_REQUIRED' : 'NORMAL';
     s.verification = challenge;
     await this.capture(s, true);
+    // The user just finished a security check in real Chromium — sync the
+    // clearance cookies + user-agent into the fast-proxy session right away.
+    if (wasVerifying && !challenge) await this.#exportSessionState(s);
     return this.public(s);
   }
 
@@ -529,12 +652,7 @@ class BrowserEngine {
   async stop(sid) {
     const s = this.get(sid);
     
-    if (this.onStorageState && s.proxySessionId) {
-      try {
-        const state = await s.context.storageState();
-        this.onStorageState(s.proxySessionId, state);
-      } catch {}
-    }
+    await this.#exportSessionState(s);
     s.status = 'CLOSED';
     clearTimeout(s.browserPoll);
     await s.context.close().catch(() => {});
@@ -589,8 +707,28 @@ class BrowserEngine {
 
   async screenshot(sid) {
     const s = this.get(sid);
-    await this.capture(s, true);
-    return s.screenshot;
+    if (s.screenshotPending) return s.screenshotPending;
+    s.screenshotPending = this.capture(s, true).then(() => s.screenshot);
+    try { return await s.screenshotPending; } finally { s.screenshotPending = null; }
+  }
+
+  async refreshInteractive(s) {
+    if (s.metadataPending) return s.metadataPending;
+    s.checkAfterInput = false;
+    const page = s.page;
+    s.metadataPending = (async () => {
+      const title = await page.title().catch(() => s.title);
+      const challenge = await this.detectVerification(page);
+      if (s.page !== page || s.status !== 'NORMAL' || s.navigationActive) return;
+      s.canonicalUrl = safeUrl(page.url()) || s.canonicalUrl;
+      s.title = title;
+      if (challenge) { s.status = 'VERIFICATION_REQUIRED'; s.verification = challenge; }
+    })();
+    try { await s.metadataPending; } finally { s.metadataPending = null; }
+  }
+
+  summary(s) {
+    return { id: s.id, canonicalUrl: safeUrl(s.page?.url()) || s.canonicalUrl, title: s.title || '', status: s.status, lastError: s.error || '' };
   }
 
   public(s) {
@@ -618,6 +756,8 @@ class BrowserEngine {
     return {
       enabled: !!this.cfg.browserEnabled,
       available: !!this.browser,
+      backend: this.backend,
+      remoteConfigured: !!(this.cfg.browserBackend === 'remote' && this.cfg.browserBackendUrl),
       ...this.capacity(),
       sessionList: [...this.sessions.values()].map(s => ({
         id: s.id, tabId: s.tabId, proxySessionId: s.proxySessionId ? `${s.proxySessionId.slice(0, 6)}…` : null, url: safeUrl(s.page?.url()) || s.canonicalUrl,

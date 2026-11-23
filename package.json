@@ -1,6 +1,6 @@
 {
   "name": "veyra-browse-crawler",
-  "version": "8.19.0",
+  "version": "8.21.0",
   "private": true,
   "description": "Veyra Browser API, adaptive proxy/browser engine, page resource acceleration, search service, and diagnostics.",
   "main": "src/server.js",
@@ -8,10 +8,23 @@
     "start": "node src/server.js",
     "prestart": "node scripts/ensure-browser.js",
     "build": "node scripts/install-wireproxy.js",
+    "diagnostics:network": "node scripts/network-diagnostics.js",
+    "benchmark:search": "node scripts/bench-search-orchestration.js",
+    "evaluate:neural": "node scripts/evaluate-neural-training.js",
+    "evaluate:answer-quality": "node scripts/evaluate-answer-quality.js",
+    "evaluate:vertical-ranker": "node scripts/train-vertical-ranker.js",
+    "train:vertical-ranker": "node scripts/train-vertical-ranker.js --write",
+    "evaluate:search-match": "node scripts/train-search-match.js",
+    "check:visual-rights": "node scripts/train-visual-ranker.js --check-rights",
+    "test:publisher-media": "node --test tests/publisher-media.test.js",
+    "test:yoti-sandbox": "node --test tests/yoti-sandbox.test.js",
+    "smoke:yoti-sandbox": "node scripts/yoti-sandbox-smoke.js",
+    "test:visual-ranker": "node --test tests/media-rights-ledger.test.js tests/visual-ranker.test.js",
     "dev": "node --watch src/server.js",
     "config": "node src/config/index.js",
     "check": "node scripts/verify-source.js",
-    "test": "npm run check",
+    "test": "npm run check && node tests/auth.test.js && node tests/gate.test.js && node tests/ai-answer.test.js && node tests/neural-crawler.test.js && node tests/neural-training.test.js && node tests/proxy-rewrite.test.js && node tests/proxy-fetch-retry.test.js && node tests/proxy-compression.test.js && node tests/acquisition-manager.test.js && node tests/google-accounts-transport.test.js && node tests/browser-status.test.js && node tests/youtube.test.js && node tests/youtube-direct-assets.test.js && node tests/youtube-watch-player.test.js && node tests/crawler-js-heavy-render.test.js && node tests/websearch.test.js && node tests/search-route.test.js && node tests/source-view.test.js && node tests/http-reader.test.js && node tests/network-diagnostics.test.js && node tests/capability-no-browser-engine.test.js && node tests/ws-relay.test.js && node tests/no-cross-session-cookies.test.js && node tests/popup-relay.test.js && node tests/runtime-patches.test.js && node tests/challenge-passthrough.test.js && node tests/signin-escape.test.js && node tests/signup-in-veyra.test.js && node tests/navigation-in-place.test.js && node tests/remote-popup-follow.test.js && node tests/guest-cache-isolation.test.js && node tests/srcfix-script-forms.test.js && node tests/fast-proxy-hardening.test.js && node --test tests/frame-stream.test.js tests/proxy-css-media.test.js tests/youtube-eligibility.test.js",
+    "pretest": "npm run test:visual-ranker && npm run test:publisher-media && npm run test:yoti-sandbox && node --test tests/source-search.test.js tests/search-region.test.js tests/vertical-search.test.js tests/browser-entry.test.js tests/crawl-proxy-contract.test.js tests/proxy-shell.test.js && node tests/escaped-navigation.test.js && node tests/escaped-root.test.js && node tests/tab-routing-isolation.test.js && node tests/fast-proxy-http-contract.test.js && node tests/dev-platform-api.test.js",
     "test:legacy": "node tests/legacy/fixed-bugs.js && node tests/legacy/vpn-fixes.js"
   },
   "engines": {
@@ -20,10 +33,12 @@
   "dependencies": {
     "cheerio": "^1.1.2",
     "cors": "^2.8.5",
+    "es-module-lexer": "3.0.5",
     "express": "^5.1.0",
-    "playwright": "^1.55.0",
-    "undici": "^6.29.0",
+    "htmlparser2": "10.1.0",
     "mongodb": "^6.20.0",
+    "playwright": "^1.65.0",
+    "undici": "^6.29.0",
     "ws": "^8.18.0"
   }
 }

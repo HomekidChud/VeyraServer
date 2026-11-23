@@ -1,0 +1,19 @@
+# Source discovery for Veyra AI overviews
+
+`POST /api/search/answer` uses `wide-v1` for signed-in overviews that identify their category. Queries without `source` and legacy follow-up callers retain their existing behavior. This widens evidence retrieval for the answer, not the ordering or latency of regular search results.
+
+## How it works
+
+- **Web:** Start with URL-only search-result hints, trusted matches in Veyra's index, relevant links from the editorial reference catalog, and the server's multi-provider Web search. The original Web lookup can use topic-specific adapters such as Wikipedia, MDN, and Stack Exchange. Explicitly scholarly searches also try Research. In parallel, the public Fast Proxy crawler checks up to six curated publishers, with at most one topical same-origin hop per publisher. It returns leads, not snippets for synthesis, and obeys crawl rules, opt-outs, privacy filters and site scope.
+- **Categories:** Images, Videos, News, Shopping, Research, and Discussions discover source pages within the selected category. They do not silently switch to Web. A thumbnail, product listing snippet, paper record, or video description returned by a search provider is not page evidence. Index searches stay within the local index.
+- **Second pass:** On thin coverage or a comparison, try up to two Web variants or one category variant. If there are no safe variants and coverage is thin, try one provider-approved continuation instead. Continuations never recurse. Keep all `site:` and `-site:` restrictions. This is a small, bounded version of [parallel and sequential research planning](https://arxiv.org/html/2512.02038v1), not a long-running research agent.
+- **Rank and read:** Fuse batches using [weighted reciprocal rank fusion](https://dl.acm.org/doi/10.1145/1571941.1572114). Deduplicate canonical URLs and supplied DOIs, give different hosts an opportunity in the shortlist, and reuse only trusted indexed text. The existing page reader applies its robots, access and concurrency rules. Fresh reads skip publisher opt-outs and non-page content; the synthesis and grounding stages work from readable text, not search snippets.
+- **Answer:** Discover for up to six seconds, shortlist up to 24 candidate pages, and send up to 12 extracted, relevant sources to synthesis. Groq takes priority when its key is configured. If hosted synthesis fails or cannot be verified, the local crawler model helps rank up to two relevant, cited excerpts. It is a ranker, not a text generator. The fallback rejects snippets, unreadable pages, and excerpts flagged by the polarity contradiction check, and abstains if nothing qualifies. That check is a heuristic, not an entailment or correctness guarantee.
+
+## Operations
+
+`GET /api/answer/status` reports the configured source discovery strategy and shortlist limit. `pipeline.sourceRetrieval` distinguishes discovered URLs, hosts, shortlisted URLs, and batch failures. `pipeline.selected` counts relevant evidence sent to synthesis, and `sources` contains only citations retained in the answer. None of those counts are evidence of accuracy by themselves.
+
+Each server process accepts one wide overview per account and four in total at once. When busy it returns a retryable response instead of queuing more work. Index stays local even when an indexed page has too little text. Indexed evidence relies on the stored snapshot; current publisher directives are checked on page reads, not inferred from historical text.
+
+Set `AI_ANSWER_WIDE_DISCOVERY=0` to revert discovery, or `AI_ANSWER_NEURAL_FALLBACK=0` to disable only the local overview fallback. `generatedBy` identifies the path when an answer is returned; `pipeline.hostedFailure` explains why the local fallback was needed. `VEYRA_SOURCE_SEARCH=0` disables the crawler lane. The checked-in fixtures exercise the hard shortlist limit, host diversity, and the second-pass budget. They are not live answer-quality benchmarks.
