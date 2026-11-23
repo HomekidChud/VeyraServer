@@ -47,8 +47,11 @@ function matchPercent(vector, model = artifact) {
 // describes lexical match; it must not replace the engine's ranking.
 function annotateMatchBatch(query, rows, category) {
   const terms = prepareQuery(query);
-  return (Array.isArray(rows) ? rows : []).filter(row => row && typeof row === "object" && !Array.isArray(row))
-    .map(row => ({ ...row, matchPercent: matchPercent(features(terms, row, category)) }));
+  const candidates = (Array.isArray(rows) ? rows : []).filter(row => row && typeof row === "object" && !Array.isArray(row));
+  const direct = category === "web" && candidates.find(row => row.source === "veyra-navigation" && row.navigation === "official-site");
+  // Retain the numeric field for old clients; the official destination has
+  // its own badge, not a claim that other results are poor text matches.
+  return candidates.map(row => ({ ...row, matchPercent: row === direct ? 100 : matchPercent(features(terms, row, category)) }));
 }
 
 module.exports = { prepareQuery, features, heuristic, predict, matchPercent, annotateMatchBatch, matchModelVersion: artifact.version };

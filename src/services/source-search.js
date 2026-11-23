@@ -47,7 +47,7 @@ function publisher(url) {
 }
 
 const clean = (value, max) => String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
-const optOut = /(?:^|[\s,:])(?:none|noindex|nosnippet)(?=$|[\s,;])/i;
+const optOut = /(?:^|[\s,:])(?:none|noindex|nosnippet|noai)(?=$|[\s,;])/i;
 const snippetCaps = /(?:^|[\s,])max-snippet\s*:\s*([^\s,;]*)/gi;
 const noFollow = /(?:^|[\s,:])(?:none|nofollow)(?=$|[\s,;])/i;
 
@@ -142,34 +142,37 @@ function createSourceSearch({ readPage, seeds = SEEDS, lookupReferences = refere
     finally { clearTimeout(timer); signal.removeEventListener("abort", onAbort); }
   }
 
-  async function read(url, scope, signal) {
-    const row = await readPage(url, { signal, allowUrl: target => allowsSiteUrl(scope, target) });
+  async function read(url, scope, signal, allowUrl = () => true) {
+    const inScope = target => allowsSiteUrl(scope, target) && allowUrl(target);
+    if (!inScope(url)) return null;
+    const row = await readPage(url, { signal, allowUrl: inScope });
     if (!row || signal.aborted) return null;
     const finalUrl = sourcePageUrl(row.finalUrl || url);
-    if (!finalUrl || publisher(finalUrl) !== publisher(url) || !allowsSiteUrl(scope, finalUrl)) return null;
+    if (!finalUrl || publisher(finalUrl) !== publisher(url) || !inScope(finalUrl)) return null;
     const page = extractSource(row.body, finalUrl, row.robotsTag);
     return page && { ...page, url: finalUrl, checkedAt: new Date().toISOString() };
   }
 
-  async function discover(scope, { signal } = {}) {
+  async function discover(scope, { signal, allowUrl = () => true } = {}) {
     if (!scope.text || !/[\p{L}\p{N}]/u.test(scope.text)) return [];
     const picked = new Map();
     const matching = catalog.filter(([url, intent]) => allowsSiteUrl(scope, url) && intent.test(scope.text));
     const direct = lookupReferences(scope).map(row => [row.url]);
     for (const [url] of [...direct, ...(scope.include.length ? [...matching, ...catalog] : matching)]) {
-      if (allowsSiteUrl(scope, url) && !picked.has(publisher(url))) picked.set(publisher(url), sourcePageUrl(url));
+      const safe = sourcePageUrl(url);
+      if (safe && allowsSiteUrl(scope, safe) && allowUrl(safe) && !picked.has(publisher(safe))) picked.set(publisher(safe), safe);
       if (picked.size === 6) break;
     }
     return runBatch([...picked.values()], signal, discoverMs, (url, cutoff, emit) =>
       withPublisher(url, cutoff, async () => {
-        const root = await read(url, scope, cutoff);
+        const root = await read(url, scope, cutoff, allowUrl);
         if (!root || root.excerptRestricted) return;
         const found = inspect(scope, root, true);
         if (found) emit({ ...found, source: "veyra-crawl", providers: ["veyra-crawl"] });
         const [next] = rankResultsByRelevance(scope.text, root.links.filter(link =>
-          allowsSiteUrl(scope, link.url) && isTopicalResult(scope.text, link, { requireTitle: true })));
+          allowsSiteUrl(scope, link.url) && allowUrl(link.url) && isTopicalResult(scope.text, link, { requireTitle: true })));
         if (next && !cutoff.aborted) {
-          const child = await read(next.url, scope, cutoff);
+          const child = await read(next.url, scope, cutoff, allowUrl);
           const result = child && !child.excerptRestricted && inspect(scope, child, true);
           if (result && result.canonicalUrl !== found?.canonicalUrl) emit({ ...result, source: "veyra-crawl", providers: ["veyra-crawl"] });
         }

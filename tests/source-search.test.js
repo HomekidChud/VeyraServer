@@ -48,6 +48,24 @@ test("discovery stops after six publishers and one same-origin hop each", async 
   assert(fetched.every(url => /(?:space|child)$/.test(url)));
 });
 
+test("discovery does not request filtered URLs, follow filtered redirects, or expose noai pages", async () => {
+  const urls = ["blocked", "redirect", "optout", "children"].map(name => `https://${name}.example/orbital-imaging`);
+  const visited = [];
+  const service = createSourceSearch({ seeds: urls.map(url => [url, /orbital/]), readPage: async (url, { allowUrl }) => {
+    visited.push(url);
+    if (url === urls[1]) {
+      const finalUrl = "https://redirect.example/restricted";
+      assert.equal(allowUrl(finalUrl), false);
+      return html(`<p>${sample}</p>`, { finalUrl });
+    }
+    if (url === urls[2]) return html(`<p>${sample}</p>`, { meta: '<meta name="robots" content="noai">' });
+    return html(`<p>${sample}</p><a href="/restricted">Orbital imaging</a>`);
+  } });
+  const leads = await service.discover(query, { allowUrl: url => !/blocked\.example|\/restricted/.test(url) });
+  assert.deepEqual(visited, urls.slice(1));
+  assert.deepEqual(leads.map(row => row.url), [urls[3]]);
+});
+
 test("keyword discovery reads the matching reference directly and still needs a topical passage", async () => {
   const asyncio = "https://docs.python.org/3/library/asyncio.html";
   const sample = "The asyncio library lets you write concurrent code using asynchronous tasks, coroutines, and the async/await syntax.";

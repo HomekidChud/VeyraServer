@@ -3,6 +3,22 @@
 const { allowsSiteUrl } = require("./search-site-scope");
 const { canonicalKey, isTopicalResult, rankResultsByRelevance } = require("./websearch");
 
+const HOME_PAGES = [
+  ["TikTok", "https://www.tiktok.com/", ["tiktok", "tik tok", "tiktok.com", "www.tiktok.com"]],
+  ["Google", "https://www.google.com/", ["google", "google.com", "www.google.com"]],
+  ["YouTube", "https://www.youtube.com/", ["youtube", "you tube", "youtube.com", "www.youtube.com"]],
+  ["Instagram", "https://www.instagram.com/", ["instagram", "instagram.com", "www.instagram.com"]],
+  ["GitHub", "https://github.com/", ["github", "github.com", "www.github.com"]],
+];
+const HOME_ALIASES = new Map(HOME_PAGES.flatMap(([title, url, aliases]) =>
+  aliases.map(alias => [alias, Object.freeze({ title, url, canonicalUrl: canonicalKey(url),
+    displayUrl: new URL(url).hostname, source: "veyra-navigation", navigation: "official-site" })])));
+function navigationResult(scope) {
+  if (scope.active) return null;
+  const topic = scope.text.normalize("NFKC").toLowerCase().trim().replace(/\s+/g, " ");
+  return HOME_ALIASES.get(topic) || null;
+}
+
 // Editorial link metadata only. None of these match terms or titles are sent
 // to publishers as search queries, and no previous user searches are used.
 const PAGES = [
@@ -35,4 +51,4 @@ function referenceResults(scope, limit = 3) {
   }));
 }
 
-module.exports = { referenceResults };
+module.exports = { referenceResults, navigationResult };

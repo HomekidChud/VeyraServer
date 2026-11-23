@@ -18,6 +18,7 @@ process.env.VEYRA_CHROMIUM_ENABLED = "false";
 process.env.INDEX_AI_FINDINGS = "true";
 process.env.AI_ANSWER_ALLOW_EXTRACTIVE_FALLBACK = "true";
 process.env.AI_ANSWER_WIDE_DISCOVERY = "true";
+process.env.AI_ANSWER_NEURAL_FALLBACK = "true";
 
 const { app, indexDocument, mongoStore, CFG } = require("../src/server");
 (async () => {
@@ -551,6 +552,25 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     const scopedWithMedia = await getSourceResults("search:example.com", {});
     assert.deepEqual(scopedWithMedia.results[0].media,
       { type: "videos", thumbnail: "https://imgs.search.brave.com/story", duration: "3:35" });
+
+    const wiki = { url: "https://en.wikipedia.org/wiki/TikTok", title: "TikTok", source: "fixture" };
+    const homeLike = { url: "https://tiktok.com/?utm_source=fixture", title: "TikTok Login", source: "fixture" };
+    app.locals.veyraWebSearch = { async search(q, options) {
+      if (q === "Tik Tok") throw new Error("provider offline");
+      return { status: "ok", provider: "fixture", results: [wiki, ...(options.limit > 1 ? [homeLike] : [])] };
+    } };
+    const direct = await getSourceResults("TikTok", { incognito: "1", limit: "2" });
+    assert.deepEqual(direct.results.map(r => r.url), ["https://www.tiktok.com/", wiki.url]);
+    assert.equal(direct.results[0].navigation, "official-site");
+    assert.ok(direct.results[0].matchPercent > direct.results[1].matchPercent);
+    assert.equal((await getSourceResults("TikTok", { incognito: "1", limit: "1" })).results[0].url, "https://www.tiktok.com/");
+    const offlineAlias = await getSourceResults("Tik Tok", { incognito: "1" });
+    assert.equal(offlineAlias.status, "ok");
+    assert.deepEqual(offlineAlias.results.map(row => row.url), ["https://www.tiktok.com/"]);
+    for (const [q, options] of [["TikTok history", {}], ["TikTokk", {}], ["TikTok -site:example.com", {}],
+      ["TikTok site:tiktok.com", {}], ["TikTok", { engine: "bing" }], ["TikTok", { offset: "10" }]]) {
+      assert.ok(!(await getSourceResults(q, { incognito: "1", ...options })).results.some(row => row.navigation));
+    }
     const previewUrl = `${base}/api/search/vertical?type=images&q=preview+fixture&preview=1`;
     const preview = await (await fetch(previewUrl)).json();
     assert.equal(preview.results.length, 6);
@@ -596,8 +616,20 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     }
 
     assert.deepEqual(aiStatus.sourceDiscovery, { strategy: "wide-v1", shortlistLimit: 24 });
+    assert.deepEqual(aiStatus.neuralFallback, { enabled: true, method: "neural-ranked-verified-excerpts" });
     const wideCalls = [];
     const readShortlist = [];
+    const overviewCrawlCalls = [];
+    app.locals.veyraSourceSearch = { async discover(scope, { signal, allowUrl }) {
+      assert.ok(signal instanceof AbortSignal);
+      overviewCrawlCalls.push(scope.text);
+      if (scope.include.length) {
+        assert.equal(allowUrl("https://outside.example/"), false);
+        assert.equal(allowUrl("https://blocked.fixture-search-route.test/"), false);
+        return [{ url: "https://fixture-search-route.test/from-crawler", source: "veyra-crawl", snippet: "UNTRUSTED", contentText: "UNTRUSTED" }];
+      }
+      return [];
+    } };
     app.locals.veyraWebSearch = { async search(q, options) {
       wideCalls.push({ lane: "web", q, offset: options.offset });
       assert.equal(options.feed, true);
@@ -646,16 +678,19 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
       assert.equal((await getSummary(scopedInput, { suffix, headers })).hasAnswer, false);
     }
     assert.equal(wideCalls.length, 0, "discovery never calls providers for guest or incognito answers");
+    assert.deepEqual(overviewCrawlCalls, []);
     const wideScoped = await getSummary(scopedInput);
     assert.deepEqual(wideCalls.map(call => call.q), [
       scopedCompare,
       "site:fixture-search-route.test -site:blocked.fixture-search-route.test SQLite",
       "site:fixture-search-route.test -site:blocked.fixture-search-route.test PostgreSQL"
     ]);
-    assert.equal(wideScoped.pipeline.sourceRetrieval.batches[2].status, "unavailable");
+    assert.equal(wideScoped.pipeline.sourceRetrieval.batches.find(row => row.lane === "crawler").status, "ok");
+    assert.equal(wideScoped.pipeline.sourceRetrieval.batches.at(-1).status, "unavailable");
     assert.equal(readShortlist[0].q, "SQLite versus PostgreSQL", "alternate searches cannot change the question sent for synthesis");
     assert.deepEqual(readShortlist[0].results.map(r => r.url).sort(),
-      [url, "https://fixture-search-route.test/comparison", "https://fixture-search-route.test/sqlite-docs"].sort());
+      [url, "https://fixture-search-route.test/comparison", "https://fixture-search-route.test/sqlite-docs",
+        "https://fixture-search-route.test/from-crawler"].sort());
     assert.equal(readShortlist[0].options.allowSource({ url, canonicalUrl: "https://outside.example/" }), false);
     assert.equal((await getSummary({ query: "geothermal", source: "web" })).pipeline.sourceRetrieval.shortlisted, 2);
     assert.deepEqual(wideCalls.slice(-2).map(call => call.offset), [undefined, 10]);
@@ -664,6 +699,7 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     assert.equal(academic.pipeline.sourceRetrieval.batches[1].lane, "research");
     assert.equal(readShortlist.at(-1).results.length, 1, "mirrors with one DOI should count as one candidate");
 
+    const countBeforeNonWeb = overviewCrawlCalls.length;
     const image = await getSummary({ query: "site:fixture-search-route.test gallery", source: "images", vertical: "images",
       results: [{ url: "https://fixture-search-route.test/ignored-gallery" }] });
     assert.equal(image.vertical, "images");
@@ -679,6 +715,7 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     assert.equal(indexedOverview.pipeline.sourceRetrieval.strategy, "wide-v1");
     assert.ok(indexedOverview.sources.every(row => row.provider === "veyra-index"));
     assert.equal(wideCalls.length, countBeforeIndex, "Index overviews must not query external providers");
+    assert.equal(overviewCrawlCalls.length, countBeforeNonWeb, "categories and Index do not use the Web crawler");
     let enter, release;
     const entered = new Promise(resolve => { enter = resolve; });
     const heldSlot = new Promise(resolve => { release = resolve; });
@@ -699,6 +736,7 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
   } finally {
     delete app.locals.veyraWebSearch;
     delete app.locals.veyraSourceSearchFetch;
+    delete app.locals.veyraSourceSearch;
     delete app.locals.veyraVerticalSearch;
     delete app.locals.veyraAnswerEngine;
     delete app.locals.veyraNeuralRobotPool;
