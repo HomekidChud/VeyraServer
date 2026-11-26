@@ -168,9 +168,11 @@ function scoreResultRelevance(query, row) {
     else if (urlTokens.has(token)) hit = 2;
     else if (snippetTokens.has(token)) hit = 1;
     if (!hit) {
-      // Character-level fuzzy match so typos and word variants still rank (e.g. "gmaes" ~ "games").
+      // Require a close whole-token match: prefix-only matching made partial
+      // words (for example "art" in "artist") count as query evidence.
       const fuzzy = allTokens.find(candidate => /^[a-z]{4,}$/.test(token) && /^[a-z]{4,}$/.test(candidate) &&
-        (((candidate.startsWith(token) || token.startsWith(candidate)) && Math.abs(candidate.length - token.length) <= 3) || diceSimilarity(candidate, token) >= 0.72));
+        Math.abs(candidate.length - token.length) <= 1 && !candidate.startsWith(token) && !token.startsWith(candidate) &&
+        diceSimilarity(candidate, token) >= 0.72);
       if (fuzzy) hit = 0.75;
     }
     if (hit) { score += hit; matched.push(token); }

@@ -1,6 +1,6 @@
 "use strict";
 const assert = require("assert");
-const { createWebSearch, classifyGoogleResponse, parseBraveApi } = require("../src/services/websearch");
+const { createWebSearch, classifyGoogleResponse, parseBraveApi, rankResultsByRelevance, scoreResultRelevance } = require("../src/services/websearch");
 const { parseSiteScope, allowsSiteUrl } = require("../src/services/search-site-scope");
 const { searchEntry, googleProxySearchQuery } = require("../src/services/search-entry");
 
@@ -59,6 +59,26 @@ const { searchEntry, googleProxySearchQuery } = require("../src/services/search-
   assert.equal(classifyGoogleResponse({ error: "malformed-response" }), "malformed-response");
   assert.equal(classifyGoogleResponse({ error: "ENOTFOUND" }), "dns-error");
   assert.equal(classifyGoogleResponse({ error: "CERT_HAS_EXPIRED" }), "tls-error");
+
+  const rankingRows = [
+    { url: "https://wildlife.example/marsh", title: "Marsh habitat guide", snippet: "Wetlands and birds", providers: ["bing"] },
+    { url: "https://results.example/forecast", title: "Aurora Borealis forecast tonight", snippet: "Clear skies and viewing conditions", providers: ["bing"] },
+    { url: "https://aurora.example/borealis/forecast", title: "Northern lights visibility", snippet: "Aurora and borealis activity forecast", providers: ["brave"] },
+    { url: "https://results.example/aurora-borealis-forecast", title: "Unrelated publisher headline", snippet: "Generic page with no topical description", providers: ["bing"] },
+    { url: "https://results.example/aurora-borealis-forecast-2", title: "Aurora Borealis forecast tonight", snippet: "Duplicate-style headline on a separate URL", providers: ["brave"] },
+    { url: "https://noise.example/landing", title: "Travel deals and hotel booking", snippet: "Aurora borealis forecast aurora borealis forecast aurora borealis forecast", providers: ["bing"] },
+  ];
+  const rankedRows = rankResultsByRelevance("aurora borealis forecast", rankingRows);
+  assert.equal(rankedRows[0].url, "https://results.example/forecast", "complete query title should lead the ranking");
+  assert.equal(rankedRows.at(-1).url, "https://wildlife.example/marsh", "a result with no query evidence should trail matched results");
+  assert.equal(scoreResultRelevance("mars", { url: "https://wildlife.example/marsh", title: "Marsh habitat", snippet: "Wetland birds" }).coverage, 0,
+    "a prefix-related word in title/URL must not count as query evidence");
+  assert.ok(scoreResultRelevance("aurorra", { url: "https://aurora.example/", title: "Aurora", snippet: "" }).coverage > 0,
+    "a close spelling typo should still receive fuzzy relevance credit");
+  assert.ok(rankedRows.findIndex(row => row.url === "https://aurora.example/borealis/forecast") < rankedRows.findIndex(row => row.url === "https://noise.example/landing"),
+    "title/URL evidence should outrank repeated query terms confined to a snippet");
+  assert.equal(rankedRows.filter(row => /forecast tonight/i.test(row.title)).length, 2,
+    "distinct near-duplicate URLs remain available rather than being mistaken for duplicate identities");
 
   let active = 0, peak = 0;
   const parallel = createWebSearch({ env: { WEB_SEARCH_ORDER: "duckduckgo,bing,brave", BRAVE_SEARCH_API_KEY: "test-key", WEB_SEARCH_CONCURRENCY: "3" }, fetchText: async url => {

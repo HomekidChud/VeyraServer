@@ -1,5 +1,5 @@
 const assert = require('assert');
-const { rewriteHtml, rewriteJsText, cacheSafeUrl, cacheSafeResponse } = require('../src/server');
+const { rewriteHtml, rewriteJsText, makeViewUrl, cacheSafeUrl, cacheSafeResponse } = require('../src/server');
 const { parse: parseImports } = require('es-module-lexer');
 
 // Compact ESM chunks must retain their original upstream module base even
@@ -66,6 +66,22 @@ assert.equal(cacheSafeUrl('https://example.com/public?page=2'), true);
 assert.equal(cacheSafeUrl('https://example.com/private?access_token=secret'), false);
 assert.equal(cacheSafeUrl('https://user:pass@example.com/public'), false);
 assert.equal(cacheSafeResponse({ ok: true, status: 200, cacheControl: 'public, max-age=60' }, 'https://example.com/public'), true);
+
+// Search-result and ordinary document links must route to the actual result,
+// not the Veyra search shell; CSS URLs emitted from inline styles keep sid.
+{
+  const destination = 'https://result.example/articles/target?q=moon+stars';
+  const sid = 'rewrite-session-42';
+  assert.equal(makeViewUrl(destination, sid), `/api/view?url=${encodeURIComponent(destination)}&sid=${sid}`);
+  const routed = rewriteHtml(`<html><body><a class="result" href="${destination}">A result</a><div style="background-image:url('/images/card.png')"></div><style>.hero{background:url('/images/hero.png')}</style></body></html>`, 'https://search.example/results', sid);
+  const expectedHref = makeViewUrl(destination, sid).replaceAll('&', '&amp;');
+  assert.ok(routed.includes(`href="${expectedHref}"`), 'result links navigate to their destination through the view route');
+  for (const asset of ['card.png', 'hero.png']) {
+    const encodedTarget = encodeURIComponent(`https://search.example/images/${asset}`);
+    assert.ok(routed.includes(`/api/resource?url=${encodedTarget}`), `inline CSS asset ${asset} is rewritten`);
+    assert.ok(routed.includes(`sid=${sid}`), `inline CSS asset ${asset} retains session routing`);
+  }
+}
 for (const response of [
   { ok: true, status: 200, cacheControl: 'private, max-age=60' },
   { ok: true, status: 200, cacheControl: 'no-store' },

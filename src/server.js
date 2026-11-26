@@ -3622,8 +3622,9 @@ function rewriteHtml(html, base, sid = "", watchPlayer = null) {
     const raw = $(el).attr("content") || ""; const m = raw.match(/^(\s*\d+\s*;\s*url\s*=\s*)(.+)$/i); if (!m) return;
     const u = resolveNavigation(m[2].trim().replace(/^['"]|['"]$/g, ""), effectiveBase); if (u) $(el).attr("content", `${m[1]}${makeViewUrl(u, sid)}`);
   });
-  $("style").each((_, el) => $(el).html(rewriteCssText($(el).html() || "", effectiveBase)));
-  $("[style]").each((_, el) => $(el).attr("style", rewriteCssText($(el).attr("style") || "", effectiveBase)));
+  // Inline CSS requests belong to the page's proxy session as well.
+  $("style").each((_, el) => $(el).html(rewriteCssText($(el).html() || "", effectiveBase, sid)));
+  $("[style]").each((_, el) => $(el).attr("style", rewriteCssText($(el).attr("style") || "", effectiveBase, sid)));
 
   
   
