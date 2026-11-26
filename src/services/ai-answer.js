@@ -409,7 +409,9 @@ class AnswerQualityModel {
   }
   predict(features) { let z = 0; for (let i = 0; i < this.weights.length; i++) z += this.weights[i] * (Number(features?.[i]) || 0); return sigmoid(z); }
   train(features, helpful) {
-    if (!features || features.length !== this.weights.length) throw new TypeError("Invalid answer-quality feature vector");
+    if (!features || features.length !== this.weights.length ||
+        !Array.from(features).every(value => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1) ||
+        typeof helpful !== "boolean") throw new TypeError("Invalid answer-quality training example");
     const target = helpful ? 1 : 0, before = this.predict(features), gradientScale = before - target;
     this.step += 1; const correction1 = 1 - Math.pow(this.beta1, this.step), correction2 = 1 - Math.pow(this.beta2, this.step);
     for (let i = 0; i < this.weights.length; i++) {
@@ -435,11 +437,22 @@ class AnswerQualityModel {
   }
   serialize() { return { version: 1, optimizer: "AdamW", objective: "binary cross-entropy with decoupled weight decay", equation: "L(θ)=−[y log(p)+(1−y)log(1−p)]; p=σ(θ·x)", updateEquation: "m_t=β₁m_{t−1}+(1−β₁)g_t; v_t=β₂v_{t−1}+(1−β₂)g_t²; θ_t=(1−ηλ)θ_{t−1}−η m̂_t/(√v̂_t+ε)", featureNames: [...ANSWER_QUALITY_FEATURES], weights: Array.from(this.weights), firstMoment: Array.from(this.firstMoment), secondMoment: Array.from(this.secondMoment), step: this.step, examples: this.examples, learningRate: this.learningRate, weightDecay: this.weightDecay }; }
   loadData(data = {}) {
-    if (data.version !== 1 || data.optimizer !== "AdamW" || !Array.isArray(data.weights) || data.weights.length !== this.weights.length || (Array.isArray(data.featureNames) && data.featureNames.join("|") !== ANSWER_QUALITY_FEATURES.join("|"))) return false;
-    for (let i = 0; i < this.weights.length; i++) { this.weights[i] = Number.isFinite(Number(data.weights[i])) ? Number(data.weights[i]) : 0; this.firstMoment[i] = Number(data.firstMoment?.[i]) || 0; this.secondMoment[i] = Number(data.secondMoment?.[i]) || 0; }
-    this.step = Math.max(0, Number(data.step) || 0); this.examples = Math.max(0, Number(data.examples) || 0);
-    this.learningRate = Math.max(0.0001, Math.min(0.2, Number(data.learningRate) || this.learningRate));
-    this.weightDecay = Math.max(0, Math.min(0.2, Number(data.weightDecay) || this.weightDecay)); return true;
+    if (data.version !== 1 || data.optimizer !== "AdamW" || !Array.isArray(data.weights) || data.weights.length !== this.weights.length ||
+        !data.weights.every(value => typeof value === "number" && Number.isFinite(value)) ||
+        (Array.isArray(data.featureNames) && data.featureNames.join("|") !== ANSWER_QUALITY_FEATURES.join("|"))) return false;
+    const moments = value => value == null ? Array(this.weights.length).fill(0) :
+      Array.isArray(value) && value.length === this.weights.length &&
+      value.every(entry => typeof entry === "number" && Number.isFinite(entry)) ? value : null;
+    const firstMoment = moments(data.firstMoment), secondMoment = moments(data.secondMoment);
+    const step = Number(data.step ?? 0), examples = Number(data.examples ?? 0);
+    const learningRate = Number(data.learningRate ?? this.learningRate), weightDecay = Number(data.weightDecay ?? this.weightDecay);
+    if (!firstMoment || !secondMoment || !Number.isFinite(step) || step < 0 || !Number.isFinite(examples) || examples < 0 ||
+        !Number.isFinite(learningRate) || learningRate <= 0 || !Number.isFinite(weightDecay) || weightDecay < 0) return false;
+    this.weights.set(data.weights); this.firstMoment.set(firstMoment); this.secondMoment.set(secondMoment);
+    this.step = step; this.examples = examples;
+    this.learningRate = Math.max(0.0001, Math.min(0.2, learningRate));
+    this.weightDecay = Math.max(0, Math.min(0.2, weightDecay));
+    return true;
   }
   report() { return { name: "logistic-regression/AdamW", featureCount: this.weights.length, trainingExamples: this.examples, optimizerSteps: this.step, objective: "binary cross-entropy with decoupled weight decay", equation: "L(θ)=−[y log(p)+(1−y)log(1−p)]; p=σ(θ·x)", updateEquation: "m_t=β₁m_{t−1}+(1−β₁)g_t; v_t=β₂v_{t−1}+(1−β₂)g_t²; θ_t=(1−ηλ)θ_{t−1}−η m̂_t/(√v̂_t+ε)", calibrated: false, hostedLLMFineTuned: false }; }
 }

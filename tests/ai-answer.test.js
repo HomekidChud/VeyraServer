@@ -103,6 +103,11 @@ const restoredQualityLearner = new AnswerQualityModel();
 assert.equal(restoredQualityLearner.loadData(qualitySnapshot), true);
 assert.equal(restoredQualityLearner.report().optimizerSteps, qualityLearner.report().optimizerSteps);
 assert.ok(Math.abs(restoredQualityLearner.predict(goodAnswerFeatures) - qualityLearner.predict(goodAnswerFeatures)) < 1e-12, "saved weights and AdamW moments should restore deterministically");
+const damagedQualityState = qualityLearner.serialize(); damagedQualityState.firstMoment[0] = Infinity;
+assert.equal(restoredQualityLearner.loadData(damagedQualityState), false, "non-finite saved optimizer moments are rejected");
+assert.equal(Number.isFinite(restoredQualityLearner.predict(goodAnswerFeatures)), true, "a rejected quality checkpoint leaves inference finite");
+assert.throws(() => qualityLearner.train(Float64Array.from([1, 1, NaN, 1, 1, 1, 1]), true), /Invalid answer-quality training example/);
+assert.throws(() => qualityLearner.train(goodAnswerFeatures, 1), /Invalid answer-quality training example/);
 
 const qualityCorpus = require("./fixtures/answer-quality-corpus");
 const qualityEvaluation = require("../scripts/evaluate-answer-quality").run();

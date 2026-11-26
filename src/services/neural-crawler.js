@@ -75,7 +75,7 @@ class NeuralCrawlerModel {
   constructor(opts = {}) {
     this.weights = new Float64Array(NUM_FEATURES);
     this.bias = 0;
-    this.learningRate = opts.learningRate || 0.01;
+    this.learningRate = clamp(Number.isFinite(Number(opts.learningRate)) && Number(opts.learningRate) > 0 ? Number(opts.learningRate) : 0.01, 0.0001, 0.2);
     this.weightDecay = Number(opts.weightDecay ?? opts.l2Regularization ?? 0.001);
     this.adamBeta1 = Number(opts.adamBeta1 ?? 0.9);
     this.adamBeta2 = Number(opts.adamBeta2 ?? 0.999);
@@ -194,12 +194,15 @@ class NeuralCrawlerModel {
   
   
   train(feedback) {
+    if (typeof feedback?.positive !== "boolean") return false;
     const url = feedback.url;
     const features = Array.isArray(feedback.features) ? feedback.features :
       url ? this.extractFeatures(url, feedback.context || {}) : null;
     if (!features || features.length !== NUM_FEATURES || !features.every(n => Number.isFinite(n) && n >= 0 && n <= 1)) return false;
     const target = feedback.positive ? 1 : 0;
-    const weight = feedback.weight || 1.0;
+    const requestedWeight = feedback.weight == null ? 1 : Number(feedback.weight);
+    if (!Number.isFinite(requestedWeight) || requestedWeight <= 0) return false;
+    const weight = clamp(requestedWeight, 0.05, 3);
 
     
     const predicted = this.score(features);
@@ -292,24 +295,44 @@ class NeuralCrawlerModel {
 
   loadData(data) {
     if (!data || ![1, 2].includes(data.version)) return false;
-    const w = data.weights || [];
-    for (let i = 0; i < NUM_FEATURES && i < w.length; i++) this.weights[i] = Number(w[i]) || 0;
-    this.bias = Number(data.bias) || 0;
+    const w = data.weights;
+    if (!Array.isArray(w) || !w.length || w.length > NUM_FEATURES || data.version === 2 && w.length !== NUM_FEATURES ||
+        !w.every(value => typeof value === "number" && Number.isFinite(value))) return false;
+    const bias = data.bias == null ? 0 : Number(data.bias);
+    const examples = data.trainingExamples == null ? 0 : Number(data.trainingExamples);
+    if (!Number.isFinite(bias) || !Number.isFinite(examples) || examples < 0) return false;
     const optimizer = data.optimizer && data.optimizer.name === "AdamW" ? data.optimizer : null;
-    this.optimizerStep = Math.max(0, Number(optimizer?.step) || 0);
-    this.firstMoment.fill(0); this.secondMoment.fill(0);
-    for (let i = 0; i < NUM_FEATURES; i++) {
-      this.firstMoment[i] = Number(optimizer?.firstMoment?.[i]) || 0;
-      this.secondMoment[i] = Number(optimizer?.secondMoment?.[i]) || 0;
+    const optimizerStep = optimizer ? Number(optimizer.step) : 0;
+    const moments = value => {
+      if (value == null) return Array(NUM_FEATURES).fill(0);
+      return Array.isArray(value) && value.length === NUM_FEATURES &&
+        value.every(entry => typeof entry === "number" && Number.isFinite(entry)) ? value : null;
+    };
+    const firstMoment = moments(optimizer?.firstMoment), secondMoment = moments(optimizer?.secondMoment);
+    const biasFirstMoment = optimizer ? Number(optimizer.biasFirstMoment ?? 0) : 0;
+    const biasSecondMoment = optimizer ? Number(optimizer.biasSecondMoment ?? 0) : 0;
+    if (!Number.isFinite(optimizerStep) || optimizerStep < 0 || !firstMoment || !secondMoment ||
+        !Number.isFinite(biasFirstMoment) || !Number.isFinite(biasSecondMoment)) return false;
+
+    this.weights.fill(0);
+    for (let i = 0; i < w.length; i++) this.weights[i] = w[i];
+    this.bias = bias;
+    this.optimizerStep = optimizerStep;
+    this.firstMoment.set(firstMoment);
+    this.secondMoment.set(secondMoment);
+    this.biasFirstMoment = biasFirstMoment;
+    this.biasSecondMoment = biasSecondMoment;
+    this.trainingExamples = examples;
+    if (data.stats && typeof data.stats === "object") {
+      for (const key of ["scored", "trained", "positiveFeedback", "negativeFeedback", "avgScore", "domainDiversityScore"]) {
+        const value = Number(data.stats[key]);
+        if (Number.isFinite(value)) this.stats[key] = value;
+      }
     }
-    this.biasFirstMoment = Number(optimizer?.biasFirstMoment) || 0;
-    this.biasSecondMoment = Number(optimizer?.biasSecondMoment) || 0;
-    this.trainingExamples = Number(data.trainingExamples) || 0;
-    if (data.stats) Object.assign(this.stats, data.stats);
     this.domainClickCounts.clear();
-    for (const [k, v] of Object.entries(data.domainClickCounts || {})) this.domainClickCounts.set(k, Number(v) || 0);
+    for (const [k, v] of Object.entries(data.domainClickCounts || {})) if (Number.isFinite(Number(v)) && Number(v) >= 0) this.domainClickCounts.set(k, Number(v));
     this.domainVisitCounts.clear();
-    for (const [k, v] of Object.entries(data.domainVisitCounts || {})) this.domainVisitCounts.set(k, Number(v) || 0);
+    for (const [k, v] of Object.entries(data.domainVisitCounts || {})) if (Number.isFinite(Number(v)) && Number(v) >= 0) this.domainVisitCounts.set(k, Number(v));
     return true;
   }
 
