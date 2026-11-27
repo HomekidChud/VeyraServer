@@ -50,6 +50,7 @@ const { CastServer, InternetConnectionManager } = require("./network/cast-server
 const { WsRelay } = require("./network/ws-relay");
 const { AIAnswerEngine } = require("./services/ai-answer");
 const { discoverAnswerSources, STRATEGY: answerDiscoveryStrategy, SHORTLIST: answerDiscoveryShortlist } = require("./services/answer-discovery");
+const { createVenueSearch } = require("./services/venue-search");
 const { AcquisitionManager, rankSearchCandidates } = require("./services/acquisition-manager");
 const { RenewingManager } = require("./services/renewing-system");
 const fullPage = require("./browser/full-page.js");
@@ -6516,6 +6517,125 @@ app.get('/api/browser/session/:sid/frames', async (req, res) => {
   }
 });
 
+
+function v2Error(res, status, code, message) {
+  return res.status(status).json({ ok: false, version: 2, error: { code, message } });
+}
+function v2Query(req) {
+  const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+  if (!q) return { error: "q is required." };
+  if (q.length > 600) return { error: "Query must be at most 600 characters." };
+  const mode = req.query.mode == null ? "web" : String(req.query.mode);
+  if (!(["web", "index", "vertical"].includes(mode))) return { error: "mode must be web, index, or vertical." };
+  const rawLimit = req.query.limit == null ? 20 : Number(req.query.limit);
+  const rawOffset = req.query.offset == null ? 0 : Number(req.query.offset);
+  if (!Number.isInteger(rawLimit) || rawLimit < 1 || rawLimit > CFG.maxSearchResults) return { error: `limit must be an integer from 1 to ${CFG.maxSearchResults}.` };
+  if (!Number.isSafeInteger(rawOffset) || rawOffset < 0) return { error: "offset must be a non-negative safe integer." };
+  if (req.query.cursor != null) return { error: "cursor is not supported; use offset." };
+  if (mode === "vertical" && (!SEARCH_VERTICALS.includes(String(req.query.type || "")))) return { error: "type is required and must be a supported vertical category." };
+  if (mode !== "vertical" && req.query.type != null) return { error: "type is only valid with mode=vertical." };
+  return { q, mode, limit: rawLimit, offset: rawOffset };
+}
+function v2Envelope(res, { q, mode, results, offset, limit, total, provider, region, extra = {}, privateRequest = false }) {
+  const hasMore = typeof total === "number" ? offset + results.length < total : results.length === limit;
+  const pagination = { offset, limit, nextOffset: hasMore ? offset + results.length : null, hasMore };
+  return res.json({ ok: true, version: 2, data: { results, ...extra }, pagination,
+    meta: { mode, query: q, provider: provider || "none", region: region || null, generatedAt: new Date().toISOString() } });
+}
+// OpenStreetMap/Overpass venue discovery is opt-in on route invocation; the
+// provider factory is injectable so tests and deployments can supply safe endpoints.
+const defaultVenueSearch = createVenueSearch();
+app.get("/api/v2/venues/search", async (req, res) => {
+  const raw = req.query;
+  const isPrivate = raw.private === "1" || raw.incognito === "1" || !authStore.userFromRequest(req);
+  if (isPrivate) { req.veyraPrivateTraffic = true; res.set("Cache-Control", "no-store"); }
+  const numeric = name => raw[name] == null ? NaN : Number(raw[name]);
+  const lat = numeric("lat"), lon = numeric("lon"), radiusMeters = numeric("radiusMeters");
+  const limit = raw.limit == null ? 20 : Number(raw.limit), offset = raw.offset == null ? 0 : Number(raw.offset);
+  const category = typeof raw.category === "string" ? raw.category : "cafe";
+  const q = typeof raw.q === "string" ? raw.q.trim() : "";
+  const valid = Number.isFinite(lat) && lat >= -90 && lat <= 90 && Number.isFinite(lon) && lon >= -180 && lon <= 180 &&
+    Number.isInteger(radiusMeters) && radiusMeters >= 1 && radiusMeters <= 50000 &&
+    Number.isInteger(limit) && limit >= 1 && limit <= 100 && Number.isInteger(offset) && offset >= 0 && offset <= 10000 &&
+    q.length <= 100 && Object.hasOwn(defaultVenueSearch.metadata.categories.reduce((o, key) => (o[key] = true, o), {}), category);
+  if (!valid) return v2Error(res, 400, "INVALID_VENUE_REQUEST", "Provide valid lat/lon, radiusMeters (1–50000), category, q (up to 100 characters), limit (1–100), and offset (0–10000)." );
+  const privacy = searchPrivacy(raw.privacy), venueScope = parseSiteScope(searchEntry(q).query);
+  if (venueScope.invalid) return v2Error(res, 400, "INVALID_SITE_SCOPE", "Use a valid hostname with site:.");
+  if (masksSearchScope(privacy, q, venueScope)) return v2Envelope(res, { q, mode: "venues", results: [], offset, limit, total: 0, provider: "none", region: null, extra: { attribution: defaultVenueSearch.metadata.attribution }, privateRequest: isPrivate });
+  const request = requestAbortSignal(req, res);
+  try {
+    const signal = AbortSignal.any([request.signal, AbortSignal.timeout(9000)]);
+    const service = app.locals.veyraVenueSearch || defaultVenueSearch;
+    const found = await service.search({ lat, lon, radiusMeters, category, q, text: q, limit, offset, signal });
+    if (request.signal.aborted) return;
+    if (!found?.ok) return v2Error(res, found?.error?.code === "TIMEOUT" ? 504 : 502, found?.error?.code || "VENUE_SEARCH_UNAVAILABLE", found?.error?.message || "Venue search is temporarily unavailable.");
+    const results = Array.isArray(found.results) ? found.results : [];
+    const hasMore = Boolean(found.hasMore);
+    return res.json({ ok: true, version: 2, data: { results, attribution: found.attribution || service.metadata?.attribution || defaultVenueSearch.metadata.attribution },
+      pagination: { offset, limit, nextOffset: hasMore ? (found.nextOffset ?? offset + results.length) : null, hasMore },
+      meta: { mode: "venues", query: q, provider: "openstreetmap", region: null, generatedAt: new Date().toISOString() } });
+  } catch { if (!request.signal.aborted) return v2Error(res, 502, "VENUE_SEARCH_UNAVAILABLE", "Venue search is temporarily unavailable."); }
+  finally { request.dispose(); }
+});
+
+app.get("/api/v2/search", async (req, res) => {
+  const isPrivate = req.query.private === "1" || req.query.incognito === "1" || !authStore.userFromRequest(req);
+  if (isPrivate) { req.veyraPrivateTraffic = true; res.set("Cache-Control", "no-store"); }
+  const input = v2Query(req);
+  if (input.error) return v2Error(res, 400, "INVALID_SEARCH_REQUEST", input.error);
+  const { q, mode, limit, offset } = input;
+  const request = requestAbortSignal(req, res);
+  const privacy = searchPrivacy(req.query.privacy);
+  const { query, preferGoogle, domain } = searchEntry(q);
+  const scope = parseSiteScope(query);
+  try {
+    if (scope.invalid) return v2Error(res, 400, "INVALID_SITE_SCOPE", "Use a valid hostname with site:.");
+    if (masksSearchScope(privacy, query, scope)) return v2Envelope(res, { q, mode, results: [], offset, limit, total: 0, provider: "none", region: req.query.region, privateRequest: isPrivate });
+    let result, results, total = null, provider = "none";
+    const options = { offset, limit, region: req.query.region, lang: typeof req.query.lang === "string" ? req.query.lang.slice(0,35) : "en", engine: typeof req.query.engine === "string" ? req.query.engine.slice(0,32) : "", privacy, noCache: isPrivate || !CFG.globalCacheEnabled, privateSearch: req.query.incognito === "1", signal: AbortSignal.any([request.signal, AbortSignal.timeout(9000)]) };
+    if (mode === "index") {
+      result = localSearch(query, offset, limit, { region: req.query.region, topical: true, privacy });
+      total = result.total; provider = "veyra-index";
+      results = result.results.filter(row => allowsSearchResult(privacy,row) && allowsSiteUrl(scope,row.url)).map(row => ({ ...row, canonicalUrl: canonicalKey(row.url) || row.url }));
+    } else if (mode === "vertical") {
+      result = await (app.locals.veyraVerticalSearch || verticalSearch).search(String(req.query.type), query, options);
+      provider = result.provider || "none";
+      results = (result.results || []).filter(row => allowsSearchResult(privacy,row) && allowsSiteUrl(scope,row.sourcePageUrl || row.url) && (!row.canonicalUrl || allowsSiteUrl(scope,row.canonicalUrl)) && (req.query.type === "images" || allowsSiteUrl(scope,row.url)));
+    } else {
+      result = await (app.locals.veyraWebSearch || webSearch).search(query, { ...options, preferGoogle, domainBrowse: !!domain, feed: false, reference: true });
+      provider = result.provider || "none";
+      results = (result.results || []).filter(row => allowsSearchResult(privacy,row) && canonicalKey(row.url) && allowsSiteUrl(scope,row.url) && (!row.canonicalUrl || allowsSiteUrl(scope,row.canonicalUrl)));
+    }
+    results = annotateMatchBatch(query, results, mode === "vertical" ? String(req.query.type) : mode);
+    return v2Envelope(res, { q, mode, results, offset, limit, total, provider, region: req.query.region,
+      extra: mode === "vertical" ? { type: req.query.type, status: result.status || "ok" } : {}, privateRequest: isPrivate });
+  } catch (error) {
+    if (!request.signal.aborted) return v2Error(res, 502, "SEARCH_UNAVAILABLE", "Search is temporarily unavailable.");
+  } finally { request.dispose(); }
+});
+app.get("/api/v2/search/deep", async (req, res) => {
+  const isPrivate = req.query.private === "1" || req.query.incognito === "1" || !authStore.userFromRequest(req);
+  if (isPrivate) { req.veyraPrivateTraffic = true; res.set("Cache-Control","no-store"); }
+  const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
+  if (q.length > 600) return v2Error(res,400,"INVALID_SEARCH_REQUEST","Query must be at most 600 characters.");
+  if (!q) return v2Error(res,400,"INVALID_SEARCH_REQUEST","q is required.");
+  const request = requestAbortSignal(req,res), { query } = searchEntry(q), scope = parseSiteScope(query), privacy = searchPrivacy(req.query.privacy);
+  try {
+    if (scope.invalid) return v2Error(res,400,"INVALID_SITE_SCOPE","Use a valid hostname with site:.");
+    if (masksSearchScope(privacy,query,scope)) return v2Envelope(res,{q,mode:"deep",results:[],offset:0,limit:20,total:0,provider:"none",region:req.query.region,extra:{kind:"discovered_sources",summaryGenerated:false,diagnostics:{batches:[]}}});
+    const inScope = row => allowsSearchResult(privacy,row) && canonicalKey(row.url) && allowsSiteUrl(scope,row.url) && (!row.canonicalUrl || allowsSiteUrl(scope,row.canonicalUrl));
+    const guarded = fn => (topic, signal, next) => masksSearchScope(privacy,topic,parseSiteScope(topic)) ? {status:"filtered",results:[]} : fn(topic,signal,next);
+    const { results, diagnostics } = await discoverAnswerSources({ query, scope, signal:request.signal, budgetMs:6000,
+      indexed: localSearch(query,0,Math.min(20,CFG.maxSearchResults),{includeText:true,maxTextChars:30000,privacy,region:req.query.region,topical:true,requireTerms:true}).results,
+      references: referenceResults(scope,3), allowSource:inScope,
+      search:guarded(async (topic,signal,next) => (app.locals.veyraWebSearch || webSearch).search(topic,{signal,region:req.query.region,lang:String(req.query.lang||"en").slice(0,35),engine:String(req.query.engine||""),limit:Math.min(20,CFG.maxSearchResults),...next,noCache:isPrivate||!CFG.globalCacheEnabled,privateSearch:req.query.incognito==="1",feed:true,reference:true})),
+      crawl: sourceSearchEnabled ? guarded(async (topic,signal) => ({results:await (app.locals.veyraSourceSearch || sourceSearch).discover(parseSiteScope(topic),{signal,allowUrl:url=>inScope({url})})})) : null
+    });
+    return v2Envelope(res,{q,mode:"deep",results,offset:0,limit:results.length,total:results.length,provider:"multi-stage-discovery",region:req.query.region,
+      extra:{kind:"discovered_sources",summaryGenerated:false,diagnostics:{strategy:diagnostics.strategy,batches:diagnostics.batches,deadlineExceeded:diagnostics.deadlineExceeded,latencyMs:diagnostics.latencyMs}}});
+  } catch { if (!request.signal.aborted) return v2Error(res,502,"SOURCE_DISCOVERY_UNAVAILABLE","Source discovery is temporarily unavailable."); }
+  finally { request.dispose(); }
+});
 
 app.get('/api/search', (req, res) => {
   try {

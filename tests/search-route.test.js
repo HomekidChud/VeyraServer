@@ -106,6 +106,94 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
   try {
     await new Promise((resolve, reject) => { server.once("listening", resolve); server.once("error", reject); });
     const base = `http://127.0.0.1:${server.address().port}`;
+    let venueArgs;
+    app.locals.veyraVenueSearch = { metadata: { attribution: { text: "© OpenStreetMap contributors", url: "https://www.openstreetmap.org/copyright", license: "ODbL-1.0", licenseUrl: "https://opendatacommons.org/licenses/odbl/1-0/" } }, async search(args) {
+      venueArgs = args;
+      return { ok: true, results: [{ id: "osm:node/1", name: "Fixture Cafe" }], hasMore: true, nextOffset: args.offset + 1, attribution: this.metadata.attribution };
+    } };
+    const venueUrl = `${base}/api/v2/venues/search?${new URLSearchParams({ lat: "40.7", lon: "-73.9", radiusMeters: "1200", category: "cafe", q: "fixture", limit: "1", offset: "2", private: "1" })}`;
+    const venueResponse = await fetch(venueUrl);
+    const venueBody = await venueResponse.json();
+    assert.equal(venueResponse.status, 200);
+    assert.equal(venueResponse.headers.get("cache-control"), "no-store");
+    assert.equal(venueBody.version, 2);
+    assert.equal(venueBody.data.results[0].name, "Fixture Cafe");
+    assert.equal(venueBody.data.attribution.license, "ODbL-1.0");
+    assert.deepEqual(venueBody.pagination, { offset: 2, limit: 1, nextOffset: 3, hasMore: true });
+    assert.equal(venueArgs.q, "fixture"); assert.equal(venueArgs.text, "fixture"); assert.equal(venueArgs.radiusMeters, 1200);
+    let maskedVenueCalls = 0;
+    app.locals.veyraVenueSearch = { metadata: { attribution: { text: "© OpenStreetMap contributors", url: "https://www.openstreetmap.org/copyright", license: "ODbL-1.0", licenseUrl: "https://opendatacommons.org/licenses/odbl/1-0/" } }, async search() { maskedVenueCalls++; return { ok: true, results: [] }; } };
+    const maskedVenue = await fetch(`${base}/api/v2/venues/search?${new URLSearchParams({ lat: "40", lon: "-70", radiusMeters: "1000", category: "cafe", q: "site:pornhub.com", privacy: "filtered" })}`);
+    const maskedVenueBody = await maskedVenue.json();
+    assert.equal(maskedVenue.status, 200); assert.equal(maskedVenue.headers.get("cache-control"), "no-store");
+    assert.deepEqual(maskedVenueBody.data.results, []); assert.equal(maskedVenueBody.meta.provider, "none"); assert.equal(maskedVenueCalls, 0);
+    const invalidVenueResponse = await fetch(`${base}/api/v2/venues/search?lat=100&lon=0&radiusMeters=100&category=cafe`);
+    assert.equal(invalidVenueResponse.status, 400); assert.equal(invalidVenueResponse.headers.get("cache-control"), "no-store");
+    app.locals.veyraVenueSearch = { async search() { return { ok: false, error: { code: "UPSTREAM_ERROR", message: "fixture failure" } }; } };
+    assert.equal((await fetch(`${base}/api/v2/venues/search?lat=40&lon=-70&radiusMeters=100&category=cafe`)).status, 502);
+    const v2Invalid = await fetch(`${base}/api/v2/search?mode=impossible&q=test`);
+    assert.equal(v2Invalid.status, 400); assert.equal(v2Invalid.headers.get("cache-control"), "no-store"); assert.equal((await v2Invalid.json()).version, 2);
+    for (const suffix of ["?mode=web", "?q=%20%20"]) {
+      const missingQuery = await fetch(`${base}/api/v2/search${suffix}`);
+      const missingQueryBody = await missingQuery.json();
+      assert.equal(missingQuery.status, 400); assert.equal(missingQuery.headers.get("cache-control"), "no-store");
+      assert.equal(missingQueryBody.error.code, "INVALID_SEARCH_REQUEST");
+    }
+    const v2Index = await fetch(`${base}/api/v2/search?mode=index&q=orbital%20lunar&limit=2&private=1`);
+    const v2IndexBody = await v2Index.json();
+    assert.equal(v2IndexBody.version, 2); assert.equal(v2IndexBody.meta.mode, "index"); assert.equal(v2Index.headers.get("cache-control"), "no-store");
+    assert.equal(v2IndexBody.pagination.offset, 0); assert.ok(Array.isArray(v2IndexBody.data.results));
+    const originalV2Web = app.locals.veyraWebSearch, originalV2Vertical = app.locals.veyraVerticalSearch, originalV2Source = app.locals.veyraSourceSearch;
+    const v2WebCalls = [];
+    try {
+      app.locals.veyraWebSearch = { async search(query, options) {
+        v2WebCalls.push(query);
+        if (query === "compare cedar vs maple") return { provider: "v2-fixture", results: [
+          { url: "https://alpha.example/source", title: "Alpha source" }, { url: "https://shared.example/guide", title: "Shared source" }
+        ] };
+        if (query === "cedar") return { provider: "v2-fixture", results: [
+          { url: "https://shared.example/guide", title: "Duplicate shared source" }, { url: "https://cedar.example/report", title: "Cedar source" }
+        ] };
+        if (query === "maple") return { provider: "v2-fixture", results: [
+          { url: "https://maple.example/report", title: "Maple source" }, { url: "https://shared.example/guide", title: "Duplicate shared source" }
+        ] };
+        return { provider: "v2-fixture", results: [{ url: "https://unexpected.example/", title: "Unexpected" }] };
+      } };
+      const v2Web = await fetch(`${base}/api/v2/search?${new URLSearchParams({ q: "local v2 fixture", limit: "2", private: "1" })}`);
+      const v2WebBody = await v2Web.json();
+      assert.equal(v2Web.status, 200); assert.equal(v2Web.headers.get("cache-control"), "no-store");
+      assert.equal(v2WebBody.meta.provider, "v2-fixture"); assert.equal(v2WebBody.meta.mode, "web");
+      const blockedV2Search = await fetch(`${base}/api/v2/search?${new URLSearchParams({ q: "site:pornhub.com guide", privacy: "filtered" })}`);
+      assert.equal(blockedV2Search.headers.get("cache-control"), "no-store");
+      assert.deepEqual((await blockedV2Search.json()).data.results, []); assert.deepEqual(v2WebCalls, ["local v2 fixture"]);
+      app.locals.veyraVerticalSearch = { async search(type, query, options) {
+        assert.equal(type, "images"); assert.equal(query, "art fixtures"); assert.equal(options.offset, 0);
+        return { type, status: "ok", provider: "vertical-v2-fixture", results: [{ url: "https://image.example/photo", title: "Fixture photo", thumbnail: "https://image.example/thumb" }] };
+      } };
+      const v2Vertical = await fetch(`${base}/api/v2/search?${new URLSearchParams({ mode: "vertical", type: "images", q: "art fixtures", private: "1" })}`);
+      const v2VerticalBody = await v2Vertical.json();
+      assert.equal(v2Vertical.status, 200); assert.equal(v2VerticalBody.data.type, "images");
+      assert.equal(v2VerticalBody.data.status, "ok"); assert.equal(v2VerticalBody.meta.provider, "vertical-v2-fixture");
+      app.locals.veyraSourceSearch = { async discover() { return { status: "empty", results: [] }; } };
+      const deepTopic = "compare cedar vs maple";
+      const deep = await fetch(`${base}/api/v2/search/deep?${new URLSearchParams({ q: deepTopic, private: "1" })}`);
+      const deepBody = await deep.json();
+      assert.equal(deep.status, 200); assert.equal(deep.headers.get("cache-control"), "no-store");
+      assert.equal(deepBody.data.kind, "discovered_sources"); assert.equal(deepBody.data.summaryGenerated, false);
+      assert.ok(deepBody.data.diagnostics.batches.some(batch => batch.lane === "alternate"));
+      assert.deepEqual(new Set(deepBody.data.results.map(row => row.url)), new Set([
+        "https://alpha.example/source", "https://shared.example/guide", "https://cedar.example/report", "https://maple.example/report"
+      ]), "repeated-query fusion should retain unique sources and deduplicate the repeated URL");
+      assert.equal(new Set(deepBody.data.results.map(row => row.url)).size, deepBody.data.results.length);
+      assert.ok(v2WebCalls.includes("cedar") && v2WebCalls.includes("maple"), "compare queries should run bounded alternate searches");
+      const deepCalls = v2WebCalls.length;
+      const blockedDeep = await fetch(`${base}/api/v2/search/deep?${new URLSearchParams({ q: "site:pornhub.com guide", privacy: "filtered" })}`);
+      assert.deepEqual((await blockedDeep.json()).data.results, []); assert.equal(v2WebCalls.length, deepCalls, "privacy-filtered deep scopes never call providers");
+    } finally {
+      app.locals.veyraWebSearch = originalV2Web;
+      app.locals.veyraVerticalSearch = originalV2Vertical;
+      if (originalV2Source === undefined) delete app.locals.veyraSourceSearch; else app.locals.veyraSourceSearch = originalV2Source;
+    }
     const suggest = input => fetch(`${base}/api/search/suggest?${new URLSearchParams(input)}`);
     for (const [q, expected] of [["orbital lun", ["orbital lunar"]], ["orbital ", ["orbital lunar"]], ["site:fixture.test lun", []]]) {
       const response = await suggest({ q, limit: "1" });
@@ -764,6 +852,7 @@ const { app, indexDocument, mongoStore, CFG } = require("../src/server");
     assert.equal((await getSummary({ query: "Veyra", source: "index" })).diagnosticCode, undefined, "a finished request releases its account slot");
     console.log("Search, answer and YouTube Express routes passed controlled local integration tests");
   } finally {
+    delete app.locals.veyraVenueSearch;
     delete app.locals.veyraWebSearch;
     delete app.locals.veyraSourceSearchFetch;
     delete app.locals.veyraSourceSearch;
